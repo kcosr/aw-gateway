@@ -1,0 +1,41 @@
+[connection]
+endpoint = "https://build-service.example.com/build-service/rhel8"
+token = "<build-service-token>"
+
+[sources]
+include = [
+    "src/**",
+    "tests/**",
+    "assets/**",
+    "aw-gateway.sample.toml",
+    "container-agent.sample.toml",
+    "Cargo.toml",
+    "Cargo.lock",
+]
+exclude = ["target/**"]
+
+[artifacts]
+include = [
+    "target/release/aw-gateway",
+    "target/release/aw-container-bootstrap",
+    "target/release/aw-container-agent",
+    "target/release/aw-ssh-command-filter",
+]
+exclude = ["**/*.d"]
+
+[request]
+timeout_sec = 900
+
+[workspace]
+reuse = true
+id = "aw-gateway-rhel8"
+create = true
+ttl_sec = 0
+
+[output]
+stdout_max_lines = 10
+stderr_max_lines = 10
+stdout_tail_lines = 10
+stderr_tail_lines = 10
+capture_logs = true
+log_dir = "/tmp/build-service-aw-gateway"

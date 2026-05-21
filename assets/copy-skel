@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Copy AW Gateway skel files into a workspace without overwriting
+# existing user files. Missing nested parent directories are created as needed.
+#
+# Usage:
+#   copy-skel --skel-dir /path/to/skel --workspace /path/to/workspace
+
+set -euo pipefail
+
+SKEL_DIR="${AW_SKEL_DIR:-}"
+WORKSPACE=""
+
+usage() {
+    echo "Usage: $0 --skel-dir DIR --workspace DIR" >&2
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --skel-dir)
+            [[ $# -ge 2 ]] || { usage; exit 2; }
+            SKEL_DIR="$2"
+            shift 2
+            ;;
+        --workspace)
+            [[ $# -ge 2 ]] || { usage; exit 2; }
+            WORKSPACE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            usage
+            exit 2
+            ;;
+    esac
+done
+
+[[ -n "$SKEL_DIR" && -n "$WORKSPACE" ]] || {
+    usage
+    exit 2
+}
+
+[[ -d "$SKEL_DIR" ]] || exit 0
+mkdir -p "$WORKSPACE"
+
+shopt -s dotglob nullglob
+while IFS= read -r -d '' source; do
+    rel="${source#"$SKEL_DIR"/}"
+    target="$WORKSPACE/$rel"
+    [[ -e "$target" ]] && continue
+    mkdir -p "$(dirname "$target")"
+    cp -a "$source" "$target"
+done < <(find "$SKEL_DIR" -type f -print0)

@@ -1,0 +1,28 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        bubblewrap \
+        ca-certificates \
+        curl \
+        git \
+        less \
+        lsof \
+        nodejs \
+        npm \
+        openssh-client \
+        openssh-server \
+        procps \
+        python3 \
+        sudo \
+        tar \
+        vim-tiny \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /opt/aw-gateway/bin /run/sshd /var/lib/codex
+
+WORKDIR /root
+
+CMD ["/bin/bash"]

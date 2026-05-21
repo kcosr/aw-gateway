@@ -1,0 +1,304 @@
+schema_version = "1"
+default_target = "default"
+
+[runtime]
+# Supported values: "podman", "docker", "colima".
+# Podman is the managed-server default.
+type = "podman"
+
+# Docker example:
+# type = "docker"
+# docker_host = "unix:///var/run/docker.sock"
+#
+# Colima example. Colima is implemented through Docker with
+# DOCKER_HOST=unix://{home}/.colima/<profile>/docker.sock.
+# type = "colima"
+# profile = "default"
+
+[logging]
+level = "info"
+directory = "{state}/logs/gateway"
+max_bytes = 104857600
+max_files = 5
+console = false
+
+[workspace]
+path = "workspace"
+state_dir = ".aw-gateway"
+
+[ssh_dispatch]
+allow_interactive_shell = true
+allow_container_commands = true
+enabled_gateway_actions = [
+  "connect",
+  "up",
+  "run",
+  "status",
+  "targets",
+  "stop",
+  "remove",
+  "set-default",
+  "show-default",
+  "reset-default",
+  "add-key",
+  "add-host-key",
+  "add-container-key",
+  "client-config",
+  "client-bundle",
+  "help",
+]
+[client_config]
+inner_alias_template = "aw-{target}"
+container_host_template = "aw-container-{target}"
+host = "gateway.example.com"
+gateway_path = "/opt/aw-gateway/bin/aw-gateway"
+default_identity_dir = "~/.ssh/aw-gateway"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+# Podman defaults container_user/container_home to the authenticated host user.
+# Docker/Colima defaults are root and /root unless overridden here.
+# container_user = "agentuser"
+# container_home = "/home/agentuser"
+# Optional target-specific host workspace. Relative paths are resolved under
+# the authenticated user's home; absolute paths may use {home}, {user}, {uid},
+# {gid}, {target}, {image}, {image_slug}, and {session_id}.
+# workspace = "{home}/workspace-internal"
+stop_when_idle = true
+remove_on_stop = false
+
+[targets.default.idle_cleanup]
+owner = "agent"
+action = "exit_container"
+idle_grace = "5m"
+preserve_processes = ["tmux", "screen"]
+poll_interval = "30s"
+shutdown_timeout = "20s"
+
+# Local workstation mode can opt into a loopback listener:
+#
+# [targets.default.local_ssh]
+# mode = "listen"
+# backend = "socket"
+# readiness = "agent_control"
+# host = "127.0.0.1"
+# port = 40222
+#
+# Docker/Colima local workstation mode can publish inner SSH on a random
+# loopback-only container runtime port and have the gateway listener proxy to
+# that TCP endpoint instead of a host-visible Unix socket:
+#
+# [targets.default.local_ssh]
+# mode = "listen"
+# backend = "published_port"
+# readiness = "ssh_only"
+# host = "127.0.0.1"
+#
+# Target-specific container runtime args and environment are explicit. For
+# example, a Docker/Colima target that needs bubblewrap and container-local
+# Codex state can opt in like this:
+#
+# [targets.default.runtime]
+# extra_run_args = [
+#   "--cap-add", "SYS_ADMIN",
+#   "--security-opt", "seccomp=unconfined",
+#   "--security-opt", "apparmor=unconfined",
+# ]
+#
+# [targets.default.container_env]
+# CODEX_HOME = "/var/lib/codex"
+#
+# [targets.default.session_env]
+# CODEX_HOME = "/var/lib/codex"
+#
+# If published-port SSH is the only host control path, disable the container
+# agent control socket so supervised services do not create an unused Unix
+# socket on a Docker/Colima bind mount:
+#
+# [container_agent]
+# control_socket = false
+
+[[lifecycle_steps]]
+phase = "pre_start"
+name = "ensure-storage-conf"
+required = true
+command = [
+  "/opt/aw-gateway/bin/ensure-storage-conf",
+  "--template",
+  "/opt/aw-gateway/skel/.config/containers/storage.conf",
+  "--shared-store",
+  "/opt/aw-gateway/shared-store",
+]
+
+[[lifecycle_steps]]
+phase = "pre_start"
+name = "ensure-workspace"
+required = true
+command = ["/usr/bin/mkdir", "-p", "{workspace}"]
+
+[[lifecycle_steps]]
+phase = "pre_start"
+name = "copy-skel"
+required = false
+command = [
+  "/opt/aw-gateway/bin/copy-skel",
+  "--skel-dir",
+  "/opt/aw-gateway/skel",
+  "--workspace",
+  "{workspace}",
+]
+
+[[host_steps]]
+name = "firewall"
+required = true
+command = ["sudo", "/opt/aw-gateway/bin/aw-iptables", "add", "{container_pid}"]
+health_check = { type = "command", command = ["sudo", "/opt/aw-gateway/bin/aw-iptables", "check", "{container_pid}"] }
+
+# Targets inherit global lifecycle, host, bootstrap, and transfer policy by
+# default. Target list entries can replace inherited entries by key, remove
+# inherited entries with enabled = false, append new entries, or insert new
+# entries with before/after.
+#
+# [targets.default.container_ssh.transfer]
+# sftp = "deny"
+# legacy_scp = "outbound"
+#
+# [targets.default.container_bootstrap]
+# enabled = true
+# agent_program = "/opt/aw-gateway/bin/aw-container-agent"
+#
+# [[targets.default.lifecycle_steps]]
+# phase = "pre_start"
+# name = "copy-skel"
+# enabled = false
+#
+# [[targets.default.lifecycle_steps]]
+# phase = "pre_start"
+# name = "target-prep"
+# after = "ensure-workspace"
+# command = ["/opt/aw-gateway/bin/target-prep", "{workspace}"]
+#
+# [[targets.default.host_steps]]
+# name = "firewall"
+# command = ["sudo", "/opt/aw-gateway/bin/aw-iptables", "add", "{container_pid}"]
+#
+# Optional bootstrap-mount mode. When enabled, the container starts by running
+# aw-container-bootstrap, which prepares passwd/group/home/state and then execs
+# aw-container-agent so the agent becomes PID 1.
+# Before enabling this block, install the referenced binaries on the host and
+# verify that the configured mount sources exist.
+#
+# [container_bootstrap]
+# enabled = true
+# entrypoint = "/opt/aw-gateway/bin/aw-container-bootstrap"
+# agent_program = "/opt/aw-gateway/bin/aw-container-agent"
+#
+# [[container_mounts]]
+# source = "/opt/aw-gateway/bin/aw-container-bootstrap"
+# target = "/opt/aw-gateway/bin/aw-container-bootstrap"
+# mode = "ro"
+#
+# [[container_mounts]]
+# source = "/opt/aw-gateway/bin/aw-container-agent"
+# target = "/opt/aw-gateway/bin/aw-container-agent"
+# mode = "ro"
+#
+# [[container_mounts]]
+# source = "/opt/aw-gateway/bin/aw-ssh-command-filter"
+# target = "/opt/aw-gateway/bin/aw-ssh-command-filter"
+# mode = "ro"
+#
+# [[container_mounts]]
+# source = "/opt/aw-gateway/bin/start-container-sshd"
+# target = "/opt/aw-gateway/bin/start-container-sshd"
+# mode = "ro"
+#
+# [[container_mounts]]
+# source = "/opt/aw-gateway/etc/aw-gateway/sshd_config_agent"
+# target = "/etc/ssh/sshd_config_agent"
+# mode = "ro"
+#
+# [[container_mounts]]
+# source = "/opt/aw-gateway/bin/acl-proxy"
+# target = "/usr/local/bin/acl-proxy"
+# mode = "ro"
+#
+# [targets.default.identity]
+# bootstrap_user = "root"
+# session_user = "{user}"
+# session_uid = "{uid}"
+# session_gid = "{gid}"
+# session_home = "/home/{user}"
+# session_shell = "/bin/bash"
+#
+[container_ssh.transfer]
+sftp = "allow"
+legacy_scp = "allow"
+
+[container_agent]
+enabled = true
+
+[[container_agent.services]]
+name = "acl-proxy"
+required = true
+user = "root"
+command = ["acl-proxy", "--config", "/etc/acl-proxy/acl-proxy.toml"]
+restart = "always"
+depends_on = []
+
+[container_agent.services.env]
+AW_IDENTITY_TOKEN = { inherit = "AW_IDENTITY_TOKEN" }
+
+[container_agent.services.health_check]
+type = "http"
+url = "http://127.0.0.1:8881/_acl-proxy/ready"
+expect_status = 200
+expect_json = { status = "ready" }
+interval = "2s"
+timeout = "1s"
+
+# A target can replace a named global service by defining a service with the
+# same name under targets.<name>.container_agent.services. This is useful when
+# a target should use a different ACL proxy config without changing global
+# mounts:
+#
+# [[targets.default.container_agent.services]]
+# name = "acl-proxy"
+# required = true
+# user = "root"
+# command = ["acl-proxy", "--config", "/etc/acl-proxy/internal-acl-proxy.toml"]
+# restart = "always"
+#
+# [targets.default.container_agent.services.env]
+# AW_IDENTITY_TOKEN = { inherit = "AW_IDENTITY_TOKEN" }
+#
+# [targets.default.container_agent.services.health_check]
+# type = "http"
+# url = "http://127.0.0.1:8881/_acl-proxy/ready"
+# expect_status = 200
+# expect_json = { status = "ready" }
+# interval = "2s"
+# timeout = "1s"
+
+[[container_agent.services]]
+name = "container-sshd"
+required = true
+user = "root"
+command = ["/opt/aw-gateway/bin/start-container-sshd"]
+restart = "always"
+depends_on = ["acl-proxy"]
+
+[container_agent.services.health_check]
+type = "tcp"
+host = "127.0.0.1"
+port = 22
+interval = "2s"
+timeout = "1s"
+
+[container_agent.ssh_bridge]
+enabled = true
+socket = "{container_state_dir}/ssh.sock"
+target = "127.0.0.1:22"
+mode = "0600"

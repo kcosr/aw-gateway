@@ -1,0 +1,58 @@
+schema_version = "1"
+
+[logging]
+level = "info"
+console = true
+
+[container_agent]
+enabled = true
+
+[container_agent.idle_cleanup]
+owner = "agent"
+action = "exit_container"
+idle_grace = "5m"
+preserve_processes = ["tmux", "screen"]
+poll_interval = "30s"
+shutdown_timeout = "20s"
+reap_signal = "TERM"
+reap_kill_after = "20s"
+
+[[container_agent.services]]
+name = "acl-proxy"
+required = true
+user = "root"
+command = ["acl-proxy", "--config", "/etc/acl-proxy/acl-proxy.toml"]
+restart = "always"
+depends_on = []
+
+[container_agent.services.env]
+AW_IDENTITY_TOKEN = { inherit = "AW_IDENTITY_TOKEN" }
+
+[container_agent.services.health_check]
+type = "http"
+url = "http://127.0.0.1:8881/_acl-proxy/ready"
+expect_status = 200
+expect_json = { status = "ready" }
+interval = "2s"
+timeout = "1s"
+
+[[container_agent.services]]
+name = "container-sshd"
+required = true
+user = "root"
+command = ["/usr/local/bin/start-container-sshd"]
+restart = "always"
+depends_on = ["acl-proxy"]
+
+[container_agent.services.health_check]
+type = "tcp"
+host = "127.0.0.1"
+port = 22
+interval = "2s"
+timeout = "1s"
+
+[container_agent.ssh_bridge]
+enabled = true
+socket = "{container_state_dir}/ssh.sock"
+target = "127.0.0.1:22"
+mode = "0600"

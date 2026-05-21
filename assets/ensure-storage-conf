@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Ensure the current user's rootless Podman storage config can see a shared
+# image store.
+#
+# Usage:
+#   ensure-storage-conf --shared-store /path/to/shared-store
+#   ensure-storage-conf --template /path/to/storage.conf
+# Optional:
+#   --storage-conf /path/to/storage.conf
+
+set -euo pipefail
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+STORAGE_CONF="${AW_STORAGE_CONF:-$CONFIG_HOME/containers/storage.conf}"
+TEMPLATE="${AW_STORAGE_CONF_TEMPLATE:-}"
+SHARED_STORE="${AW_SHARED_IMAGE_STORE:-}"
+
+usage() {
+    echo "Usage: $0 [--storage-conf PATH] [--template PATH | --shared-store PATH]" >&2
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --storage-conf)
+            [[ $# -ge 2 ]] || { usage; exit 2; }
+            STORAGE_CONF="$2"
+            shift 2
+            ;;
+        --template)
+            [[ $# -ge 2 ]] || { usage; exit 2; }
+            TEMPLATE="$2"
+            shift 2
+            ;;
+        --shared-store)
+            [[ $# -ge 2 ]] || { usage; exit 2; }
+            SHARED_STORE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            usage
+            exit 2
+            ;;
+    esac
+done
+
+if [[ -f "$STORAGE_CONF" ]]; then
+    chmod 600 "$STORAGE_CONF"
+    exit 0
+fi
+
+mkdir -p "$(dirname "$STORAGE_CONF")"
+
+if [[ -n "$TEMPLATE" ]]; then
+    if [[ -f "$TEMPLATE" ]]; then
+        cp "$TEMPLATE" "$STORAGE_CONF"
+        chmod 600 "$STORAGE_CONF"
+        exit 0
+    fi
+    [[ -n "$SHARED_STORE" ]] || {
+        echo "storage config template not found: $TEMPLATE" >&2
+        exit 1
+    }
+fi
+
+if [[ -z "$TEMPLATE" || -n "$SHARED_STORE" ]]; then
+    [[ -n "$SHARED_STORE" ]] || {
+        echo "either --template or --shared-store is required" >&2
+        exit 2
+    }
+    cat > "$STORAGE_CONF" <<EOF
+[storage]
+driver = "overlay"
+
+[storage.options]
+additionalimagestores = ["$SHARED_STORE"]
+
+[storage.options.overlay]
+mount_program = "/usr/bin/fuse-overlayfs"
+EOF
+fi
+
+chmod 600 "$STORAGE_CONF"

@@ -1,0 +1,40 @@
+[package]
+name = "aw-gateway"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "aw-gateway"
+path = "src/bin/aw-gateway.rs"
+
+[[bin]]
+name = "aw-container-agent"
+path = "src/bin/aw-container-agent.rs"
+
+[[bin]]
+name = "aw-container-bootstrap"
+path = "src/bin/aw-container-bootstrap.rs"
+
+[[bin]]
+name = "aw-ssh-command-filter"
+path = "src/bin/aw-ssh-command-filter.rs"
+
+[dependencies]
+anyhow = "1.0.100"
+clap = { version = "4.5.53", features = ["derive", "env"] }
+libc = "0.2.177"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+shell-words = "1.1.0"
+tokio = { version = "1.48.0", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.9.8"
+tracing = "0.1.41"
+tracing-appender = "0.2.4"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+assert_cmd = "2.1.1"
+predicates = "3.1.3"
+tempfile = "3.23.0"

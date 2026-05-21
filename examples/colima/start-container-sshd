@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+run_dir=${AW_SSHD_RUN_DIR:-/run/sshd}
+mkdir -p "$run_dir"
+
+base_config=${AW_SSHD_BASE_CONFIG:-/etc/ssh/sshd_config_agent}
+config=${AW_SSHD_RUNTIME_CONFIG:-/run/sshd_config_agent}
+cp "$base_config" "$config"
+
+if [[ -n "${AW_SSHD_SETENV_CONFIG:-}" && -r "${AW_SSHD_SETENV_CONFIG}" ]]; then
+  grep -E '^[[:space:]]*SetEnv[[:space:]]+' "$AW_SSHD_SETENV_CONFIG" >> "$config" || true
+fi
+
+policy=${AW_SSHD_POLICY_CONFIG:-}
+if [[ -n "$policy" && ! -r "$policy" ]]; then
+  echo "sshd policy config is not readable: $policy" >&2
+  exit 1
+fi
+
+policy_value() {
+  local key=$1
+  local default=$2
+  if [[ -z "$policy" ]]; then
+    echo "$default"
+    return
+  fi
+  awk -F= -v key="$key" -v dflt="$default" '
+    {
+      lhs = $1
+      rhs = $2
+      gsub(/[[:space:]]/, "", lhs)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", rhs)
+      gsub(/^"|"$/, "", rhs)
+      if (lhs == key) {
+        found = 1
+        value = rhs
+      }
+    }
+    END {
+      if (found) {
+        print value
+      } else {
+        print dflt
+      }
+    }
+  ' "$policy"
+}
+
+sftp=$(policy_value sftp allow)
+legacy_scp=$(policy_value legacy_scp allow)
+
+case "$sftp" in
+  allow) ;;
+  deny) sed -i '/^[[:space:]]*Subsystem[[:space:]]\+sftp[[:space:]]/d' "$config" ;;
+  *) echo "invalid sftp policy value: $sftp" >&2; exit 1 ;;
+esac
+
+case "$legacy_scp" in
+  allow) ;;
+  deny|inbound|outbound)
+    filter=${AW_SSH_COMMAND_FILTER:-/opt/aw-gateway/bin/aw-ssh-command-filter}
+    if [[ ! -x "$filter" ]]; then
+      echo "ssh command filter is not executable: $filter" >&2
+      exit 1
+    fi
+    printf '\nForceCommand %s --config %s\n' "$filter" "$policy" >> "$config"
+    ;;
+  *) echo "invalid legacy_scp policy value: $legacy_scp" >&2; exit 1 ;;
+esac
+
+if [[ "${AW_SSHD_DRY_RUN_CONFIG:-}" == "1" ]]; then
+  cat "$config"
+  exit 0
+fi
+
+ssh-keygen -A
+/usr/sbin/sshd -t -f "$config"
+exec /usr/sbin/sshd -e -D -f "$config"

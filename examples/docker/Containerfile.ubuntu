@@ -1,0 +1,29 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN if id ubuntu >/dev/null 2>&1; then userdel ubuntu && rm -rf /home/ubuntu; fi
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        git \
+        less \
+        lsof \
+        nodejs \
+        npm \
+        openssh-client \
+        openssh-server \
+        procps \
+        python3 \
+        sudo \
+        tar \
+        vim-tiny \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /opt/aw-gateway/bin /run/sshd
+
+WORKDIR /root
+
+CMD ["/bin/bash"]

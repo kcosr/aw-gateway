@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Manage iptables rules for transparent proxy in a container network namespace.
+#
+# Intended install path for managed AW Gateway hosts:
+#   /opt/aw-gateway/bin/aw-iptables
+#
+# The gateway sample config expects:
+#   sudo /opt/aw-gateway/bin/aw-iptables add <container-pid>
+#   sudo /opt/aw-gateway/bin/aw-iptables check <container-pid>
+#
+# "check" is read-only and exits non-zero if the expected chains/rules are not
+# installed. It is suitable for aw-gateway host-step health checks.
+
+set -euo pipefail
+
+PROXY_IP="169.254.1.2"    # host.containers.internal for podman
+PROXY_PORT=8881
+LOCAL_HTTP_PORT=8881      # local proxy HTTP port (handles HTTP + CONNECT)
+LOCAL_HTTPS_PORT=8889     # local proxy HTTPS intercept port
+
+NAT_CHAIN="AW_OUT_NAT"
+FILTER_CHAIN="AW_OUT_FILTER"
+PROXY_UID=0               # container root; owner match runs in container userns
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+usage() {
+    echo "Usage: $0 {add|check|status} <container-pid>" >&2
+    exit 1
+}
+
+[[ $# -eq 2 ]] || usage
+
+ACTION="$1"
+PID="$2"
+
+[[ "$PID" =~ ^[0-9]+$ ]] || die "invalid PID: must be numeric"
+[[ -d "/proc/$PID" ]] || die "process $PID not found"
+
+ns() {
+    nsenter -t "$PID" -n -U "$@"
+}
+
+ensure_chain() {
+    local table="$1"
+    local chain="$2"
+
+    ns iptables -t "$table" -N "$chain" 2>/dev/null || true
+    ns iptables -t "$table" -F "$chain"
+    ns iptables -t "$table" -D OUTPUT -j "$chain" 2>/dev/null || true
+    ns iptables -t "$table" -A OUTPUT -j "$chain"
+}
+
+add_rules() {
+    ensure_chain nat "$NAT_CHAIN"
+    ensure_chain filter "$FILTER_CHAIN"
+
+    ns iptables -t nat -A "$NAT_CHAIN" -d 127.0.0.0/8 -j RETURN
+    ns iptables -t nat -A "$NAT_CHAIN" -m owner --uid-owner "$PROXY_UID" \
+        -p tcp -d "$PROXY_IP" --dport "$PROXY_PORT" -j RETURN
+    ns iptables -t nat -A "$NAT_CHAIN" -p tcp --dport 80 \
+        -j REDIRECT --to-port "$LOCAL_HTTP_PORT"
+    ns iptables -t nat -A "$NAT_CHAIN" -p tcp --dport 443 \
+        -j REDIRECT --to-port "$LOCAL_HTTPS_PORT"
+
+    ns iptables -A "$FILTER_CHAIN" -m state --state ESTABLISHED,RELATED -j ACCEPT
+    ns iptables -A "$FILTER_CHAIN" -d 127.0.0.0/8 -j ACCEPT
+    ns iptables -A "$FILTER_CHAIN" -p udp --dport 53 -j ACCEPT
+    ns iptables -A "$FILTER_CHAIN" -p tcp --dport 53 -j ACCEPT
+    ns iptables -A "$FILTER_CHAIN" -m owner --uid-owner "$PROXY_UID" \
+        -p tcp -d "$PROXY_IP" --dport "$PROXY_PORT" -j ACCEPT
+    ns iptables -A "$FILTER_CHAIN" -p tcp -d "$PROXY_IP" \
+        --dport "$PROXY_PORT" -j DROP
+    ns iptables -A "$FILTER_CHAIN" -j DROP
+
+    echo "Proxy rules added (PID $PID, proxy UID $PROXY_UID)"
+}
+
+check_rule() {
+    if ! ns iptables "$@" >/dev/null 2>&1; then
+        die "missing rule: iptables $*"
+    fi
+}
+
+check_rules() {
+    check_rule -t nat -L "$NAT_CHAIN" -n
+    check_rule -t filter -L "$FILTER_CHAIN" -n
+    check_rule -t nat -C OUTPUT -j "$NAT_CHAIN"
+    check_rule -t filter -C OUTPUT -j "$FILTER_CHAIN"
+
+    check_rule -t nat -C "$NAT_CHAIN" -d 127.0.0.0/8 -j RETURN
+    check_rule -t nat -C "$NAT_CHAIN" -m owner --uid-owner "$PROXY_UID" \
+        -p tcp -d "$PROXY_IP" --dport "$PROXY_PORT" -j RETURN
+    check_rule -t nat -C "$NAT_CHAIN" -p tcp --dport 80 \
+        -j REDIRECT --to-port "$LOCAL_HTTP_PORT"
+    check_rule -t nat -C "$NAT_CHAIN" -p tcp --dport 443 \
+        -j REDIRECT --to-port "$LOCAL_HTTPS_PORT"
+
+    check_rule -C "$FILTER_CHAIN" -m state --state ESTABLISHED,RELATED -j ACCEPT
+    check_rule -C "$FILTER_CHAIN" -d 127.0.0.0/8 -j ACCEPT
+    check_rule -C "$FILTER_CHAIN" -p udp --dport 53 -j ACCEPT
+    check_rule -C "$FILTER_CHAIN" -p tcp --dport 53 -j ACCEPT
+    check_rule -C "$FILTER_CHAIN" -m owner --uid-owner "$PROXY_UID" \
+        -p tcp -d "$PROXY_IP" --dport "$PROXY_PORT" -j ACCEPT
+    check_rule -C "$FILTER_CHAIN" -p tcp -d "$PROXY_IP" \
+        --dport "$PROXY_PORT" -j DROP
+    check_rule -C "$FILTER_CHAIN" -j DROP
+
+    echo "Proxy rules present (PID $PID, proxy UID $PROXY_UID)"
+}
+
+show_status() {
+    echo "=== NAT Rules (OUTPUT) ==="
+    ns iptables -t nat -L OUTPUT -n --line-numbers
+    if ns iptables -t nat -L "$NAT_CHAIN" -n --line-numbers 2>/dev/null; then
+        echo
+        echo "=== NAT Chain ($NAT_CHAIN) ==="
+        ns iptables -t nat -L "$NAT_CHAIN" -n --line-numbers
+    fi
+    echo
+    echo "=== Filter Rules (OUTPUT) ==="
+    ns iptables -L OUTPUT -n --line-numbers
+    if ns iptables -L "$FILTER_CHAIN" -n --line-numbers 2>/dev/null; then
+        echo
+        echo "=== Filter Chain ($FILTER_CHAIN) ==="
+        ns iptables -L "$FILTER_CHAIN" -n --line-numbers
+    fi
+}
+
+case "$ACTION" in
+    add) add_rules ;;
+    check) check_rules ;;
+    status) show_status ;;
+    *) die "unknown action: $ACTION (allowed: add, check, status)" ;;
+esac

@@ -1,0 +1,91 @@
+# aw-gateway Agent Instructions
+
+This repository contains `aw-gateway`, a gateway for disposable or reusable
+container workspaces that users access through SSH-compatible clients.
+
+## What This Repo Is
+
+`aw-gateway` is a Rust gateway for disposable or reusable container workspaces.
+It uses SSH as the user-facing interface, starts or reuses a configured
+container target, supervises in-container services, and bridges SSH-compatible
+clients to container-local SSH instead of the host shell or host filesystem.
+
+## Fast Bootstrap
+
+1. Build: `cargo build`
+2. Format: `cargo fmt`
+3. Test: `cargo test`
+4. Lint: `cargo clippy --all-targets --all-features`
+5. Release build: `cargo build --release`
+6. Validate gateway config: `cargo run --bin aw-gateway -- --config aw-gateway.sample.toml config validate`
+7. Validate agent config: `cargo run --bin aw-container-agent -- --config container-agent.sample.toml config validate`
+
+## Development
+
+- Use `cargo fmt`, `cargo test`, and `cargo clippy --all-targets --all-features`
+  before handing off substantial changes.
+- Run `cargo build --release` before release-oriented or packaging changes.
+- Keep protocol/proxy modes quiet on stdout. Use stderr/logs for diagnostics.
+- Keep implementation generic where possible. Deployment-specific behavior
+  should usually be expressed through config, not hard-coded.
+- Prefer deterministic offline tests for config, dispatch, path, and lifecycle
+  decisions.
+- Update `README.md` for user-facing behavior, config, or workflow changes.
+
+## Layout
+
+- `src/bin/` contains small binary entrypoints.
+- `src/config.rs` owns TOML schema and validation.
+- `src/gateway.rs` owns host-side CLI dispatch and lifecycle orchestration.
+- `src/gateway/` contains focused gateway support modules for client config,
+  file utilities, health checks, identity/key handling, listener proxying,
+  status models, and session marker state.
+- `src/agent.rs` owns in-container service supervision and socket APIs.
+- `src/ssh_dispatch.rs` owns `SSH_ORIGINAL_COMMAND` parsing.
+- `src/runtime.rs` owns Podman, Docker, and Colima command construction.
+- `aw-gateway.sample.toml` and `container-agent.sample.toml` are the canonical
+  sample configs.
+
+## Changelog
+
+Location: `CHANGELOG.md` (root)
+
+### Format
+
+Use these sections under `## [Unreleased]`:
+- `### Breaking Changes` - API/config changes requiring migration
+- `### Added` - New features
+- `### Changed` - Changes to existing behavior
+- `### Fixed` - Bug fixes
+- `### Removed` - Removed features
+
+### Rules
+
+- New entries always go under `## [Unreleased]`.
+- Append to existing subsections; do not create duplicate subsection headers.
+- Do not edit already released version sections.
+- Use inline PR links when a PR exists:
+  `([#123](https://github.com/kcosr/aw-gateway/pull/123))`.
+
+## Releasing
+
+The first release version is `0.1.0`, matching `Cargo.toml`. Since the crate is
+already set to that version, release it with:
+
+```bash
+node scripts/release.mjs current
+```
+
+For later releases:
+
+```bash
+node scripts/release.mjs patch    # Bug fixes, e.g. 0.1.0 -> 0.1.1
+node scripts/release.mjs minor    # New features, e.g. 0.1.1 -> 0.2.0
+node scripts/release.mjs major    # Breaking changes, e.g. 0.2.0 -> 1.0.0
+node scripts/release.mjs 0.2.3    # Explicit version
+```
+
+The release script verifies a clean `main` branch, optionally bumps
+`Cargo.toml` and `Cargo.lock`, stamps `CHANGELOG.md`, commits and tags the
+release, pushes to origin, creates a GitHub prerelease from the changelog
+notes, then opens a new `## [Unreleased]` section for the next cycle.
