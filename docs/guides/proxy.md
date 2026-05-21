@@ -177,6 +177,7 @@ Wire the firewall with a host step:
 [[host_steps]]
 name = "transparent-proxy-firewall"
 required = true
+timeout = "30s"
 command = ["/opt/site-policy/bin/proxy-firewall", "add", "{container_pid}"]
 
 [host_steps.health_check]

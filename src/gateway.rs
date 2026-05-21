@@ -29,11 +29,11 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
-use tokio::process::Command;
 use tokio::time::{Duration, Instant, sleep};
 
 pub const DEFAULT_GATEWAY_CONFIG: &str = include_str!("../aw-gateway.sample.toml");
 const MAX_SSH_ORIGINAL_COMMAND_BYTES: usize = 64 * 1024;
+const DEFAULT_HOST_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
 
 mod client;
 mod fileutil;
@@ -45,7 +45,7 @@ mod session;
 
 use client::{read_default_selection, resolve_target_selection};
 use fileutil::{atomic_write_file, write_private_file};
-use health::{render_command, run_argv, run_health_check};
+use health::{render_command, run_argv_with_timeout, run_health_check};
 use model::{GatewayStatus, ReadyStatus, TcpEndpoint, gateway_status_name};
 use session::{generate_session_id_value, validate_session_id};
 
@@ -1298,20 +1298,11 @@ impl Runtime {
     ) -> anyhow::Result<()> {
         let vars = self.vars(container_pid);
         let command = render_command(&step.command, &vars)?;
-        let output = Command::new(&command[0]).args(&command[1..]).output().await;
-        match output {
-            Ok(output) if output.status.success() => Ok(()),
-            Ok(output) if !step.required => {
-                tracing::warn!(step = step.name, stderr = %String::from_utf8_lossy(&output.stderr), "optional lifecycle step failed");
-                Ok(())
-            }
-            Ok(output) => anyhow::bail!(
-                "lifecycle step {:?} failed: {}",
-                step.name,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
+        let timeout = host_hook_timeout(step.timeout.as_deref())?;
+        match run_argv_with_timeout(&command, timeout).await {
+            Ok(()) => Ok(()),
             Err(err) if !step.required => {
-                tracing::warn!(step = step.name, error = %err, "optional lifecycle step could not run");
+                tracing::warn!(step = step.name, error = %err, "optional lifecycle step failed");
                 Ok(())
             }
             Err(err) => Err(err).with_context(|| format!("run lifecycle step {:?}", step.name)),
@@ -1322,7 +1313,8 @@ impl Runtime {
         for step in &self.effective_host_steps {
             let vars = self.vars(Some(container_pid));
             let command = render_command(&step.command, &vars)?;
-            let command_result = run_argv(&command).await;
+            let timeout = host_hook_timeout(step.timeout.as_deref())?;
+            let command_result = run_argv_with_timeout(&command, timeout).await;
             if let Err(err) = command_result {
                 if step.required {
                     return Err(err).with_context(|| format!("host step {:?}", step.name));
@@ -1976,6 +1968,13 @@ fn resolve_target_workspace(
     let configured = target.workspace.as_deref().unwrap_or(&cfg.workspace.path);
     let rendered = template::render(configured, &vars)?;
     Ok(paths::resolve_workspace(&user.home, &rendered))
+}
+
+fn host_hook_timeout(configured: Option<&str>) -> anyhow::Result<Duration> {
+    configured
+        .map(crate::config::parse_duration)
+        .transpose()
+        .map(|timeout| timeout.unwrap_or(DEFAULT_HOST_HOOK_TIMEOUT))
 }
 
 fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<GatewayConfig> {
@@ -2794,6 +2793,16 @@ name = "{{image_slug}}"
             normalize_image_selection("localhost/ubuntu/dev:latest"),
             "ubuntu/dev"
         );
+    }
+
+    #[test]
+    fn host_hook_timeout_defaults_to_sixty_seconds() {
+        assert_eq!(host_hook_timeout(None).unwrap(), Duration::from_secs(60));
+        assert_eq!(
+            host_hook_timeout(Some("250ms")).unwrap(),
+            Duration::from_millis(250)
+        );
+        assert!(host_hook_timeout(Some("5")).is_err());
     }
 
     #[test]
