@@ -2,8 +2,10 @@ use crate::config::{HealthCheck, parse_duration};
 use crate::template::{self, Vars};
 use anyhow::Context;
 use std::collections::BTreeMap;
+use std::os::unix::process::CommandExt;
+use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -16,12 +18,155 @@ pub(super) fn render_command(command: &[String], vars: &Vars) -> anyhow::Result<
 }
 
 pub(super) async fn run_argv(command: &[String]) -> anyhow::Result<()> {
-    let output = Command::new(&command[0]).args(&command[1..]).output().await;
-    match output {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim()),
-        Err(err) => Err(err).with_context(|| format!("run {:?}", command)),
+    run_argv_inner(command, None).await
+}
+
+pub(super) async fn run_argv_with_timeout(
+    command: &[String],
+    timeout_duration: Duration,
+) -> anyhow::Result<()> {
+    run_argv_inner(command, Some(timeout_duration)).await
+}
+
+async fn run_argv_inner(
+    command: &[String],
+    timeout_duration: Option<Duration>,
+) -> anyhow::Result<()> {
+    let output = command_output(command, timeout_duration).await?;
+    if output.status.success() {
+        return Ok(());
     }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::bail!(
+        "command {:?} failed with {}: {}",
+        command,
+        output.status,
+        stderr.trim()
+    )
+}
+
+struct CommandOutput {
+    status: std::process::ExitStatus,
+    stderr: Vec<u8>,
+}
+
+async fn command_output(
+    command: &[String],
+    timeout_duration: Option<Duration>,
+) -> anyhow::Result<CommandOutput> {
+    if timeout_duration.is_none() {
+        return Command::new(&command[0])
+            .args(&command[1..])
+            .output()
+            .await
+            .map(|output| CommandOutput {
+                status: output.status,
+                stderr: output.stderr,
+            })
+            .with_context(|| format!("run {:?}", command));
+    }
+
+    let timeout_duration = timeout_duration.expect("checked above");
+    let mut command_builder = Command::new(&command[0]);
+    command_builder
+        .args(&command[1..])
+        .kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    command_builder.as_std_mut().process_group(0);
+    let mut child = command_builder
+        .spawn()
+        .with_context(|| format!("run {:?}", command))?;
+    let child_pid = child.id();
+    let stderr = child.stderr.take();
+    let mut stderr_reader = tokio::spawn(read_pipe(stderr));
+
+    match timeout(timeout_duration, child.wait()).await {
+        Ok(Ok(status)) => {
+            let stderr = stderr_reader
+                .await
+                .context("join stderr reader")?
+                .context("read stderr")?;
+            Ok(CommandOutput { status, stderr })
+        }
+        Ok(Err(err)) => {
+            let _ = stderr_reader.await;
+            Err(err).with_context(|| format!("wait for {:?}", command))
+        }
+        Err(_) => {
+            let kill_result = kill_child_process_group(child_pid);
+            let wait_result = timeout(Duration::from_secs(5), child.wait()).await;
+            let stderr = match timeout(Duration::from_secs(1), &mut stderr_reader).await {
+                Ok(Ok(Ok(stderr))) => stderr,
+                Ok(Ok(Err(err))) => {
+                    tracing::warn!(command = ?command, error = %err, "timed-out command stderr read failed");
+                    Vec::new()
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(command = ?command, error = %err, "timed-out command stderr reader join failed");
+                    Vec::new()
+                }
+                Err(_) => {
+                    stderr_reader.abort();
+                    Vec::new()
+                }
+            };
+            if let Err(err) = kill_result {
+                tracing::warn!(command = ?command, error = %err, "timed-out command kill failed");
+            }
+            match wait_result {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(command = ?command, error = %err, "timed-out command reap failed");
+                }
+                Err(_) => {
+                    tracing::warn!(command = ?command, "timed-out command reap did not finish after SIGKILL");
+                }
+            }
+            let stderr = String::from_utf8_lossy(&stderr);
+            let detail = stderr.trim();
+            if detail.is_empty() {
+                anyhow::bail!(
+                    "command {:?} timed out after {:?}",
+                    command,
+                    timeout_duration
+                );
+            }
+            anyhow::bail!(
+                "command {:?} timed out after {:?}: {}",
+                command,
+                timeout_duration,
+                detail
+            );
+        }
+    }
+}
+
+fn kill_child_process_group(child_pid: Option<u32>) -> std::io::Result<()> {
+    let Some(child_pid) = child_pid else {
+        return Ok(());
+    };
+    let process_group = libc::pid_t::try_from(child_pid)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let rc = unsafe { libc::killpg(process_group, libc::SIGKILL) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(err)
+        }
+    }
+}
+
+async fn read_pipe(pipe: Option<impl tokio::io::AsyncRead + Unpin>) -> anyhow::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    if let Some(mut pipe) = pipe {
+        pipe.read_to_end(&mut output).await?;
+    }
+    Ok(output)
 }
 
 pub(super) async fn run_health_check(
@@ -151,5 +296,62 @@ mod tests {
             health_check_timeout(Some("250ms")),
             Duration::from_millis(250)
         );
+    }
+
+    #[tokio::test]
+    async fn run_argv_with_timeout_kills_hung_command() {
+        let started = std::time::Instant::now();
+        let err = run_argv_with_timeout(
+            &["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn run_argv_with_timeout_kills_descendant_holding_stderr() {
+        let started = std::time::Instant::now();
+        let err = run_argv_with_timeout(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "sleep 30 & echo started >&2; wait".into(),
+            ],
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn run_argv_with_timeout_reports_status_and_stderr() {
+        let err = run_argv_with_timeout(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo expected-error >&2; exit 7".into(),
+            ],
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        let err = format!("{err:#}");
+
+        assert!(err.contains("exit status: 7"), "{err}");
+        assert!(err.contains("expected-error"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_argv_without_timeout_still_supports_command_health_checks() {
+        run_argv(&["/bin/sh".into(), "-c".into(), "sleep 1".into()])
+            .await
+            .unwrap();
     }
 }

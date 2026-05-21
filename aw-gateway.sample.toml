@@ -124,6 +124,7 @@ shutdown_timeout = "20s"
 phase = "pre_start"
 name = "ensure-storage-conf"
 required = true
+timeout = "60s"
 command = [
   "/opt/aw-gateway/bin/ensure-storage-conf",
   "--template",
@@ -136,12 +137,14 @@ command = [
 phase = "pre_start"
 name = "ensure-workspace"
 required = true
+timeout = "60s"
 command = ["/usr/bin/mkdir", "-p", "{workspace}"]
 
 [[lifecycle_steps]]
 phase = "pre_start"
 name = "copy-skel"
 required = false
+timeout = "60s"
 command = [
   "/opt/aw-gateway/bin/copy-skel",
   "--skel-dir",
@@ -153,6 +156,7 @@ command = [
 [[host_steps]]
 name = "firewall"
 required = true
+timeout = "30s"
 command = ["sudo", "/opt/aw-gateway/bin/aw-iptables", "add", "{container_pid}"]
 health_check = { type = "command", command = ["sudo", "/opt/aw-gateway/bin/aw-iptables", "check", "{container_pid}"] }
 
@@ -178,10 +182,12 @@ health_check = { type = "command", command = ["sudo", "/opt/aw-gateway/bin/aw-ip
 # phase = "pre_start"
 # name = "target-prep"
 # after = "ensure-workspace"
+# timeout = "60s"
 # command = ["/opt/aw-gateway/bin/target-prep", "{workspace}"]
 #
 # [[targets.default.host_steps]]
 # name = "firewall"
+# timeout = "30s"
 # command = ["sudo", "/opt/aw-gateway/bin/aw-iptables", "add", "{container_pid}"]
 #
 # Optional bootstrap-mount mode. When enabled, the container starts by running

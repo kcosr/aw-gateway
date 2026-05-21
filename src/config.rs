@@ -246,7 +246,7 @@ impl GatewayConfig {
             |step| StepKey {
                 name: step.name.clone(),
             },
-            RawContainerBootstrapStep::to_effective,
+            |step, _| RawContainerBootstrapStep::to_effective(step),
         )?;
         for step in &steps {
             step.validate()?;
@@ -953,21 +953,37 @@ pub struct RawLifecycleStep {
     pub after: Option<String>,
     pub required: Option<bool>,
     pub command: Option<Vec<String>>,
+    pub timeout: Option<String>,
 }
 
 impl RawLifecycleStep {
-    fn to_effective(&self) -> anyhow::Result<LifecycleStep> {
+    fn to_effective(&self, inherited: Option<&LifecycleStep>) -> anyhow::Result<LifecycleStep> {
+        let inherit_payload =
+            self.timeout.is_some() && self.command.is_none() && self.required.is_none();
+        let command = self.command.clone().or_else(|| {
+            inherit_payload
+                .then(|| inherited.map(|step| step.command.clone()))
+                .flatten()
+        });
         Ok(LifecycleStep {
             phase: self.phase,
             name: self.name.clone(),
-            required: self.required.unwrap_or(true),
-            command: self.command.clone().ok_or_else(|| {
+            required: self
+                .required
+                .or_else(|| {
+                    inherit_payload
+                        .then(|| inherited.map(|step| step.required))
+                        .flatten()
+                })
+                .unwrap_or(true),
+            command: command.ok_or_else(|| {
                 anyhow::anyhow!(
                     "lifecycle_steps {}/{} command must be provided when enabled",
                     lifecycle_phase_name(self.phase),
                     self.name
                 )
             })?,
+            timeout: self.timeout.clone(),
         })
     }
 }
@@ -980,6 +996,7 @@ pub struct LifecycleStep {
     #[serde(default = "default_true")]
     pub required: bool,
     pub command: Vec<String>,
+    pub timeout: Option<String>,
 }
 
 impl LifecycleStep {
@@ -992,7 +1009,11 @@ impl LifecycleStep {
                 GATEWAY_TEMPLATE_VARS
             }
         };
-        validate_command_templates(field, &self.command, vars)
+        validate_command_templates(field, &self.command, vars)?;
+        if let Some(timeout) = &self.timeout {
+            parse_duration(timeout)?;
+        }
+        Ok(())
     }
 }
 
@@ -1016,20 +1037,42 @@ pub struct RawHostStep {
     pub required: Option<bool>,
     pub command: Option<Vec<String>>,
     pub health_check: Option<HealthCheck>,
+    pub timeout: Option<String>,
 }
 
 impl RawHostStep {
-    fn to_effective(&self) -> anyhow::Result<HostStep> {
+    fn to_effective(&self, inherited: Option<&HostStep>) -> anyhow::Result<HostStep> {
+        let inherit_payload = self.timeout.is_some()
+            && self.command.is_none()
+            && self.required.is_none()
+            && self.health_check.is_none();
+        let command = self.command.clone().or_else(|| {
+            inherit_payload
+                .then(|| inherited.map(|step| step.command.clone()))
+                .flatten()
+        });
         Ok(HostStep {
             name: self.name.clone(),
-            required: self.required.unwrap_or(true),
-            command: self.command.clone().ok_or_else(|| {
+            required: self
+                .required
+                .or_else(|| {
+                    inherit_payload
+                        .then(|| inherited.map(|step| step.required))
+                        .flatten()
+                })
+                .unwrap_or(true),
+            command: command.ok_or_else(|| {
                 anyhow::anyhow!(
                     "host_steps {} command must be provided when enabled",
                     self.name
                 )
             })?,
-            health_check: self.health_check.clone(),
+            health_check: self.health_check.clone().or_else(|| {
+                inherit_payload
+                    .then(|| inherited.and_then(|step| step.health_check.clone()))
+                    .flatten()
+            }),
+            timeout: self.timeout.clone(),
         })
     }
 }
@@ -1042,6 +1085,7 @@ pub struct HostStep {
     pub required: bool,
     pub command: Vec<String>,
     pub health_check: Option<HealthCheck>,
+    pub timeout: Option<String>,
 }
 
 impl HostStep {
@@ -1049,6 +1093,9 @@ impl HostStep {
         validate_name(field, &self.name)?;
         validate_command(field, &self.command)?;
         validate_command_templates(field, &self.command, GATEWAY_TEMPLATE_VARS)?;
+        if let Some(timeout) = &self.timeout {
+            parse_duration(timeout)?;
+        }
         if let Some(health_check) = &self.health_check {
             if matches!(health_check, HealthCheck::Process) {
                 anyhow::bail!("host_step health_check does not support process checks");
@@ -2018,7 +2065,7 @@ impl RawStepEntry for RawLifecycleStep {
     }
 
     fn has_payload(&self) -> bool {
-        self.required.is_some() || self.command.is_some()
+        self.required.is_some() || self.command.is_some() || self.timeout.is_some()
     }
 }
 
@@ -2036,7 +2083,10 @@ impl RawStepEntry for RawHostStep {
     }
 
     fn has_payload(&self) -> bool {
-        self.required.is_some() || self.command.is_some() || self.health_check.is_some()
+        self.required.is_some()
+            || self.command.is_some()
+            || self.health_check.is_some()
+            || self.timeout.is_some()
     }
 }
 
@@ -2111,7 +2161,7 @@ where
     K: MergeKey,
     FK: Fn(&T) -> K,
     RK: Fn(&R) -> K,
-    C: Fn(&R) -> anyhow::Result<T>,
+    C: Fn(&R, Option<&T>) -> anyhow::Result<T>,
 {
     let mut result = inherited;
     let mut effective_keys: Vec<K> = result.iter().map(&inherited_key).collect();
@@ -2132,7 +2182,7 @@ where
                 );
             }
             if entry.enabled() {
-                result[index] = convert(entry)?;
+                result[index] = convert(entry, Some(&result[index]))?;
                 effective_keys[index] = key;
             } else {
                 result.remove(index);
@@ -2176,7 +2226,7 @@ where
         } else {
             result.len()
         };
-        result.insert(insert_at, convert(entry)?);
+        result.insert(insert_at, convert(entry, None)?);
         effective_keys.insert(insert_at, key);
     }
 
@@ -2750,6 +2800,89 @@ health_check = { type = "process" }
     }
 
     #[test]
+    fn lifecycle_and_host_step_timeouts_validate() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[[lifecycle_steps]]
+phase = "pre_start"
+name = "prep"
+command = ["/bin/true"]
+timeout = "250ms"
+
+[[host_steps]]
+name = "firewall"
+command = ["/bin/true"]
+timeout = "2m"
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let target = cfg.targets.get("default").unwrap();
+        assert_eq!(
+            cfg.effective_lifecycle_steps(target).unwrap()[0]
+                .timeout
+                .as_deref(),
+            Some("250ms")
+        );
+        assert_eq!(
+            cfg.effective_host_steps(target).unwrap()[0]
+                .timeout
+                .as_deref(),
+            Some("2m")
+        );
+    }
+
+    #[test]
+    fn lifecycle_and_host_step_timeouts_reject_invalid_durations() {
+        for (config, expected) in [
+            (
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[[lifecycle_steps]]
+phase = "pre_start"
+name = "prep"
+command = ["/bin/true"]
+timeout = "5"
+"#,
+                "missing an explicit unit",
+            ),
+            (
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[[host_steps]]
+name = "firewall"
+command = ["/bin/true"]
+timeout = "1d"
+"#,
+                "unsupported duration unit",
+            ),
+        ] {
+            let cfg: GatewayConfig = toml::from_str(config).unwrap();
+            let err = format!("{:#}", cfg.validate().unwrap_err());
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
     fn client_config_rejects_newline_scalars() {
         let cfg: GatewayConfig = toml::from_str(
             r#"
@@ -3062,6 +3195,49 @@ enabled = false
     }
 
     #[test]
+    fn target_step_timeout_only_overrides_keep_inherited_payload() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[[lifecycle_steps]]
+phase = "pre_start"
+name = "prep"
+command = ["/bin/prep"]
+timeout = "10s"
+
+[[host_steps]]
+name = "firewall"
+command = ["/bin/firewall"]
+timeout = "10s"
+
+[[targets.default.lifecycle_steps]]
+phase = "pre_start"
+name = "prep"
+timeout = "20s"
+
+[[targets.default.host_steps]]
+name = "firewall"
+timeout = "30s"
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let target = cfg.targets.get("default").unwrap();
+        let lifecycle = cfg.effective_lifecycle_steps(target).unwrap();
+        assert_eq!(lifecycle[0].command, ["/bin/prep"]);
+        assert_eq!(lifecycle[0].timeout.as_deref(), Some("20s"));
+        let host = cfg.effective_host_steps(target).unwrap();
+        assert_eq!(host[0].command, ["/bin/firewall"]);
+        assert_eq!(host[0].timeout.as_deref(), Some("30s"));
+    }
+
+    #[test]
     fn target_step_merge_rejects_invalid_controls() {
         for (config, expected) in [
             (
@@ -3203,6 +3379,48 @@ after = "b"
 command = ["/bin/one"]
 "#,
                 "sets both before and after",
+            ),
+            (
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[[host_steps]]
+name = "firewall"
+command = ["/bin/old"]
+
+[[targets.default.host_steps]]
+name = "firewall"
+enabled = false
+timeout = "1s"
+"#,
+                "disabled but includes command payload",
+            ),
+            (
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[[lifecycle_steps]]
+phase = "pre_start"
+name = "prep"
+command = ["/bin/old"]
+
+[[targets.default.lifecycle_steps]]
+phase = "pre_start"
+name = "prep"
+enabled = false
+timeout = "1s"
+"#,
+                "disabled but includes command payload",
             ),
         ] {
             let cfg: GatewayConfig = toml::from_str(config).unwrap();

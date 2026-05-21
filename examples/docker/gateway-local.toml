@@ -78,6 +78,7 @@ shutdown_timeout = "20s"
 phase = "pre_start"
 name = "ensure-workspace"
 required = true
+timeout = "60s"
 command = ["/usr/bin/mkdir", "-p", "{workspace}"]
 
 [[container_mounts]]

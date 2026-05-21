@@ -91,6 +91,7 @@ shutdown_timeout = "10s"
 phase = "pre_start"
 name = "ensure-workspace"
 required = true
+timeout = "60s"
 command = ["/bin/mkdir", "-p", "{workspace}"]
 
 [[container_bootstrap_steps]]

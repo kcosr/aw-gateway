@@ -31,12 +31,16 @@ rules:
 [[host_steps]]
 name = "network-policy"
 required = true
+timeout = "30s"
 command = ["/opt/aw-gateway/bin/container-firewall", "add", "{container_pid}"]
 
 [host_steps.health_check]
 type = "command"
 command = ["/opt/aw-gateway/bin/container-firewall", "check", "{container_pid}"]
 ```
+
+Host step commands default to a `60s` timeout when `timeout` is omitted. Set a
+larger timeout only when the policy helper has a known longer setup path.
 
 If the helper needs elevated privileges, configure that in the host OS, for
 example with a narrow `sudoers` rule for only that helper and action. Keep the

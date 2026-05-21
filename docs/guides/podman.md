@@ -498,6 +498,7 @@ that calls a site-managed script:
 [[host_steps]]
 name = "network-policy"
 required = true
+timeout = "30s"
 command = ["/opt/aw-gateway/bin/network-policy", "add", "{container_pid}"]
 
 [host_steps.health_check]

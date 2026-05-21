@@ -374,9 +374,11 @@ Gateway configs commonly include:
 - `[targets.<name>.identity]`: container bootstrap and session identity
   fields.
 - `[[lifecycle_steps]]`: phase-keyed host hooks for `pre_start`,
-  `post_start_host`, `pre_stop`, and `post_stop`.
+  `post_start_host`, `pre_stop`, and `post_stop`, with per-step command
+  timeouts.
 - `[[host_steps]]`: post-start host hooks that run after agent readiness, such
-  as firewall setup, with optional command health checks.
+  as firewall setup, with per-step command timeouts and optional command health
+  checks.
 - `[[container_mounts]]` and `[[targets.<name>.container_mounts]]`: extra
   host-to-container bind mounts, typically read-only bootstrap
   binaries/configs/certs.
@@ -441,10 +443,38 @@ A same-key target entry replaces the inherited entry in place, while
 `enabled = false` removes an inherited entry. New target-only entries append by
 default and can specify one of `before = "name"` or `after = "name"`; lifecycle
 ordering references are resolved only within the same phase.
+As a convenience, a target lifecycle or host step entry that sets only
+`timeout` inherits the missing fields from the matching global entry; any other
+partial override must include the full replacement payload.
 
 Use `lifecycle_steps` for host hooks tied to a lifecycle phase, including stop
 and teardown phases. Use `host_steps` for post-start checks and setup that
 should run after the container agent is ready and can report readiness.
+Lifecycle and host hook commands use `timeout = "60s"` by default. Set a larger
+per-step `timeout` when a hook legitimately needs more time. The timeout uses
+the same explicit units as other durations: `ms`, `s`, `m`, or `h`. Timed-out
+required hooks fail the operation after the child process is killed and reaped;
+timed-out optional hooks warn and continue. `host_steps.health_check` timeouts
+are separate from the host step command timeout.
+
+```toml
+[[lifecycle_steps]]
+phase = "pre_start"
+name = "ensure-workspace"
+required = true
+timeout = "60s"
+command = ["/usr/bin/mkdir", "-p", "{workspace}"]
+
+[[host_steps]]
+name = "network-policy"
+required = true
+timeout = "30s"
+command = ["/opt/site-policy/bin/network-policy", "add", "{container_pid}"]
+
+[host_steps.health_check]
+type = "command"
+command = ["/opt/site-policy/bin/network-policy", "check", "{container_pid}"]
+```
 
 When `sftp = "deny"`, `start-container-sshd` removes the SFTP subsystem from
 the runtime SSHD config. Modern OpenSSH SCP uses SFTP, so that blocks both.

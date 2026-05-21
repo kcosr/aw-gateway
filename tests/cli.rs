@@ -78,6 +78,44 @@ name = "{image_slug}"
 }
 
 #[test]
+fn gateway_config_validate_accepts_host_hook_timeouts() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[[lifecycle_steps]]
+phase = "pre_start"
+name = "prep"
+command = ["/bin/true"]
+timeout = "250ms"
+
+[[host_steps]]
+name = "firewall"
+command = ["/bin/true"]
+timeout = "1m"
+"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["config", "validate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ok"));
+}
+
+#[test]
 fn status_all_cli_parses_without_touching_up() {
     let args = GatewayArgs::try_parse_from(["aw-gateway", "status", "--all", "--json"]).unwrap();
     match args.command {
