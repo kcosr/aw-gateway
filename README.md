@@ -443,6 +443,9 @@ A same-key target entry replaces the inherited entry in place, while
 `enabled = false` removes an inherited entry. New target-only entries append by
 default and can specify one of `before = "name"` or `after = "name"`; lifecycle
 ordering references are resolved only within the same phase.
+As a convenience, a target lifecycle or host step entry that sets only
+`timeout` inherits the missing fields from the matching global entry; any other
+partial override must include the full replacement payload.
 
 Use `lifecycle_steps` for host hooks tied to a lifecycle phase, including stop
 and teardown phases. Use `host_steps` for post-start checks and setup that

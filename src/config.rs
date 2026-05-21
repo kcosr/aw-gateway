@@ -3400,6 +3400,28 @@ timeout = "1s"
 "#,
                 "disabled but includes command payload",
             ),
+            (
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[[lifecycle_steps]]
+phase = "pre_start"
+name = "prep"
+command = ["/bin/old"]
+
+[[targets.default.lifecycle_steps]]
+phase = "pre_start"
+name = "prep"
+enabled = false
+timeout = "1s"
+"#,
+                "disabled but includes command payload",
+            ),
         ] {
             let cfg: GatewayConfig = toml::from_str(config).unwrap();
             let err = format!("{:#}", cfg.validate().unwrap_err());

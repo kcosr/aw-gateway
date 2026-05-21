@@ -2,6 +2,7 @@ use crate::config::{HealthCheck, parse_duration};
 use crate::template::{self, Vars};
 use anyhow::Context;
 use std::collections::BTreeMap;
+use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -66,14 +67,19 @@ async fn command_output(
     }
 
     let timeout_duration = timeout_duration.expect("checked above");
-    let mut child = Command::new(&command[0])
+    let mut command_builder = Command::new(&command[0]);
+    command_builder
         .args(&command[1..])
+        .kill_on_drop(true)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    command_builder.as_std_mut().process_group(0);
+    let mut child = command_builder
         .spawn()
         .with_context(|| format!("run {:?}", command))?;
+    let child_pid = child.id();
     let stderr = child.stderr.take();
-    let stderr_reader = tokio::spawn(read_pipe(stderr));
+    let mut stderr_reader = tokio::spawn(read_pipe(stderr));
 
     match timeout(timeout_duration, child.wait()).await {
         Ok(Ok(status)) => {
@@ -88,18 +94,34 @@ async fn command_output(
             Err(err).with_context(|| format!("wait for {:?}", command))
         }
         Err(_) => {
-            let kill_result = child.kill().await;
-            let wait_result = child.wait().await;
-            let stderr = stderr_reader
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or_default();
+            let kill_result = kill_child_process_group(child_pid);
+            let wait_result = timeout(Duration::from_secs(5), child.wait()).await;
+            let stderr = match timeout(Duration::from_secs(1), &mut stderr_reader).await {
+                Ok(Ok(Ok(stderr))) => stderr,
+                Ok(Ok(Err(err))) => {
+                    tracing::warn!(command = ?command, error = %err, "timed-out command stderr read failed");
+                    Vec::new()
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(command = ?command, error = %err, "timed-out command stderr reader join failed");
+                    Vec::new()
+                }
+                Err(_) => {
+                    stderr_reader.abort();
+                    Vec::new()
+                }
+            };
             if let Err(err) = kill_result {
                 tracing::warn!(command = ?command, error = %err, "timed-out command kill failed");
             }
-            if let Err(err) = wait_result {
-                tracing::warn!(command = ?command, error = %err, "timed-out command reap failed");
+            match wait_result {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(command = ?command, error = %err, "timed-out command reap failed");
+                }
+                Err(_) => {
+                    tracing::warn!(command = ?command, "timed-out command reap did not finish after SIGKILL");
+                }
             }
             let stderr = String::from_utf8_lossy(&stderr);
             let detail = stderr.trim();
@@ -116,6 +138,25 @@ async fn command_output(
                 timeout_duration,
                 detail
             );
+        }
+    }
+}
+
+fn kill_child_process_group(child_pid: Option<u32>) -> std::io::Result<()> {
+    let Some(child_pid) = child_pid else {
+        return Ok(());
+    };
+    let process_group = libc::pid_t::try_from(child_pid)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let rc = unsafe { libc::killpg(process_group, libc::SIGKILL) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(err)
         }
     }
 }
@@ -263,6 +304,24 @@ mod tests {
         let err = run_argv_with_timeout(
             &["/bin/sh".into(), "-c".into(), "sleep 5".into()],
             Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn run_argv_with_timeout_kills_descendant_holding_stderr() {
+        let started = std::time::Instant::now();
+        let err = run_argv_with_timeout(
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "sleep 30 & echo started >&2; wait".into(),
+            ],
+            Duration::from_millis(200),
         )
         .await
         .unwrap_err();
