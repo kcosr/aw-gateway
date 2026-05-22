@@ -735,6 +735,33 @@ mod tests {
     }
 
     #[test]
+    fn preserves_target_first_run_cwd_shape_with_session_id_forms() {
+        let cfg = SshDispatchConfig::default();
+        assert_eq!(
+            parse_gateway_action("run default --cwd /workspace -- cargo test", &cfg).unwrap(),
+            Some(GatewayAction::Run(RunAction {
+                target: Some("default".into()),
+                session_id: None,
+                cwd: Some("/workspace".into()),
+                command: vec!["cargo".into(), "test".into()],
+            }))
+        );
+        assert_eq!(
+            parse_gateway_action(
+                "run default --session-id abc123def456 --cwd /workspace -- cargo test",
+                &cfg,
+            )
+            .unwrap(),
+            Some(GatewayAction::Run(RunAction {
+                target: Some("default".into()),
+                session_id: Some("abc123def456".into()),
+                cwd: Some("/workspace".into()),
+                command: vec!["cargo".into(), "test".into()],
+            }))
+        );
+    }
+
+    #[test]
     fn rejects_malformed_session_id_actions() {
         let cfg = SshDispatchConfig::default();
         for command in [
