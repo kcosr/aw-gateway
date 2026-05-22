@@ -855,9 +855,10 @@ client-bundle [target] [--identity-file PATH] [--rotate-key]
 A session is one gateway connection or invocation tracked for lifecycle and
 idle cleanup decisions. Ephemeral targets generate a fresh 12-character
 lowercase hexadecimal session ID unless `--session-id ID` is supplied. Use an
-explicit session ID when another tool needs deterministic naming for
-`connect`, `run`, `launch`, `up`, `status`, or `stop` against the same
-per-session container. Fixed targets reject `--session-id`.
+explicit session ID when another tool needs deterministic naming for local
+`connect`, `run`, `launch`, `up`, `status`, or `stop` commands against the same
+per-session container. SSH dispatch accepts `--session-id` for `connect`, `run`,
+and `launch`. Fixed targets reject `--session-id`.
 
 Gateway command behavior:
 
