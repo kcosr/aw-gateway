@@ -2353,7 +2353,6 @@ const GATEWAY_TEMPLATE_VARS_NO_PID: &[&str] = &[
     "container_name",
     "container_state_dir",
     "container_state_dir_in_container",
-    "container_pid",
     "session_id",
 ];
 
@@ -2417,6 +2416,7 @@ const LAUNCH_TEMPLATE_BUILTINS: &[&str] = &[
     "container_name",
     "container_state_dir",
     "container_state_dir_in_container",
+    "container_pid",
     "session_id",
 ];
 
@@ -3954,7 +3954,7 @@ name = "{image_slug}"
 target = "default"
 description = "Run agent"
 cwd = "{container_home}/{var.repo}"
-env = { FLAG = "{var.flag}", LIMIT = "{var.limit}" }
+env = { FLAG = "{var.flag}", LIMIT = "{var.limit}", PID = "{container_pid}" }
 command = ["agent", "--mode", "{var.mode}"]
 
 [launches.agent.vars]
@@ -4072,6 +4072,47 @@ repo = { type = "string", required = true, default = "main" }
             let cfg: GatewayConfig = toml::from_str(config).unwrap();
             let err = format!("{:#}", cfg.validate().unwrap_err());
             assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn pre_pid_templates_reject_container_pid() {
+        for (config, expected) in [
+            (
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.container_env]
+PID = "{container_pid}"
+"#,
+                "target.container_env.PID",
+            ),
+            (
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[[lifecycle_steps]]
+phase = "pre_start"
+name = "pre"
+command = ["echo", "{container_pid}"]
+"#,
+                "validate lifecycle_steps",
+            ),
+        ] {
+            let cfg: GatewayConfig = toml::from_str(config).unwrap();
+            let err = format!("{:#}", cfg.validate().unwrap_err());
+            assert!(err.contains(expected), "{err}");
+            assert!(err.contains("unknown interpolation variable"), "{err}");
         }
     }
 
