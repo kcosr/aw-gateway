@@ -941,21 +941,21 @@ mod tests {
     #[test]
     fn parse_managed_containers_accepts_docker_ndjson_labels() {
         let raw = br#"
-{"Names":"scratch-x9k2p","Image":"scratch/dev","State":"exited","Status":"Exited (0) 2 minutes ago","Labels":"io.aw-gateway.gateway=true,io.aw-gateway.user=alice,io.aw-gateway.uid=2450,io.aw-gateway.target=scratch,io.aw-gateway.session_id=x9k2p"}
+{"Names":"scratch-1a2b3c4d5e6f","Image":"scratch/dev","State":"exited","Status":"Exited (0) 2 minutes ago","Labels":"io.aw-gateway.gateway=true,io.aw-gateway.user=alice,io.aw-gateway.uid=2450,io.aw-gateway.target=scratch,io.aw-gateway.session_id=1a2b3c4d5e6f"}
 {"Names":"other","Image":"busybox","State":"running","Status":"Up 2 minutes","Labels":"io.aw-gateway.gateway=false,io.aw-gateway.user=alice,io.aw-gateway.uid=2450"}
 "#;
 
         let containers = parse_managed_containers(raw).unwrap();
 
         assert_eq!(containers.len(), 1);
-        assert_eq!(containers[0].name, "scratch-x9k2p");
+        assert_eq!(containers[0].name, "scratch-1a2b3c4d5e6f");
         assert!(!containers[0].running);
         assert_eq!(
             containers[0]
                 .labels
                 .get("io.aw-gateway.session_id")
                 .map(String::as_str),
-            Some("x9k2p")
+            Some("1a2b3c4d5e6f")
         );
     }
 

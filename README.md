@@ -846,9 +846,9 @@ client-bundle [target] [--identity-file PATH] [--rotate-key]
 
 A session is one gateway connection or invocation tracked for lifecycle and
 idle cleanup decisions. Fixed targets usually let the gateway generate session
-IDs automatically. Ephemeral targets can use `--session-id` when another tool
-needs to correlate `up`, `status`, or `stop` with the same per-session
-container.
+IDs automatically. Generated session IDs are 12 lowercase hexadecimal
+characters. Ephemeral targets can use `--session-id` when another tool needs to
+correlate `up`, `status`, or `stop` with the same per-session container.
 
 Gateway command behavior:
 

@@ -2763,28 +2763,28 @@ mod tests {
     fn status_all_entries_project_multiple_ephemeral_containers() {
         let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
         cfg.targets.get_mut("default").unwrap().mode = TargetMode::Ephemeral;
-        let mut first = managed_labels("default", "ubuntu-dev-x9k2p");
+        let mut first = managed_labels("default", "ubuntu-dev-1a2b3c4d5e6f");
         first.insert("io.aw-gateway.image".into(), "scratch/dev".into());
         first.insert("io.aw-gateway.mode".into(), "ephemeral".into());
-        first.insert("io.aw-gateway.session_id".into(), "x9k2p".into());
-        let mut second = managed_labels("default", "ubuntu-dev-m4v8r");
+        first.insert("io.aw-gateway.session_id".into(), "1a2b3c4d5e6f".into());
+        let mut second = managed_labels("default", "ubuntu-dev-0f1e2d3c4b5a");
         second.insert("io.aw-gateway.image".into(), "scratch/dev".into());
         second.insert("io.aw-gateway.mode".into(), "ephemeral".into());
-        second.insert("io.aw-gateway.session_id".into(), "m4v8r".into());
+        second.insert("io.aw-gateway.session_id".into(), "0f1e2d3c4b5a".into());
 
         let entries = status_all_entries(
             &cfg,
             vec![
-                managed_container("ubuntu-dev-x9k2p", "scratch/dev", false, first),
-                managed_container("ubuntu-dev-m4v8r", "scratch/dev", true, second),
+                managed_container("ubuntu-dev-1a2b3c4d5e6f", "scratch/dev", false, first),
+                managed_container("ubuntu-dev-0f1e2d3c4b5a", "scratch/dev", true, second),
             ],
         );
 
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].session_id.as_deref(), Some("x9k2p"));
+        assert_eq!(entries[0].session_id.as_deref(), Some("1a2b3c4d5e6f"));
         assert_eq!(entries[0].launch, None);
         assert_eq!(entries[0].status, "stopped");
-        assert_eq!(entries[1].session_id.as_deref(), Some("m4v8r"));
+        assert_eq!(entries[1].session_id.as_deref(), Some("0f1e2d3c4b5a"));
         assert_eq!(entries[1].status, "running");
     }
 
@@ -2808,15 +2808,15 @@ mod tests {
     #[test]
     fn status_all_entry_projects_ephemeral_launch_label() {
         let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
-        let mut labels = managed_labels("default", "ubuntu-dev-x9k2p");
+        let mut labels = managed_labels("default", "ubuntu-dev-1a2b3c4d5e6f");
         labels.insert("io.aw-gateway.mode".into(), "ephemeral".into());
-        labels.insert("io.aw-gateway.session_id".into(), "x9k2p".into());
+        labels.insert("io.aw-gateway.session_id".into(), "1a2b3c4d5e6f".into());
         labels.insert("io.aw-gateway.launch".into(), "agent-pack-codex".into());
 
         let entries = status_all_entries(
             &cfg,
             vec![managed_container(
-                "ubuntu-dev-x9k2p",
+                "ubuntu-dev-1a2b3c4d5e6f",
                 "runtime-image",
                 true,
                 labels,
@@ -2865,7 +2865,7 @@ mod tests {
         assert!(!runtime.labels().contains_key("io.aw-gateway.launch"));
 
         runtime.target.mode = TargetMode::Ephemeral;
-        runtime.session_id = Some("x9k2p".into());
+        runtime.session_id = Some("1a2b3c4d5e6f".into());
 
         assert_eq!(
             runtime

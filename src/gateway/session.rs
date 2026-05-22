@@ -241,9 +241,8 @@ fn unix_time_ms() -> anyhow::Result<u128> {
 }
 
 pub(super) fn generate_session_id_value() -> anyhow::Result<String> {
-    let now_ms = unix_time_ms()?;
     let token = random_hex_token()?;
-    Ok(format!("s{now_ms}-{}-{}", std::process::id(), &token[..12]))
+    Ok(token[..12].to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -302,4 +301,23 @@ pub(super) fn local_listener_is_active(status: &LocalListenerStatus) -> bool {
     process_start_time(status.gateway_pid).is_ok_and(|start_time| {
         !status.gateway_start_time.is_empty() && start_time == status.gateway_start_time
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_session_ids_are_short_lower_hex() {
+        let id = generate_session_id_value().unwrap();
+
+        assert_eq!(id.len(), 12);
+        assert!(id.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert!(id.chars().all(|ch| !ch.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn explicit_session_id_validation_keeps_existing_shape() {
+        validate_session_id("x9k2p.custom_id").unwrap();
+    }
 }
