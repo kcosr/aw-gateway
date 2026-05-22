@@ -10,14 +10,25 @@ pub enum Dispatch {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayAction {
-    Connect(Option<String>),
+    Connect(TargetSessionAction),
     Up(Option<String>),
     Run(RunAction),
-    Launches { json: bool },
-    LaunchShow { name: String, json: bool },
-    LaunchRun { name: String, vars: Vec<String> },
+    Launches {
+        json: bool,
+    },
+    LaunchShow {
+        name: String,
+        json: bool,
+    },
+    LaunchRun {
+        name: String,
+        session_id: Option<String>,
+        vars: Vec<String>,
+    },
     Status(StatusAction),
-    Targets { json: bool },
+    Targets {
+        json: bool,
+    },
     Stop(Option<String>),
     Remove(Option<String>),
     SetDefault(String),
@@ -32,8 +43,15 @@ pub enum GatewayAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TargetSessionAction {
+    pub target: Option<String>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RunAction {
     pub target: Option<String>,
+    pub session_id: Option<String>,
     pub cwd: Option<String>,
     pub command: Vec<String>,
 }
@@ -135,8 +153,8 @@ fn parse_native(
         return Ok(None);
     };
     let parsed = match action {
-        "connect" if words.len() <= 2 && action_enabled(cfg, "connect") => {
-            GatewayAction::Connect(words.get(1).cloned())
+        "connect" if action_enabled(cfg, "connect") => {
+            GatewayAction::Connect(parse_target_session_action(words)?)
         }
         "up" if words.len() <= 2 && action_enabled(cfg, "up") => {
             GatewayAction::Up(words.get(1).cloned())
@@ -221,19 +239,52 @@ fn parse_status_action(words: &[String]) -> anyhow::Result<GatewayAction> {
     Ok(GatewayAction::Status(action))
 }
 
+fn parse_target_session_action(words: &[String]) -> anyhow::Result<TargetSessionAction> {
+    let mut action = TargetSessionAction::default();
+    let mut index = 1;
+    while let Some(arg) = words.get(index).map(String::as_str) {
+        if let Some(value) = arg.strip_prefix("--session-id=") {
+            set_session_id(&mut action.session_id, value.to_string())?;
+            index += 1;
+            continue;
+        }
+        match arg {
+            "--session-id" => {
+                let value = words
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--session-id requires a value"))?;
+                set_session_id(&mut action.session_id, value.clone())?;
+                index += 2;
+            }
+            value if !value.starts_with('-') => {
+                if action.target.replace(value.to_string()).is_some() {
+                    anyhow::bail!("target may only be specified once");
+                }
+                index += 1;
+            }
+            _ => anyhow::bail!("invalid connect option {arg:?}"),
+        }
+    }
+    Ok(action)
+}
+
+fn set_session_id(slot: &mut Option<String>, value: String) -> anyhow::Result<()> {
+    if slot.replace(value).is_some() {
+        anyhow::bail!("--session-id may only be specified once");
+    }
+    Ok(())
+}
+
 fn parse_run_action(words: &[String]) -> anyhow::Result<GatewayAction> {
     let mut action = RunAction::default();
     let mut index = 1;
 
-    if let Some(value) = words.get(index)
-        && value != "--"
-        && !value.starts_with('-')
-    {
-        action.target = Some(value.clone());
-        index += 1;
-    }
-
     while let Some(flag) = words.get(index).map(String::as_str) {
+        if let Some(value) = flag.strip_prefix("--session-id=") {
+            set_session_id(&mut action.session_id, value.to_string())?;
+            index += 1;
+            continue;
+        }
         match flag {
             "--cwd" => {
                 let value = words
@@ -242,12 +293,25 @@ fn parse_run_action(words: &[String]) -> anyhow::Result<GatewayAction> {
                 action.cwd = Some(value.clone());
                 index += 2;
             }
+            "--session-id" => {
+                let value = words
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--session-id requires a value"))?;
+                set_session_id(&mut action.session_id, value.clone())?;
+                index += 2;
+            }
             "--" => {
                 action.command = words[index + 1..].to_vec();
                 if action.command.is_empty() {
                     anyhow::bail!("run requires -- followed by a command");
                 }
                 return Ok(GatewayAction::Run(action));
+            }
+            value if !value.starts_with('-') => {
+                if action.target.replace(value.to_string()).is_some() {
+                    anyhow::bail!("target may only be specified once");
+                }
+                index += 1;
             }
             _ => anyhow::bail!("invalid run option {flag:?}"),
         }
@@ -283,10 +347,24 @@ fn parse_launch_action(words: &[String]) -> anyhow::Result<GatewayAction> {
     }
 
     let mut vars = Vec::new();
+    let mut session_id = None;
     let mut index = 2;
     while let Some(arg) = words.get(index).map(String::as_str) {
         if arg == "--json" {
             anyhow::bail!("launch execution does not support --json");
+        }
+        if let Some(value) = arg.strip_prefix("--session-id=") {
+            set_session_id(&mut session_id, value.to_string())?;
+            index += 1;
+            continue;
+        }
+        if arg == "--session-id" {
+            let Some(value) = words.get(index + 1) else {
+                anyhow::bail!("--session-id requires a value");
+            };
+            set_session_id(&mut session_id, value.clone())?;
+            index += 2;
+            continue;
         }
         if let Some(value) = arg.strip_prefix("--var=") {
             vars.push(value.to_string());
@@ -306,6 +384,7 @@ fn parse_launch_action(words: &[String]) -> anyhow::Result<GatewayAction> {
 
     Ok(GatewayAction::LaunchRun {
         name: name.clone(),
+        session_id,
         vars,
     })
 }
@@ -441,7 +520,13 @@ mod tests {
         let cfg = SshDispatchConfig::default();
         let action =
             parse_gateway_action("/opt/aw-gateway/bin/aw-gateway connect default", &cfg).unwrap();
-        assert_eq!(action, Some(GatewayAction::Connect(Some("default".into()))));
+        assert_eq!(
+            action,
+            Some(GatewayAction::Connect(TargetSessionAction {
+                target: Some("default".into()),
+                session_id: None,
+            }))
+        );
         let action =
             parse_gateway_action("/opt/aw-gateway/bin/aw-gateway up default", &cfg).unwrap();
         assert_eq!(action, Some(GatewayAction::Up(Some("default".into()))));
@@ -454,6 +539,7 @@ mod tests {
             action,
             Some(GatewayAction::Run(RunAction {
                 target: Some("default".into()),
+                session_id: None,
                 cwd: None,
                 command: vec!["bash".into(), "-l".into()],
             }))
@@ -519,7 +605,10 @@ mod tests {
         for (command, expected) in [
             (
                 "connect default",
-                Some(GatewayAction::Connect(Some("default".into()))),
+                Some(GatewayAction::Connect(TargetSessionAction {
+                    target: Some("default".into()),
+                    session_id: None,
+                })),
             ),
             (
                 "up default",
@@ -556,6 +645,7 @@ mod tests {
             parse_gateway_action("run ubuntu-base --cwd /tmp -- pwd", &cfg).unwrap(),
             Some(GatewayAction::Run(RunAction {
                 target: Some("ubuntu-base".into()),
+                session_id: None,
                 cwd: Some("/tmp".into()),
                 command: vec!["pwd".into()],
             }))
@@ -564,6 +654,7 @@ mod tests {
             parse_gateway_action("run -- pwd", &cfg).unwrap(),
             Some(GatewayAction::Run(RunAction {
                 target: None,
+                session_id: None,
                 cwd: None,
                 command: vec!["pwd".into()],
             }))
@@ -606,6 +697,65 @@ mod tests {
     }
 
     #[test]
+    fn parses_connect_and_run_session_id_forms() {
+        let cfg = SshDispatchConfig::default();
+        for command in [
+            "connect default --session-id abc123def456",
+            "connect --session-id abc123def456 default",
+            "connect default --session-id=abc123def456",
+            "connect --session-id=abc123def456 default",
+        ] {
+            assert_eq!(
+                parse_gateway_action(command, &cfg).unwrap(),
+                Some(GatewayAction::Connect(TargetSessionAction {
+                    target: Some("default".into()),
+                    session_id: Some("abc123def456".into()),
+                })),
+                "command {command:?}"
+            );
+        }
+
+        for command in [
+            "run default --session-id abc123def456 -- bash -l",
+            "run --session-id abc123def456 default -- bash -l",
+            "run default --session-id=abc123def456 -- bash -l",
+            "run --session-id=abc123def456 default -- bash -l",
+        ] {
+            assert_eq!(
+                parse_gateway_action(command, &cfg).unwrap(),
+                Some(GatewayAction::Run(RunAction {
+                    target: Some("default".into()),
+                    session_id: Some("abc123def456".into()),
+                    cwd: None,
+                    command: vec!["bash".into(), "-l".into()],
+                })),
+                "command {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_session_id_actions() {
+        let cfg = SshDispatchConfig::default();
+        for command in [
+            "connect default --session-id",
+            "connect --session-id abc --session-id def default",
+            "connect first second --session-id abc",
+            "run default --session-id",
+            "run --session-id abc --session-id def default -- pwd",
+            "run first second --session-id abc -- pwd",
+            "launch show repo-shell --session-id abc",
+            "launch repo-shell --session-id",
+            "launch repo-shell --session-id abc --session-id def",
+        ] {
+            assert!(
+                parse_gateway_action(command, &cfg).is_err(),
+                "expected {command:?} to fail"
+            );
+        }
+    }
+
+    #[test]
     fn parses_launch_actions() {
         let cfg = SshDispatchConfig::default();
         for (command, expected) in [
@@ -632,6 +782,7 @@ mod tests {
                 "launch repo-shell --var repo=https://example.test/repo.git --var branch=main",
                 Some(GatewayAction::LaunchRun {
                     name: "repo-shell".into(),
+                    session_id: None,
                     vars: vec![
                         "repo=https://example.test/repo.git".into(),
                         "branch=main".into(),
@@ -642,6 +793,23 @@ mod tests {
                 "launch repo-shell --var=repo=https://example.test/repo.git",
                 Some(GatewayAction::LaunchRun {
                     name: "repo-shell".into(),
+                    session_id: None,
+                    vars: vec!["repo=https://example.test/repo.git".into()],
+                }),
+            ),
+            (
+                "launch repo-shell --session-id abc123def456 --var repo=https://example.test/repo.git",
+                Some(GatewayAction::LaunchRun {
+                    name: "repo-shell".into(),
+                    session_id: Some("abc123def456".into()),
+                    vars: vec!["repo=https://example.test/repo.git".into()],
+                }),
+            ),
+            (
+                "launch repo-shell --session-id=abc123def456 --var=repo=https://example.test/repo.git",
+                Some(GatewayAction::LaunchRun {
+                    name: "repo-shell".into(),
+                    session_id: Some("abc123def456".into()),
                     vars: vec!["repo=https://example.test/repo.git".into()],
                 }),
             ),
@@ -680,6 +848,25 @@ mod tests {
             "launches --json",
             "launch show repo-shell",
             "launch repo-shell --var repo=x",
+        ] {
+            let err = parse_gateway_action(command, &cfg).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("invalid or disabled gateway action shape"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_session_actions_are_rejected() {
+        let mut cfg = SshDispatchConfig::default();
+        cfg.enabled_gateway_actions
+            .retain(|action| action != "connect" && action != "run" && action != "launch");
+        for command in [
+            "connect default --session-id abc123def456",
+            "run default --session-id abc123def456 -- pwd",
+            "launch repo-shell --session-id abc123def456 --var repo=x",
         ] {
             let err = parse_gateway_action(command, &cfg).unwrap_err();
             assert!(

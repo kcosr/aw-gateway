@@ -4,6 +4,9 @@
 
 ### Added
 
+- Added explicit `--session-id` support to `connect`, `run`, and executable
+  `launch` commands, including matching SSH-dispatch parsing for deterministic
+  ephemeral target sessions.
 - Added named launches with strict launch/includes config, typed `{var.<name>}`
   variables, discovery/detail CLI output, post-ready setup steps, launch
   execution, and minimal launch provenance in status surfaces
