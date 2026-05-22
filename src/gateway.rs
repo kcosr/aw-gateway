@@ -1207,10 +1207,6 @@ fn status_all_entry(cfg: &GatewayConfig, container: ManagedContainer) -> AllStat
         .cloned()
         .unwrap_or_else(|| "unknown".into());
     let session_id = container.labels.get("io.aw-gateway.session_id").cloned();
-    // Container labels are creation-time metadata. For fixed/reusable
-    // containers, active per-session launch provenance is available through
-    // `status <target>` session markers while the launch is running.
-    let launch = container.labels.get("io.aw-gateway.launch").cloned();
     let mode = container
         .labels
         .get("io.aw-gateway.mode")
@@ -1218,6 +1214,12 @@ fn status_all_entry(cfg: &GatewayConfig, container: ManagedContainer) -> AllStat
         .unwrap_or_else(|| {
             infer_status_all_mode(cfg, &target, &container.name, session_id.as_deref())
         });
+    // Launch labels are only persisted on ephemeral session containers. Fixed
+    // targets can be reused across launches, so their live provenance comes
+    // from per-session markers in `status <target>`.
+    let launch = (mode == "ephemeral")
+        .then(|| container.labels.get("io.aw-gateway.launch").cloned())
+        .flatten();
     let user = container
         .labels
         .get("io.aw-gateway.user")
@@ -1764,7 +1766,9 @@ impl Runtime {
         if let Some(session_id) = &self.session_id {
             labels.insert("io.aw-gateway.session_id".into(), session_id.clone());
         }
-        if let Some(launch_name) = &self.launch_name {
+        if self.target.mode == TargetMode::Ephemeral
+            && let Some(launch_name) = &self.launch_name
+        {
             labels.insert("io.aw-gateway.launch".into(), launch_name.clone());
         }
         labels
@@ -2796,16 +2800,17 @@ mod tests {
     }
 
     #[test]
-    fn status_all_entry_projects_launch_label() {
+    fn status_all_entry_projects_ephemeral_launch_label() {
         let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
-        let mut labels = managed_labels("default", "ubuntu-dev");
-        labels.insert("io.aw-gateway.mode".into(), "fixed".into());
+        let mut labels = managed_labels("default", "ubuntu-dev-x9k2p");
+        labels.insert("io.aw-gateway.mode".into(), "ephemeral".into());
+        labels.insert("io.aw-gateway.session_id".into(), "x9k2p".into());
         labels.insert("io.aw-gateway.launch".into(), "agent-pack-codex".into());
 
         let entries = status_all_entries(
             &cfg,
             vec![managed_container(
-                "ubuntu-dev",
+                "ubuntu-dev-x9k2p",
                 "runtime-image",
                 true,
                 labels,
@@ -2818,6 +2823,51 @@ mod tests {
         assert!(!serialized.contains("repo"));
         assert!(!serialized.contains("pack_id"));
         assert!(!serialized.contains("AGENT_PACK_ID"));
+    }
+
+    #[test]
+    fn status_all_entry_ignores_stale_fixed_launch_label() {
+        let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+        let mut labels = managed_labels("default", "ubuntu-dev");
+        labels.insert("io.aw-gateway.mode".into(), "fixed".into());
+        labels.insert("io.aw-gateway.launch".into(), "stale-launch".into());
+
+        let entries = status_all_entries(
+            &cfg,
+            vec![managed_container(
+                "ubuntu-dev",
+                "runtime-image",
+                true,
+                labels,
+            )],
+        );
+
+        assert_eq!(entries[0].launch, None);
+        assert!(
+            !serde_json::to_string(&entries)
+                .unwrap()
+                .contains("stale-launch")
+        );
+    }
+
+    #[test]
+    fn runtime_labels_only_persist_launch_for_ephemeral_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+
+        assert_eq!(runtime.target.mode, TargetMode::Fixed);
+        assert!(!runtime.labels().contains_key("io.aw-gateway.launch"));
+
+        runtime.target.mode = TargetMode::Ephemeral;
+        runtime.session_id = Some("x9k2p".into());
+
+        assert_eq!(
+            runtime
+                .labels()
+                .get("io.aw-gateway.launch")
+                .map(String::as_str),
+            Some("agent-pack-codex")
+        );
     }
 
     #[test]

@@ -431,6 +431,11 @@ impl LaunchVarConfig {
                 "launch {launch_name:?} variable {var_name:?} cannot set both required and default"
             );
         }
+        if self.var_type != LaunchVarType::Enum && self.values.is_some() {
+            anyhow::bail!(
+                "launch {launch_name:?} variable {var_name:?} values are only valid for enum variables"
+            );
+        }
         match self.var_type {
             LaunchVarType::String => {
                 if let Some(default) = &self.default
@@ -4067,6 +4072,60 @@ command = ["true"]
 repo = { type = "string", required = true, default = "main" }
 "#,
                 "cannot set both required and default",
+            ),
+            (
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.bad]
+target = "default"
+command = ["true"]
+
+[launches.bad.vars]
+repo = { type = "string", values = ["main"] }
+"#,
+                "values are only valid for enum variables",
+            ),
+            (
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.bad]
+target = "default"
+command = ["true"]
+
+[launches.bad.vars]
+debug = { type = "boolean", values = ["true"] }
+"#,
+                "values are only valid for enum variables",
+            ),
+            (
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.bad]
+target = "default"
+command = ["true"]
+
+[launches.bad.vars]
+count = { type = "number", values = ["1"] }
+"#,
+                "values are only valid for enum variables",
             ),
         ] {
             let cfg: GatewayConfig = toml::from_str(config).unwrap();
