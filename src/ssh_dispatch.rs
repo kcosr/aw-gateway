@@ -261,7 +261,7 @@ fn parse_launch_action(words: &[String]) -> anyhow::Result<GatewayAction> {
         anyhow::bail!("launch requires a launch name");
     };
     if name == "show" {
-        let Some(name) = words.get(2) else {
+        let Some(launch_name) = words.get(2) else {
             anyhow::bail!("launch show requires a launch name");
         };
         let json = match words {
@@ -277,7 +277,7 @@ fn parse_launch_action(words: &[String]) -> anyhow::Result<GatewayAction> {
             ),
         };
         return Ok(GatewayAction::LaunchShow {
-            name: name.clone(),
+            name: launch_name.clone(),
             json,
         });
     }

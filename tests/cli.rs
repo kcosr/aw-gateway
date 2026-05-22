@@ -609,6 +609,9 @@ fn help_over_ssh_prints_allowed_commands() {
         .stdout(predicate::str::contains(
             "run [target] [--cwd DIR] -- <command>",
         ))
+        .stdout(predicate::str::contains("launches"))
+        .stdout(predicate::str::contains("launch show <name>"))
+        .stdout(predicate::str::contains("launch <name> [--var key=value]"))
         .stdout(predicate::str::contains("client-config [target]"))
         .stdout(predicate::str::contains("remove [target]"))
         .stdout(predicate::str::contains("help"));
