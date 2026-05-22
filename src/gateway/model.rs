@@ -51,6 +51,7 @@ pub(super) struct TcpEndpoint {
 pub(super) struct GatewayStatus {
     pub(super) target: String,
     pub(super) session_id: Option<String>,
+    pub(super) launch: Option<String>,
     pub(super) mode: String,
     pub(super) user: String,
     pub(super) image: String,
@@ -72,6 +73,8 @@ pub(super) struct SessionMarker {
     pub(super) gateway_start_time: String,
     pub(super) container: String,
     pub(super) target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) launch: Option<String>,
     pub(super) created_at_ms: u128,
 }
 
@@ -82,6 +85,7 @@ pub(super) struct SessionStatus {
     pub(super) gateway_pid: u32,
     pub(super) container: String,
     pub(super) target: String,
+    pub(super) launch: Option<String>,
     pub(super) created_at_ms: u128,
 }
 
@@ -102,6 +106,7 @@ impl From<SessionMarker> for SessionStatus {
             gateway_pid: marker.gateway_pid,
             container: marker.container,
             target: marker.target,
+            launch: marker.launch,
             created_at_ms: marker.created_at_ms,
         }
     }

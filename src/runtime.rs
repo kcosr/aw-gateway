@@ -9,6 +9,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use tokio::process::Command;
+use tokio::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct ContainerRuntime {
@@ -223,15 +224,33 @@ impl ContainerRuntime {
     }
 
     pub async fn exec(&self, spec: &ContainerExecSpec) -> anyhow::Result<i32> {
-        let status = self
-            .command()
+        self.exec_with_timeout(spec, None).await
+    }
+
+    pub async fn exec_with_timeout(
+        &self,
+        spec: &ContainerExecSpec,
+        timeout_duration: Option<Duration>,
+    ) -> anyhow::Result<i32> {
+        let mut command = self.command();
+        command
             .arg("exec")
             .args(self.exec_args(spec))
-            .status()
-            .await
-            .with_context(|| {
-                format!("run {} exec {}", self.runtime_label(), spec.container_name)
-            })?;
+            .kill_on_drop(true);
+        let status = match timeout_duration {
+            Some(timeout_duration) => tokio::time::timeout(timeout_duration, command.status())
+                .await
+                .with_context(|| {
+                    format!(
+                        "{} exec {} timed out after {:?}",
+                        self.runtime_label(),
+                        spec.container_name,
+                        timeout_duration
+                    )
+                })?,
+            None => command.status().await,
+        }
+        .with_context(|| format!("run {} exec {}", self.runtime_label(), spec.container_name))?;
         Ok(exit_code(status))
     }
 
@@ -922,21 +941,21 @@ mod tests {
     #[test]
     fn parse_managed_containers_accepts_docker_ndjson_labels() {
         let raw = br#"
-{"Names":"scratch-x9k2p","Image":"scratch/dev","State":"exited","Status":"Exited (0) 2 minutes ago","Labels":"io.aw-gateway.gateway=true,io.aw-gateway.user=alice,io.aw-gateway.uid=2450,io.aw-gateway.target=scratch,io.aw-gateway.session_id=x9k2p"}
+{"Names":"scratch-1a2b3c4d5e6f","Image":"scratch/dev","State":"exited","Status":"Exited (0) 2 minutes ago","Labels":"io.aw-gateway.gateway=true,io.aw-gateway.user=alice,io.aw-gateway.uid=2450,io.aw-gateway.target=scratch,io.aw-gateway.session_id=1a2b3c4d5e6f"}
 {"Names":"other","Image":"busybox","State":"running","Status":"Up 2 minutes","Labels":"io.aw-gateway.gateway=false,io.aw-gateway.user=alice,io.aw-gateway.uid=2450"}
 "#;
 
         let containers = parse_managed_containers(raw).unwrap();
 
         assert_eq!(containers.len(), 1);
-        assert_eq!(containers[0].name, "scratch-x9k2p");
+        assert_eq!(containers[0].name, "scratch-1a2b3c4d5e6f");
         assert!(!containers[0].running);
         assert_eq!(
             containers[0]
                 .labels
                 .get("io.aw-gateway.session_id")
                 .map(String::as_str),
-            Some("x9k2p")
+            Some("1a2b3c4d5e6f")
         );
     }
 
@@ -1005,6 +1024,41 @@ mod tests {
                 "id -u",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn exec_with_timeout_reports_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-runtime");
+        std::fs::write(
+            &runtime_program,
+            "#!/bin/sh\nif [ \"$1\" = exec ]; then sleep 5; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::Podman,
+            program: runtime_program.display().to_string(),
+            env: BTreeMap::new(),
+        };
+        let spec = ContainerExecSpec {
+            stdin_tty: false,
+            stdout_tty: false,
+            user: "2450:100".into(),
+            cwd: None,
+            env: BTreeMap::new(),
+            container_name: "ubuntu-dev".into(),
+            command: vec!["sleep".into(), "5".into()],
+        };
+
+        let started = std::time::Instant::now();
+        let err = runtime
+            .exec_with_timeout(&spec, Some(Duration::from_millis(100)))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]

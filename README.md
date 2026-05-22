@@ -47,6 +47,8 @@ controlled bridge.
 - Runtime support for Podman, Docker, and Colima.
 - Config-driven lifecycle steps before container start and host steps after
   start, including health checks.
+- Named launches for validated, discoverable command templates that prepare a
+  ready target and then run a final in-container command.
 - In-container service supervision with dependency ordering, restart policy,
   service health checks, and graceful shutdown.
 - Built-in Unix-socket bridge from the host workspace to container SSH.
@@ -379,6 +381,11 @@ Gateway configs commonly include:
 - `[[host_steps]]`: post-start host hooks that run after agent readiness, such
   as firewall setup, with per-step command timeouts and optional command health
   checks.
+- `[launches.<name>]`: named command templates that select a target, validate
+  caller variables, optionally run post-ready setup steps, and execute a final
+  command inside the ready container.
+- `target_includes` and `launch_includes`: section-specific include globs for
+  splitting target and launch definitions into separate TOML files.
 - `[[container_mounts]]` and `[[targets.<name>.container_mounts]]`: extra
   host-to-container bind mounts, typically read-only bootstrap
   binaries/configs/certs.
@@ -476,6 +483,119 @@ type = "command"
 command = ["/opt/site-policy/bin/network-policy", "check", "{container_pid}"]
 ```
 
+## Launches
+
+Launches are stateless, configured command templates. They do not add a job
+history or background launch manager. A launch selects an existing target,
+validates typed caller variables, starts or reuses the target through the
+normal readiness path, runs optional `post_ready` steps, then executes the
+final command inside the ready container.
+
+Caller variables are referenced only as `{var.<name>}`. Built-ins such as
+`{workspace}`, `{container_home}`, `{session_id}`, `{target}`, and
+`{container_name}` remain unprefixed. Unknown variables fail config
+validation, and unprefixed caller variables such as `{repo}` are rejected.
+
+```toml
+[launches.repo-shell]
+target = "default"
+description = "Clone a repository and open a shell."
+cwd = "{container_home}/repo"
+env = { REPO_URL = "{var.repo}" }
+command = ["/bin/bash", "-lc", "exec /bin/bash"]
+
+[launches.repo-shell.vars]
+repo = { type = "string", required = true, description = "Git repository URL" }
+branch = { type = "string", default = "main" }
+mode = { type = "enum", values = ["fast", "safe"], default = "safe" }
+debug = { type = "boolean", default = false }
+limit = { type = "number", default = 1 }
+
+[[launches.repo-shell.steps]]
+phase = "post_ready"
+location = "container"
+name = "clone"
+required = true
+timeout = "5m"
+cwd = "{container_home}"
+command = ["git", "clone", "--branch", "{var.branch}", "--single-branch", "{var.repo}", "repo"]
+```
+
+Supported variable types are `string`, `enum`, `boolean`, and `number`.
+Boolean CLI values must be `true` or `false`; number values must parse as
+finite numbers; enum values must exactly match the configured `values`.
+Optional variables referenced by templates must define a default.
+
+Launch commands:
+
+```bash
+aw-gateway launches
+aw-gateway launches --json
+aw-gateway launch show repo-shell
+aw-gateway launch show repo-shell --json
+aw-gateway launch repo-shell --var repo=https://example.test/repo.git --var branch=main
+```
+
+When `launches` and `launch` are present in
+`ssh_dispatch.enabled_gateway_actions`, the same commands can be invoked
+through the host SSH gateway:
+
+```bash
+ssh host launches
+ssh host 'launch show repo-shell --json'
+ssh host 'launch repo-shell --var repo=https://example.test/repo.git --var branch=main'
+```
+
+Omit `launch` from `ssh_dispatch.enabled_gateway_actions` if SSH users should
+not start configured launch workflows. Omit `launches` if SSH users should not
+list configured launches.
+
+`launches --json` emits a bare array of launch summaries. Each summary includes
+`name`, `target`, optional `description`, and a `vars` object keyed by variable
+name with `type`, `required`, optional `default`, optional enum `values`, and
+optional `description`. `launch show --json` emits one detail object with the
+same variable metadata plus `steps`, optional final `cwd`, optional final
+`env`, and final `command`.
+
+Launch execution order is:
+
+1. Load, include, and validate config.
+2. Resolve the named launch.
+3. Validate supplied `--var key=value` values and apply defaults.
+4. Resolve and prepare the configured target.
+5. Run the existing target lifecycle, readiness checks, and target
+   `host_steps`.
+6. Run launch `post_ready` steps in TOML order.
+7. Execute the final command inside the ready container.
+8. Drop the session marker and run normal gateway-owned cleanup.
+
+Container launch step environment is target session env, then rendered launch
+env, then rendered step env, with later values overriding earlier. The final
+command receives target session env plus rendered launch env. Host launch step
+env is exactly the rendered step env.
+
+Launch provenance is intentionally minimal. Session markers, status JSON, and
+newly created ephemeral session container labels store only the launch name as
+`launch`; resolved variables, argv, env, repository URLs, and branch names are
+not persisted. Fixed/reused containers do not persist launch labels because the
+container can outlive any one launch session.
+`aw-gateway status <target> --json` and `aw-gateway status --all --json`
+include nullable `launch` fields. Text `status <target>` prints
+`launch: <name>` only when present, and `status --all` includes a compact
+`LAUNCH` column.
+
+Target and launch definitions can be split into strict section-specific include
+files:
+
+```toml
+target_includes = ["/etc/aw-gateway/targets/*.toml"]
+launch_includes = ["/etc/aw-gateway/launches/*.toml"]
+```
+
+Include glob matches are sorted lexicographically before composition. Includes
+reject cycles, duplicate target or launch names, unknown fields, and partial
+object merge or override behavior.
+
 When `sftp = "deny"`, `start-container-sshd` removes the SFTP subsystem from
 the runtime SSHD config. Modern OpenSSH SCP uses SFTP, so that blocks both.
 When `legacy_scp` is not `"allow"`, the helper adds a container-side
@@ -492,10 +612,12 @@ controlled by SFTP/SCP transfer policy. Host-gateway SSH dispatch checks the
 global transfer table before dispatch; per-target transfer overrides apply to
 direct container-SSHD access. If a deployment intends to expose management-only
 SSH commands without arbitrary container exec, omit `run` from
-`ssh_dispatch.enabled_gateway_actions`; also omit `connect` if users should not
-receive a full container SSH session. `allow_container_commands = false` blocks
-non-gateway passthrough commands, but it does not disable explicitly enabled
-gateway actions.
+`ssh_dispatch.enabled_gateway_actions`; omit `launch` if users should not start
+configured launch workflows; omit `launches` if users should not discover
+configured launches; also omit `connect` if users should not receive a full
+container SSH session. `allow_container_commands = false` blocks non-gateway
+passthrough commands, but it does not disable explicitly enabled gateway
+actions.
 
 ## Container Agent Services
 
@@ -514,6 +636,9 @@ answers gateway control requests over a private Unix-domain control socket.
 Disabling the control socket is useful for published-port SSH backends, but it
 also removes agent-control readiness and mutating control requests through that
 socket.
+Before starting a container, the gateway checks the resolved host and
+in-container Unix socket paths and fails fast if any path exceeds the platform
+socket path limit.
 
 Service example:
 
@@ -724,9 +849,9 @@ client-bundle [target] [--identity-file PATH] [--rotate-key]
 
 A session is one gateway connection or invocation tracked for lifecycle and
 idle cleanup decisions. Fixed targets usually let the gateway generate session
-IDs automatically. Ephemeral targets can use `--session-id` when another tool
-needs to correlate `up`, `status`, or `stop` with the same per-session
-container.
+IDs automatically. Generated session IDs are 12 lowercase hexadecimal
+characters. Ephemeral targets can use `--session-id` when another tool needs to
+correlate `up`, `status`, or `stop` with the same per-session container.
 
 Gateway command behavior:
 

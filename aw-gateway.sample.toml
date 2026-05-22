@@ -1,6 +1,12 @@
 schema_version = "1"
 default_target = "default"
 
+# Optional section-specific include globs. Matches are sorted before loading.
+# Included target files may define target_includes and [targets.<name>] only.
+# Included launch files may define launch_includes and [launches.<name>] only.
+# target_includes = ["/etc/aw-gateway/targets/*.toml"]
+# launch_includes = ["/etc/aw-gateway/launches/*.toml"]
+
 [runtime]
 # Supported values: "podman", "docker", "colima".
 # Podman is the managed-server default.
@@ -33,6 +39,8 @@ enabled_gateway_actions = [
   "connect",
   "up",
   "run",
+  "launches",
+  "launch",
   "status",
   "targets",
   "stop",
@@ -189,6 +197,36 @@ health_check = { type = "command", command = ["sudo", "/opt/aw-gateway/bin/aw-ip
 # name = "firewall"
 # timeout = "30s"
 # command = ["sudo", "/opt/aw-gateway/bin/aw-iptables", "add", "{container_pid}"]
+#
+# Named launches are typed, validated command templates. They select an
+# existing target, run optional post_ready setup steps after normal target
+# readiness, and execute a final command inside the ready container. Caller
+# variables must use the {var.<name>} namespace; built-ins such as
+# {container_home}, {workspace}, {session_id}, {target}, and {container_name}
+# stay unprefixed.
+#
+# [launches.repo-shell]
+# target = "default"
+# description = "Clone a repository and open a shell."
+# cwd = "{container_home}/repo"
+# env = { REPO_URL = "{var.repo}" }
+# command = ["/bin/bash", "-lc", "exec /bin/bash"]
+#
+# [launches.repo-shell.vars]
+# repo = { type = "string", required = true, description = "Git repository URL" }
+# branch = { type = "string", default = "main" }
+# mode = { type = "enum", values = ["fast", "safe"], default = "safe" }
+# debug = { type = "boolean", default = false }
+# limit = { type = "number", default = 1 }
+#
+# [[launches.repo-shell.steps]]
+# phase = "post_ready"
+# location = "container"
+# name = "clone"
+# required = true
+# timeout = "5m"
+# cwd = "{container_home}"
+# command = ["git", "clone", "--branch", "{var.branch}", "--single-branch", "{var.repo}", "repo"]
 #
 # Optional bootstrap-mount mode. When enabled, the container starts by running
 # aw-container-bootstrap, which prepares passwd/group/home/state and then execs
