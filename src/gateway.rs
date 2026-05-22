@@ -1,15 +1,16 @@
 use crate::cli::{
     AddContainerKeyArgs, AddHostKeyArgs, AddKeyArgs, ClientBundleArgs, ClientConfigArgs,
-    ConfigCommand, GatewayArgs, GatewayCommand, RunArgs, SetDefaultArgs, StatusArg, StopArgs,
-    TargetArg, TargetsArgs, UpArgs,
+    ConfigCommand, GatewayArgs, GatewayCommand, LaunchArgs, LaunchesArgs, RunArgs, SetDefaultArgs,
+    StatusArg, StopArgs, TargetArg, TargetsArgs, UpArgs,
 };
 use crate::config::{
     AGENT_SCHEMA_VERSION, BootstrapIdentity, ContainerAgentConfig, ContainerAgentFile,
     ContainerBootstrapConfig, ContainerBootstrapFile, ContainerBootstrapStep, ContainerMountMode,
     ContainerRuntimeType, ContainerSshConfig, ControlSocketConfig, GatewayConfig, HostStep,
-    IdleCleanupAction, IdleCleanupOwner, LifecyclePhase, LifecycleStep, LocalSshBackend,
-    LocalSshMode, LocalSshReadiness, LoggingConfig, RenderedContainerBootstrapStep, TargetConfig,
-    TargetMode, validate_name, validate_passwd_scalar,
+    IdleCleanupAction, IdleCleanupOwner, LaunchConfig, LaunchStep, LaunchStepLocation,
+    LaunchVarConfig, LaunchVarType, LifecyclePhase, LifecycleStep, LocalSshBackend, LocalSshMode,
+    LocalSshReadiness, LoggingConfig, RenderedContainerBootstrapStep, TargetConfig, TargetMode,
+    validate_name, validate_passwd_scalar,
 };
 use crate::paths::{self, UserContext};
 use crate::runtime::{
@@ -45,7 +46,7 @@ mod session;
 
 use client::{read_default_selection, resolve_target_selection};
 use fileutil::{atomic_write_file, write_private_file};
-use health::{render_command, run_argv_with_timeout, run_health_check};
+use health::{render_command, run_argv_with_options, run_argv_with_timeout, run_health_check};
 use model::{GatewayStatus, ReadyStatus, TcpEndpoint, gateway_status_name};
 use session::{generate_session_id_value, validate_session_id};
 
@@ -72,6 +73,8 @@ pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
         Some(GatewayCommand::Connect(TargetArg { target })) => connect(args.config, target).await,
         Some(GatewayCommand::Up(status)) => up(args.config, status).await,
         Some(GatewayCommand::Run(run_args)) => run_container_command(args.config, run_args).await,
+        Some(GatewayCommand::Launch(launch_args)) => launch(args.config, launch_args).await,
+        Some(GatewayCommand::Launches(launches_args)) => launches(args.config, launches_args).await,
         Some(GatewayCommand::Stop(stop_args)) => stop(args.config, stop_args).await,
         Some(GatewayCommand::Remove(target_arg)) => remove(args.config, target_arg).await,
         Some(GatewayCommand::Status(status_args)) => status(args.config, status_args).await,
@@ -442,21 +445,30 @@ async fn run_container_command(config_path: Option<PathBuf>, args: RunArgs) -> a
         .cwd
         .as_deref()
         .map(|cwd| paths::expand_home(&runtime.container_home, cwd));
-    let exec_spec = ContainerExecSpec {
-        stdin_tty: std::io::stdin().is_terminal(),
-        stdout_tty: std::io::stdout().is_terminal(),
-        user: runtime.exec_identity(),
-        cwd,
-        env: runtime.session_env()?,
-        container_name: runtime.container_name.clone(),
-        command,
-    };
-    let code = runtime.container_runtime.exec(&exec_spec).await?;
+    let code = exec_final_container_command(&runtime, command, cwd, runtime.session_env()?).await?;
     drop(session);
     if let Err(err) = runtime.apply_gateway_idle_cleanup().await {
         tracing::warn!(error = %err, "gateway-owned idle cleanup failed");
     }
     std::process::exit(code);
+}
+
+async fn exec_final_container_command(
+    runtime: &Runtime,
+    command: Vec<String>,
+    cwd: Option<PathBuf>,
+    env: BTreeMap<String, String>,
+) -> anyhow::Result<i32> {
+    let exec_spec = ContainerExecSpec {
+        stdin_tty: std::io::stdin().is_terminal(),
+        stdout_tty: std::io::stdout().is_terminal(),
+        user: runtime.exec_identity(),
+        cwd,
+        env,
+        container_name: runtime.container_name.clone(),
+        command,
+    };
+    runtime.container_runtime.exec(&exec_spec).await
 }
 
 async fn stop(config_path: Option<PathBuf>, args: StopArgs) -> anyhow::Result<()> {
@@ -533,6 +545,9 @@ async fn status(config_path: Option<PathBuf>, status: StatusArg) -> anyhow::Resu
             result.status,
             result.container.unwrap_or_else(|| "not-created".into())
         );
+        if let Some(launch) = &result.launch {
+            println!("launch: {launch}");
+        }
     }
     Ok(())
 }
@@ -551,14 +566,15 @@ async fn status_all(config_path: Option<PathBuf>, json: bool) -> anyhow::Result<
         println!("No aw-gateway-managed containers found for this user.");
     } else {
         println!(
-            "{:<15} {:<11} {:<11} {:<22} STATUS",
-            "TARGET", "SESSION", "MODE", "CONTAINER"
+            "{:<15} {:<11} {:<16} {:<11} {:<22} STATUS",
+            "TARGET", "SESSION", "LAUNCH", "MODE", "CONTAINER"
         );
         for entry in summaries {
             println!(
-                "{:<15} {:<11} {:<11} {:<22} {}",
+                "{:<15} {:<11} {:<16} {:<11} {:<22} {}",
                 entry.target,
                 entry.session_id.as_deref().unwrap_or("-"),
+                entry.launch.as_deref().unwrap_or("-"),
                 entry.mode,
                 entry.container,
                 entry.status
@@ -586,6 +602,134 @@ async fn targets(config_path: Option<PathBuf>, args: TargetsArgs) -> anyhow::Res
     Ok(())
 }
 
+async fn launches(config_path: Option<PathBuf>, args: LaunchesArgs) -> anyhow::Result<()> {
+    let cfg = load_config(config_path)?;
+    let entries = launch_summaries(&cfg);
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+    } else if entries.is_empty() {
+        println!("No launches configured.");
+    } else {
+        println!(
+            "{:<24} {:<24} {:<25} DESCRIPTION",
+            "LAUNCH", "TARGET", "REQUIRED VARS"
+        );
+        for entry in entries {
+            let required = entry
+                .vars
+                .iter()
+                .filter_map(|(name, var)| var.required.then_some(name.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "{:<24} {:<24} {:<25} {}",
+                entry.name,
+                entry.target,
+                required,
+                entry.description.unwrap_or_default()
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn launch(config_path: Option<PathBuf>, args: LaunchArgs) -> anyhow::Result<()> {
+    if args.action_or_name == "show" {
+        if args.name.is_none() && !args.json {
+            let cfg = load_config(config_path.clone())?;
+            if cfg.launches.contains_key("show") {
+                return launch_execute_with_config(cfg, "show", args.vars).await;
+            }
+        }
+        let name = args
+            .name
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("launch show requires a launch name"))?;
+        if !args.vars.is_empty() {
+            anyhow::bail!("launch show does not accept --var");
+        }
+        return launch_show(config_path, name, args.json).await;
+    }
+    if args.json {
+        anyhow::bail!("launch execution does not support --json");
+    }
+    if args.name.is_some() {
+        anyhow::bail!("unexpected extra launch argument {:?}", args.name.unwrap());
+    }
+    launch_execute(config_path, &args.action_or_name, args.vars).await
+}
+
+async fn launch_show(config_path: Option<PathBuf>, name: &str, json: bool) -> anyhow::Result<()> {
+    let cfg = load_config(config_path)?;
+    let launch = cfg
+        .launches
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("unknown launch {name:?}"))?;
+    let detail = launch_detail(name, launch);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&detail)?);
+    } else {
+        print_launch_detail(&detail);
+    }
+    Ok(())
+}
+
+async fn launch_execute(
+    config_path: Option<PathBuf>,
+    name: &str,
+    supplied: Vec<String>,
+) -> anyhow::Result<()> {
+    let cfg = load_config(config_path.clone())?;
+    launch_execute_with_config(cfg, name, supplied).await
+}
+
+async fn launch_execute_with_config(
+    cfg: GatewayConfig,
+    name: &str,
+    supplied: Vec<String>,
+) -> anyhow::Result<()> {
+    let launch = cfg
+        .launches
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("unknown launch {name:?}"))?
+        .clone();
+    let resolved_vars = resolve_launch_vars(name, &launch, supplied)?;
+    let runtime = Runtime::from_config(
+        cfg,
+        Some(&launch.target),
+        None,
+        true,
+        Some(name.to_string()),
+    )
+    .await?;
+    let session_kind = "launch";
+    let session = runtime.create_launch_session_marker(session_kind)?;
+    let result = async {
+        let ready = runtime.ensure_ready().await?;
+        let _agent_session = runtime.agent_session_hold(session_kind).await?;
+        let container_pid = ready.container_pid.to_string();
+        let vars = launch_template_vars(&runtime, &resolved_vars, Some(&container_pid));
+        let launch_env = render_template_map(&launch.env, &vars)?;
+        run_launch_steps(&runtime, &launch, &vars, &launch_env).await?;
+        let mut env = runtime.session_env()?;
+        env.extend(launch_env);
+        let cwd = render_launch_cwd(
+            launch.cwd.as_deref(),
+            &vars,
+            runtime.container_home.as_path(),
+        )?;
+        let command = render_command(&launch.command, &vars)?;
+        exec_final_container_command(&runtime, command, cwd, env).await
+    }
+    .await;
+    drop(session);
+    if let Err(err) = runtime.apply_gateway_idle_cleanup().await {
+        tracing::warn!(error = %err, "gateway-owned idle cleanup failed");
+    }
+    let code = result?;
+    std::process::exit(code);
+}
+
 #[derive(Debug, Serialize)]
 struct TargetEntry {
     target: String,
@@ -595,16 +739,404 @@ struct TargetEntry {
     default: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct LaunchSummary {
+    name: String,
+    target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    vars: BTreeMap<String, LaunchVarMetadata>,
+}
+
+#[derive(Debug, Serialize)]
+struct LaunchDetail {
+    name: String,
+    target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    vars: BTreeMap<String, LaunchVarMetadata>,
+    steps: Vec<LaunchStepDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    env: BTreeMap<String, String>,
+    command: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LaunchStepDetail {
+    name: String,
+    phase: String,
+    location: String,
+    required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    env: BTreeMap<String, String>,
+    command: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LaunchVarMetadata {
+    #[serde(rename = "type")]
+    var_type: &'static str,
+    required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default: Option<crate::config::LaunchVarValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    values: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct AllStatusEntry {
     target: String,
     session_id: Option<String>,
+    launch: Option<String>,
     mode: String,
     user: String,
     uid: String,
     image: String,
     container: String,
     status: String,
+}
+
+fn launch_summaries(cfg: &GatewayConfig) -> Vec<LaunchSummary> {
+    cfg.launches
+        .iter()
+        .map(|(name, launch)| LaunchSummary {
+            name: name.clone(),
+            target: launch.target.clone(),
+            description: launch.description.clone(),
+            vars: launch_var_metadata(&launch.vars),
+        })
+        .collect()
+}
+
+fn launch_detail(name: &str, launch: &LaunchConfig) -> LaunchDetail {
+    LaunchDetail {
+        name: name.to_string(),
+        target: launch.target.clone(),
+        description: launch.description.clone(),
+        vars: launch_var_metadata(&launch.vars),
+        steps: launch.steps.iter().map(launch_step_detail).collect(),
+        cwd: launch.cwd.clone(),
+        env: launch.env.clone(),
+        command: launch.command.clone(),
+    }
+}
+
+fn launch_var_metadata(
+    vars: &BTreeMap<String, LaunchVarConfig>,
+) -> BTreeMap<String, LaunchVarMetadata> {
+    vars.iter()
+        .map(|(name, var)| {
+            (
+                name.clone(),
+                LaunchVarMetadata {
+                    var_type: launch_var_type_name(var.var_type),
+                    required: var.required,
+                    default: var.default.clone(),
+                    values: var.values.clone(),
+                    description: var.description.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn launch_step_detail(step: &LaunchStep) -> LaunchStepDetail {
+    LaunchStepDetail {
+        name: step.name.clone(),
+        phase: "post_ready".into(),
+        location: match step.location {
+            LaunchStepLocation::Host => "host",
+            LaunchStepLocation::Container => "container",
+        }
+        .into(),
+        required: step.required,
+        timeout: step.timeout.clone(),
+        cwd: step.cwd.clone(),
+        env: step.env.clone(),
+        command: step.command.clone(),
+    }
+}
+
+fn print_launch_detail(detail: &LaunchDetail) {
+    println!("Launch: {}", detail.name);
+    println!("Target: {}", detail.target);
+    println!(
+        "Description: {}",
+        detail.description.as_deref().unwrap_or_default()
+    );
+    if !detail.vars.is_empty() {
+        println!("\nVariables:");
+        for (name, var) in &detail.vars {
+            println!(
+                "  {name} ({}){}",
+                launch_var_text(var),
+                launch_var_description(var)
+            );
+        }
+    }
+    if !detail.steps.is_empty() {
+        println!("\nSteps:");
+        for (index, step) in detail.steps.iter().enumerate() {
+            let required = if step.required {
+                "required"
+            } else {
+                "optional"
+            };
+            let timeout = step
+                .timeout
+                .as_deref()
+                .map(|value| format!(", timeout: {value}"))
+                .unwrap_or_default();
+            println!(
+                "  {}. {} [{}/{}, {}{}]",
+                index + 1,
+                step.name,
+                step.phase,
+                step.location,
+                required,
+                timeout
+            );
+            if let Some(cwd) = &step.cwd {
+                println!("     cwd: {cwd}");
+            }
+            if !step.env.is_empty() {
+                println!("     env: {}", env_summary(&step.env));
+            }
+            println!("     argv: {}", step.command.join(" "));
+        }
+    }
+    println!("\nCommand:");
+    if let Some(cwd) = &detail.cwd {
+        println!("  cwd: {cwd}");
+    }
+    if !detail.env.is_empty() {
+        println!("  env: {}", env_summary(&detail.env));
+    }
+    println!("  argv: {}", detail.command.join(" "));
+}
+
+fn launch_var_text(var: &LaunchVarMetadata) -> String {
+    let mut parts = Vec::new();
+    match (var.var_type, &var.values) {
+        ("enum", Some(values)) => parts.push(format!("enum: {}", values.join(", "))),
+        (var_type, _) => parts.push(var_type.to_string()),
+    }
+    if var.required {
+        parts.push("required".into());
+    } else if let Some(default) = &var.default {
+        parts.push(format!("default: {}", default.rendered()));
+    }
+    parts.join(", ")
+}
+
+fn launch_var_description(var: &LaunchVarMetadata) -> String {
+    var.description
+        .as_deref()
+        .map(|description| format!(" - {description}"))
+        .unwrap_or_default()
+}
+
+fn env_summary(env: &BTreeMap<String, String>) -> String {
+    env.iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn launch_var_type_name(var_type: LaunchVarType) -> &'static str {
+    match var_type {
+        LaunchVarType::String => "string",
+        LaunchVarType::Enum => "enum",
+        LaunchVarType::Boolean => "boolean",
+        LaunchVarType::Number => "number",
+    }
+}
+
+fn resolve_launch_vars(
+    launch_name: &str,
+    launch: &LaunchConfig,
+    supplied: Vec<String>,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut resolved = BTreeMap::new();
+    let mut supplied_map = BTreeMap::new();
+    for raw in supplied {
+        let Some((key, value)) = raw.split_once('=') else {
+            anyhow::bail!("--var must be key=value");
+        };
+        if supplied_map
+            .insert(key.to_string(), value.to_string())
+            .is_some()
+        {
+            anyhow::bail!("duplicate launch variable {key:?}");
+        }
+    }
+    for key in supplied_map.keys() {
+        if !launch.vars.contains_key(key) {
+            anyhow::bail!("unknown launch variable {key:?}");
+        }
+    }
+    for (name, var) in &launch.vars {
+        if let Some(value) = supplied_map.get(name) {
+            resolved.insert(name.clone(), validate_launch_var_value(name, var, value)?);
+        } else if let Some(default) = var.default_rendered() {
+            resolved.insert(name.clone(), default);
+        } else if var.required {
+            anyhow::bail!("missing required launch variable {name:?}");
+        }
+    }
+    tracing::debug!(
+        launch = launch_name,
+        vars = resolved.len(),
+        "resolved launch variables"
+    );
+    Ok(resolved)
+}
+
+fn validate_launch_var_value(
+    name: &str,
+    var: &LaunchVarConfig,
+    value: &str,
+) -> anyhow::Result<String> {
+    match var.var_type {
+        LaunchVarType::String => Ok(value.to_string()),
+        LaunchVarType::Enum => {
+            let values = var.values.as_deref().unwrap_or(&[]);
+            if values.iter().any(|allowed| allowed == value) {
+                Ok(value.to_string())
+            } else {
+                anyhow::bail!(
+                    "invalid enum launch variable {name:?}; expected one of {}",
+                    values.join(", ")
+                );
+            }
+        }
+        LaunchVarType::Boolean => match value {
+            "true" | "false" => Ok(value.to_string()),
+            _ => anyhow::bail!("invalid boolean launch variable {name:?}; expected true or false"),
+        },
+        LaunchVarType::Number => {
+            let parsed = value
+                .parse::<f64>()
+                .with_context(|| format!("invalid number launch variable {name:?}"))?;
+            if !parsed.is_finite() {
+                anyhow::bail!("invalid number launch variable {name:?}; expected finite number");
+            }
+            Ok(canonical_cli_number(value, parsed))
+        }
+    }
+}
+
+fn canonical_cli_number(raw: &str, parsed: f64) -> String {
+    if raw.parse::<i64>().is_ok() {
+        raw.trim_start_matches('+').to_string()
+    } else {
+        let text = parsed.to_string();
+        text.strip_suffix(".0").unwrap_or(&text).to_string()
+    }
+}
+
+async fn run_launch_steps(
+    runtime: &Runtime,
+    launch: &LaunchConfig,
+    vars: &Vars,
+    launch_env: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let session_env = runtime.session_env()?;
+    for step in &launch.steps {
+        let result = match step.location {
+            LaunchStepLocation::Host => run_host_launch_step(step, vars, runtime).await,
+            LaunchStepLocation::Container => {
+                run_container_launch_step(step, launch_env, &session_env, vars, runtime).await
+            }
+        };
+        if let Err(err) = result {
+            if step.required {
+                return Err(err).with_context(|| format!("launch step {:?}", step.name));
+            }
+            tracing::warn!(step = step.name, error = %err, "optional launch step failed");
+        }
+    }
+    Ok(())
+}
+
+async fn run_host_launch_step(
+    step: &LaunchStep,
+    vars: &Vars,
+    runtime: &Runtime,
+) -> anyhow::Result<()> {
+    let command = render_command(&step.command, vars)?;
+    let cwd = step.cwd.as_deref();
+    let cwd = render_launch_cwd(cwd, vars, runtime.user.home.as_path())?;
+    let env = render_template_map(&step.env, vars)?;
+    let timeout = host_hook_timeout(step.timeout.as_deref())?;
+    run_argv_with_options(&command, timeout, cwd.as_deref(), &env).await
+}
+
+async fn run_container_launch_step(
+    step: &LaunchStep,
+    launch_env: &BTreeMap<String, String>,
+    session_env: &BTreeMap<String, String>,
+    vars: &Vars,
+    runtime: &Runtime,
+) -> anyhow::Result<()> {
+    let mut env = session_env.clone();
+    env.extend(launch_env.clone());
+    env.extend(render_template_map(&step.env, vars)?);
+    let cwd = render_launch_cwd(step.cwd.as_deref(), vars, runtime.container_home.as_path())?;
+    let exec_spec = ContainerExecSpec {
+        stdin_tty: false,
+        stdout_tty: false,
+        user: runtime.exec_identity(),
+        cwd,
+        env,
+        container_name: runtime.container_name.clone(),
+        command: render_command(&step.command, vars)?,
+    };
+    let code = runtime.container_runtime.exec(&exec_spec).await?;
+    if code != 0 {
+        anyhow::bail!("container launch step exited with status {code}");
+    }
+    Ok(())
+}
+
+fn render_template_map(
+    values: &BTreeMap<String, String>,
+    vars: &Vars,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    values
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), template::render(value, vars)?)))
+        .collect()
+}
+
+fn render_launch_cwd(
+    cwd: Option<&str>,
+    vars: &Vars,
+    home_base: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    cwd.map(|cwd| template::render(cwd, vars))
+        .transpose()
+        .map(|cwd| cwd.map(|cwd| paths::expand_home(home_base, &cwd)))
+}
+
+fn launch_template_vars(
+    runtime: &Runtime,
+    resolved_vars: &BTreeMap<String, String>,
+    container_pid: Option<&str>,
+) -> Vars {
+    let mut vars = runtime.vars(container_pid);
+    for (key, value) in resolved_vars {
+        vars.insert(format!("var.{key}"), value.clone());
+    }
+    vars
 }
 
 fn status_all_entries(
@@ -624,6 +1156,7 @@ fn status_all_entry(cfg: &GatewayConfig, container: ManagedContainer) -> AllStat
         .cloned()
         .unwrap_or_else(|| "unknown".into());
     let session_id = container.labels.get("io.aw-gateway.session_id").cloned();
+    let launch = container.labels.get("io.aw-gateway.launch").cloned();
     let mode = container
         .labels
         .get("io.aw-gateway.mode")
@@ -660,6 +1193,7 @@ fn status_all_entry(cfg: &GatewayConfig, container: ManagedContainer) -> AllStat
     AllStatusEntry {
         target,
         session_id,
+        launch,
         mode,
         user,
         uid,
@@ -727,6 +1261,7 @@ struct Runtime {
     cfg: GatewayConfig,
     target_name: String,
     target: TargetConfig,
+    launch_name: Option<String>,
     session_id: Option<String>,
     user: UserContext,
     bootstrap_user: String,
@@ -755,7 +1290,27 @@ impl Runtime {
         session_id: Option<String>,
         generate_session_id: bool,
     ) -> anyhow::Result<Runtime> {
+        Self::load_with_launch(config_path, target, session_id, generate_session_id, None).await
+    }
+
+    async fn load_with_launch(
+        config_path: Option<PathBuf>,
+        target: Option<&str>,
+        session_id: Option<String>,
+        generate_session_id: bool,
+        launch_name: Option<String>,
+    ) -> anyhow::Result<Runtime> {
         let cfg = load_config(config_path)?;
+        Self::from_config(cfg, target, session_id, generate_session_id, launch_name).await
+    }
+
+    async fn from_config(
+        cfg: GatewayConfig,
+        target: Option<&str>,
+        session_id: Option<String>,
+        generate_session_id: bool,
+        launch_name: Option<String>,
+    ) -> anyhow::Result<Runtime> {
         let user = UserContext::current()?;
         let target_name = match target {
             Some(target) => resolve_target_selection(&cfg, Some(target))?,
@@ -889,6 +1444,7 @@ impl Runtime {
             cfg,
             target_name,
             target: target_cfg,
+            launch_name,
             session_id,
             user,
             bootstrap_user,
@@ -1015,6 +1571,7 @@ impl Runtime {
             None
         };
         let sessions = self.active_session_markers()?;
+        let launch = sessions.iter().find_map(|session| session.launch.clone());
         let agent_ready = agent
             .as_ref()
             .and_then(|value| value.get("ready"))
@@ -1023,6 +1580,7 @@ impl Runtime {
         Ok(GatewayStatus {
             target: self.target_name.clone(),
             session_id: self.session_id.clone(),
+            launch,
             mode: format!("{:?}", self.target.mode).to_lowercase(),
             user: self.user.user.clone(),
             image: self.target.image.clone(),
@@ -1161,6 +1719,9 @@ impl Runtime {
         ]);
         if let Some(session_id) = &self.session_id {
             labels.insert("io.aw-gateway.session_id".into(), session_id.clone());
+        }
+        if let Some(launch_name) = &self.launch_name {
+            labels.insert("io.aw-gateway.launch".into(), launch_name.clone());
         }
         labels
     }
@@ -2071,6 +2632,7 @@ mod tests {
             vec![AllStatusEntry {
                 target: "default".into(),
                 session_id: None,
+                launch: None,
                 mode: "fixed".into(),
                 user: "alice".into(),
                 uid: "2450".into(),
@@ -2104,6 +2666,7 @@ mod tests {
 
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].session_id.as_deref(), Some("x9k2p"));
+        assert_eq!(entries[0].launch, None);
         assert_eq!(entries[0].status, "stopped");
         assert_eq!(entries[1].session_id.as_deref(), Some("m4v8r"));
         assert_eq!(entries[1].status, "running");
@@ -2122,7 +2685,123 @@ mod tests {
         assert_eq!(entries[0].target, "old-target");
         assert_eq!(entries[0].mode, "unknown");
         assert_eq!(entries[0].session_id, None);
+        assert_eq!(entries[0].launch, None);
         assert_eq!(entries[0].status, "running");
+    }
+
+    #[test]
+    fn status_all_entry_projects_launch_label() {
+        let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+        let mut labels = managed_labels("default", "ubuntu-dev");
+        labels.insert("io.aw-gateway.mode".into(), "fixed".into());
+        labels.insert("io.aw-gateway.launch".into(), "agent-pack-codex".into());
+
+        let entries = status_all_entries(
+            &cfg,
+            vec![managed_container(
+                "ubuntu-dev",
+                "runtime-image",
+                true,
+                labels,
+            )],
+        );
+
+        assert_eq!(entries[0].launch.as_deref(), Some("agent-pack-codex"));
+        let serialized = serde_json::to_string(&entries).unwrap();
+        assert!(serialized.contains("agent-pack-codex"));
+        assert!(!serialized.contains("repo"));
+        assert!(!serialized.contains("pack_id"));
+        assert!(!serialized.contains("AGENT_PACK_ID"));
+    }
+
+    #[test]
+    fn launch_var_resolution_rejects_duplicates_and_normalizes_values() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.agent]
+target = "default"
+command = ["true", "{var.count}", "{var.debug}", "{var.mode}"]
+
+[launches.agent.vars]
+repo = { type = "string", required = true }
+count = { type = "number", default = 1 }
+debug = { type = "boolean", default = false }
+mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
+"#,
+        )
+        .unwrap();
+        let launch = cfg.launches.get("agent").unwrap();
+        let vars = resolve_launch_vars(
+            "agent",
+            launch,
+            vec![
+                "repo=https://example.test/repo.git".into(),
+                "count=2.0".into(),
+                "debug=true".into(),
+                "mode=safe".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(vars["count"], "2");
+        assert_eq!(vars["debug"], "true");
+        assert_eq!(vars["mode"], "safe");
+
+        let err = resolve_launch_vars("agent", launch, vec!["repo=a".into(), "repo=b".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate launch variable"), "{err}");
+    }
+
+    #[test]
+    fn status_json_serializes_nullable_launch_fields() {
+        let status = GatewayStatus {
+            target: "default".into(),
+            session_id: None,
+            launch: None,
+            mode: "fixed".into(),
+            user: "alice".into(),
+            image: "ubuntu/dev".into(),
+            container: Some("ubuntu-dev".into()),
+            container_pid: Some(123),
+            active_sessions: 1,
+            sessions: vec![model::SessionStatus {
+                id: "s1".into(),
+                kind: "run-command".into(),
+                gateway_pid: 1234,
+                container: "ubuntu-dev".into(),
+                target: "default".into(),
+                launch: None,
+                created_at_ms: 10,
+            }],
+            agent_ready: false,
+            ssh_socket: PathBuf::from("/tmp/ssh.sock"),
+            status: "container-running".into(),
+            agent: None,
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        assert!(value.get("launch").unwrap().is_null());
+        assert!(value["sessions"][0].get("launch").unwrap().is_null());
+
+        let all = AllStatusEntry {
+            target: "default".into(),
+            session_id: None,
+            launch: None,
+            mode: "fixed".into(),
+            user: "alice".into(),
+            uid: "2450".into(),
+            image: "ubuntu/dev".into(),
+            container: "ubuntu-dev".into(),
+            status: "running".into(),
+        };
+        let value = serde_json::to_value(&all).unwrap();
+        assert!(value.get("launch").unwrap().is_null());
     }
 
     #[test]
@@ -2210,6 +2889,7 @@ name = "{{image_slug}}"
             cfg,
             target_name: "default".into(),
             target,
+            launch_name: None,
             session_id: None,
             user,
             bootstrap_user: "root".into(),
@@ -2340,6 +3020,7 @@ name = "{{image_slug}}"
             cfg,
             target_name: "default".into(),
             target,
+            launch_name: None,
             session_id: None,
             user: UserContext {
                 uid: 2450,
@@ -2419,6 +3100,7 @@ name = "{{image_slug}}"
             cfg,
             target_name: "default".into(),
             target,
+            launch_name: None,
             session_id: None,
             user: UserContext {
                 uid: 2450,
@@ -2474,6 +3156,7 @@ name = "{{image_slug}}"
             cfg,
             target_name: "default".into(),
             target,
+            launch_name: None,
             session_id: None,
             user: UserContext {
                 uid: 2450,
@@ -2542,6 +3225,7 @@ name = "{{image_slug}}"
             cfg,
             target_name: "default".into(),
             target,
+            launch_name: None,
             session_id: None,
             user: UserContext {
                 uid: 2450,
@@ -2647,6 +3331,7 @@ name = "{{image_slug}}"
             cfg,
             target_name: "default".into(),
             target,
+            launch_name: None,
             session_id: None,
             user: UserContext {
                 uid: 2450,
@@ -2731,6 +3416,7 @@ name = "{{image_slug}}"
             cfg,
             target_name: "default".into(),
             target,
+            launch_name: None,
             session_id: None,
             user: UserContext {
                 uid: 2450,
@@ -2820,9 +3506,27 @@ name = "{{image_slug}}"
             gateway_start_time: process_start_time(std::process::id()).unwrap(),
             container: "ubuntu-dev".into(),
             target: "default".into(),
+            launch: None,
             created_at_ms: 0,
         };
         assert!(session_marker_is_active(&marker));
+    }
+
+    #[test]
+    fn old_shape_session_marker_deserializes_without_launch() {
+        let raw = r#"
+{
+  "id": "test",
+  "kind": "run-command",
+  "gateway_pid": 123,
+  "gateway_start_time": "456",
+  "container": "ubuntu-dev",
+  "target": "default",
+  "created_at_ms": 789
+}
+"#;
+        let marker: SessionMarker = serde_json::from_str(raw).unwrap();
+        assert_eq!(marker.launch, None);
     }
 
     #[test]

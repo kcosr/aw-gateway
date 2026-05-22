@@ -32,6 +32,18 @@ impl Runtime {
     }
 
     pub(super) fn create_session_marker(&self, kind: &str) -> anyhow::Result<SessionGuard> {
+        self.create_session_marker_with_launch(kind, None)
+    }
+
+    pub(super) fn create_launch_session_marker(&self, kind: &str) -> anyhow::Result<SessionGuard> {
+        self.create_session_marker_with_launch(kind, self.launch_name.as_deref())
+    }
+
+    fn create_session_marker_with_launch(
+        &self,
+        kind: &str,
+        launch: Option<&str>,
+    ) -> anyhow::Result<SessionGuard> {
         let dir = self.session_marker_dir();
         paths::ensure_private_dir(&dir)?;
         let id = generate_session_id_value()?;
@@ -43,6 +55,7 @@ impl Runtime {
             gateway_start_time: process_start_time(std::process::id()).unwrap_or_default(),
             container: self.container_name.clone(),
             target: self.target_name.clone(),
+            launch: launch.map(str::to_string),
             created_at_ms: unix_time_ms()?,
         };
         write_private_file(&path, &serde_json::to_vec_pretty(&marker)?, 0o600)

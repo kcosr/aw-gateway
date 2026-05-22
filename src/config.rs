@@ -1,5 +1,6 @@
 use crate::template;
 use anyhow::Context;
+use glob::glob;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -15,6 +16,10 @@ pub struct GatewayConfig {
     #[serde(default = "default_target")]
     pub default_target: String,
     #[serde(default)]
+    pub target_includes: Vec<String>,
+    #[serde(default)]
+    pub launch_includes: Vec<String>,
+    #[serde(default)]
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -24,6 +29,7 @@ pub struct GatewayConfig {
     pub ssh_dispatch: SshDispatchConfig,
     #[serde(default)]
     pub client_config: ClientConfig,
+    #[serde(default)]
     pub targets: BTreeMap<String, TargetConfig>,
     #[serde(default)]
     pub lifecycle_steps: Vec<LifecycleStep>,
@@ -39,16 +45,43 @@ pub struct GatewayConfig {
     pub container_agent: ContainerAgentConfig,
     #[serde(default)]
     pub container_ssh: ContainerSshConfig,
+    #[serde(default)]
+    pub launches: BTreeMap<String, LaunchConfig>,
 }
 
 impl GatewayConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let cfg: Self =
+        let mut cfg: Self =
             toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        cfg.compose_includes(path)?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    fn compose_includes(&mut self, root_path: &Path) -> anyhow::Result<()> {
+        let mut target_seen = BTreeSet::new();
+        let mut launch_seen = BTreeSet::new();
+        let root_dir = root_path.parent().unwrap_or_else(|| Path::new("."));
+        let root_canonical = canonical_existing_path(root_path)?;
+        let mut target_stack = BTreeSet::from([root_canonical.clone()]);
+        let mut launch_stack = BTreeSet::from([root_canonical]);
+        compose_target_includes(
+            &mut self.targets,
+            &self.target_includes,
+            root_dir,
+            &mut target_seen,
+            &mut target_stack,
+        )?;
+        compose_launch_includes(
+            &mut self.launches,
+            &self.launch_includes,
+            root_dir,
+            &mut launch_seen,
+            &mut launch_stack,
+        )?;
+        Ok(())
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -72,6 +105,10 @@ impl GatewayConfig {
         for (name, target) in &self.targets {
             validate_name("target", name)?;
             target.validate(name)?;
+        }
+        for (name, launch) in &self.launches {
+            validate_name("launch", name)?;
+            launch.validate(name, self)?;
         }
         self.runtime.validate()?;
         validate_template(
@@ -275,6 +312,359 @@ impl GatewayConfig {
         container_agent.validate()?;
         Ok(container_agent)
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TargetIncludeFile {
+    #[serde(default)]
+    target_includes: Vec<String>,
+    #[serde(default)]
+    targets: BTreeMap<String, TargetConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchIncludeFile {
+    #[serde(default)]
+    launch_includes: Vec<String>,
+    #[serde(default)]
+    launches: BTreeMap<String, LaunchConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchConfig {
+    pub target: String,
+    pub description: Option<String>,
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub vars: BTreeMap<String, LaunchVarConfig>,
+    #[serde(default)]
+    pub steps: Vec<LaunchStep>,
+}
+
+impl LaunchConfig {
+    pub fn validate(&self, launch_name: &str, cfg: &GatewayConfig) -> anyhow::Result<()> {
+        if !cfg.targets.contains_key(&self.target) {
+            anyhow::bail!(
+                "launch {launch_name:?} references unknown target {:?}",
+                self.target
+            );
+        }
+        validate_command("launch.command", &self.command)?;
+        for (name, var) in &self.vars {
+            validate_name("launch var", name)?;
+            var.validate(launch_name, name)?;
+        }
+        let allowed = self.allowed_template_vars();
+        let allowed_refs = allowed.iter().map(String::as_str).collect::<Vec<_>>();
+        if let Some(cwd) = &self.cwd {
+            validate_template("launch.cwd", cwd, &allowed_refs)?;
+        }
+        validate_env_keyed_template_map("launch.env", &self.env, &allowed_refs)?;
+        validate_command_templates("launch.command", &self.command, &allowed_refs)?;
+        let mut referenced_vars = BTreeSet::new();
+        collect_var_references(self.cwd.as_deref(), &mut referenced_vars)?;
+        collect_var_references_from_map(&self.env, &mut referenced_vars)?;
+        collect_var_references_from_command(&self.command, &mut referenced_vars)?;
+        let mut step_names = BTreeSet::new();
+        for step in &self.steps {
+            step.validate(launch_name, &allowed_refs)?;
+            if !step_names.insert(step.name.clone()) {
+                anyhow::bail!(
+                    "launch {launch_name:?} defines duplicate step {:?}",
+                    step.name
+                );
+            }
+            collect_var_references(step.cwd.as_deref(), &mut referenced_vars)?;
+            collect_var_references_from_map(&step.env, &mut referenced_vars)?;
+            collect_var_references_from_command(&step.command, &mut referenced_vars)?;
+        }
+        for var_name in referenced_vars {
+            let var = self.vars.get(&var_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "launch {launch_name:?} references undeclared variable {var_name:?}"
+                )
+            })?;
+            if !var.required && var.default.is_none() {
+                anyhow::bail!(
+                    "launch {launch_name:?} optional variable {var_name:?} is referenced by a template and must define default"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn allowed_template_vars(&self) -> Vec<String> {
+        let mut allowed = LAUNCH_TEMPLATE_BUILTINS
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        allowed.extend(self.vars.keys().map(|name| format!("var.{name}")));
+        allowed
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchVarConfig {
+    #[serde(rename = "type")]
+    pub var_type: LaunchVarType,
+    #[serde(default)]
+    pub required: bool,
+    pub default: Option<LaunchVarValue>,
+    pub values: Option<Vec<String>>,
+    pub description: Option<String>,
+}
+
+impl LaunchVarConfig {
+    fn validate(&self, launch_name: &str, var_name: &str) -> anyhow::Result<()> {
+        match self.var_type {
+            LaunchVarType::String => {
+                if let Some(default) = &self.default
+                    && !matches!(default, LaunchVarValue::String(_))
+                {
+                    anyhow::bail!(
+                        "launch {launch_name:?} variable {var_name:?} string default must be a TOML string"
+                    );
+                }
+            }
+            LaunchVarType::Enum => {
+                let values = self.values.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "launch {launch_name:?} enum variable {var_name:?} requires values"
+                    )
+                })?;
+                if values.is_empty() {
+                    anyhow::bail!(
+                        "launch {launch_name:?} enum variable {var_name:?} values must not be empty"
+                    );
+                }
+                for value in values {
+                    if value.is_empty() {
+                        anyhow::bail!(
+                            "launch {launch_name:?} enum variable {var_name:?} values must not include empty strings"
+                        );
+                    }
+                }
+                if let Some(default) = &self.default {
+                    let LaunchVarValue::String(default) = default else {
+                        anyhow::bail!(
+                            "launch {launch_name:?} enum variable {var_name:?} default must be a TOML string"
+                        );
+                    };
+                    if !values.contains(default) {
+                        anyhow::bail!(
+                            "launch {launch_name:?} enum variable {var_name:?} default must match one configured value"
+                        );
+                    }
+                }
+            }
+            LaunchVarType::Boolean => {
+                if let Some(default) = &self.default
+                    && !matches!(default, LaunchVarValue::Boolean(_))
+                {
+                    anyhow::bail!(
+                        "launch {launch_name:?} boolean variable {var_name:?} default must be a TOML boolean"
+                    );
+                }
+            }
+            LaunchVarType::Number => {
+                if let Some(default) = &self.default
+                    && !matches!(
+                        default,
+                        LaunchVarValue::Integer(_) | LaunchVarValue::Float(_)
+                    )
+                {
+                    anyhow::bail!(
+                        "launch {launch_name:?} number variable {var_name:?} default must be a TOML number"
+                    );
+                }
+                if let Some(LaunchVarValue::Float(value)) = &self.default
+                    && !value.is_finite()
+                {
+                    anyhow::bail!(
+                        "launch {launch_name:?} number variable {var_name:?} default must be finite"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn default_rendered(&self) -> Option<String> {
+        self.default.as_ref().map(LaunchVarValue::rendered)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchVarType {
+    String,
+    Enum,
+    Boolean,
+    Number,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum LaunchVarValue {
+    String(String),
+    Boolean(bool),
+    Integer(i64),
+    Float(f64),
+}
+
+impl LaunchVarValue {
+    pub fn rendered(&self) -> String {
+        match self {
+            LaunchVarValue::String(value) => value.clone(),
+            LaunchVarValue::Boolean(value) => value.to_string(),
+            LaunchVarValue::Integer(value) => value.to_string(),
+            LaunchVarValue::Float(value) => canonical_number_string(*value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchStep {
+    pub phase: LaunchStepPhase,
+    pub location: LaunchStepLocation,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub required: bool,
+    pub timeout: Option<String>,
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub command: Vec<String>,
+}
+
+impl LaunchStep {
+    fn validate(&self, launch_name: &str, allowed: &[&str]) -> anyhow::Result<()> {
+        validate_name("launch step", &self.name)?;
+        if self.phase != LaunchStepPhase::PostReady {
+            anyhow::bail!(
+                "launch {launch_name:?} step {:?} only supports phase = \"post_ready\"",
+                self.name
+            );
+        }
+        validate_command("launch.steps.command", &self.command)?;
+        validate_command_templates("launch.steps.command", &self.command, allowed)?;
+        if let Some(cwd) = &self.cwd {
+            validate_template("launch.steps.cwd", cwd, allowed)?;
+        }
+        validate_env_keyed_template_map("launch.steps.env", &self.env, allowed)?;
+        if let Some(timeout) = &self.timeout {
+            parse_duration(timeout)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchStepPhase {
+    PostReady,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchStepLocation {
+    Host,
+    Container,
+}
+
+fn compose_target_includes(
+    targets: &mut BTreeMap<String, TargetConfig>,
+    patterns: &[String],
+    base_dir: &Path,
+    seen: &mut BTreeSet<PathBuf>,
+    stack: &mut BTreeSet<PathBuf>,
+) -> anyhow::Result<()> {
+    for path in expand_include_patterns(patterns, base_dir)? {
+        let canonical = canonical_existing_path(&path)?;
+        if stack.contains(&canonical) {
+            anyhow::bail!("target_includes cycle detected at {}", path.display());
+        }
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        stack.insert(canonical.clone());
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let include: TargetIncludeFile =
+            toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        let include_dir = path.parent().unwrap_or(base_dir);
+        compose_target_includes(targets, &include.target_includes, include_dir, seen, stack)?;
+        for (name, target) in include.targets {
+            if targets.insert(name.clone(), target).is_some() {
+                anyhow::bail!("duplicate target {name:?} from include {}", path.display());
+            }
+        }
+        stack.remove(&canonical);
+    }
+    Ok(())
+}
+
+fn compose_launch_includes(
+    launches: &mut BTreeMap<String, LaunchConfig>,
+    patterns: &[String],
+    base_dir: &Path,
+    seen: &mut BTreeSet<PathBuf>,
+    stack: &mut BTreeSet<PathBuf>,
+) -> anyhow::Result<()> {
+    for path in expand_include_patterns(patterns, base_dir)? {
+        let canonical = canonical_existing_path(&path)?;
+        if stack.contains(&canonical) {
+            anyhow::bail!("launch_includes cycle detected at {}", path.display());
+        }
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        stack.insert(canonical.clone());
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let include: LaunchIncludeFile =
+            toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        let include_dir = path.parent().unwrap_or(base_dir);
+        compose_launch_includes(launches, &include.launch_includes, include_dir, seen, stack)?;
+        for (name, launch) in include.launches {
+            if launches.insert(name.clone(), launch).is_some() {
+                anyhow::bail!("duplicate launch {name:?} from include {}", path.display());
+            }
+        }
+        stack.remove(&canonical);
+    }
+    Ok(())
+}
+
+fn expand_include_patterns(patterns: &[String], base_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for pattern in patterns {
+        let pattern_path = Path::new(pattern);
+        let full_pattern = if pattern_path.is_absolute() {
+            pattern_path.to_path_buf()
+        } else {
+            base_dir.join(pattern_path)
+        };
+        let pattern_text = full_pattern.display().to_string();
+        for entry in glob(&pattern_text).with_context(|| format!("expand glob {pattern:?}"))? {
+            paths.push(entry.with_context(|| format!("read glob entry for {pattern:?}"))?);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn canonical_existing_path(path: &Path) -> anyhow::Result<PathBuf> {
+    path.canonicalize()
+        .with_context(|| format!("canonicalize {}", path.display()))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -2002,6 +2392,25 @@ const RUNTIME_TEMPLATE_VARS: &[&str] = &["user", "home"];
 
 const IDENTITY_TEMPLATE_VARS: &[&str] = &["user", "uid", "gid", "home"];
 
+const LAUNCH_TEMPLATE_BUILTINS: &[&str] = &[
+    "user",
+    "uid",
+    "gid",
+    "home",
+    "container_user",
+    "container_home",
+    "workspace",
+    "state",
+    "state_dir",
+    "target",
+    "image",
+    "image_slug",
+    "container_name",
+    "container_state_dir",
+    "container_state_dir_in_container",
+    "session_id",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct StepKey {
     name: String,
@@ -2303,6 +2712,55 @@ fn validate_env_map(field: &str, env: &BTreeMap<String, String>) -> anyhow::Resu
         )?;
     }
     Ok(())
+}
+
+fn validate_env_keyed_template_map(
+    field: &str,
+    env: &BTreeMap<String, String>,
+    allowed: &[&str],
+) -> anyhow::Result<()> {
+    for (key, value) in env {
+        validate_env_key(key)?;
+        validate_template(&format!("{field}.{key}"), value, allowed)?;
+    }
+    Ok(())
+}
+
+fn collect_var_references(input: Option<&str>, refs: &mut BTreeSet<String>) -> anyhow::Result<()> {
+    let Some(input) = input else {
+        return Ok(());
+    };
+    for key in template::referenced_keys(input)? {
+        if let Some(var_name) = key.strip_prefix("var.") {
+            refs.insert(var_name.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn collect_var_references_from_map(
+    values: &BTreeMap<String, String>,
+    refs: &mut BTreeSet<String>,
+) -> anyhow::Result<()> {
+    for value in values.values() {
+        collect_var_references(Some(value), refs)?;
+    }
+    Ok(())
+}
+
+fn collect_var_references_from_command(
+    command: &[String],
+    refs: &mut BTreeSet<String>,
+) -> anyhow::Result<()> {
+    for arg in command {
+        collect_var_references(Some(arg), refs)?;
+    }
+    Ok(())
+}
+
+fn canonical_number_string(value: f64) -> String {
+    let text = value.to_string();
+    text.strip_suffix(".0").unwrap_or(&text).to_string()
 }
 
 fn validate_ssh_config_scalar(field: &str, value: &str) -> anyhow::Result<()> {
@@ -3470,6 +3928,247 @@ target = "missing-port"
         )
         .unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn launch_schema_validates_vars_templates_and_steps() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.agent]
+target = "default"
+description = "Run agent"
+cwd = "{container_home}/{var.repo}"
+env = { FLAG = "{var.flag}", LIMIT = "{var.limit}" }
+command = ["agent", "--mode", "{var.mode}"]
+
+[launches.agent.vars]
+repo = { type = "string", required = true }
+flag = { type = "boolean", default = true }
+limit = { type = "number", default = 2.5 }
+mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
+
+[[launches.agent.steps]]
+phase = "post_ready"
+location = "container"
+name = "prep"
+required = false
+timeout = "5s"
+cwd = "{container_home}"
+env = { STEP_FLAG = "{var.flag}" }
+command = ["prep", "{var.repo}"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn launch_schema_rejects_bad_vars_and_templates() {
+        for (config, expected) in [
+            (
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.bad]
+target = "missing"
+command = ["true"]
+"#,
+                "unknown target",
+            ),
+            (
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.bad]
+target = "default"
+command = ["true", "{repo}"]
+
+[launches.bad.vars]
+repo = { type = "string", required = true }
+"#,
+                "unknown interpolation variable",
+            ),
+            (
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.bad]
+target = "default"
+command = ["true", "{var.repo}"]
+
+[launches.bad.vars]
+repo = { type = "string" }
+"#,
+                "must define default",
+            ),
+            (
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.bad]
+target = "default"
+command = ["true"]
+
+[launches.bad.vars]
+mode = { type = "enum", values = [] }
+"#,
+                "values must not be empty",
+            ),
+        ] {
+            let cfg: GatewayConfig = toml::from_str(config).unwrap();
+            let err = format!("{:#}", cfg.validate().unwrap_err());
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn include_composition_expands_sorted_and_rejects_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let targets = dir.path().join("targets");
+        let launches = dir.path().join("launches");
+        std::fs::create_dir_all(&targets).unwrap();
+        std::fs::create_dir_all(&launches).unwrap();
+        std::fs::write(
+            targets.join("b.toml"),
+            r#"
+[targets.b]
+image = "ubuntu/b"
+mode = "fixed"
+name = "b"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            targets.join("a.toml"),
+            r#"
+[targets.a]
+image = "ubuntu/a"
+mode = "fixed"
+name = "a"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            launches.join("agent.toml"),
+            r#"
+[launches.agent]
+target = "a"
+command = ["true"]
+"#,
+        )
+        .unwrap();
+        let root = dir.path().join("gateway.toml");
+        std::fs::write(
+            &root,
+            format!(
+                r#"
+schema_version = "1"
+default_target = "a"
+target_includes = ["{}/*.toml"]
+launch_includes = ["{}/*.toml"]
+"#,
+                targets.display(),
+                launches.display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = GatewayConfig::load(&root).unwrap();
+        assert_eq!(
+            cfg.targets.keys().cloned().collect::<Vec<_>>(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(cfg.launches.contains_key("agent"));
+
+        std::fs::write(
+            targets.join("dup.toml"),
+            r#"
+[targets.a]
+image = "ubuntu/dup"
+mode = "fixed"
+name = "dup"
+"#,
+        )
+        .unwrap();
+        let err = GatewayConfig::load(&root).unwrap_err().to_string();
+        assert!(err.contains("duplicate target"), "{err}");
+    }
+
+    #[test]
+    fn includes_reject_cycles_and_unknown_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.toml");
+        let b = dir.path().join("b.toml");
+        std::fs::write(
+            &a,
+            format!(
+                r#"
+target_includes = ["{}"]
+"#,
+                b.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &b,
+            format!(
+                r#"
+target_includes = ["{}"]
+"#,
+                a.display()
+            ),
+        )
+        .unwrap();
+        let root = dir.path().join("gateway.toml");
+        std::fs::write(
+            &root,
+            format!(
+                r#"
+schema_version = "1"
+target_includes = ["{}"]
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+"#,
+                a.display()
+            ),
+        )
+        .unwrap();
+        let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
+        assert!(err.contains("cycle"), "{err}");
+
+        std::fs::write(&a, "unknown = true\n").unwrap();
+        let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
+        assert!(err.contains("unknown field"), "{err}");
     }
 
     #[test]

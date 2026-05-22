@@ -3,6 +3,16 @@ use std::collections::BTreeMap;
 pub type Vars = BTreeMap<String, String>;
 
 pub fn validate_keys(input: &str, allowed: &[&str]) -> anyhow::Result<()> {
+    for key in referenced_keys(input)? {
+        if !allowed.contains(&key) {
+            anyhow::bail!("unknown interpolation variable {{{key}}} in {input:?}");
+        }
+    }
+    Ok(())
+}
+
+pub fn referenced_keys(input: &str) -> anyhow::Result<Vec<&str>> {
+    let mut keys = Vec::new();
     let mut rest = input;
     while let Some(start) = rest.find('{') {
         let tail = &rest[start + 1..];
@@ -13,12 +23,10 @@ pub fn validate_keys(input: &str, allowed: &[&str]) -> anyhow::Result<()> {
         if key.is_empty() {
             anyhow::bail!("empty interpolation in {input:?}");
         }
-        if !allowed.contains(&key) {
-            anyhow::bail!("unknown interpolation variable {{{key}}} in {input:?}");
-        }
+        keys.push(key);
         rest = &tail[end + 1..];
     }
-    Ok(())
+    Ok(keys)
 }
 
 pub fn render(input: &str, vars: &Vars) -> anyhow::Result<String> {
@@ -77,6 +85,14 @@ mod tests {
     fn validates_allowed_keys() {
         validate_keys("{image_slug}-{session_id}", &["image_slug", "session_id"]).unwrap();
         assert!(validate_keys("{missing}", &["image_slug"]).is_err());
+    }
+
+    #[test]
+    fn extracts_referenced_keys() {
+        assert_eq!(
+            referenced_keys("{image_slug}-{session_id}").unwrap(),
+            vec!["image_slug", "session_id"]
+        );
     }
 
     #[test]

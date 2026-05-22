@@ -728,6 +728,274 @@ fn targets_over_ssh_supports_json() {
         .stdout(predicate::str::contains("\"default\": true"));
 }
 
+#[test]
+fn launches_cli_lists_and_serializes_var_metadata() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(&config, launch_config_for_test()).unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("launches")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("LAUNCH"))
+        .stdout(predicate::str::contains("agent-pack-codex"))
+        .stdout(predicate::str::contains("pack_id, repo"))
+        .stdout(predicate::str::contains("Clone a repo"));
+
+    let output = Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["launches", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert!(value[0].get("required_vars").is_none());
+    assert_eq!(value[0]["name"], "agent-pack-codex");
+    assert_eq!(value[0]["vars"]["repo"]["type"], "string");
+    assert_eq!(value[0]["vars"]["repo"]["required"], true);
+    assert_eq!(
+        value[0]["vars"]["repo"]["description"],
+        "Git repository URL"
+    );
+    assert_eq!(value[0]["vars"]["model"]["type"], "enum");
+    assert_eq!(value[0]["vars"]["model"]["required"], false);
+    assert_eq!(value[0]["vars"]["model"]["default"], "gpt-5.5");
+    assert_eq!(value[0]["vars"]["model"]["values"][1], "gpt-5.4");
+}
+
+#[test]
+fn launches_cli_reports_empty_config() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    let workspace = dir.path().join("workspace");
+    std::fs::write(&config, gateway_sample_for_test(&dir, &workspace)).unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("launches")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No launches configured."));
+}
+
+#[test]
+fn launch_show_text_and_json_include_execution_details() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(&config, launch_config_for_test()).unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["launch", "show", "agent-pack-codex"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Launch: agent-pack-codex"))
+        .stdout(predicate::str::contains("Target: default"))
+        .stdout(predicate::str::contains("repo (string, required)"))
+        .stdout(predicate::str::contains("clone [post_ready/container"))
+        .stdout(predicate::str::contains(
+            "argv: codex exec --model {var.model}",
+        ));
+
+    let output = Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["launch", "show", "agent-pack-codex", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["name"], "agent-pack-codex");
+    assert_eq!(value["steps"][0]["name"], "clone");
+    assert_eq!(value["steps"][0]["timeout"], "5m");
+    assert_eq!(value["cwd"], "{container_home}/repo");
+    assert_eq!(value["env"]["AGENT_PACK_ID"], "{var.pack_id}");
+    assert_eq!(value["command"][0], "codex");
+}
+
+#[test]
+fn launch_show_json_omits_absent_optional_fields() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.minimal]
+target = "default"
+command = ["true"]
+"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["launch", "show", "minimal", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert!(value.get("description").is_none());
+    assert!(value.get("cwd").is_none());
+    assert!(value.get("env").is_none());
+    assert_eq!(value["steps"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn launch_cli_rejects_bad_vars_before_startup() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(&config, launch_config_for_test()).unwrap();
+
+    for (args, expected) in [
+        (
+            vec!["launch", "agent-pack-codex", "--var", "repo"],
+            "--var must be key=value",
+        ),
+        (
+            vec![
+                "launch",
+                "agent-pack-codex",
+                "--var",
+                "repo=a",
+                "--var",
+                "repo=b",
+            ],
+            "duplicate launch variable",
+        ),
+        (
+            vec!["launch", "agent-pack-codex", "--var", "extra=x"],
+            "unknown launch variable",
+        ),
+        (
+            vec!["launch", "agent-pack-codex", "--var", "repo=a"],
+            "missing required launch variable",
+        ),
+        (
+            vec![
+                "launch",
+                "agent-pack-codex",
+                "--var",
+                "repo=a",
+                "--var",
+                "pack_id=p",
+                "--var",
+                "model=bad",
+            ],
+            "invalid enum launch variable",
+        ),
+        (
+            vec![
+                "launch",
+                "agent-pack-codex",
+                "--var",
+                "repo=a",
+                "--var",
+                "pack_id=p",
+                "--var",
+                "debug=yes",
+            ],
+            "invalid boolean launch variable",
+        ),
+        (
+            vec![
+                "launch",
+                "agent-pack-codex",
+                "--var",
+                "repo=a",
+                "--var",
+                "pack_id=p",
+                "--var",
+                "count=NaN",
+            ],
+            "invalid number launch variable",
+        ),
+    ] {
+        Command::cargo_bin("aw-gateway")
+            .unwrap()
+            .arg("--config")
+            .arg(&config)
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(expected));
+    }
+}
+
+#[test]
+fn launch_cli_reports_unknown_launch() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(&config, launch_config_for_test()).unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["launch", "missing"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown launch \"missing\""));
+}
+
+fn launch_config_for_test() -> &'static str {
+    r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.agent-pack-codex]
+target = "default"
+description = "Clone a repo, initialize agent-pack, and run Codex."
+cwd = "{container_home}/repo"
+env = { AGENT_PACK_ID = "{var.pack_id}" }
+command = ["codex", "exec", "--model", "{var.model}"]
+
+[launches.agent-pack-codex.vars]
+repo = { type = "string", required = true, description = "Git repository URL" }
+pack_id = { type = "string", required = true }
+model = { type = "enum", values = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"], default = "gpt-5.5" }
+debug = { type = "boolean", default = false }
+count = { type = "number", default = 1 }
+
+[[launches.agent-pack-codex.steps]]
+phase = "post_ready"
+location = "container"
+name = "clone"
+timeout = "5m"
+cwd = "{container_home}"
+command = ["git", "clone", "--branch", "main", "--single-branch", "{var.repo}", "repo"]
+"#
+}
+
 fn gateway_sample_for_test(dir: &TempDir, workspace: &std::path::Path) -> String {
     include_str!("../aw-gateway.sample.toml")
         .replace(

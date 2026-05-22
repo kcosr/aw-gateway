@@ -18,21 +18,32 @@ pub(super) fn render_command(command: &[String], vars: &Vars) -> anyhow::Result<
 }
 
 pub(super) async fn run_argv(command: &[String]) -> anyhow::Result<()> {
-    run_argv_inner(command, None).await
+    run_argv_inner(command, None, None, &BTreeMap::new()).await
 }
 
 pub(super) async fn run_argv_with_timeout(
     command: &[String],
     timeout_duration: Duration,
 ) -> anyhow::Result<()> {
-    run_argv_inner(command, Some(timeout_duration)).await
+    run_argv_inner(command, Some(timeout_duration), None, &BTreeMap::new()).await
+}
+
+pub(super) async fn run_argv_with_options(
+    command: &[String],
+    timeout_duration: Duration,
+    cwd: Option<&std::path::Path>,
+    env: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    run_argv_inner(command, Some(timeout_duration), cwd, env).await
 }
 
 async fn run_argv_inner(
     command: &[String],
     timeout_duration: Option<Duration>,
+    cwd: Option<&std::path::Path>,
+    env: &BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
-    let output = command_output(command, timeout_duration).await?;
+    let output = command_output(command, timeout_duration, cwd, env).await?;
     if output.status.success() {
         return Ok(());
     }
@@ -53,10 +64,16 @@ struct CommandOutput {
 async fn command_output(
     command: &[String],
     timeout_duration: Option<Duration>,
+    cwd: Option<&std::path::Path>,
+    env: &BTreeMap<String, String>,
 ) -> anyhow::Result<CommandOutput> {
     if timeout_duration.is_none() {
-        return Command::new(&command[0])
-            .args(&command[1..])
+        let mut command_builder = Command::new(&command[0]);
+        command_builder.args(&command[1..]).envs(env);
+        if let Some(cwd) = cwd {
+            command_builder.current_dir(cwd);
+        }
+        return command_builder
             .output()
             .await
             .map(|output| CommandOutput {
@@ -70,9 +87,13 @@ async fn command_output(
     let mut command_builder = Command::new(&command[0]);
     command_builder
         .args(&command[1..])
+        .envs(env)
         .kill_on_drop(true)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        command_builder.current_dir(cwd);
+    }
     command_builder.as_std_mut().process_group(0);
     let mut child = command_builder
         .spawn()
@@ -353,5 +374,29 @@ mod tests {
         run_argv(&["/bin/sh".into(), "-c".into(), "sleep 1".into()])
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_argv_with_options_honors_cwd_and_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "printf '%s:%s' \"$PWD\" \"$LAUNCH_TEST\" > {}",
+                output.display()
+            ),
+        ];
+        let env = BTreeMap::from([("LAUNCH_TEST".to_string(), "from-env".to_string())]);
+
+        run_argv_with_options(&command, Duration::from_secs(5), Some(dir.path()), &env)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(output).unwrap(),
+            format!("{}:from-env", dir.path().display())
+        );
     }
 }

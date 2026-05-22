@@ -4,6 +4,9 @@
 
 ### Added
 
+- Added named launches with strict launch/includes config, typed `{var.<name>}`
+  variables, discovery/detail CLI output, post-ready setup steps, launch
+  execution, and minimal launch provenance in status surfaces.
 - Added configurable per-step `timeout` values for `lifecycle_steps` and `host_steps` ([#2](https://github.com/kcosr/aw-gateway/pull/2)).
 
 ### Changed

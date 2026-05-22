@@ -26,6 +26,8 @@ pub enum GatewayCommand {
     Connect(TargetArg),
     Up(UpArgs),
     Run(RunArgs),
+    Launch(LaunchArgs),
+    Launches(LaunchesArgs),
     Stop(StopArgs),
     Remove(TargetArg),
     Status(StatusArg),
@@ -136,6 +138,25 @@ pub struct RunArgs {
 
     #[arg(last = true)]
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct LaunchesArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct LaunchArgs {
+    pub action_or_name: String,
+
+    pub name: Option<String>,
+
+    #[arg(long)]
+    pub json: bool,
+
+    #[arg(long = "var")]
+    pub vars: Vec<String>,
 }
 
 #[derive(Debug, Args)]
