@@ -536,6 +536,20 @@ aw-gateway launch show repo-shell --json
 aw-gateway launch repo-shell --var repo=https://example.test/repo.git --var branch=main
 ```
 
+When `launches` and `launch` are present in
+`ssh_dispatch.enabled_gateway_actions`, the same commands can be invoked
+through the host SSH gateway:
+
+```bash
+ssh host launches
+ssh host 'launch show repo-shell --json'
+ssh host 'launch repo-shell --var repo=https://example.test/repo.git --var branch=main'
+```
+
+Omit `launch` from `ssh_dispatch.enabled_gateway_actions` if SSH users should
+not start configured launch workflows. Omit `launches` if SSH users should not
+list configured launches.
+
 `launches --json` emits a bare array of launch summaries. Each summary includes
 `name`, `target`, optional `description`, and a `vars` object keyed by variable
 name with `type`, `required`, optional `default`, optional enum `values`, and
@@ -561,8 +575,10 @@ command receives target session env plus rendered launch env. Host launch step
 env is exactly the rendered step env.
 
 Launch provenance is intentionally minimal. Session markers, status JSON, and
-newly created container labels store only the launch name as `launch`; resolved
-variables, argv, env, repository URLs, and branch names are not persisted.
+newly created ephemeral session container labels store only the launch name as
+`launch`; resolved variables, argv, env, repository URLs, and branch names are
+not persisted. Fixed/reused containers do not persist launch labels because the
+container can outlive any one launch session.
 `aw-gateway status <target> --json` and `aw-gateway status --all --json`
 include nullable `launch` fields. Text `status <target>` prints
 `launch: <name>` only when present, and `status --all` includes a compact
@@ -596,10 +612,12 @@ controlled by SFTP/SCP transfer policy. Host-gateway SSH dispatch checks the
 global transfer table before dispatch; per-target transfer overrides apply to
 direct container-SSHD access. If a deployment intends to expose management-only
 SSH commands without arbitrary container exec, omit `run` from
-`ssh_dispatch.enabled_gateway_actions`; also omit `connect` if users should not
-receive a full container SSH session. `allow_container_commands = false` blocks
-non-gateway passthrough commands, but it does not disable explicitly enabled
-gateway actions.
+`ssh_dispatch.enabled_gateway_actions`; omit `launch` if users should not start
+configured launch workflows; omit `launches` if users should not discover
+configured launches; also omit `connect` if users should not receive a full
+container SSH session. `allow_container_commands = false` blocks non-gateway
+passthrough commands, but it does not disable explicitly enabled gateway
+actions.
 
 ## Container Agent Services
 

@@ -39,6 +39,8 @@ enabled_gateway_actions = [
   "connect",
   "up",
   "run",
+  "launches",
+  "launch",
   "status",
   "targets",
   "stop",

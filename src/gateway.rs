@@ -217,6 +217,9 @@ async fn run_gateway_action(
             )
             .await
         }
+        GatewayAction::Launches { json } => launches(config_path, LaunchesArgs { json }).await,
+        GatewayAction::LaunchShow { name, json } => launch_show(config_path, &name, json).await,
+        GatewayAction::LaunchRun { name, vars } => launch_execute(config_path, &name, vars).await,
         GatewayAction::Status(action) => {
             status(
                 config_path,
@@ -333,6 +336,9 @@ fn gateway_help_text(cfg: &GatewayConfig) -> String {
             "run [target] [--cwd DIR] -- <command>",
             "Run a command in the container",
         ),
+        ("launches", "List configured launches"),
+        ("launch show <name>", "Show launch variables and steps"),
+        ("launch <name> [--var key=value]", "Run a configured launch"),
         ("stop [target]", "Stop the container"),
         ("remove [target]", "Stop and remove the container"),
         ("show-default", "Show your default target"),

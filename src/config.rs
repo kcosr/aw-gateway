@@ -834,6 +834,8 @@ impl SshDispatchConfig {
             "connect",
             "up",
             "run",
+            "launches",
+            "launch",
             "status",
             "targets",
             "stop",
@@ -2816,6 +2818,8 @@ fn default_enabled_gateway_actions() -> Vec<String> {
         "connect",
         "up",
         "run",
+        "launches",
+        "launch",
         "status",
         "targets",
         "stop",
@@ -3439,6 +3443,22 @@ CODEX_HOME = "/var/lib/codex"
 "#,
         )
         .unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn ssh_dispatch_defaults_include_launch_actions() {
+        let cfg = SshDispatchConfig::default();
+        assert!(
+            cfg.enabled_gateway_actions
+                .iter()
+                .any(|action| action == "launches")
+        );
+        assert!(
+            cfg.enabled_gateway_actions
+                .iter()
+                .any(|action| action == "launch")
+        );
         cfg.validate().unwrap();
     }
 

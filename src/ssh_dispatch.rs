@@ -13,6 +13,9 @@ pub enum GatewayAction {
     Connect(Option<String>),
     Up(Option<String>),
     Run(RunAction),
+    Launches { json: bool },
+    LaunchShow { name: String, json: bool },
+    LaunchRun { name: String, vars: Vec<String> },
     Status(StatusAction),
     Targets { json: bool },
     Stop(Option<String>),
@@ -139,9 +142,13 @@ fn parse_native(
             GatewayAction::Up(words.get(1).cloned())
         }
         "run" if action_enabled(cfg, "run") => parse_run_action(words)?,
+        "launches" if action_enabled(cfg, "launches") => GatewayAction::Launches {
+            json: parse_json_flag(words, "launches")?,
+        },
+        "launch" if action_enabled(cfg, "launch") => parse_launch_action(words)?,
         "status" if action_enabled(cfg, "status") => parse_status_action(words)?,
         "targets" if action_enabled(cfg, "targets") => GatewayAction::Targets {
-            json: parse_json_flag(words)?,
+            json: parse_json_flag(words, "targets")?,
         },
         "stop" if words.len() <= 2 && action_enabled(cfg, "stop") => {
             GatewayAction::Stop(words.get(1).cloned())
@@ -174,9 +181,9 @@ fn parse_native(
             parse_client_bundle_action(words)?
         }
         "help" if words.len() == 1 && action_enabled(cfg, "help") => GatewayAction::Help,
-        "connect" | "up" | "run" | "status" | "targets" | "stop" | "remove" | "rm"
-        | "set-default" | "show-default" | "reset-default" | "add-key" | "add-host-key"
-        | "add-container-key" | "client-config" | "client-bundle" | "help" => {
+        "connect" | "up" | "run" | "launches" | "launch" | "status" | "targets" | "stop"
+        | "remove" | "rm" | "set-default" | "show-default" | "reset-default" | "add-key"
+        | "add-host-key" | "add-container-key" | "client-config" | "client-bundle" | "help" => {
             anyhow::bail!(
                 "invalid or disabled gateway action shape: {}",
                 words.join(" ")
@@ -249,10 +256,64 @@ fn parse_run_action(words: &[String]) -> anyhow::Result<GatewayAction> {
     anyhow::bail!("run requires -- followed by a command")
 }
 
-fn parse_json_flag(words: &[String]) -> anyhow::Result<bool> {
+fn parse_launch_action(words: &[String]) -> anyhow::Result<GatewayAction> {
+    let Some(name) = words.get(1) else {
+        anyhow::bail!("launch requires a launch name");
+    };
+    if name == "show" {
+        let Some(name) = words.get(2) else {
+            anyhow::bail!("launch show requires a launch name");
+        };
+        let json = match words {
+            [command, subcommand, _] if command == "launch" && subcommand == "show" => false,
+            [command, subcommand, _, flag]
+                if command == "launch" && subcommand == "show" && flag == "--json" =>
+            {
+                true
+            }
+            _ => anyhow::bail!(
+                "invalid or disabled gateway action shape: {}",
+                words.join(" ")
+            ),
+        };
+        return Ok(GatewayAction::LaunchShow {
+            name: name.clone(),
+            json,
+        });
+    }
+
+    let mut vars = Vec::new();
+    let mut index = 2;
+    while let Some(arg) = words.get(index).map(String::as_str) {
+        if arg == "--json" {
+            anyhow::bail!("launch execution does not support --json");
+        }
+        if let Some(value) = arg.strip_prefix("--var=") {
+            vars.push(value.to_string());
+            index += 1;
+            continue;
+        }
+        if arg == "--var" {
+            let Some(value) = words.get(index + 1) else {
+                anyhow::bail!("--var must be key=value");
+            };
+            vars.push(value.clone());
+            index += 2;
+            continue;
+        }
+        anyhow::bail!("unexpected extra launch argument {arg:?}");
+    }
+
+    Ok(GatewayAction::LaunchRun {
+        name: name.clone(),
+        vars,
+    })
+}
+
+fn parse_json_flag(words: &[String], command: &str) -> anyhow::Result<bool> {
     match words {
-        [command] if command == "targets" => Ok(false),
-        [command, flag] if command == "targets" && flag == "--json" => Ok(true),
+        [value] if value == command => Ok(false),
+        [value, flag] if value == command && flag == "--json" => Ok(true),
         _ => anyhow::bail!(
             "invalid or disabled gateway action shape: {}",
             words.join(" ")
@@ -542,6 +603,91 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn parses_launch_actions() {
+        let cfg = SshDispatchConfig::default();
+        for (command, expected) in [
+            ("launches", Some(GatewayAction::Launches { json: false })),
+            (
+                "launches --json",
+                Some(GatewayAction::Launches { json: true }),
+            ),
+            (
+                "launch show repo-shell",
+                Some(GatewayAction::LaunchShow {
+                    name: "repo-shell".into(),
+                    json: false,
+                }),
+            ),
+            (
+                "launch show repo-shell --json",
+                Some(GatewayAction::LaunchShow {
+                    name: "repo-shell".into(),
+                    json: true,
+                }),
+            ),
+            (
+                "launch repo-shell --var repo=https://example.test/repo.git --var branch=main",
+                Some(GatewayAction::LaunchRun {
+                    name: "repo-shell".into(),
+                    vars: vec![
+                        "repo=https://example.test/repo.git".into(),
+                        "branch=main".into(),
+                    ],
+                }),
+            ),
+            (
+                "launch repo-shell --var=repo=https://example.test/repo.git",
+                Some(GatewayAction::LaunchRun {
+                    name: "repo-shell".into(),
+                    vars: vec!["repo=https://example.test/repo.git".into()],
+                }),
+            ),
+        ] {
+            assert_eq!(parse_gateway_action(command, &cfg).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_launch_actions() {
+        let cfg = SshDispatchConfig::default();
+        for command in [
+            "launches extra",
+            "launch",
+            "launch show",
+            "launch show repo-shell --var repo=x",
+            "launch show repo-shell extra",
+            "launch repo-shell --json",
+            "launch repo-shell --var",
+            "launch repo-shell extra",
+        ] {
+            assert!(
+                parse_gateway_action(command, &cfg).is_err(),
+                "expected {command:?} to fail"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_launch_actions_are_rejected() {
+        let mut cfg = SshDispatchConfig::default();
+        cfg.enabled_gateway_actions
+            .retain(|action| action != "launch" && action != "launches");
+        for command in [
+            "launches",
+            "launches --json",
+            "launch show repo-shell",
+            "launch repo-shell --var repo=x",
+        ] {
+            let err = parse_gateway_action(command, &cfg).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("invalid or disabled gateway action shape"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

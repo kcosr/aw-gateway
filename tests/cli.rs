@@ -831,6 +831,36 @@ fn launch_show_text_and_json_include_execution_details() {
 }
 
 #[test]
+fn launch_discovery_over_ssh_dispatch_uses_same_handlers() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(&config, launch_config_for_test()).unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .env("SSH_ORIGINAL_COMMAND", "launches --json")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\": \"agent-pack-codex\""))
+        .stdout(predicate::str::contains("\"type\": \"enum\""));
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .env(
+            "SSH_ORIGINAL_COMMAND",
+            "launch show agent-pack-codex --json",
+        )
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"name\": \"agent-pack-codex\""))
+        .stdout(predicate::str::contains("\"command\""));
+}
+
+#[test]
 fn launch_show_json_omits_absent_optional_fields() {
     let dir = tempdir().unwrap();
     let config = dir.path().join("gateway.toml");
