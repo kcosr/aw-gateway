@@ -35,6 +35,7 @@ use tokio::time::{Duration, Instant, sleep};
 pub const DEFAULT_GATEWAY_CONFIG: &str = include_str!("../aw-gateway.sample.toml");
 const MAX_SSH_ORIGINAL_COMMAND_BYTES: usize = 64 * 1024;
 const DEFAULT_HOST_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
 
 mod client;
 mod fileutil;
@@ -1186,6 +1187,18 @@ fn launch_template_vars(
     vars
 }
 
+#[cfg(unix)]
+fn unix_socket_path_bytes(path: &Path) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().len()
+}
+
+#[cfg(not(unix))]
+fn unix_socket_path_bytes(path: &Path) -> usize {
+    path.as_os_str().to_string_lossy().len()
+}
+
 fn status_launch(session_id: Option<&str>, sessions: &[model::SessionStatus]) -> Option<String> {
     match session_id {
         Some(session_id) => sessions
@@ -1492,7 +1505,7 @@ impl Runtime {
             &cfg.workspace.state_dir,
             [state_kind, state_id],
         );
-        Ok(Runtime {
+        let runtime = Runtime {
             cfg,
             target_name,
             target: target_cfg,
@@ -1516,7 +1529,9 @@ impl Runtime {
             effective_container_bootstrap,
             effective_container_bootstrap_steps,
             effective_container_agent,
-        })
+        };
+        runtime.validate_unix_socket_paths()?;
+        Ok(runtime)
     }
 
     async fn ensure_ready(&self) -> anyhow::Result<ReadyStatus> {
@@ -2416,6 +2431,74 @@ impl Runtime {
         self.container_state_dir.join("ssh.sock")
     }
 
+    fn container_agent_socket(&self) -> anyhow::Result<Option<PathBuf>> {
+        if !self.agent_control_enabled() {
+            return Ok(None);
+        }
+        let template = self
+            .effective_container_agent
+            .control_socket
+            .as_ref()
+            .and_then(ControlSocketConfig::path)
+            .unwrap_or("{container_state_dir}/agent.sock");
+        Ok(Some(self.render_container_socket_template(template)?))
+    }
+
+    fn container_ssh_socket(&self) -> anyhow::Result<Option<PathBuf>> {
+        let Some(bridge) = self
+            .effective_container_agent
+            .ssh_bridge
+            .as_ref()
+            .filter(|bridge| self.agent_enabled() && bridge.enabled)
+        else {
+            return Ok(None);
+        };
+        let socket = bridge
+            .socket
+            .as_deref()
+            .expect("validated enabled ssh_bridge must include socket");
+        Ok(Some(self.render_container_socket_template(socket)?))
+    }
+
+    fn render_container_socket_template(&self, value: &str) -> anyhow::Result<PathBuf> {
+        let mut vars = Vars::new();
+        vars.insert(
+            "container_state_dir".into(),
+            self.container_state_dir_in_container.display().to_string(),
+        );
+        Ok(PathBuf::from(template::render(value, &vars)?))
+    }
+
+    fn effective_unix_socket_paths(&self) -> anyhow::Result<Vec<(&'static str, PathBuf)>> {
+        let mut paths = Vec::new();
+        if self.agent_control_enabled() {
+            paths.push(("host agent socket path", self.agent_socket()));
+            if let Some(path) = self.container_agent_socket()? {
+                paths.push(("container agent socket path", path));
+            }
+        }
+        if self.ssh_endpoint_configured() && self.ssh_backend() == LocalSshBackend::Socket {
+            paths.push(("host ssh socket path", self.ssh_socket()));
+        }
+        if let Some(path) = self.container_ssh_socket()? {
+            paths.push(("container ssh socket path", path));
+        }
+        Ok(paths)
+    }
+
+    fn validate_unix_socket_paths(&self) -> anyhow::Result<()> {
+        for (label, path) in self.effective_unix_socket_paths()? {
+            let bytes = unix_socket_path_bytes(&path);
+            if bytes > UNIX_SOCKET_PATH_MAX_BYTES {
+                anyhow::bail!(
+                    "{label} is too long for a Unix domain socket ({bytes} bytes, limit {UNIX_SOCKET_PATH_MAX_BYTES}): {}. Shorten target workspace, workspace.state_dir, or explicit --session-id.",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn ssh_backend(&self) -> LocalSshBackend {
         self.target
             .local_ssh
@@ -3155,6 +3238,130 @@ name = "{{image_slug}}"
                 "expected {field} in error, got {err}"
             );
         }
+    }
+
+    #[test]
+    fn unix_socket_path_inventory_includes_host_and_container_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+            cfg.container_agent.enabled = true;
+            cfg.container_agent.control_socket = None;
+            cfg.container_agent.ssh_bridge = Some(crate::config::SshBridgeConfig {
+                enabled: true,
+                socket: Some("{container_state_dir}/ssh.sock".into()),
+                target: "127.0.0.1:22".into(),
+                mode: "0600".into(),
+            });
+        });
+
+        let labels = runtime
+            .effective_unix_socket_paths()
+            .unwrap()
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>();
+
+        assert!(labels.contains(&"host agent socket path"));
+        assert!(labels.contains(&"host ssh socket path"));
+        assert!(labels.contains(&"container agent socket path"));
+        assert!(labels.contains(&"container ssh socket path"));
+    }
+
+    #[tokio::test]
+    async fn runtime_load_rejects_overlong_generated_host_socket_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("w".repeat(90));
+        let config = dir.path().join("gateway.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+
+[workspace]
+path = "{}"
+state_dir = ".aw-gateway"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "ephemeral"
+ephemeral_name = "{{image_slug}}-{{session_id}}"
+stop_when_idle = true
+"#,
+                workspace.display(),
+            ),
+        )
+        .unwrap();
+
+        let err = Runtime::load(Some(config), Some("default"), None, true)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("host agent socket path"), "{err}");
+        assert!(err.contains("too long for a Unix domain socket"), "{err}");
+        assert!(err.contains("workspace.state_dir"), "{err}");
+        assert!(err.contains("explicit --session-id"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn runtime_load_rejects_overlong_explicit_container_socket_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let session_id = "a".repeat(64);
+        let container_home = format!("/home/{}", "b".repeat(80));
+        let config = dir.path().join("gateway.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+
+[workspace]
+path = "{}"
+state_dir = ".aw-gateway"
+
+[container_agent]
+control_socket = false
+
+[container_agent.ssh_bridge]
+enabled = true
+socket = "{{container_state_dir}}/ssh.sock"
+target = "127.0.0.1:22"
+mode = "0600"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "ephemeral"
+ephemeral_name = "{{image_slug}}-{{session_id}}"
+stop_when_idle = true
+
+[targets.default.identity]
+session_home = "{container_home}"
+
+[targets.default.local_ssh]
+backend = "published_port"
+"#,
+                workspace.display(),
+            ),
+        )
+        .unwrap();
+
+        let err = Runtime::load(Some(config), Some("default"), Some(session_id), false)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("container ssh socket path"), "{err}");
+        assert!(err.contains("too long for a Unix domain socket"), "{err}");
+        assert!(err.contains(&container_home), "{err}");
+        assert!(err.contains("explicit --session-id"), "{err}");
     }
 
     #[test]

@@ -636,6 +636,9 @@ answers gateway control requests over a private Unix-domain control socket.
 Disabling the control socket is useful for published-port SSH backends, but it
 also removes agent-control readiness and mutating control requests through that
 socket.
+Before starting a container, the gateway checks the resolved host and
+in-container Unix socket paths and fails fast if any path exceeds the platform
+socket path limit.
 
 Service example:
 
