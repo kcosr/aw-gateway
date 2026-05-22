@@ -757,6 +757,8 @@ fn launches_cli_lists_and_serializes_var_metadata() {
         .stdout
         .clone();
     let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert!(value.is_array());
+    assert_eq!(value.as_array().unwrap().len(), 1);
     assert!(value[0].get("required_vars").is_none());
     assert_eq!(value[0]["name"], "agent-pack-codex");
     assert_eq!(value[0]["vars"]["repo"]["type"], "string");
@@ -864,6 +866,15 @@ command = ["true"]
     assert!(value.get("cwd").is_none());
     assert!(value.get("env").is_none());
     assert_eq!(value["steps"].as_array().unwrap().len(), 0);
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["launch", "show", "minimal"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Description:").not());
 }
 
 #[test]
@@ -935,6 +946,14 @@ fn launch_cli_rejects_bad_vars_before_startup() {
             ],
             "invalid number launch variable",
         ),
+        (
+            vec!["launch", "agent-pack-codex", "--json"],
+            "launch execution does not support --json",
+        ),
+        (
+            vec!["launch", "agent-pack-codex", "extra"],
+            "unexpected extra launch argument",
+        ),
     ] {
         Command::cargo_bin("aw-gateway")
             .unwrap()
@@ -945,6 +964,15 @@ fn launch_cli_rejects_bad_vars_before_startup() {
             .failure()
             .stderr(predicate::str::contains(expected));
     }
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["launch", "show", "agent-pack-codex", "--var", "x=y"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
 }
 
 #[test]

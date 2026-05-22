@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -26,7 +27,8 @@ pub enum GatewayCommand {
     Connect(TargetArg),
     Up(UpArgs),
     Run(RunArgs),
-    Launch(LaunchArgs),
+    #[command(subcommand)]
+    Launch(LaunchCommand),
     Launches(LaunchesArgs),
     Stop(StopArgs),
     Remove(TargetArg),
@@ -146,17 +148,19 @@ pub struct LaunchesArgs {
     pub json: bool,
 }
 
-#[derive(Debug, Args)]
-pub struct LaunchArgs {
-    pub action_or_name: String,
+#[derive(Debug, Subcommand)]
+pub enum LaunchCommand {
+    Show(LaunchShowArgs),
+    #[command(external_subcommand)]
+    Run(Vec<OsString>),
+}
 
-    pub name: Option<String>,
+#[derive(Debug, Args)]
+pub struct LaunchShowArgs {
+    pub name: String,
 
     #[arg(long)]
     pub json: bool,
-
-    #[arg(long = "var")]
-    pub vars: Vec<String>,
 }
 
 #[derive(Debug, Args)]

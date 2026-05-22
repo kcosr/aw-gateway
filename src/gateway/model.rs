@@ -73,7 +73,7 @@ pub(super) struct SessionMarker {
     pub(super) gateway_start_time: String,
     pub(super) container: String,
     pub(super) target: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) launch: Option<String>,
     pub(super) created_at_ms: u128,
 }

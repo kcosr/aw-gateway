@@ -9,6 +9,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use tokio::process::Command;
+use tokio::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct ContainerRuntime {
@@ -223,15 +224,33 @@ impl ContainerRuntime {
     }
 
     pub async fn exec(&self, spec: &ContainerExecSpec) -> anyhow::Result<i32> {
-        let status = self
-            .command()
+        self.exec_with_timeout(spec, None).await
+    }
+
+    pub async fn exec_with_timeout(
+        &self,
+        spec: &ContainerExecSpec,
+        timeout_duration: Option<Duration>,
+    ) -> anyhow::Result<i32> {
+        let mut command = self.command();
+        command
             .arg("exec")
             .args(self.exec_args(spec))
-            .status()
-            .await
-            .with_context(|| {
-                format!("run {} exec {}", self.runtime_label(), spec.container_name)
-            })?;
+            .kill_on_drop(true);
+        let status = match timeout_duration {
+            Some(timeout_duration) => tokio::time::timeout(timeout_duration, command.status())
+                .await
+                .with_context(|| {
+                    format!(
+                        "{} exec {} timed out after {:?}",
+                        self.runtime_label(),
+                        spec.container_name,
+                        timeout_duration
+                    )
+                })?,
+            None => command.status().await,
+        }
+        .with_context(|| format!("run {} exec {}", self.runtime_label(), spec.container_name))?;
         Ok(exit_code(status))
     }
 
@@ -1005,6 +1024,41 @@ mod tests {
                 "id -u",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn exec_with_timeout_reports_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-runtime");
+        std::fs::write(
+            &runtime_program,
+            "#!/bin/sh\nif [ \"$1\" = exec ]; then sleep 5; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::Podman,
+            program: runtime_program.display().to_string(),
+            env: BTreeMap::new(),
+        };
+        let spec = ContainerExecSpec {
+            stdin_tty: false,
+            stdout_tty: false,
+            user: "2450:100".into(),
+            cwd: None,
+            env: BTreeMap::new(),
+            container_name: "ubuntu-dev".into(),
+            command: vec!["sleep".into(), "5".into()],
+        };
+
+        let started = std::time::Instant::now();
+        let err = runtime
+            .exec_with_timeout(&spec, Some(Duration::from_millis(100)))
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]

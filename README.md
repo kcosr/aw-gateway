@@ -498,7 +498,7 @@ validation, and unprefixed caller variables such as `{repo}` are rejected.
 
 ```toml
 [launches.repo-shell]
-target = "ubuntu-dev"
+target = "default"
 description = "Clone a repository and open a shell."
 cwd = "{container_home}/repo"
 env = { REPO_URL = "{var.repo}" }

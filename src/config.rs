@@ -108,6 +108,9 @@ impl GatewayConfig {
         }
         for (name, launch) in &self.launches {
             validate_name("launch", name)?;
+            if name == "show" {
+                anyhow::bail!("launch name \"show\" is reserved for launch show");
+            }
             launch.validate(name, self)?;
         }
         self.runtime.validate()?;
@@ -423,6 +426,11 @@ pub struct LaunchVarConfig {
 
 impl LaunchVarConfig {
     fn validate(&self, launch_name: &str, var_name: &str) -> anyhow::Result<()> {
+        if self.required && self.default.is_some() {
+            anyhow::bail!(
+                "launch {launch_name:?} variable {var_name:?} cannot set both required and default"
+            );
+        }
         match self.var_type {
             LaunchVarType::String => {
                 if let Some(default) = &self.default
@@ -2345,6 +2353,7 @@ const GATEWAY_TEMPLATE_VARS_NO_PID: &[&str] = &[
     "container_name",
     "container_state_dir",
     "container_state_dir_in_container",
+    "container_pid",
     "session_id",
 ];
 
@@ -4040,6 +4049,24 @@ command = ["true"]
 mode = { type = "enum", values = [] }
 "#,
                 "values must not be empty",
+            ),
+            (
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.bad]
+target = "default"
+command = ["true"]
+
+[launches.bad.vars]
+repo = { type = "string", required = true, default = "main" }
+"#,
+                "cannot set both required and default",
             ),
         ] {
             let cfg: GatewayConfig = toml::from_str(config).unwrap();
