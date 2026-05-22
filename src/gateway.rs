@@ -35,7 +35,28 @@ use tokio::time::{Duration, Instant, sleep};
 pub const DEFAULT_GATEWAY_CONFIG: &str = include_str!("../aw-gateway.sample.toml");
 const MAX_SSH_ORIGINAL_COMMAND_BYTES: usize = 64 * 1024;
 const DEFAULT_HOST_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[cfg(target_os = "linux")]
 const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 103;
+#[cfg(not(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+const UNIX_SOCKET_PATH_MAX_BYTES: usize = 103;
 
 mod client;
 mod fileutil;
@@ -2491,7 +2512,7 @@ impl Runtime {
             let bytes = unix_socket_path_bytes(&path);
             if bytes > UNIX_SOCKET_PATH_MAX_BYTES {
                 anyhow::bail!(
-                    "{label} is too long for a Unix domain socket ({bytes} bytes, limit {UNIX_SOCKET_PATH_MAX_BYTES}): {}. Shorten target workspace, workspace.state_dir, or explicit --session-id.",
+                    "{label} is too long for a Unix domain socket ({bytes} bytes, limit {UNIX_SOCKET_PATH_MAX_BYTES}): {}. Shorten target workspace, workspace.state_dir, target.identity.session_home, or explicit --session-id.",
                     path.display()
                 );
             }
@@ -3361,6 +3382,7 @@ backend = "published_port"
         assert!(err.contains("container ssh socket path"), "{err}");
         assert!(err.contains("too long for a Unix domain socket"), "{err}");
         assert!(err.contains(&container_home), "{err}");
+        assert!(err.contains("target.identity.session_home"), "{err}");
         assert!(err.contains("explicit --session-id"), "{err}");
     }
 
