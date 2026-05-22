@@ -1,6 +1,6 @@
 use crate::cli::{
     AddContainerKeyArgs, AddHostKeyArgs, AddKeyArgs, ClientBundleArgs, ClientConfigArgs,
-    ConfigCommand, GatewayArgs, GatewayCommand, LaunchCommand, LaunchesArgs, RunArgs,
+    ConfigCommand, ConnectArgs, GatewayArgs, GatewayCommand, LaunchCommand, LaunchesArgs, RunArgs,
     SetDefaultArgs, StatusArg, StopArgs, TargetArg, TargetsArgs, UpArgs,
 };
 use crate::config::{
@@ -92,7 +92,7 @@ use session::{
 pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
     match args.command {
         Some(GatewayCommand::Config(command)) => run_config(command, args.config).await,
-        Some(GatewayCommand::Connect(TargetArg { target })) => connect(args.config, target).await,
+        Some(GatewayCommand::Connect(connect_args)) => connect(args.config, connect_args).await,
         Some(GatewayCommand::Up(status)) => up(args.config, status).await,
         Some(GatewayCommand::Run(run_args)) => run_container_command(args.config, run_args).await,
         Some(GatewayCommand::Launch(launch_command)) => launch(args.config, launch_command).await,
@@ -178,6 +178,7 @@ async fn dispatch_from_ssh(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                 config_path,
                 RunArgs {
                     target: None,
+                    session_id: None,
                     cwd: None,
                     command: vec!["/usr/bin/bash".into()],
                 },
@@ -189,6 +190,7 @@ async fn dispatch_from_ssh(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                 config_path,
                 RunArgs {
                     target: None,
+                    session_id: None,
                     cwd: None,
                     command: vec!["/usr/bin/bash".into(), "-lc".into(), command],
                 },
@@ -205,7 +207,16 @@ async fn run_gateway_action(
     action: GatewayAction,
 ) -> anyhow::Result<()> {
     match action {
-        GatewayAction::Connect(target) => connect(config_path, target).await,
+        GatewayAction::Connect(action) => {
+            connect(
+                config_path,
+                ConnectArgs {
+                    target: action.target,
+                    session_id: action.session_id,
+                },
+            )
+            .await
+        }
         GatewayAction::Up(target) => {
             let runtime = Runtime::load(config_path.clone(), target.as_deref(), None, true).await?;
             if runtime
@@ -233,6 +244,7 @@ async fn run_gateway_action(
                 config_path,
                 RunArgs {
                     target: action.target,
+                    session_id: action.session_id,
                     cwd: action.cwd,
                     command: action.command,
                 },
@@ -241,7 +253,11 @@ async fn run_gateway_action(
         }
         GatewayAction::Launches { json } => launches(config_path, LaunchesArgs { json }).await,
         GatewayAction::LaunchShow { name, json } => launch_show(config_path, &name, json).await,
-        GatewayAction::LaunchRun { name, vars } => launch_execute(config_path, &name, vars).await,
+        GatewayAction::LaunchRun {
+            name,
+            session_id,
+            vars,
+        } => launch_execute(config_path, &name, session_id, vars).await,
         GatewayAction::Status(action) => {
             status(
                 config_path,
@@ -355,12 +371,15 @@ fn gateway_help_text(cfg: &GatewayConfig) -> String {
         ("status --all", "List your managed containers"),
         ("targets", "List configured targets"),
         (
-            "run [target] [--cwd DIR] -- <command>",
+            "run [--session-id ID] [target] [--cwd DIR] -- <command>",
             "Run a command in the container",
         ),
         ("launches", "List configured launches"),
         ("launch show <name>", "Show launch variables and steps"),
-        ("launch <name> [--var key=value]", "Run a configured launch"),
+        (
+            "launch <name> [--session-id ID] [--var key=value]",
+            "Run a configured launch",
+        ),
         ("stop [target]", "Stop the container"),
         ("remove [target]", "Stop and remove the container"),
         ("show-default", "Show your default target"),
@@ -383,7 +402,10 @@ fn gateway_help_text(cfg: &GatewayConfig) -> String {
             "add-container-key [target]",
             "Add an SSH public key to the container",
         ),
-        ("connect [target]", "Connect to the container SSH service"),
+        (
+            "connect [--session-id ID] [target]",
+            "Connect to the container SSH service",
+        ),
         ("help", "Show this help"),
     ];
     for (command, description) in commands {
@@ -410,8 +432,8 @@ fn gateway_help_text(cfg: &GatewayConfig) -> String {
     lines.join("\n")
 }
 
-async fn connect(config_path: Option<PathBuf>, target: Option<String>) -> anyhow::Result<()> {
-    let runtime = Runtime::load(config_path, target.as_deref(), None, true).await?;
+async fn connect(config_path: Option<PathBuf>, args: ConnectArgs) -> anyhow::Result<()> {
+    let runtime = Runtime::load(config_path, args.target.as_deref(), args.session_id, true).await?;
     runtime.ensure_ssh_endpoint_configured()?;
     let session = runtime.create_session_marker("connect")?;
     let ready = runtime.ensure_ready().await?;
@@ -463,7 +485,7 @@ async fn run_container_command(config_path: Option<PathBuf>, args: RunArgs) -> a
     if args.command.is_empty() {
         anyhow::bail!("run requires -- followed by a command; use up to start or hold a target");
     }
-    let runtime = Runtime::load(config_path, args.target.as_deref(), None, true).await?;
+    let runtime = Runtime::load(config_path, args.target.as_deref(), args.session_id, true).await?;
     let session_kind = "run-command";
     let session = runtime.create_session_marker(session_kind)?;
     let _ready = runtime.ensure_ready().await?;
@@ -665,13 +687,15 @@ async fn launch(config_path: Option<PathBuf>, command: LaunchCommand) -> anyhow:
     match command {
         LaunchCommand::Show(args) => launch_show(config_path, &args.name, args.json).await,
         LaunchCommand::Run(raw) => {
-            let (name, vars) = parse_launch_run_args(raw)?;
-            launch_execute(config_path, &name, vars).await
+            let (name, session_id, vars) = parse_launch_run_args(raw)?;
+            launch_execute(config_path, &name, session_id, vars).await
         }
     }
 }
 
-fn parse_launch_run_args(raw: Vec<std::ffi::OsString>) -> anyhow::Result<(String, Vec<String>)> {
+fn parse_launch_run_args(
+    raw: Vec<std::ffi::OsString>,
+) -> anyhow::Result<(String, Option<String>, Vec<String>)> {
     let mut args = raw.into_iter();
     let Some(name) = args.next() else {
         anyhow::bail!("launch requires a launch name");
@@ -680,12 +704,33 @@ fn parse_launch_run_args(raw: Vec<std::ffi::OsString>) -> anyhow::Result<(String
         .into_string()
         .map_err(|_| anyhow::anyhow!("launch name must be valid UTF-8"))?;
     let mut vars = Vec::new();
+    let mut session_id = None;
     while let Some(arg) = args.next() {
         let arg = arg
             .into_string()
             .map_err(|_| anyhow::anyhow!("launch arguments must be valid UTF-8"))?;
         if arg == "--json" {
             anyhow::bail!("launch execution does not support --json");
+        }
+        if let Some(value) = arg.strip_prefix("--session-id=") {
+            if session_id.replace(value.to_string()).is_some() {
+                anyhow::bail!("--session-id may only be specified once");
+            }
+            continue;
+        }
+        if arg == "--session-id" {
+            if session_id.is_some() {
+                anyhow::bail!("--session-id may only be specified once");
+            }
+            let Some(value) = args.next() else {
+                anyhow::bail!("--session-id requires a value");
+            };
+            session_id = Some(
+                value
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("session id must be valid UTF-8"))?,
+            );
+            continue;
         }
         if let Some(value) = arg.strip_prefix("--var=") {
             vars.push(value.to_string());
@@ -704,7 +749,7 @@ fn parse_launch_run_args(raw: Vec<std::ffi::OsString>) -> anyhow::Result<(String
         }
         anyhow::bail!("unexpected extra launch argument {arg:?}");
     }
-    Ok((name, vars))
+    Ok((name, session_id, vars))
 }
 
 async fn launch_show(config_path: Option<PathBuf>, name: &str, json: bool) -> anyhow::Result<()> {
@@ -725,15 +770,17 @@ async fn launch_show(config_path: Option<PathBuf>, name: &str, json: bool) -> an
 async fn launch_execute(
     config_path: Option<PathBuf>,
     name: &str,
+    session_id: Option<String>,
     supplied: Vec<String>,
 ) -> anyhow::Result<()> {
     let cfg = load_config(config_path.clone())?;
-    launch_execute_with_config(cfg, name, supplied).await
+    launch_execute_with_config(cfg, name, session_id, supplied).await
 }
 
 async fn launch_execute_with_config(
     cfg: GatewayConfig,
     name: &str,
+    session_id: Option<String>,
     supplied: Vec<String>,
 ) -> anyhow::Result<()> {
     let launch = cfg
@@ -745,7 +792,7 @@ async fn launch_execute_with_config(
     let runtime = Runtime::from_config(
         cfg,
         Some(&launch.target),
-        None,
+        session_id,
         true,
         Some(name.to_string()),
     )
@@ -3326,6 +3373,97 @@ stop_when_idle = true
         assert!(err.contains("too long for a Unix domain socket"), "{err}");
         assert!(err.contains("workspace.state_dir"), "{err}");
         assert!(err.contains("explicit --session-id"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn runtime_load_uses_explicit_ephemeral_session_id_for_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let config = dir.path().join("gateway.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+
+[workspace]
+path = "{}"
+state_dir = ".aw-gateway"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "ephemeral"
+ephemeral_name = "{{image_slug}}-{{session_id}}"
+stop_when_idle = true
+"#,
+                workspace.display(),
+            ),
+        )
+        .unwrap();
+
+        let runtime = Runtime::load(
+            Some(config),
+            Some("default"),
+            Some("abc123def456".into()),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(runtime.session_id.as_deref(), Some("abc123def456"));
+        assert_eq!(runtime.container_name, "ubuntu-dev-abc123def456");
+        assert!(
+            runtime
+                .container_state_dir
+                .ends_with(".aw-gateway/sessions/abc123def456")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_load_rejects_explicit_session_id_for_fixed_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let config = dir.path().join("gateway.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+
+[workspace]
+path = "{}"
+state_dir = ".aw-gateway"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+"#,
+                workspace.display(),
+            ),
+        )
+        .unwrap();
+
+        let err = Runtime::load(
+            Some(config),
+            Some("default"),
+            Some("abc123def456".into()),
+            true,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("--session-id is only valid for ephemeral targets"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

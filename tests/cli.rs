@@ -132,6 +132,83 @@ fn status_all_cli_parses_without_touching_up() {
 }
 
 #[test]
+fn connect_and_run_cli_parse_session_id_forms() {
+    for args in [
+        vec![
+            "aw-gateway",
+            "connect",
+            "--session-id",
+            "abc123def456",
+            "code-review-worker",
+        ],
+        vec![
+            "aw-gateway",
+            "connect",
+            "--session-id=abc123def456",
+            "code-review-worker",
+        ],
+        vec![
+            "aw-gateway",
+            "connect",
+            "code-review-worker",
+            "--session-id",
+            "abc123def456",
+        ],
+    ] {
+        let args = GatewayArgs::try_parse_from(args).unwrap();
+        match args.command {
+            Some(GatewayCommand::Connect(connect)) => {
+                assert_eq!(connect.target.as_deref(), Some("code-review-worker"));
+                assert_eq!(connect.session_id.as_deref(), Some("abc123def456"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    for args in [
+        vec![
+            "aw-gateway",
+            "run",
+            "--session-id",
+            "abc123def456",
+            "code-review-worker",
+            "--",
+            "bash",
+            "-l",
+        ],
+        vec![
+            "aw-gateway",
+            "run",
+            "--session-id=abc123def456",
+            "code-review-worker",
+            "--",
+            "bash",
+            "-l",
+        ],
+        vec![
+            "aw-gateway",
+            "run",
+            "code-review-worker",
+            "--session-id",
+            "abc123def456",
+            "--",
+            "bash",
+            "-l",
+        ],
+    ] {
+        let args = GatewayArgs::try_parse_from(args).unwrap();
+        match args.command {
+            Some(GatewayCommand::Run(run)) => {
+                assert_eq!(run.target.as_deref(), Some("code-review-worker"));
+                assert_eq!(run.session_id.as_deref(), Some("abc123def456"));
+                assert_eq!(run.command, vec!["bash".to_string(), "-l".to_string()]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn status_all_cli_rejects_target_and_session_id_at_handler_boundary() {
     let dir = tempdir().unwrap();
     let config = dir.path().join("gateway.toml");
@@ -607,11 +684,13 @@ fn help_over_ssh_prints_allowed_commands() {
         .stdout(predicate::str::contains("AW Gateway commands:"))
         .stdout(predicate::str::contains("up [target]"))
         .stdout(predicate::str::contains(
-            "run [target] [--cwd DIR] -- <command>",
+            "run [--session-id ID] [target] [--cwd DIR] -- <command>",
         ))
         .stdout(predicate::str::contains("launches"))
         .stdout(predicate::str::contains("launch show <name>"))
-        .stdout(predicate::str::contains("launch <name> [--var key=value]"))
+        .stdout(predicate::str::contains(
+            "launch <name> [--session-id ID] [--var key=value]",
+        ))
         .stdout(predicate::str::contains("client-config [target]"))
         .stdout(predicate::str::contains("remove [target]"))
         .stdout(predicate::str::contains("help"));
@@ -647,6 +726,57 @@ fn ssh_dispatch_rejects_host_side_transfer_commands_when_policy_disallows_them()
 }
 
 #[test]
+fn ssh_dispatch_accepts_session_id_forms_before_runtime_validation() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    let workspace = dir.path().join("workspace");
+    let sample = gateway_sample_for_test(&dir, &workspace);
+    std::fs::write(&config, sample).unwrap();
+
+    for original_command in [
+        "connect default --session-id abc123def456",
+        "connect --session-id abc123def456 default",
+        "connect default --session-id=abc123def456",
+        "run default --session-id abc123def456 -- pwd",
+        "run --session-id=abc123def456 default -- pwd",
+    ] {
+        Command::cargo_bin("aw-gateway")
+            .unwrap()
+            .arg("--config")
+            .arg(&config)
+            .env("SSH_ORIGINAL_COMMAND", original_command)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "--session-id is only valid for ephemeral targets",
+            ));
+    }
+}
+
+#[test]
+fn launch_over_ssh_accepts_session_id_forms_before_runtime_validation() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(&config, launch_config_for_test()).unwrap();
+
+    for original_command in [
+        "launch agent-pack-codex --session-id abc123def456 --var repo=a --var pack_id=p",
+        "launch agent-pack-codex --session-id=abc123def456 --var=repo=a --var pack_id=p",
+    ] {
+        Command::cargo_bin("aw-gateway")
+            .unwrap()
+            .arg("--config")
+            .arg(&config)
+            .env("SSH_ORIGINAL_COMMAND", original_command)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "--session-id is only valid for ephemeral targets",
+            ));
+    }
+}
+
+#[test]
 fn help_cli_prints_allowed_commands() {
     let dir = tempdir().unwrap();
     let config = dir.path().join("gateway.toml");
@@ -664,7 +794,7 @@ fn help_cli_prints_allowed_commands() {
         .stdout(predicate::str::contains("AW Gateway commands:"))
         .stdout(predicate::str::contains("up [target]"))
         .stdout(predicate::str::contains(
-            "run [target] [--cwd DIR] -- <command>",
+            "run [--session-id ID] [target] [--cwd DIR] -- <command>",
         ))
         .stdout(predicate::str::contains("client-config [target]"))
         .stdout(predicate::str::contains("help"));
@@ -675,6 +805,15 @@ fn run_cli_requires_command() {
     Command::cargo_bin("aw-gateway")
         .unwrap()
         .args(["run", "default"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "run requires -- followed by a command",
+        ));
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .args(["run", "--session-id", "abc123def456", "default"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(
@@ -1006,6 +1145,45 @@ fn launch_cli_rejects_bad_vars_before_startup() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("unexpected argument"));
+}
+
+#[test]
+fn launch_cli_accepts_session_id_forms_before_runtime_validation() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(&config, launch_config_for_test()).unwrap();
+
+    for args in [
+        vec![
+            "launch",
+            "agent-pack-codex",
+            "--session-id",
+            "abc123def456",
+            "--var",
+            "repo=a",
+            "--var",
+            "pack_id=p",
+        ],
+        vec![
+            "launch",
+            "agent-pack-codex",
+            "--session-id=abc123def456",
+            "--var=repo=a",
+            "--var",
+            "pack_id=p",
+        ],
+    ] {
+        Command::cargo_bin("aw-gateway")
+            .unwrap()
+            .arg("--config")
+            .arg(&config)
+            .args(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "--session-id is only valid for ephemeral targets",
+            ));
+    }
 }
 
 #[test]

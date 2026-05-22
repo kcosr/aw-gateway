@@ -24,7 +24,7 @@ pub struct GatewayArgs {
 pub enum GatewayCommand {
     #[command(subcommand)]
     Config(ConfigCommand),
-    Connect(TargetArg),
+    Connect(ConnectArgs),
     Up(UpArgs),
     Run(RunArgs),
     #[command(subcommand)]
@@ -60,6 +60,14 @@ pub struct InitArgs {
 #[derive(Debug, Args, Clone)]
 pub struct TargetArg {
     pub target: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct ConnectArgs {
+    pub target: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -134,6 +142,9 @@ pub struct AddContainerKeyArgs {
 #[derive(Debug, Args)]
 pub struct RunArgs {
     pub target: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
 
     #[arg(long)]
     pub cwd: Option<String>,

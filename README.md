@@ -534,6 +534,7 @@ aw-gateway launches --json
 aw-gateway launch show repo-shell
 aw-gateway launch show repo-shell --json
 aw-gateway launch repo-shell --var repo=https://example.test/repo.git --var branch=main
+aw-gateway launch repo-shell --session-id abc123def456 --var repo=https://example.test/repo.git
 ```
 
 When `launches` and `launch` are present in
@@ -544,6 +545,7 @@ through the host SSH gateway:
 ssh host launches
 ssh host 'launch show repo-shell --json'
 ssh host 'launch repo-shell --var repo=https://example.test/repo.git --var branch=main'
+ssh host 'launch repo-shell --session-id=abc123def456 --var=repo=https://example.test/repo.git'
 ```
 
 Omit `launch` from `ssh_dispatch.enabled_gateway_actions` if SSH users should
@@ -830,9 +832,12 @@ Gateway commands:
 ```text
 config validate
 config init [path] [--force]
-connect [target]
+connect [--session-id ID] [target]
 up [target] [--json] [--session-id ID]
-run [target] [--cwd DIR] -- <command> [args...]
+run [--session-id ID] [target] [--cwd DIR] -- <command> [args...]
+launches [--json]
+launch show <name> [--json]
+launch <name> [--session-id ID] [--var key=value]...
 stop [target] [--session-id ID]
 remove [target]
 status [target] [--json] [--session-id ID]
@@ -848,22 +853,29 @@ client-bundle [target] [--identity-file PATH] [--rotate-key]
 ```
 
 A session is one gateway connection or invocation tracked for lifecycle and
-idle cleanup decisions. Fixed targets usually let the gateway generate session
-IDs automatically. Generated session IDs are 12 lowercase hexadecimal
-characters. Ephemeral targets can use `--session-id` when another tool needs to
-correlate `up`, `status`, or `stop` with the same per-session container.
+idle cleanup decisions. Ephemeral targets generate a fresh 12-character
+lowercase hexadecimal session ID unless `--session-id ID` is supplied. Use an
+explicit session ID when another tool needs deterministic naming for local
+`connect`, `run`, `launch`, `up`, `status`, or `stop` commands against the same
+per-session container. SSH dispatch accepts `--session-id` for `connect`, `run`,
+and `launch`. Fixed targets reject `--session-id`.
 
 Gateway command behavior:
 
 - `config validate`: load and validate the gateway config.
 - `config init [path] [--force]`: write the embedded sample gateway config.
-- `connect [target]`: start or reuse a target and proxy the current SSH stream
-  to the container SSH bridge.
+- `connect [--session-id ID] [target]`: start or reuse a target and proxy the
+  current SSH stream to the container SSH bridge.
 - `up [target] [--json] [--session-id ID]`: start or reuse a target and report
   readiness. Local-listen targets keep the listener alive until interrupted.
-- `run [target] [--cwd DIR] -- <command> [args...]`: start or reuse a target
-  and run one command inside the container. A command is required; use `up` to
-  start or hold a target without running a command.
+- `run [--session-id ID] [target] [--cwd DIR] -- <command> [args...]`: start or
+  reuse a target and run one command inside the container. A command is
+  required; use `up` to start or hold a target without running a command.
+- `launches [--json]`: list configured launches.
+- `launch show <name> [--json]`: show one configured launch's variables, steps,
+  and final command.
+- `launch <name> [--session-id ID] [--var key=value]...`: start or reuse the
+  launch target, run any post-ready steps, and execute the launch command.
 - `stop [target] [--session-id ID]`: stop a target, or a specific ephemeral
   session target.
 - `remove [target]`: stop a fixed target if needed, then remove its existing
