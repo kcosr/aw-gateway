@@ -42,7 +42,9 @@ console = false
 # type = "none"
 #
 # Bearer auth reads the token from the configured file and requires
-# Authorization: Bearer <token> on /api/v1/* requests.
+# Authorization: Bearer <token> on /api/v1/* requests. Use loopback or a
+# TLS-terminating reverse proxy; on Unix, the token file must not be group- or
+# world-readable.
 #
 # [http.auth]
 # type = "bearer"

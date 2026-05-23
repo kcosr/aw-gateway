@@ -19,6 +19,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+const MAX_BEARER_TOKEN_BYTES: usize = 4096;
+
 #[derive(Clone)]
 struct AppState {
     config_path: Option<PathBuf>,
@@ -157,6 +159,11 @@ async fn run(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> 
         if request.command.is_empty() {
             return Err(HttpError::invalid_request("command must not be empty"));
         }
+        if request.command.iter().any(|arg| arg.is_empty()) {
+            return Err(HttpError::invalid_request(
+                "command elements must not be empty",
+            ));
+        }
         let options = operation_options(request.mode.as_deref(), request.output.as_deref())?;
         Ok(GatewayOperation::Run {
             target: request.target,
@@ -169,8 +176,15 @@ async fn run(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> 
     .await
 }
 
-async fn not_found(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    match authorize(&state, &headers) {
+async fn not_found(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    if !uri.path().starts_with("/api/v1/") {
+        return HttpError::not_found("route not found").into_response();
+    }
+    match authorize(&state, &headers).await {
         Ok(()) => HttpError::not_found("route not found").into_response(),
         Err(err) => err.into_response(),
     }
@@ -182,15 +196,16 @@ async fn handle_metadata(
     action: &'static str,
     operation: impl FnOnce() -> Result<GatewayOperation, HttpError>,
 ) -> Response {
-    match authorize_action(&state, &headers, action)
+    let operation = match authorize_action(&state, &headers, action)
+        .await
         .and_then(|()| operation())
-        .map_err(IntoResponse::into_response)
     {
-        Ok(operation) => match execute_gateway_operation(state.config_path, operation).await {
-            Ok(result) => metadata_result_response(result),
-            Err(err) => operation_error_response(err),
-        },
-        Err(response) => response,
+        Ok(operation) => operation,
+        Err(err) => return err.into_response(),
+    };
+    match execute_gateway_operation(state.config_path, operation).await {
+        Ok(result) => metadata_result_response(result),
+        Err(err) => operation_error_response(err),
     }
 }
 
@@ -200,27 +215,30 @@ async fn handle_execution(
     action: &'static str,
     operation: impl FnOnce() -> Result<GatewayOperation, HttpError>,
 ) -> Response {
-    match authorize_action(&state, &headers, action)
+    let operation = match authorize_action(&state, &headers, action)
+        .await
         .and_then(|()| operation())
-        .map_err(IntoResponse::into_response)
     {
-        Ok(operation) => match execute_gateway_operation(state.config_path, operation).await {
-            Ok(GatewayOperationResult::Run(outcome))
-            | Ok(GatewayOperationResult::Launch(outcome)) => execution_response(outcome),
-            Ok(_) => HttpError::operation_failed("operation returned an unexpected result")
-                .into_response(),
-            Err(err) => operation_error_response(err),
-        },
-        Err(response) => response,
+        Ok(operation) => operation,
+        Err(err) => return err.into_response(),
+    };
+    match execute_gateway_operation(state.config_path, operation).await {
+        Ok(GatewayOperationResult::Run(outcome)) | Ok(GatewayOperationResult::Launch(outcome)) => {
+            execution_response(outcome)
+        }
+        Ok(_) => {
+            HttpError::operation_failed("operation returned an unexpected result").into_response()
+        }
+        Err(err) => operation_error_response(err),
     }
 }
 
-fn authorize_action(
+async fn authorize_action(
     state: &AppState,
     headers: &HeaderMap,
     action: &'static str,
 ) -> Result<(), HttpError> {
-    authorize(state, headers)?;
+    authorize(state, headers).await?;
     if !state
         .config
         .http
@@ -235,28 +253,41 @@ fn authorize_action(
     Ok(())
 }
 
-fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), HttpError> {
+async fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), HttpError> {
     match state.config.http.auth.auth_type {
         HttpAuthType::None => Ok(()),
-        HttpAuthType::Bearer => authorize_bearer(state, headers),
+        HttpAuthType::Bearer => authorize_bearer(state, headers).await,
     }
 }
 
-fn authorize_bearer(state: &AppState, headers: &HeaderMap) -> Result<(), HttpError> {
+async fn authorize_bearer(state: &AppState, headers: &HeaderMap) -> Result<(), HttpError> {
     let supplied = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .filter(|value| !value.is_empty())
         .ok_or_else(|| HttpError::unauthorized("unauthorized"))?;
-    let expected = read_bearer_token(state)?;
-    if supplied != expected {
+    let expected = read_bearer_token(state).await?;
+    if !constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
         return Err(HttpError::unauthorized("unauthorized"));
     }
     Ok(())
 }
 
-fn read_bearer_token(state: &AppState) -> Result<String, HttpError> {
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() > MAX_BEARER_TOKEN_BYTES || right.len() > MAX_BEARER_TOKEN_BYTES {
+        return false;
+    }
+    let mut diff = left.len() ^ right.len();
+    for index in 0..MAX_BEARER_TOKEN_BYTES {
+        let left_byte = left.get(index).copied().unwrap_or_default();
+        let right_byte = right.get(index).copied().unwrap_or_default();
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+    diff == 0
+}
+
+async fn read_bearer_token(state: &AppState) -> Result<String, HttpError> {
     let token_file = state
         .config
         .http
@@ -266,13 +297,45 @@ fn read_bearer_token(state: &AppState) -> Result<String, HttpError> {
         .ok_or_else(|| HttpError::unauthorized("unauthorized"))?;
     let user = UserContext::current().map_err(|_| HttpError::unauthorized("unauthorized"))?;
     let path = paths::expand_home(&user.home, token_file);
-    let token =
-        std::fs::read_to_string(path).map_err(|_| HttpError::unauthorized("unauthorized"))?;
+    let metadata = tokio::fs::metadata(&path).await.map_err(|err| {
+        tracing::warn!(path = %path.display(), error = %err, "failed to stat http bearer token file");
+        HttpError::unauthorized("unauthorized")
+    })?;
+    validate_bearer_token_file(&path, &metadata)?;
+    let token = tokio::fs::read_to_string(&path).await.map_err(|err| {
+        tracing::warn!(path = %path.display(), error = %err, "failed to read http bearer token file");
+        HttpError::unauthorized("unauthorized")
+    })?;
     let token = token.trim().to_string();
-    if token.is_empty() {
+    if token.is_empty() || token.len() > MAX_BEARER_TOKEN_BYTES {
         return Err(HttpError::unauthorized("unauthorized"));
     }
     Ok(token)
+}
+
+#[cfg(unix)]
+fn validate_bearer_token_file(
+    path: &std::path::Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), HttpError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if metadata.permissions().mode() & 0o077 != 0 {
+        tracing::warn!(
+            path = %path.display(),
+            "http bearer token file must not be group- or world-readable"
+        );
+        return Err(HttpError::unauthorized("unauthorized"));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_bearer_token_file(
+    _path: &std::path::Path,
+    _metadata: &std::fs::Metadata,
+) -> Result<(), HttpError> {
+    Ok(())
 }
 
 fn metadata_result_response(result: GatewayOperationResult) -> Response {
@@ -342,16 +405,19 @@ fn wait_payload(
 
 fn operation_error_response(err: anyhow::Error) -> Response {
     let message = err.to_string();
-    if message.contains("unknown launch") {
-        HttpError::not_found(message).into_response()
-    } else if message.contains("launch variable") {
+    if message.contains("launch variable") {
         HttpError::new(
             StatusCode::BAD_REQUEST,
             ErrorCode::InvalidLaunchVar,
             message,
         )
         .into_response()
-    } else if message.contains("invalid session id") {
+    } else if message.contains("unknown launch") {
+        HttpError::not_found(message).into_response()
+    } else if message.contains("--session-id")
+        || message.contains("session_id")
+        || message.contains("invalid session id")
+    {
         HttpError::invalid_request(message).into_response()
     } else {
         HttpError::operation_failed(message).into_response()
@@ -403,6 +469,9 @@ fn output_selection(output: Option<&[String]>) -> Result<OutputSelection, HttpEr
     let Some(output) = output else {
         return Ok(OutputSelection::BOTH);
     };
+    if output.is_empty() {
+        return Err(HttpError::invalid_output("output must not be empty"));
+    }
     let mut seen = BTreeSet::new();
     let mut selection = OutputSelection {
         stdout: false,
@@ -693,7 +762,7 @@ schema_version = "1"
 [http]
 enabled = true
 listen = "127.0.0.1:0"
-enabled_actions = ["status", "targets", "launches", "run", "launch"]
+enabled_actions = ["status", "targets", "launches", "run", "launch", "up"]
 
 [runtime]
 type = "podman"
@@ -755,6 +824,12 @@ command = ["launch-command"]
         (status, serde_json::from_slice(&body).unwrap())
     }
 
+    async fn response_json(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
     async fn post_json(app: Router, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
         request_json(app, "POST", uri, Body::from(body.to_string())).await
     }
@@ -773,11 +848,24 @@ command = ["launch-command"]
         }
     }
 
-    #[test]
-    fn bearer_auth_allows_matching_token_and_rejects_missing_or_wrong_header() {
+    #[cfg(unix)]
+    fn set_private_file_mode(path: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn set_private_file_mode(_path: &std::path::Path) {}
+
+    #[tokio::test]
+    async fn bearer_auth_allows_matching_token_and_rejects_missing_or_wrong_header() {
         let dir = tempfile::tempdir().unwrap();
         let token_file = dir.path().join("token");
         std::fs::write(&token_file, "secret-token\n").unwrap();
+        set_private_file_mode(&token_file);
         let state = test_state(HttpConfig {
             enabled: true,
             listen: "127.0.0.1:0".into(),
@@ -790,36 +878,64 @@ command = ["launch-command"]
 
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, "Bearer secret-token".parse().unwrap());
-        authorize(&state, &headers).unwrap();
+        authorize(&state, &headers).await.unwrap();
 
-        let missing = authorize(&state, &HeaderMap::new()).unwrap_err();
+        let missing = authorize(&state, &HeaderMap::new()).await.unwrap_err();
         assert_eq!(missing.status, StatusCode::UNAUTHORIZED);
         assert_eq!(missing.code, ErrorCode::Unauthorized);
 
         let mut wrong_scheme = HeaderMap::new();
         wrong_scheme.insert(AUTHORIZATION, "Basic secret-token".parse().unwrap());
         assert_eq!(
-            authorize(&state, &wrong_scheme).unwrap_err().code,
+            authorize(&state, &wrong_scheme).await.unwrap_err().code,
             ErrorCode::Unauthorized
         );
 
         let mut wrong_token = HeaderMap::new();
         wrong_token.insert(AUTHORIZATION, "Bearer other".parse().unwrap());
         assert_eq!(
-            authorize(&state, &wrong_token).unwrap_err().code,
+            authorize(&state, &wrong_token).await.unwrap_err().code,
             ErrorCode::Unauthorized
         );
     }
 
-    #[test]
-    fn none_auth_allows_missing_authorization() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bearer_auth_rejects_group_or_world_readable_token_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let token_file = dir.path().join("token");
+        std::fs::write(&token_file, "secret-token\n").unwrap();
+        let mut permissions = std::fs::metadata(&token_file).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&token_file, permissions).unwrap();
+        let state = test_state(HttpConfig {
+            enabled: true,
+            listen: "127.0.0.1:0".into(),
+            enabled_actions: vec!["status".into()],
+            auth: HttpAuthConfig {
+                auth_type: HttpAuthType::Bearer,
+                token_file: Some(token_file.display().to_string()),
+            },
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer secret-token".parse().unwrap());
+        let err = authorize(&state, &headers).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.code, ErrorCode::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn none_auth_allows_missing_authorization() {
         let state = test_state(HttpConfig {
             enabled: true,
             listen: "127.0.0.1:0".into(),
             enabled_actions: vec!["status".into()],
             auth: HttpAuthConfig::default(),
         });
-        authorize(&state, &HeaderMap::new()).unwrap();
+        authorize(&state, &HeaderMap::new()).await.unwrap();
     }
 
     #[test]
@@ -853,6 +969,13 @@ command = ["launch-command"]
         let unknown = vec!["log".to_string()];
         assert_eq!(
             operation_options(Some("wait"), Some(&unknown))
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidOutput
+        );
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            operation_options(Some("wait"), Some(&empty))
                 .unwrap_err()
                 .code,
             ErrorCode::InvalidOutput
@@ -912,11 +1035,19 @@ command = ["launch-command"]
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    #[test]
-    fn operation_errors_map_launch_validation_to_invalid_launch_var() {
+    #[tokio::test]
+    async fn operation_errors_map_launch_validation_to_invalid_launch_var() {
         let response =
             operation_error_response(anyhow::anyhow!("missing required launch variable \"repo\""));
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_launch_var");
+
+        let response =
+            operation_error_response(anyhow::anyhow!("unknown launch variable \"repo\""));
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_launch_var");
     }
 
     #[tokio::test]
@@ -928,11 +1059,18 @@ command = ["launch-command"]
             auth: HttpAuthConfig::default(),
         });
 
-        let response = authorize_action(&state, &HeaderMap::new(), "status").unwrap_err();
+        let response = authorize_action(&state, &HeaderMap::new(), "status")
+            .await
+            .unwrap_err();
         assert_eq!(response.status, StatusCode::FORBIDDEN);
         assert_eq!(response.code, ErrorCode::DisabledAction);
 
-        let response = not_found(State(state), HeaderMap::new()).await;
+        let response = not_found(
+            State(state),
+            HeaderMap::new(),
+            "/api/v1/missing".parse().unwrap(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -1056,10 +1194,21 @@ command = ["launch-command"]
         assert_eq!(body["ok"], true);
         assert_eq!(body["data"][0]["target"], "default");
 
-        let (status, body) = get_json(app, "/api/v1/launches").await;
+        let (status, body) = post_json(app.clone(), "/api/v1/up", r#"{"target":"default"}"#).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["data"]["target"], "default");
+
+        let (status, body) = get_json(app.clone(), "/api/v1/launches").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], true);
         assert_eq!(body["data"][0]["name"], "echo");
+
+        let (status, body) = get_json(app, "/api/v1/launches/echo").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["data"]["name"], "echo");
+        assert_eq!(body["data"]["command"][0], "launch-command");
     }
 
     #[tokio::test]
@@ -1091,6 +1240,24 @@ command = ["launch-command"]
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid_output");
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/api/v1/run",
+            r#"{"command":["x"],"output":[]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_output");
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/api/v1/launches/echo/run",
+            r#"{"vars":{"bogus":1}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_launch_var");
 
         let (status, body) = post_json(
             app,
