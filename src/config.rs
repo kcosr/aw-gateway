@@ -1,4 +1,4 @@
-use crate::template;
+use crate::{action, template};
 use anyhow::Context;
 use glob::glob;
 use serde::{Deserialize, Serialize};
@@ -1211,29 +1211,9 @@ impl Default for SshDispatchConfig {
 
 impl SshDispatchConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
-        let allowed = [
-            "connect",
-            "up",
-            "run",
-            "launches",
-            "launch",
-            "status",
-            "targets",
-            "stop",
-            "remove",
-            "set-default",
-            "add-key",
-            "add-host-key",
-            "add-container-key",
-            "client-config",
-            "client-bundle",
-            "show-default",
-            "reset-default",
-            "help",
-        ];
-        for action in &self.enabled_actions {
-            if !allowed.contains(&action.as_str()) {
-                anyhow::bail!("unknown enabled_actions entry {action:?}");
+        for enabled_action in &self.enabled_actions {
+            if !action::is_gateway_action_name(enabled_action) {
+                anyhow::bail!("unknown enabled_actions entry {enabled_action:?}");
             }
         }
         Ok(())
@@ -4204,29 +4184,7 @@ fn default_true() -> bool {
 }
 
 fn default_enabled_actions() -> Vec<String> {
-    [
-        "connect",
-        "up",
-        "run",
-        "launches",
-        "launch",
-        "status",
-        "targets",
-        "stop",
-        "remove",
-        "set-default",
-        "show-default",
-        "reset-default",
-        "add-key",
-        "add-host-key",
-        "add-container-key",
-        "client-config",
-        "client-bundle",
-        "help",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
+    action::default_enabled_actions()
 }
 
 fn default_inner_alias_template() -> String {

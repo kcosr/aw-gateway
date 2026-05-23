@@ -1,3 +1,4 @@
+use crate::action;
 use crate::config::SshDispatchConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,9 +200,7 @@ fn parse_native(
             parse_client_bundle_action(words)?
         }
         "help" if words.len() == 1 && action_enabled(cfg, "help") => GatewayAction::Help,
-        "connect" | "up" | "run" | "launches" | "launch" | "status" | "targets" | "stop"
-        | "remove" | "rm" | "set-default" | "show-default" | "reset-default" | "add-key"
-        | "add-host-key" | "add-container-key" | "client-config" | "client-bundle" | "help" => {
+        _ if action::is_gateway_action_name(action) || action == "rm" => {
             anyhow::bail!(
                 "invalid or disabled gateway action shape: {}",
                 words.join(" ")
@@ -367,6 +366,7 @@ fn parse_launch_action(words: &[String]) -> anyhow::Result<GatewayAction> {
             continue;
         }
         if let Some(value) = arg.strip_prefix("--var=") {
+            validate_launch_var_pair(value)?;
             vars.push(value.to_string());
             index += 1;
             continue;
@@ -375,6 +375,7 @@ fn parse_launch_action(words: &[String]) -> anyhow::Result<GatewayAction> {
             let Some(value) = words.get(index + 1) else {
                 anyhow::bail!("--var must be key=value");
             };
+            validate_launch_var_pair(value)?;
             vars.push(value.clone());
             index += 2;
             continue;
@@ -387,6 +388,13 @@ fn parse_launch_action(words: &[String]) -> anyhow::Result<GatewayAction> {
         session_id,
         vars,
     })
+}
+
+fn validate_launch_var_pair(value: &str) -> anyhow::Result<()> {
+    if value.split_once('=').is_none() {
+        anyhow::bail!("--var must be key=value");
+    }
+    Ok(())
 }
 
 fn parse_json_flag(words: &[String], command: &str) -> anyhow::Result<bool> {

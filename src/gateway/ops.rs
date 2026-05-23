@@ -16,7 +16,7 @@ use crate::ssh_dispatch::{GatewayAction, RunAction, StatusAction};
 use anyhow::Context;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) enum GatewayOperation {
     Targets,
     Status {
@@ -33,6 +33,7 @@ pub(super) enum GatewayOperation {
         session_id: Option<String>,
         cwd: Option<String>,
         command: Vec<String>,
+        options: OperationExecutionOptions,
     },
     Launches,
     LaunchShow {
@@ -41,7 +42,8 @@ pub(super) enum GatewayOperation {
     Launch {
         name: String,
         session_id: Option<String>,
-        vars: Vec<String>,
+        vars: SuppliedLaunchVars,
+        options: OperationExecutionOptions,
     },
     Stop {
         target: Option<String>,
@@ -80,19 +82,145 @@ pub(super) enum GatewayOperationResult {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) enum OperationMode {
+    Wait,
+    Stream,
+    Detach,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OutputSelection {
+    pub(super) stdout: bool,
+    pub(super) stderr: bool,
+}
+
+impl OutputSelection {
+    pub(super) const BOTH: Self = Self {
+        stdout: true,
+        stderr: true,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct OperationExecutionOptions {
+    pub(super) mode: OperationMode,
+    pub(super) output: OutputSelection,
+}
+
+impl OperationExecutionOptions {
+    pub(super) const STREAM: Self = Self {
+        mode: OperationMode::Stream,
+        output: OutputSelection::BOTH,
+    };
+
+    #[cfg(test)]
+    pub(super) const WAIT: Self = Self {
+        mode: OperationMode::Wait,
+        output: OutputSelection::BOTH,
+    };
+
+    #[cfg(test)]
+    pub(super) const DETACH: Self = Self {
+        mode: OperationMode::Detach,
+        output: OutputSelection::BOTH,
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ExecutionOutcome {
-    exit_code: i32,
+pub(super) enum ExecutionOutcome {
+    Streamed {
+        exit_code: i32,
+    },
+    // Captured output remains bytes internally. The future HTTP JSON layer must
+    // choose its own encoding policy instead of inheriting an accidental string conversion.
+    Captured {
+        exit_code: i32,
+        stdout: Option<Vec<u8>>,
+        stderr: Option<Vec<u8>>,
+    },
+    Detached {
+        operation_id: String,
+    },
 }
 
 impl ExecutionOutcome {
     pub(super) fn new(exit_code: i32) -> Self {
-        Self { exit_code }
+        Self::Streamed { exit_code }
     }
 
-    pub(super) fn exit_code(&self) -> i32 {
-        self.exit_code
+    pub(super) fn captured(
+        exit_code: i32,
+        stdout: Option<Vec<u8>>,
+        stderr: Option<Vec<u8>>,
+    ) -> Self {
+        Self::Captured {
+            exit_code,
+            stdout,
+            stderr,
+        }
     }
+
+    pub(super) fn detached(operation_id: String) -> Self {
+        Self::Detached { operation_id }
+    }
+
+    pub(super) fn exit_code(&self) -> Option<i32> {
+        match self {
+            Self::Streamed { exit_code } | Self::Captured { exit_code, .. } => Some(*exit_code),
+            Self::Detached { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(super) struct SuppliedLaunchVars {
+    values: std::collections::BTreeMap<String, SuppliedLaunchVarValue>,
+}
+
+impl SuppliedLaunchVars {
+    pub(super) fn from_cli_pairs(supplied: Vec<String>) -> anyhow::Result<Self> {
+        let mut vars = Self::default();
+        for raw in supplied {
+            let Some((key, value)) = raw.split_once('=') else {
+                anyhow::bail!("--var must be key=value");
+            };
+            vars.insert(
+                key.to_string(),
+                SuppliedLaunchVarValue::String(value.to_string()),
+            )?;
+        }
+        Ok(vars)
+    }
+
+    pub(super) fn insert(
+        &mut self,
+        key: String,
+        value: SuppliedLaunchVarValue,
+    ) -> anyhow::Result<()> {
+        if self.values.insert(key.clone(), value).is_some() {
+            anyhow::bail!("duplicate launch variable {key:?}");
+        }
+        Ok(())
+    }
+
+    pub(super) fn get(&self, key: &str) -> Option<&SuppliedLaunchVarValue> {
+        self.values.get(key)
+    }
+
+    pub(super) fn keys(&self) -> impl Iterator<Item = &String> {
+        self.values.keys()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(super) enum SuppliedLaunchVarValue {
+    String(String),
+    Boolean(bool),
+    Integer(i64),
+    Float(f64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +262,7 @@ impl GatewayOperation {
             session_id: args.session_id,
             cwd: args.cwd,
             command: args.command,
+            options: OperationExecutionOptions::STREAM,
         })
     }
 
@@ -145,11 +274,16 @@ impl GatewayOperation {
         Self::LaunchShow { name: args.name }
     }
 
-    pub(super) fn launch_run(name: String, session_id: Option<String>, vars: Vec<String>) -> Self {
+    pub(super) fn launch_run(
+        name: String,
+        session_id: Option<String>,
+        vars: SuppliedLaunchVars,
+    ) -> Self {
         Self::Launch {
             name,
             session_id,
             vars,
+            options: OperationExecutionOptions::STREAM,
         }
     }
 
@@ -183,8 +317,8 @@ impl GatewayOperation {
         }
     }
 
-    pub(super) fn from_ssh_action(action: GatewayAction) -> Option<Self> {
-        match action {
+    pub(super) fn from_ssh_action(action: GatewayAction) -> anyhow::Result<Option<Self>> {
+        Ok(match action {
             GatewayAction::Up(target) => Some(Self::Up {
                 target,
                 session_id: None,
@@ -196,7 +330,10 @@ impl GatewayOperation {
                 name,
                 session_id,
                 vars,
-            } => Some(Self::launch_run(name, session_id, vars)),
+            } => {
+                let vars = SuppliedLaunchVars::from_cli_pairs(vars)?;
+                Some(Self::launch_run(name, session_id, vars))
+            }
             GatewayAction::Status(action) => Some(Self::from_status_action(action)),
             GatewayAction::Targets { .. } => Some(Self::Targets),
             GatewayAction::Stop(target) => Some(Self::Stop {
@@ -219,7 +356,7 @@ impl GatewayOperation {
             | GatewayAction::AddContainerKey(_)
             | GatewayAction::ClientBundle(_)
             | GatewayAction::Help => None,
-        }
+        })
     }
 
     fn from_run_action(action: RunAction) -> Self {
@@ -228,6 +365,7 @@ impl GatewayOperation {
             session_id: action.session_id,
             cwd: action.cwd,
             command: action.command,
+            options: OperationExecutionOptions::STREAM,
         }
     }
 
@@ -266,8 +404,9 @@ pub(super) async fn execute_gateway_operation(
             session_id,
             cwd,
             command,
+            options,
         } => Ok(GatewayOperationResult::Run(
-            operation_run(config_path, target, session_id, cwd, command).await?,
+            operation_run(config_path, target, session_id, cwd, command, options).await?,
         )),
         GatewayOperation::Launches => {
             let cfg = load_config(config_path)?;
@@ -284,10 +423,11 @@ pub(super) async fn execute_gateway_operation(
             name,
             session_id,
             vars,
+            options,
         } => {
             let cfg = load_config(config_path)?;
             Ok(GatewayOperationResult::Launch(
-                launch_execute_with_config(cfg, &name, session_id, vars).await?,
+                launch_execute_with_config(cfg, &name, session_id, vars, options).await?,
             ))
         }
         GatewayOperation::Stop { target, session_id } => Ok(GatewayOperationResult::Stop(
@@ -327,9 +467,10 @@ async fn operation_run(
     session_id: Option<String>,
     cwd: Option<String>,
     command: Vec<String>,
+    options: OperationExecutionOptions,
 ) -> anyhow::Result<ExecutionOutcome> {
     let runtime = Runtime::load(config_path, target.as_deref(), session_id, true).await?;
-    run_container_command_with_runtime(runtime, cwd, command).await
+    run_container_command_with_runtime(runtime, cwd, command, options).await
 }
 
 fn operation_set_default(
@@ -539,6 +680,7 @@ mod tests {
                 session_id: Some("abc123".into()),
                 cwd: Some("/work".into()),
                 command: vec!["cargo".into(), "test".into()],
+                options: OperationExecutionOptions::STREAM,
             }
         );
     }
@@ -566,12 +708,19 @@ mod tests {
             GatewayOperation::launch_run(
                 "repo-shell".into(),
                 Some("abc123".into()),
-                vec!["repo=https://example.test/repo.git".into()],
+                SuppliedLaunchVars::from_cli_pairs(vec![
+                    "repo=https://example.test/repo.git".into()
+                ])
+                .unwrap(),
             ),
             GatewayOperation::Launch {
                 name: "repo-shell".into(),
                 session_id: Some("abc123".into()),
-                vars: vec!["repo=https://example.test/repo.git".into()],
+                vars: SuppliedLaunchVars::from_cli_pairs(vec![
+                    "repo=https://example.test/repo.git".into()
+                ])
+                .unwrap(),
+                options: OperationExecutionOptions::STREAM,
             }
         );
     }
@@ -584,7 +733,8 @@ mod tests {
                 session_id: Some("abc123".into()),
                 cwd: Some("/work".into()),
                 command: vec!["cargo".into(), "test".into()],
-            })),
+            }))
+            .unwrap(),
             Some(
                 GatewayOperation::from_run_args(RunArgs {
                     target: Some("dev".into()),
@@ -600,21 +750,25 @@ mod tests {
                 name: "repo-shell".into(),
                 session_id: Some("abc123".into()),
                 vars: vec!["repo=https://example.test/repo.git".into()],
-            }),
+            })
+            .unwrap(),
             Some(GatewayOperation::launch_run(
                 "repo-shell".into(),
                 Some("abc123".into()),
-                vec!["repo=https://example.test/repo.git".into()],
+                SuppliedLaunchVars::from_cli_pairs(vec![
+                    "repo=https://example.test/repo.git".into()
+                ])
+                .unwrap(),
             ))
         );
         assert_eq!(
-            GatewayOperation::from_ssh_action(GatewayAction::Launches { json: true }),
+            GatewayOperation::from_ssh_action(GatewayAction::Launches { json: true }).unwrap(),
             Some(GatewayOperation::from_launches_args(LaunchesArgs {
                 json: false
             }))
         );
         assert_eq!(
-            GatewayOperation::from_ssh_action(GatewayAction::Targets { json: true }),
+            GatewayOperation::from_ssh_action(GatewayAction::Targets { json: true }).unwrap(),
             Some(GatewayOperation::from_targets_args(TargetsArgs {
                 json: false
             }))
@@ -623,7 +777,8 @@ mod tests {
             GatewayOperation::from_ssh_action(GatewayAction::LaunchShow {
                 name: "repo-shell".into(),
                 json: true,
-            }),
+            })
+            .unwrap(),
             Some(GatewayOperation::from_launch_show_args(LaunchShowArgs {
                 name: "repo-shell".into(),
                 json: false,
@@ -633,7 +788,8 @@ mod tests {
             GatewayOperation::from_ssh_action(GatewayAction::Status(StatusAction {
                 target: Some("dev".into()),
                 all: false,
-            })),
+            }))
+            .unwrap(),
             Some(GatewayOperation::from_status_args(StatusArg {
                 target: Some("dev".into()),
                 all: false,
@@ -645,7 +801,8 @@ mod tests {
             GatewayOperation::from_ssh_action(GatewayAction::Status(StatusAction {
                 target: None,
                 all: true,
-            })),
+            }))
+            .unwrap(),
             Some(GatewayOperation::from_status_args(StatusArg {
                 target: None,
                 all: true,

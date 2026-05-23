@@ -75,8 +75,9 @@ use model::{
     LaunchVarMetadata, ReadyStatus, TargetEntry, TcpEndpoint, gateway_status_name,
 };
 use ops::{
-    ExecutionOutcome, GatewayOperation, GatewayOperationResult, RemoveResult, StopResult,
-    execute_gateway_operation, operation_up_with_runtime,
+    ExecutionOutcome, GatewayOperation, GatewayOperationResult, OperationExecutionOptions,
+    OperationMode, OutputSelection, RemoveResult, StopResult, SuppliedLaunchVarValue,
+    SuppliedLaunchVars, execute_gateway_operation, operation_up_with_runtime,
 };
 use session::{generate_session_id_value, validate_session_id};
 
@@ -227,7 +228,7 @@ async fn run_gateway_action(
     action: GatewayAction,
 ) -> anyhow::Result<()> {
     if let Some(render) = SshOperationRender::from_action(&action) {
-        let operation = GatewayOperation::from_ssh_action(action)
+        let operation = GatewayOperation::from_ssh_action(action)?
             .expect("ssh operation render must match operation conversion");
         let result = execute_gateway_operation(config_path, operation).await?;
         return render_operation_result(result, render);
@@ -538,37 +539,71 @@ async fn run_container_command(config_path: Option<PathBuf>, args: RunArgs) -> a
 }
 
 fn exit_with_execution_outcome(outcome: ExecutionOutcome) -> ! {
-    std::process::exit(outcome.exit_code());
+    let code = outcome
+        .exit_code()
+        .expect("CLI/SSH command execution must return a completed outcome");
+    std::process::exit(code);
 }
 
 async fn run_container_command_with_runtime(
     runtime: Runtime,
     cwd: Option<String>,
     command: Vec<String>,
+    options: OperationExecutionOptions,
 ) -> anyhow::Result<ExecutionOutcome> {
     let session_kind = "run-command";
-    let session = runtime.create_session_marker(session_kind)?;
+    if options.mode == OperationMode::Detach {
+        return detach_run_container_command(runtime, session_kind, cwd, command).await;
+    }
+    let mut session = runtime.begin_operation_session(session_kind, false)?;
     let result = async {
         let _ready = runtime.ensure_ready().await?;
-        let _agent_session = runtime.agent_session_hold(session_kind).await?;
+        runtime
+            .hold_operation_agent_session(&mut session, session_kind)
+            .await?;
         let cwd = cwd
             .as_deref()
             .map(|cwd| paths::expand_home(&runtime.container_home, cwd));
-        exec_final_container_command(&runtime, command, cwd, runtime.session_env()?).await
+        exec_final_container_command_with_options(
+            &runtime,
+            command,
+            cwd,
+            runtime.session_env()?,
+            options,
+        )
+        .await
     }
     .await;
-    let outcome = SessionOutcome::from_exit_code_result(&result);
-    let result = runtime.finish_post_session(session, result, outcome).await;
-    let code = result?;
-    Ok(ExecutionOutcome::new(code))
+    let outcome = SessionOutcome::from_execution_result(&result);
+    runtime
+        .finish_operation_session(session, result, outcome)
+        .await
 }
 
+#[cfg(test)]
 async fn exec_final_container_command(
     runtime: &Runtime,
     command: Vec<String>,
     cwd: Option<PathBuf>,
     env: BTreeMap<String, String>,
-) -> anyhow::Result<i32> {
+) -> anyhow::Result<ExecutionOutcome> {
+    exec_final_container_command_with_options(
+        runtime,
+        command,
+        cwd,
+        env,
+        OperationExecutionOptions::STREAM,
+    )
+    .await
+}
+
+async fn exec_final_container_command_with_options(
+    runtime: &Runtime,
+    command: Vec<String>,
+    cwd: Option<PathBuf>,
+    env: BTreeMap<String, String>,
+    options: OperationExecutionOptions,
+) -> anyhow::Result<ExecutionOutcome> {
     let exec_spec = ContainerExecSpec {
         stdin_tty: std::io::stdin().is_terminal(),
         stdout_tty: std::io::stdout().is_terminal(),
@@ -578,7 +613,72 @@ async fn exec_final_container_command(
         container_name: runtime.container_name.clone(),
         command,
     };
-    runtime.container_runtime.exec(&exec_spec).await
+    match options.mode {
+        OperationMode::Stream => Ok(ExecutionOutcome::new(
+            runtime.container_runtime.exec(&exec_spec).await?,
+        )),
+        OperationMode::Wait => {
+            let output = runtime.container_runtime.exec_capture(&exec_spec).await?;
+            Ok(ExecutionOutcome::captured(
+                output.exit_code,
+                options.output.stdout.then_some(output.stdout),
+                options.output.stderr.then_some(output.stderr),
+            ))
+        }
+        OperationMode::Detach => Ok(ExecutionOutcome::new(
+            runtime.container_runtime.exec_discard(&exec_spec).await?,
+        )),
+    }
+}
+
+async fn detach_run_container_command(
+    runtime: Runtime,
+    session_kind: &'static str,
+    cwd: Option<String>,
+    command: Vec<String>,
+) -> anyhow::Result<ExecutionOutcome> {
+    let operation_id = generate_session_id_value()?;
+    let session = runtime.begin_operation_session(session_kind, false)?;
+    let background_id = operation_id.clone();
+    tokio::spawn(async move {
+        let mut session = session;
+        let result = async {
+            let _ready = runtime.ensure_ready().await?;
+            runtime
+                .hold_operation_agent_session(&mut session, session_kind)
+                .await?;
+            let cwd = cwd
+                .as_deref()
+                .map(|cwd| paths::expand_home(&runtime.container_home, cwd));
+            exec_final_container_command_with_options(
+                &runtime,
+                command,
+                cwd,
+                runtime.session_env()?,
+                OperationExecutionOptions {
+                    mode: OperationMode::Detach,
+                    output: OutputSelection {
+                        stdout: false,
+                        stderr: false,
+                    },
+                },
+            )
+            .await
+        }
+        .await;
+        let session_outcome = SessionOutcome::from_execution_result(&result);
+        let result = runtime
+            .finish_operation_session(session, result, session_outcome)
+            .await;
+        if let Err(err) = result {
+            tracing::warn!(
+                operation_id = %background_id,
+                error = %err,
+                "detached run operation failed"
+            );
+        }
+    });
+    Ok(ExecutionOutcome::detached(operation_id))
 }
 
 async fn stop(config_path: Option<PathBuf>, args: StopArgs) -> anyhow::Result<()> {
@@ -891,6 +991,7 @@ async fn launch_execute(
     session_id: Option<String>,
     supplied: Vec<String>,
 ) -> anyhow::Result<()> {
+    let supplied = SuppliedLaunchVars::from_cli_pairs(supplied)?;
     let result = execute_gateway_operation(
         config_path,
         GatewayOperation::launch_run(name.to_string(), session_id, supplied),
@@ -906,18 +1007,25 @@ async fn launch_execute_with_config(
     cfg: GatewayConfig,
     name: &str,
     session_id: Option<String>,
-    supplied: Vec<String>,
+    supplied: SuppliedLaunchVars,
+    options: OperationExecutionOptions,
 ) -> anyhow::Result<ExecutionOutcome> {
     let launch = cfg.effective_launch(name)?;
-    let resolved_vars = resolve_launch_vars(name, &launch, supplied)?;
+    let resolved_vars = resolve_launch_vars(name, &launch, &supplied)?;
     let target = launch.target.clone();
     let runtime =
         Runtime::from_config(cfg, Some(&target), session_id, true, Some(name.to_string())).await?;
     let session_kind = "launch";
-    let session = runtime.create_launch_session_marker(session_kind)?;
+    if options.mode == OperationMode::Detach {
+        return detach_launch_execute_with_runtime(runtime, launch, resolved_vars, session_kind)
+            .await;
+    }
+    let mut session = runtime.begin_operation_session(session_kind, true)?;
     let result = async {
         let ready = runtime.ensure_ready().await?;
-        let _agent_session = runtime.agent_session_hold(session_kind).await?;
+        runtime
+            .hold_operation_agent_session(&mut session, session_kind)
+            .await?;
         let container_pid = ready.container_pid.to_string();
         let vars = launch_template_vars(&runtime, &resolved_vars, Some(&container_pid));
         let launch_env = render_template_map(&launch.env, &vars)?;
@@ -929,13 +1037,71 @@ async fn launch_execute_with_config(
             runtime.container_home.as_path(),
         )?;
         let command = render_command(&launch.command, &vars)?;
-        exec_final_container_command(&runtime, command, cwd, env).await
+        exec_final_container_command_with_options(&runtime, command, cwd, env, options).await
     }
     .await;
-    let outcome = SessionOutcome::from_exit_code_result(&result);
-    let result = runtime.finish_post_session(session, result, outcome).await;
-    let code = result?;
-    Ok(ExecutionOutcome::new(code))
+    let outcome = SessionOutcome::from_execution_result(&result);
+    runtime
+        .finish_operation_session(session, result, outcome)
+        .await
+}
+
+async fn detach_launch_execute_with_runtime(
+    runtime: Runtime,
+    launch: LaunchConfig,
+    resolved_vars: BTreeMap<String, String>,
+    session_kind: &'static str,
+) -> anyhow::Result<ExecutionOutcome> {
+    let operation_id = generate_session_id_value()?;
+    let session = runtime.begin_operation_session(session_kind, true)?;
+    let background_id = operation_id.clone();
+    tokio::spawn(async move {
+        let mut session = session;
+        let result = async {
+            let ready = runtime.ensure_ready().await?;
+            runtime
+                .hold_operation_agent_session(&mut session, session_kind)
+                .await?;
+            let container_pid = ready.container_pid.to_string();
+            let vars = launch_template_vars(&runtime, &resolved_vars, Some(&container_pid));
+            let launch_env = render_template_map(&launch.env, &vars)?;
+            run_launch_steps(&runtime, &launch, &vars, &launch_env).await?;
+            let env = launch_final_env(&runtime.session_env()?, &launch_env);
+            let cwd = render_launch_cwd(
+                launch.cwd.as_deref(),
+                &vars,
+                runtime.container_home.as_path(),
+            )?;
+            let command = render_command(&launch.command, &vars)?;
+            exec_final_container_command_with_options(
+                &runtime,
+                command,
+                cwd,
+                env,
+                OperationExecutionOptions {
+                    mode: OperationMode::Detach,
+                    output: OutputSelection {
+                        stdout: false,
+                        stderr: false,
+                    },
+                },
+            )
+            .await
+        }
+        .await;
+        let session_outcome = SessionOutcome::from_execution_result(&result);
+        let result = runtime
+            .finish_operation_session(session, result, session_outcome)
+            .await;
+        if let Err(err) = result {
+            tracing::warn!(
+                operation_id = %background_id,
+                error = %err,
+                "detached launch operation failed"
+            );
+        }
+    });
+    Ok(ExecutionOutcome::detached(operation_id))
 }
 
 fn launch_summaries(cfg: &GatewayConfig) -> anyhow::Result<Vec<LaunchSummary>> {
@@ -1097,28 +1263,16 @@ fn launch_var_type_name(var_type: LaunchVarType) -> &'static str {
 fn resolve_launch_vars(
     launch_name: &str,
     launch: &LaunchConfig,
-    supplied: Vec<String>,
+    supplied: &SuppliedLaunchVars,
 ) -> anyhow::Result<BTreeMap<String, String>> {
     let mut resolved = BTreeMap::new();
-    let mut supplied_map = BTreeMap::new();
-    for raw in supplied {
-        let Some((key, value)) = raw.split_once('=') else {
-            anyhow::bail!("--var must be key=value");
-        };
-        if supplied_map
-            .insert(key.to_string(), value.to_string())
-            .is_some()
-        {
-            anyhow::bail!("duplicate launch variable {key:?}");
-        }
-    }
-    for key in supplied_map.keys() {
+    for key in supplied.keys() {
         if !launch.vars.contains_key(key) {
             anyhow::bail!("unknown launch variable {key:?}");
         }
     }
     for (name, var) in &launch.vars {
-        if let Some(value) = supplied_map.get(name) {
+        if let Some(value) = supplied.get(name) {
             resolved.insert(name.clone(), validate_launch_var_value(name, var, value)?);
         } else if let Some(default) = var.default_rendered() {
             resolved.insert(name.clone(), default);
@@ -1137,11 +1291,17 @@ fn resolve_launch_vars(
 fn validate_launch_var_value(
     name: &str,
     var: &LaunchVarConfig,
-    value: &str,
+    value: &SuppliedLaunchVarValue,
 ) -> anyhow::Result<String> {
     match var.var_type {
-        LaunchVarType::String => Ok(value.to_string()),
+        LaunchVarType::String => match value {
+            SuppliedLaunchVarValue::String(value) => Ok(value.to_string()),
+            _ => anyhow::bail!("invalid string launch variable {name:?}; expected string"),
+        },
         LaunchVarType::Enum => {
+            let SuppliedLaunchVarValue::String(value) = value else {
+                anyhow::bail!("invalid enum launch variable {name:?}; expected string");
+            };
             let values = var.values.as_deref().unwrap_or(&[]);
             if values.iter().any(|allowed| allowed == value) {
                 Ok(value.to_string())
@@ -1153,18 +1313,37 @@ fn validate_launch_var_value(
             }
         }
         LaunchVarType::Boolean => match value {
-            "true" | "false" => Ok(value.to_string()),
+            SuppliedLaunchVarValue::Boolean(value) => Ok(value.to_string()),
+            SuppliedLaunchVarValue::String(value) if value == "true" || value == "false" => {
+                Ok(value.to_string())
+            }
             _ => anyhow::bail!("invalid boolean launch variable {name:?}; expected true or false"),
         },
-        LaunchVarType::Number => {
-            let parsed = value
-                .parse::<f64>()
-                .with_context(|| format!("invalid number launch variable {name:?}"))?;
-            if !parsed.is_finite() {
-                anyhow::bail!("invalid number launch variable {name:?}; expected finite number");
+        LaunchVarType::Number => match value {
+            SuppliedLaunchVarValue::Integer(value) => Ok(value.to_string()),
+            SuppliedLaunchVarValue::Float(value) => {
+                if !value.is_finite() {
+                    anyhow::bail!(
+                        "invalid number launch variable {name:?}; expected finite number"
+                    );
+                }
+                Ok(canonical_cli_number(&value.to_string(), *value))
             }
-            Ok(canonical_cli_number(value, parsed))
-        }
+            SuppliedLaunchVarValue::String(value) => {
+                let parsed = value
+                    .parse::<f64>()
+                    .with_context(|| format!("invalid number launch variable {name:?}"))?;
+                if !parsed.is_finite() {
+                    anyhow::bail!(
+                        "invalid number launch variable {name:?}; expected finite number"
+                    );
+                }
+                Ok(canonical_cli_number(value, parsed))
+            }
+            SuppliedLaunchVarValue::Boolean(_) => {
+                anyhow::bail!("invalid number launch variable {name:?}")
+            }
+        },
     }
 }
 
@@ -1494,10 +1673,27 @@ impl SessionOutcome {
         }
     }
 
+    #[cfg(test)]
     fn from_exit_code_result(result: &anyhow::Result<i32>) -> Self {
         match result {
             Ok(0) => Self::Success,
             Ok(_) | Err(_) => Self::Failure,
+        }
+    }
+
+    fn from_execution_result(result: &anyhow::Result<ExecutionOutcome>) -> Self {
+        match result {
+            Ok(outcome) => outcome
+                .exit_code()
+                .map(|code| {
+                    if code == 0 {
+                        Self::Success
+                    } else {
+                        Self::Failure
+                    }
+                })
+                .unwrap_or(Self::Success),
+            Err(_) => Self::Failure,
         }
     }
 }
@@ -1869,6 +2065,45 @@ impl Runtime {
         drop(session);
         self.apply_post_session_cleanup(outcome).await;
         result
+    }
+
+    fn begin_operation_session(
+        &self,
+        kind: &str,
+        launch_marker: bool,
+    ) -> anyhow::Result<OperationSessionGuard> {
+        let session = if launch_marker {
+            self.create_launch_session_marker(kind)?
+        } else {
+            self.create_session_marker(kind)?
+        };
+        Ok(OperationSessionGuard {
+            session: Some(session),
+            agent_session: None,
+        })
+    }
+
+    async fn hold_operation_agent_session(
+        &self,
+        session: &mut OperationSessionGuard,
+        kind: &str,
+    ) -> anyhow::Result<()> {
+        session.agent_session = self.agent_session_hold(kind).await?;
+        Ok(())
+    }
+
+    async fn finish_operation_session<T>(
+        &self,
+        mut session: OperationSessionGuard,
+        result: anyhow::Result<T>,
+        outcome: SessionOutcome,
+    ) -> anyhow::Result<T> {
+        drop(session.agent_session.take());
+        let marker = session
+            .session
+            .take()
+            .expect("operation session marker must be present");
+        self.finish_post_session(marker, result, outcome).await
     }
 
     async fn apply_post_session_cleanup(&self, outcome: SessionOutcome) {
@@ -3347,6 +3582,11 @@ struct AgentSessionHold {
     _reader: BufReader<UnixStream>,
 }
 
+struct OperationSessionGuard {
+    session: Option<session::SessionGuard>,
+    agent_session: Option<AgentSessionHold>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3382,6 +3622,19 @@ exit 0
             user = user.user,
             uid = user.uid,
         )
+    }
+
+    fn session_marker_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| {
+                        entry.path().extension().and_then(|value| value.to_str()) == Some("json")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     fn test_control_socket_paths(base: &Path) -> ControlSocketPaths {
@@ -4111,7 +4364,7 @@ exit 0
         );
         let runtime = test_runtime(&dir, fake_runtime, |_| {});
 
-        let code = exec_final_container_command(
+        let outcome = exec_final_container_command(
             &runtime,
             vec!["/bin/launch-final".into()],
             None,
@@ -4120,7 +4373,65 @@ exit 0
         .await
         .unwrap();
 
-        assert_eq!(code, 37);
+        assert_eq!(outcome, ExecutionOutcome::new(37));
+    }
+
+    #[tokio::test]
+    async fn wait_capture_final_container_command_returns_selected_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_runtime = dir.path().join("runtime");
+        write_fake_runtime(
+            &fake_runtime,
+            r#"#!/bin/sh
+if [ "$1" = "exec" ]; then
+  echo "captured stdout"
+  echo "captured stderr" >&2
+  exit 23
+fi
+exit 0
+"#,
+        );
+        let runtime = test_runtime(&dir, fake_runtime, |_| {});
+
+        let both = exec_final_container_command_with_options(
+            &runtime,
+            vec!["/bin/capture".into()],
+            None,
+            BTreeMap::new(),
+            OperationExecutionOptions::WAIT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            both,
+            ExecutionOutcome::captured(
+                23,
+                Some(b"captured stdout\n".to_vec()),
+                Some(b"captured stderr\n".to_vec()),
+            )
+        );
+
+        let stdout_only = exec_final_container_command_with_options(
+            &runtime,
+            vec!["/bin/capture".into()],
+            None,
+            BTreeMap::new(),
+            OperationExecutionOptions {
+                mode: OperationMode::Wait,
+                output: OutputSelection {
+                    stdout: true,
+                    stderr: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            stdout_only,
+            ExecutionOutcome::captured(23, Some(b"captured stdout\n".to_vec()), None)
+        );
     }
 
     #[tokio::test]
@@ -4137,11 +4448,71 @@ exit 0
             runtime,
             None,
             vec!["/bin/command-that-returns-37".into()],
+            OperationExecutionOptions::STREAM,
         )
         .await
         .unwrap();
 
         assert_eq!(outcome, ExecutionOutcome::new(37));
+    }
+
+    #[tokio::test]
+    async fn detached_run_keeps_session_marker_until_background_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_runtime = dir.path().join("runtime");
+        let log = dir.path().join("runtime.log");
+        let user = UserContext::current().unwrap();
+        write_fake_runtime(
+            &fake_runtime,
+            &format!(
+                r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  exec)
+    echo started > "{log}"
+    sleep 0.2
+    echo done >> "{log}"
+    ;;
+esac
+exit 0
+"#,
+                user = user.user,
+                uid = user.uid,
+                log = log.display()
+            ),
+        );
+        let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+            cfg.target_defaults.host_steps.clear();
+            cfg.targets.get_mut("default").unwrap().stop_when_idle = Some(false);
+        });
+        let marker_dir = runtime.session_marker_dir();
+
+        let outcome = run_container_command_with_runtime(
+            runtime,
+            None,
+            vec!["/bin/background".into()],
+            OperationExecutionOptions::DETACH,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, ExecutionOutcome::Detached { .. }));
+        assert_eq!(session_marker_count(&marker_dir), 1);
+
+        for _ in 0..20 {
+            let done = std::fs::read_to_string(&log)
+                .map(|value| value.contains("done"))
+                .unwrap_or(false);
+            if done && session_marker_count(&marker_dir) == 0 {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        panic!("detached background operation did not finish and clear marker");
     }
 
     #[tokio::test]
@@ -4169,9 +4540,15 @@ exit 0
         );
         cfg.validate().unwrap();
 
-        let outcome = launch_execute_with_config(cfg, "returns-nonzero", None, Vec::new())
-            .await
-            .unwrap();
+        let outcome = launch_execute_with_config(
+            cfg,
+            "returns-nonzero",
+            None,
+            SuppliedLaunchVars::default(),
+            OperationExecutionOptions::STREAM,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, ExecutionOutcome::new(42));
     }
@@ -4249,25 +4626,68 @@ mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
         )
         .unwrap();
         let launch = cfg.effective_launch("agent").unwrap();
-        let vars = resolve_launch_vars(
-            "agent",
-            &launch,
-            vec![
-                "repo=https://example.test/repo.git".into(),
-                "count=2.0".into(),
-                "debug=true".into(),
-                "mode=safe".into(),
-            ],
-        )
+        let supplied = SuppliedLaunchVars::from_cli_pairs(vec![
+            "repo=https://example.test/repo.git".into(),
+            "count=2.0".into(),
+            "debug=true".into(),
+            "mode=safe".into(),
+        ])
         .unwrap();
+        let vars = resolve_launch_vars("agent", &launch, &supplied).unwrap();
         assert_eq!(vars["count"], "2");
         assert_eq!(vars["debug"], "true");
         assert_eq!(vars["mode"], "safe");
 
-        let err = resolve_launch_vars("agent", &launch, vec!["repo=a".into(), "repo=b".into()])
+        let err = SuppliedLaunchVars::from_cli_pairs(vec!["repo=a".into(), "repo=b".into()])
             .unwrap_err()
             .to_string();
         assert!(err.contains("duplicate launch variable"), "{err}");
+
+        let unknown = SuppliedLaunchVars::from_cli_pairs(vec![
+            "repo=https://example.test/repo.git".into(),
+            "extra=value".into(),
+        ])
+        .unwrap();
+        let err = resolve_launch_vars("agent", &launch, &unknown)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown launch variable"), "{err}");
+
+        let missing = SuppliedLaunchVars::default();
+        let err = resolve_launch_vars("agent", &launch, &missing)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing required launch variable"), "{err}");
+
+        let invalid_bool = SuppliedLaunchVars::from_cli_pairs(vec![
+            "repo=https://example.test/repo.git".into(),
+            "debug=yes".into(),
+        ])
+        .unwrap();
+        let err = resolve_launch_vars("agent", &launch, &invalid_bool)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid boolean launch variable"), "{err}");
+
+        let mut typed = SuppliedLaunchVars::default();
+        typed
+            .insert(
+                "repo".into(),
+                SuppliedLaunchVarValue::String("https://example.test/repo.git".into()),
+            )
+            .unwrap();
+        typed
+            .insert("count".into(), SuppliedLaunchVarValue::Integer(3))
+            .unwrap();
+        typed
+            .insert("debug".into(), SuppliedLaunchVarValue::Boolean(true))
+            .unwrap();
+        typed
+            .insert("mode".into(), SuppliedLaunchVarValue::String("safe".into()))
+            .unwrap();
+        let vars = resolve_launch_vars("agent", &launch, &typed).unwrap();
+        assert_eq!(vars["count"], "3");
+        assert_eq!(vars["debug"], "true");
     }
 
     #[test]

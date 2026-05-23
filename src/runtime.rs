@@ -7,7 +7,7 @@ use std::ffi::OsStr;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Stdio};
 use tokio::process::Command;
 use tokio::time::Duration;
 
@@ -52,6 +52,13 @@ pub struct ContainerExecSpec {
     pub env: BTreeMap<String, String>,
     pub container_name: String,
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerExecOutput {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -251,6 +258,60 @@ impl ContainerRuntime {
             None => command.status().await,
         }
         .with_context(|| format!("run {} exec {}", self.runtime_label(), spec.container_name))?;
+        Ok(exit_code(status))
+    }
+
+    pub async fn exec_capture(
+        &self,
+        spec: &ContainerExecSpec,
+    ) -> anyhow::Result<ContainerExecOutput> {
+        self.exec_capture_with_timeout(spec, None).await
+    }
+
+    pub async fn exec_capture_with_timeout(
+        &self,
+        spec: &ContainerExecSpec,
+        timeout_duration: Option<Duration>,
+    ) -> anyhow::Result<ContainerExecOutput> {
+        let mut command = self.command();
+        command
+            .arg("exec")
+            .args(self.exec_args(spec))
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let output = match timeout_duration {
+            Some(timeout_duration) => tokio::time::timeout(timeout_duration, command.output())
+                .await
+                .with_context(|| {
+                    format!(
+                        "{} exec {} timed out after {:?}",
+                        self.runtime_label(),
+                        spec.container_name,
+                        timeout_duration
+                    )
+                })?,
+            None => command.output().await,
+        }
+        .with_context(|| format!("run {} exec {}", self.runtime_label(), spec.container_name))?;
+        Ok(ContainerExecOutput {
+            exit_code: exit_code(output.status),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+    }
+
+    pub async fn exec_discard(&self, spec: &ContainerExecSpec) -> anyhow::Result<i32> {
+        let mut command = self.command();
+        command
+            .arg("exec")
+            .args(self.exec_args(spec))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let status = command.status().await.with_context(|| {
+            format!("run {} exec {}", self.runtime_label(), spec.container_name)
+        })?;
         Ok(exit_code(status))
     }
 
@@ -1059,6 +1120,40 @@ mod tests {
 
         assert!(err.to_string().contains("timed out"), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn exec_capture_closes_stdin_for_noninteractive_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-runtime");
+        std::fs::write(
+            &runtime_program,
+            "#!/bin/sh\nif [ \"$1\" = exec ]; then read line || true; echo done; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::Podman,
+            program: runtime_program.display().to_string(),
+            env: BTreeMap::new(),
+        };
+        let spec = ContainerExecSpec {
+            stdin_tty: false,
+            stdout_tty: false,
+            user: "2450:100".into(),
+            cwd: None,
+            env: BTreeMap::new(),
+            container_name: "ubuntu-dev".into(),
+            command: vec!["read".into()],
+        };
+
+        let output = runtime
+            .exec_capture_with_timeout(&spec, Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, b"done\n");
     }
 
     #[tokio::test]
