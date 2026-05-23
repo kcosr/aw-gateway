@@ -317,8 +317,8 @@ impl GatewayOperation {
         }
     }
 
-    pub(super) fn from_ssh_action(action: GatewayAction) -> Option<Self> {
-        match action {
+    pub(super) fn from_ssh_action(action: GatewayAction) -> anyhow::Result<Option<Self>> {
+        Ok(match action {
             GatewayAction::Up(target) => Some(Self::Up {
                 target,
                 session_id: None,
@@ -331,7 +331,7 @@ impl GatewayOperation {
                 session_id,
                 vars,
             } => {
-                let vars = SuppliedLaunchVars::from_cli_pairs(vars).ok()?;
+                let vars = SuppliedLaunchVars::from_cli_pairs(vars)?;
                 Some(Self::launch_run(name, session_id, vars))
             }
             GatewayAction::Status(action) => Some(Self::from_status_action(action)),
@@ -356,7 +356,7 @@ impl GatewayOperation {
             | GatewayAction::AddContainerKey(_)
             | GatewayAction::ClientBundle(_)
             | GatewayAction::Help => None,
-        }
+        })
     }
 
     fn from_run_action(action: RunAction) -> Self {
@@ -733,7 +733,8 @@ mod tests {
                 session_id: Some("abc123".into()),
                 cwd: Some("/work".into()),
                 command: vec!["cargo".into(), "test".into()],
-            })),
+            }))
+            .unwrap(),
             Some(
                 GatewayOperation::from_run_args(RunArgs {
                     target: Some("dev".into()),
@@ -749,7 +750,8 @@ mod tests {
                 name: "repo-shell".into(),
                 session_id: Some("abc123".into()),
                 vars: vec!["repo=https://example.test/repo.git".into()],
-            }),
+            })
+            .unwrap(),
             Some(GatewayOperation::launch_run(
                 "repo-shell".into(),
                 Some("abc123".into()),
@@ -760,13 +762,13 @@ mod tests {
             ))
         );
         assert_eq!(
-            GatewayOperation::from_ssh_action(GatewayAction::Launches { json: true }),
+            GatewayOperation::from_ssh_action(GatewayAction::Launches { json: true }).unwrap(),
             Some(GatewayOperation::from_launches_args(LaunchesArgs {
                 json: false
             }))
         );
         assert_eq!(
-            GatewayOperation::from_ssh_action(GatewayAction::Targets { json: true }),
+            GatewayOperation::from_ssh_action(GatewayAction::Targets { json: true }).unwrap(),
             Some(GatewayOperation::from_targets_args(TargetsArgs {
                 json: false
             }))
@@ -775,7 +777,8 @@ mod tests {
             GatewayOperation::from_ssh_action(GatewayAction::LaunchShow {
                 name: "repo-shell".into(),
                 json: true,
-            }),
+            })
+            .unwrap(),
             Some(GatewayOperation::from_launch_show_args(LaunchShowArgs {
                 name: "repo-shell".into(),
                 json: false,
@@ -785,7 +788,8 @@ mod tests {
             GatewayOperation::from_ssh_action(GatewayAction::Status(StatusAction {
                 target: Some("dev".into()),
                 all: false,
-            })),
+            }))
+            .unwrap(),
             Some(GatewayOperation::from_status_args(StatusArg {
                 target: Some("dev".into()),
                 all: false,
@@ -797,7 +801,8 @@ mod tests {
             GatewayOperation::from_ssh_action(GatewayAction::Status(StatusAction {
                 target: None,
                 all: true,
-            })),
+            }))
+            .unwrap(),
             Some(GatewayOperation::from_status_args(StatusArg {
                 target: None,
                 all: true,

@@ -1110,6 +1110,26 @@ fn launch_over_ssh_accepts_session_id_forms_before_runtime_validation() {
 }
 
 #[test]
+fn launch_over_ssh_rejects_duplicate_vars_without_panic() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(&config, launch_config_for_test()).unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .env(
+            "SSH_ORIGINAL_COMMAND",
+            "launch agent-pack-codex --var repo=a --var repo=b --var pack_id=p",
+        )
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("duplicate launch variable"))
+        .stderr(predicate::str::contains("panicked").not());
+}
+
+#[test]
 fn help_cli_prints_allowed_commands() {
     let dir = tempdir().unwrap();
     let config = dir.path().join("gateway.toml");

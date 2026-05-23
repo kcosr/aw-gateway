@@ -277,6 +277,7 @@ impl ContainerRuntime {
         command
             .arg("exec")
             .args(self.exec_args(spec))
+            .stdin(Stdio::null())
             .kill_on_drop(true);
         let output = match timeout_duration {
             Some(timeout_duration) => tokio::time::timeout(timeout_duration, command.output())
@@ -1119,6 +1120,40 @@ mod tests {
 
         assert!(err.to_string().contains("timed out"), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn exec_capture_closes_stdin_for_noninteractive_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-runtime");
+        std::fs::write(
+            &runtime_program,
+            "#!/bin/sh\nif [ \"$1\" = exec ]; then read line || true; echo done; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::Podman,
+            program: runtime_program.display().to_string(),
+            env: BTreeMap::new(),
+        };
+        let spec = ContainerExecSpec {
+            stdin_tty: false,
+            stdout_tty: false,
+            user: "2450:100".into(),
+            cwd: None,
+            env: BTreeMap::new(),
+            container_name: "ubuntu-dev".into(),
+            command: vec!["read".into()],
+        };
+
+        let output = runtime
+            .exec_capture_with_timeout(&spec, Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout, b"done\n");
     }
 
     #[tokio::test]

@@ -228,7 +228,7 @@ async fn run_gateway_action(
     action: GatewayAction,
 ) -> anyhow::Result<()> {
     if let Some(render) = SshOperationRender::from_action(&action) {
-        let operation = GatewayOperation::from_ssh_action(action)
+        let operation = GatewayOperation::from_ssh_action(action)?
             .expect("ssh operation render must match operation conversion");
         let result = execute_gateway_operation(config_path, operation).await?;
         return render_operation_result(result, render);
