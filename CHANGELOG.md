@@ -12,7 +12,8 @@
 ### Added
 
 - Added target-level `workspace_cleanup` config for best-effort cleanup of
-  resolved ephemeral session workspaces after success or after any outcome.
+  resolved ephemeral session workspaces after success or after any outcome
+  ([#7](https://github.com/kcosr/aw-gateway/pull/7)).
 - Added `[control_sockets]` and `[targets.<name>.control_sockets]` config for
   short runtime-only gateway control and SSH bridge socket directories
   ([#6](https://github.com/kcosr/aw-gateway/pull/6)).
