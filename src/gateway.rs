@@ -1721,6 +1721,7 @@ impl Runtime {
                     self.validate_labels(existing)?;
                     self.run_lifecycle_phase(LifecyclePhase::PreStart, None)
                         .await?;
+                    self.remove_stale_control_socket_files()?;
                     attempted_container_start = true;
                     self.container_runtime.start(&self.container_name).await?;
                     started_container = true;
@@ -1729,6 +1730,7 @@ impl Runtime {
                 ContainerReadinessPlan::CreateMissing => {
                     self.run_lifecycle_phase(LifecyclePhase::PreStart, None)
                         .await?;
+                    self.remove_stale_control_socket_files()?;
                     attempted_container_start = true;
                     self.start_container().await?;
                     started_container = true;
@@ -2599,7 +2601,7 @@ impl Runtime {
             }
         }
         ensure_control_socket_dir(&self.control_sockets.host_dir)?;
-        self.remove_stale_control_socket_files()
+        Ok(())
     }
 
     fn remove_stale_control_socket_files(&self) -> anyhow::Result<()> {
@@ -4348,6 +4350,135 @@ mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
     }
 
     #[tokio::test]
+    async fn ensure_ready_reuse_running_preserves_control_socket_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_runtime = dir.path().join("runtime");
+        write_fake_runtime(&fake_runtime, &fake_running_runtime_script(0));
+        let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+            cfg.target_defaults.host_steps.clear();
+        });
+        runtime.prepare_control_socket_dir().unwrap();
+        std::fs::write(&runtime.control_sockets.host_agent_socket, "").unwrap();
+        std::fs::write(&runtime.control_sockets.host_ssh_socket, "").unwrap();
+
+        runtime.ensure_ready().await.unwrap();
+
+        assert!(runtime.control_sockets.host_agent_socket.exists());
+        assert!(runtime.control_sockets.host_ssh_socket.exists());
+    }
+
+    #[tokio::test]
+    async fn ensure_ready_start_stopped_removes_stale_control_socket_files_before_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_runtime = dir.path().join("runtime");
+        let state = dir.path().join("running");
+        let log = dir.path().join("start.log");
+        let user = UserContext::current().unwrap();
+        write_fake_runtime(
+            &fake_runtime,
+            &format!(
+                r#"#!/bin/sh
+case "$1" in
+  inspect)
+    if [ -f "{state}" ]; then
+      running=true
+    else
+      running=false
+    fi
+    cat <<JSON
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":$running,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  start)
+    if [ -e "{agent_socket}" ] || [ -e "{ssh_socket}" ]; then
+      echo stale-present > "{log}"
+      exit 9
+    fi
+    echo clean > "{log}"
+    touch "{state}"
+    ;;
+esac
+exit 0
+"#,
+                state = state.display(),
+                log = log.display(),
+                agent_socket = dir.path().join("runtime-sockets/agent.sock").display(),
+                ssh_socket = dir.path().join("runtime-sockets/ssh.sock").display(),
+                user = user.user,
+                uid = user.uid,
+            ),
+        );
+        let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+            cfg.target_defaults.lifecycle_steps.clear();
+            cfg.target_defaults.host_steps.clear();
+        });
+        runtime.prepare_control_socket_dir().unwrap();
+        std::fs::write(&runtime.control_sockets.host_agent_socket, "").unwrap();
+        std::fs::write(&runtime.control_sockets.host_ssh_socket, "").unwrap();
+
+        runtime.ensure_ready().await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "clean\n");
+        assert!(!runtime.control_sockets.host_agent_socket.exists());
+        assert!(!runtime.control_sockets.host_ssh_socket.exists());
+    }
+
+    #[tokio::test]
+    async fn ensure_ready_create_missing_removes_stale_control_socket_files_before_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_runtime = dir.path().join("runtime");
+        let state = dir.path().join("running");
+        let log = dir.path().join("run.log");
+        let user = UserContext::current().unwrap();
+        write_fake_runtime(
+            &fake_runtime,
+            &format!(
+                r#"#!/bin/sh
+case "$1" in
+  inspect)
+    if [ ! -f "{state}" ]; then
+      echo "container not found" >&2
+      exit 1
+    fi
+    cat <<JSON
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  run)
+    if [ -e "{agent_socket}" ] || [ -e "{ssh_socket}" ]; then
+      echo stale-present > "{log}"
+      exit 9
+    fi
+    echo clean > "{log}"
+    touch "{state}"
+    ;;
+esac
+exit 0
+"#,
+                state = state.display(),
+                log = log.display(),
+                agent_socket = dir.path().join("runtime-sockets/agent.sock").display(),
+                ssh_socket = dir.path().join("runtime-sockets/ssh.sock").display(),
+                user = user.user,
+                uid = user.uid,
+            ),
+        );
+        let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+            cfg.target_defaults.lifecycle_steps.clear();
+            cfg.target_defaults.host_steps.clear();
+        });
+        runtime.prepare_control_socket_dir().unwrap();
+        std::fs::write(&runtime.control_sockets.host_agent_socket, "").unwrap();
+        std::fs::write(&runtime.control_sockets.host_ssh_socket, "").unwrap();
+
+        runtime.ensure_ready().await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "clean\n");
+        assert!(!runtime.control_sockets.host_agent_socket.exists());
+        assert!(!runtime.control_sockets.host_ssh_socket.exists());
+    }
+
+    #[tokio::test]
     async fn runtime_load_rejects_rendered_passwd_delimiters() {
         for (field, identity_line) in [
             ("session_user", r#"session_user = "bad:user""#),
@@ -4976,7 +5107,7 @@ name = "{{image_slug}}"
     }
 
     #[test]
-    fn prepare_control_socket_dir_is_private_and_removes_stale_socket_files() {
+    fn prepare_control_socket_dir_is_private_and_preserves_socket_files() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
             enable_default_ssh_bridge(cfg);
@@ -4998,6 +5129,23 @@ name = "{{image_slug}}"
         runtime.prepare_control_socket_dir().unwrap();
 
         assert!(runtime.control_sockets.host_dir.is_dir());
+        assert!(runtime.control_sockets.host_agent_socket.exists());
+        assert!(runtime.control_sockets.host_ssh_socket.exists());
+    }
+
+    #[test]
+    fn remove_stale_control_socket_files_removes_socket_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+            enable_default_ssh_bridge(cfg);
+        });
+
+        std::fs::create_dir_all(&runtime.control_sockets.host_dir).unwrap();
+        std::fs::write(&runtime.control_sockets.host_agent_socket, "").unwrap();
+        std::fs::write(&runtime.control_sockets.host_ssh_socket, "").unwrap();
+
+        runtime.remove_stale_control_socket_files().unwrap();
+
         assert!(!runtime.control_sockets.host_agent_socket.exists());
         assert!(!runtime.control_sockets.host_ssh_socket.exists());
     }
