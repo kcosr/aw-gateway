@@ -72,6 +72,12 @@
   ([#11](https://github.com/kcosr/aw-gateway/pull/11)).
 - Lifecycle and host hook commands now use a finite `60s` default timeout when no per-step `timeout` is configured ([#2](https://github.com/kcosr/aw-gateway/pull/2)).
 
+### Fixed
+
+- Preserved live control socket paths when reusing already-running containers,
+  while still removing stale paths before stopped or missing container startup
+  ([#12](https://github.com/kcosr/aw-gateway/pull/12)).
+
 ## [0.1.0] - 2026-05-21
 
 ### Added
