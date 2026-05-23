@@ -1195,8 +1195,8 @@ pub struct SshDispatchConfig {
     pub allow_interactive_shell: bool,
     #[serde(default = "default_true")]
     pub allow_container_commands: bool,
-    #[serde(default = "default_enabled_gateway_actions")]
-    pub enabled_gateway_actions: Vec<String>,
+    #[serde(default = "default_enabled_actions")]
+    pub enabled_actions: Vec<String>,
 }
 
 impl Default for SshDispatchConfig {
@@ -1204,7 +1204,7 @@ impl Default for SshDispatchConfig {
         Self {
             allow_interactive_shell: true,
             allow_container_commands: true,
-            enabled_gateway_actions: default_enabled_gateway_actions(),
+            enabled_actions: default_enabled_actions(),
         }
     }
 }
@@ -1231,9 +1231,9 @@ impl SshDispatchConfig {
             "reset-default",
             "help",
         ];
-        for action in &self.enabled_gateway_actions {
+        for action in &self.enabled_actions {
             if !allowed.contains(&action.as_str()) {
-                anyhow::bail!("unknown enabled_gateway_actions entry {action:?}");
+                anyhow::bail!("unknown enabled_actions entry {action:?}");
             }
         }
         Ok(())
@@ -4203,7 +4203,7 @@ fn default_true() -> bool {
     true
 }
 
-fn default_enabled_gateway_actions() -> Vec<String> {
+fn default_enabled_actions() -> Vec<String> {
     [
         "connect",
         "up",
@@ -5193,16 +5193,70 @@ CODEX_HOME = "/var/lib/codex"
     fn ssh_dispatch_defaults_include_launch_actions() {
         let cfg = SshDispatchConfig::default();
         assert!(
-            cfg.enabled_gateway_actions
+            cfg.enabled_actions
                 .iter()
                 .any(|action| action == "launches")
         );
-        assert!(
-            cfg.enabled_gateway_actions
-                .iter()
-                .any(|action| action == "launch")
-        );
+        assert!(cfg.enabled_actions.iter().any(|action| action == "launch"));
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn ssh_dispatch_enabled_actions_accepts_current_action_set() {
+        let cfg: SshDispatchConfig = toml::from_str(
+            r#"
+enabled_actions = [
+  "connect",
+  "up",
+  "run",
+  "launches",
+  "launch",
+  "status",
+  "targets",
+  "stop",
+  "remove",
+  "set-default",
+  "show-default",
+  "reset-default",
+  "add-key",
+  "add-host-key",
+  "add-container-key",
+  "client-config",
+  "client-bundle",
+  "help",
+]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.enabled_actions, default_enabled_actions());
+    }
+
+    #[test]
+    fn ssh_dispatch_rejects_retired_enabled_gateway_actions_key() {
+        let err = toml::from_str::<SshDispatchConfig>(
+            r#"
+enabled_gateway_actions = ["connect"]
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn ssh_dispatch_validation_reports_enabled_actions() {
+        let cfg: SshDispatchConfig = toml::from_str(
+            r#"
+enabled_actions = ["connect", "bogus"]
+"#,
+        )
+        .unwrap();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown enabled_actions entry \"bogus\""),
+            "{err}"
+        );
     }
 
     #[test]
