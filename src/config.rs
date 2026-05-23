@@ -81,6 +81,7 @@ impl GatewayConfig {
             );
         }
         self.target_defaults.validate_partial("target_defaults")?;
+        self.launch_defaults.validate_partial("launch_defaults")?;
         validate_name("default_target", &self.default_target)?;
         if !self.targets.contains_key(&self.default_target) {
             anyhow::bail!(
@@ -124,6 +125,7 @@ impl GatewayConfig {
             if name == "show" {
                 anyhow::bail!("launch name \"show\" is reserved for launch show");
             }
+            launch.validate_partial(name)?;
             self.effective_launch_with_targets(name, launch, &effective_targets)
                 .with_context(|| format!("validate effective launch {name:?}"))?;
         }
@@ -397,6 +399,46 @@ pub struct LaunchConfigInput {
 }
 
 impl LaunchConfigInput {
+    fn validate_partial(&self, launch_name: &str) -> anyhow::Result<()> {
+        if let Some(target) = &self.target {
+            validate_name("launch.target", target)?;
+        }
+        for (name, var) in &self.vars {
+            validate_name("launch var", name)?;
+            var.validate(launch_name, name)?;
+        }
+        let allowed = self.allowed_template_vars();
+        let allowed_refs = allowed.iter().map(String::as_str).collect::<Vec<_>>();
+        if let Some(cwd) = &self.cwd {
+            validate_partial_launch_template("launch.cwd", cwd, &allowed_refs)?;
+        }
+        validate_partial_launch_env_map("launch.env", &self.env, &allowed_refs)?;
+        if let Some(command) = &self.command {
+            validate_command("launch.command", command)?;
+            validate_partial_launch_command_templates("launch.command", command, &allowed_refs)?;
+        }
+        let mut step_names = BTreeSet::new();
+        for step in &self.steps {
+            step.validate_partial(launch_name, &allowed_refs)?;
+            if !step_names.insert(step.name.clone()) {
+                anyhow::bail!(
+                    "launch {launch_name:?} defines duplicate step {:?}",
+                    step.name
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn allowed_template_vars(&self) -> Vec<String> {
+        let mut allowed = LAUNCH_TEMPLATE_BUILTINS
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        allowed.extend(self.vars.keys().map(|name| format!("var.{name}")));
+        allowed
+    }
+
     fn overlay(mut self, later: &Self) -> anyhow::Result<Self> {
         if let Some(target) = &later.target {
             self.target = Some(target.clone());
@@ -580,6 +622,26 @@ pub struct LaunchStep {
 }
 
 impl LaunchStep {
+    fn validate_partial(&self, launch_name: &str, allowed: &[&str]) -> anyhow::Result<()> {
+        validate_name("launch step", &self.name)?;
+        if self.phase != LaunchStepPhase::PostReady {
+            anyhow::bail!(
+                "launch {launch_name:?} step {:?} only supports phase = \"post_ready\"",
+                self.name
+            );
+        }
+        validate_command("launch.steps.command", &self.command)?;
+        validate_partial_launch_command_templates("launch.steps.command", &self.command, allowed)?;
+        if let Some(cwd) = &self.cwd {
+            validate_partial_launch_template("launch.steps.cwd", cwd, allowed)?;
+        }
+        validate_partial_launch_env_map("launch.steps.env", &self.env, allowed)?;
+        if let Some(timeout) = &self.timeout {
+            parse_duration(timeout)?;
+        }
+        Ok(())
+    }
+
     fn validate(&self, launch_name: &str, allowed: &[&str]) -> anyhow::Result<()> {
         validate_name("launch step", &self.name)?;
         if self.phase != LaunchStepPhase::PostReady {
@@ -859,6 +921,30 @@ impl WorkspaceConfigInput {
             state_dir: self.state_dir.unwrap_or_else(default_workspace_state_dir),
             cleanup: self.cleanup.unwrap_or_default(),
         }
+    }
+
+    fn validate_partial(&self, target_name: &str) -> anyhow::Result<()> {
+        if let Some(path) = &self.path {
+            if path.trim().is_empty() {
+                anyhow::bail!("target {target_name:?} workspace.path must not be empty");
+            }
+            validate_template(
+                "target.workspace.path",
+                path,
+                TARGET_WORKSPACE_TEMPLATE_VARS,
+            )?;
+        }
+        if let Some(state_dir) = &self.state_dir {
+            if state_dir.trim().is_empty() {
+                anyhow::bail!("target {target_name:?} workspace.state_dir must not be empty");
+            }
+            validate_template(
+                "target.workspace.state_dir",
+                state_dir,
+                GATEWAY_TEMPLATE_VARS_NO_PID,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -1189,6 +1275,49 @@ impl TargetConfigInput {
     }
 
     fn validate_partial(&self, target_name: &str) -> anyhow::Result<()> {
+        if let Some(image) = &self.image
+            && image.trim().is_empty()
+        {
+            anyhow::bail!("target {target_name:?} image is required");
+        }
+        if let Some(name) = &self.name {
+            validate_template("target.name", name, &["image_slug"])?;
+        }
+        if let Some(ephemeral_name) = &self.ephemeral_name {
+            validate_template(
+                "target.ephemeral_name",
+                ephemeral_name,
+                &["image_slug", "session_id"],
+            )?;
+        }
+        if let Some(workspace) = &self.workspace {
+            workspace.validate_partial(target_name)?;
+        }
+        if let Some(runtime) = &self.runtime {
+            runtime.validate_partial(target_name)?;
+        }
+        if let Some(identity) = &self.identity {
+            identity.validate_partial(target_name)?;
+        }
+        if let Some(container_user) = &self.container_user {
+            validate_name("target.container_user", container_user)?;
+        }
+        if let Some(container_home) = &self.container_home
+            && !container_home.is_absolute()
+        {
+            anyhow::bail!("target {target_name:?} container_home must be absolute");
+        }
+        validate_env_map("target.container_env", &self.container_env)?;
+        validate_env_map("target.session_env", &self.session_env)?;
+        for mount in &self.container_mounts {
+            mount.validate()?;
+        }
+        if let Some(idle_cleanup) = &self.idle_cleanup {
+            idle_cleanup.clone().into_effective()?;
+        }
+        if let Some(local_ssh) = &self.local_ssh {
+            local_ssh.validate_partial()?;
+        }
         validate_raw_target_steps(
             target_name,
             "lifecycle_steps",
@@ -1216,6 +1345,9 @@ impl TargetConfigInput {
         }
         if let Some(container_bootstrap) = &self.container_bootstrap {
             container_bootstrap.validate(target_name)?;
+        }
+        if let Some(container_agent) = &self.container_agent {
+            container_agent.validate_partial()?;
         }
         Ok(())
     }
@@ -1716,6 +1848,16 @@ impl TargetRuntimeConfigInput {
             extra_run_args: self.extra_run_args.unwrap_or_default(),
         }
     }
+
+    fn validate_partial(&self, target_name: &str) -> anyhow::Result<()> {
+        if let Some(extra_run_args) = &self.extra_run_args {
+            TargetRuntimeConfig {
+                extra_run_args: extra_run_args.clone(),
+            }
+            .validate(target_name)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1731,6 +1873,19 @@ pub struct TargetIdentityConfig {
 
 impl TargetIdentityConfig {
     fn validate(&self, target_name: &str) -> anyhow::Result<()> {
+        self.validate_partial(target_name)?;
+        if let Some(session_user) = &self.session_user
+            && !session_user.contains('{')
+            && (self.session_uid.is_none() || self.session_gid.is_none())
+        {
+            anyhow::bail!(
+                "target {target_name:?} identity with literal session_user requires explicit session_uid and session_gid"
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_partial(&self, target_name: &str) -> anyhow::Result<()> {
         for (field, value) in [
             ("bootstrap_user", &self.bootstrap_user),
             ("session_user", &self.session_user),
@@ -1750,14 +1905,6 @@ impl TargetIdentityConfig {
                 value,
                 IDENTITY_TEMPLATE_VARS,
             )?;
-        }
-        if let Some(session_user) = &self.session_user
-            && !session_user.contains('{')
-            && (self.session_uid.is_none() || self.session_gid.is_none())
-        {
-            anyhow::bail!(
-                "target {target_name:?} identity with literal session_user requires explicit session_uid and session_gid"
-            );
         }
         Ok(())
     }
@@ -2004,6 +2151,16 @@ impl LocalSshConfigInput {
             host: self.host.unwrap_or_else(default_listen_host),
             port: self.port,
         }
+    }
+
+    fn validate_partial(&self) -> anyhow::Result<()> {
+        if let Some(host) = &self.host
+            && host != "127.0.0.1"
+            && host != "::1"
+        {
+            anyhow::bail!("local_ssh listen host must be loopback-only");
+        }
+        Ok(())
     }
 }
 
@@ -2734,6 +2891,44 @@ impl ContainerAgentConfigInput {
         cfg.validate_gateway()?;
         Ok(cfg)
     }
+
+    fn validate_partial(&self) -> anyhow::Result<()> {
+        let mut names = BTreeSet::new();
+        for service in &self.services {
+            service.validate()?;
+            if !names.insert(service.name.clone()) {
+                anyhow::bail!("duplicate container_agent service {:?}", service.name);
+            }
+        }
+        for service in &self.services {
+            for dep in &service.depends_on {
+                if !names.contains(dep) {
+                    anyhow::bail!(
+                        "service {:?} depends on unknown service {:?}",
+                        service.name,
+                        dep
+                    );
+                }
+            }
+        }
+        validate_service_dependency_graph(&self.services)?;
+        if let Some(ssh_bridge) = &self.ssh_bridge {
+            ssh_bridge.validate_partial_gateway()?;
+        }
+        if self
+            .control_socket
+            .as_ref()
+            .is_some_and(|control_socket| matches!(control_socket, ControlSocketConfig::Path(_)))
+        {
+            anyhow::bail!(
+                "container_agent.control_socket path values are managed by control_sockets.container_dir in gateway config; use false to disable the control socket"
+            );
+        }
+        if let Some(idle_cleanup) = &self.idle_cleanup {
+            idle_cleanup.clone().into_effective()?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -3126,6 +3321,26 @@ impl SshBridgeConfigInput {
             target: self.target.unwrap_or_else(default_bridge_target),
             mode: self.mode.unwrap_or_else(default_socket_mode),
         }
+    }
+
+    fn validate_partial_gateway(&self) -> anyhow::Result<()> {
+        if self.socket.is_some() {
+            anyhow::bail!(
+                "container_agent.ssh_bridge.socket is managed by control_sockets.container_dir in gateway config"
+            );
+        }
+        if let Some(mode) = &self.mode {
+            let mode = parse_socket_mode(mode)?;
+            if mode != 0o600 {
+                anyhow::bail!("ssh_bridge mode currently supports only 0600");
+            }
+        }
+        if let Some(target) = &self.target
+            && !target.contains(':')
+        {
+            anyhow::bail!("ssh_bridge target must be host:port");
+        }
+        Ok(())
     }
 }
 
@@ -3594,6 +3809,38 @@ fn validate_command_templates(
     Ok(())
 }
 
+fn validate_partial_launch_template(
+    field: &str,
+    value: &str,
+    allowed: &[&str],
+) -> anyhow::Result<()> {
+    for key in template::referenced_keys(value).with_context(|| format!("validate {field}"))? {
+        if allowed.contains(&key) {
+            continue;
+        }
+        if let Some(var_name) = key.strip_prefix("var.") {
+            validate_name("launch var", var_name).with_context(|| format!("validate {field}"))?;
+            continue;
+        }
+        return Err(anyhow::anyhow!(
+            "unknown interpolation variable {{{key}}} in {value:?}"
+        ))
+        .with_context(|| format!("validate {field}"));
+    }
+    Ok(())
+}
+
+fn validate_partial_launch_command_templates(
+    field: &str,
+    command: &[String],
+    allowed: &[&str],
+) -> anyhow::Result<()> {
+    for arg in command {
+        validate_partial_launch_template(field, arg, allowed)?;
+    }
+    Ok(())
+}
+
 fn validate_command(field: &str, command: &[String]) -> anyhow::Result<()> {
     if command.is_empty() {
         anyhow::bail!("{field} command must not be empty");
@@ -3649,6 +3896,18 @@ fn validate_env_keyed_template_map(
     for (key, value) in env {
         validate_env_key(key)?;
         validate_template(&format!("{field}.{key}"), value, allowed)?;
+    }
+    Ok(())
+}
+
+fn validate_partial_launch_env_map(
+    field: &str,
+    env: &BTreeMap<String, String>,
+    allowed: &[&str],
+) -> anyhow::Result<()> {
+    for (key, value) in env {
+        validate_env_key(key)?;
+        validate_partial_launch_template(&format!("{field}.{key}"), value, allowed)?;
     }
     Ok(())
 }
@@ -5355,6 +5614,33 @@ name = "{image_slug}"
     }
 
     #[test]
+    fn target_defaults_validate_present_fields_before_overlay() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+default_target = "default"
+
+[target_defaults]
+image = "scratch/dev"
+name = "scratch-dev"
+
+[target_defaults.workspace]
+path = "{bad}"
+
+[targets.default]
+
+[targets.default.workspace]
+path = "workspace"
+"#,
+        )
+        .unwrap();
+
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("unknown interpolation variable"), "{err}");
+        assert!(err.contains("target.workspace.path"), "{err}");
+    }
+
+    #[test]
     fn root_only_rejects_target_shaped_sections_at_root() {
         for config in [
             r#"schema_version = "1"
@@ -5568,6 +5854,30 @@ command = ["true"]
         .unwrap();
         let err = format!("{:#}", cfg.validate().unwrap_err());
         assert!(err.contains("target is required after defaults"), "{err}");
+    }
+
+    #[test]
+    fn launch_defaults_validate_present_fields_without_launches() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+default_target = "default"
+
+[target_defaults]
+image = "scratch/dev"
+name = "scratch-dev"
+
+[targets.default]
+
+[launch_defaults.vars."bad name"]
+type = "string"
+"#,
+        )
+        .unwrap();
+
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("launch var"), "{err}");
+        assert!(err.contains("bad name"), "{err}");
     }
 
     #[test]
