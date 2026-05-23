@@ -444,7 +444,7 @@ Gateway configs commonly include:
   Set `sftp = "deny"` to block SFTP and modern OpenSSH SCP. Set
   `legacy_scp = "deny"`, `"inbound"`, or `"outbound"` to control legacy
   `scp -t`/`scp -f` server mode through the container-side command filter.
-  A target may replace the full transfer table with
+  A target may overlay individual transfer fields with
   `[targets.<name>.container_ssh.transfer]`.
 - `[target_defaults.container_agent]`: optional in-container supervision and SSH bridge
   support.
@@ -504,8 +504,8 @@ sftp = "allow"        # allow | deny
 legacy_scp = "allow"  # allow | deny | inbound | outbound
 ```
 
-Target transfer policy replaces the full default transfer table for that
-target, so every transfer field must be specified:
+Target transfer policy overlays the default transfer table field-by-field, so
+set only the fields that differ for that target:
 
 ```toml
 [targets.internal.container_ssh.transfer]
@@ -589,6 +589,32 @@ required = true
 timeout = "5m"
 cwd = "{container_home}"
 command = ["git", "clone", "--branch", "{var.branch}", "--single-branch", "{var.repo}", "repo"]
+```
+
+Common launch behavior can be factored into `[launch_defaults]`. Defaults use
+the same partial launch shape as concrete launches: scalar fields such as
+`target`, `cwd`, `description`, and `command` are replaced by a concrete
+launch, `env` and `vars` merge by key, and `steps` merge by `name`.
+
+```toml
+[launch_defaults]
+target = "default"
+cwd = "{container_home}"
+env = { CODEX_HOME = "{container_home}/.codex" }
+
+[launch_defaults.vars]
+repo = { type = "string", required = true, description = "Git repository URL" }
+
+[[launch_defaults.steps]]
+phase = "post_ready"
+location = "container"
+name = "prepare"
+command = ["mkdir", "-p", "{container_home}/repo"]
+
+[launches.repo-shell]
+description = "Clone a repository and open a shell."
+cwd = "{container_home}/repo"
+command = ["/bin/bash", "-lc", "exec /bin/bash"]
 ```
 
 Supported variable types are `string`, `enum`, `boolean`, and `number`.
@@ -678,10 +704,11 @@ bidirectional protocol channel rather than separate upload/download server
 commands.
 
 `target_defaults.container_ssh.transfer` only applies to traffic that
-traverses the container SSHD. Gateway actions such as `run` execute through the host container runtime,
-so they do not pass through the container SSHD `ForceCommand` and are not
-controlled by SFTP/SCP transfer policy. Host-gateway SSH dispatch checks the
-default transfer table before dispatch; per-target transfer overrides apply to
+traverses the container SSHD. Gateway actions such as `run` execute through the
+host container runtime, so they do not pass through the container SSHD
+`ForceCommand` and are not controlled by SFTP/SCP transfer policy.
+Host-gateway SSH dispatch checks the default transfer table before dispatch;
+per-target transfer overrides do not relax that host-side gate and only affect
 direct container-SSHD access. If a deployment intends to expose management-only
 SSH commands without arbitrary container exec, omit `run` from
 `ssh_dispatch.enabled_gateway_actions`; omit `launch` if users should not start

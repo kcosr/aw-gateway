@@ -163,12 +163,7 @@ async fn dispatch_from_ssh(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         anyhow::bail!("SSH_ORIGINAL_COMMAND exceeds {MAX_SSH_ORIGINAL_COMMAND_BYTES} bytes");
     }
     if let Some(command) = original.as_deref() {
-        let user = UserContext::current()?;
-        let selection = client::read_default_selection(&user)
-            .transpose()?
-            .unwrap_or_else(|| cfg.default_target.clone());
-        let target_name = client::resolve_target_selection(&cfg, Some(&selection))?;
-        let transfer = cfg.effective_target(&target_name)?.container_ssh.transfer;
+        let transfer = cfg.effective_container_ssh_defaults()?.transfer;
         if let Some(direction) = legacy_scp_server_direction(command)
             && !legacy_scp_mode_allows(transfer.legacy_scp, direction)
         {

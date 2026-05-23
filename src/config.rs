@@ -192,6 +192,14 @@ impl GatewayConfig {
             .into_effective())
     }
 
+    pub fn effective_container_ssh_defaults(&self) -> anyhow::Result<ContainerSshConfig> {
+        TargetConfigInput::builtin_defaults()
+            .overlay(&self.target_defaults)?
+            .container_ssh
+            .unwrap_or_default()
+            .to_effective_config()
+    }
+
     pub fn effective_launches(&self) -> anyhow::Result<BTreeMap<String, LaunchConfig>> {
         let targets = self.effective_targets()?;
         self.launches

@@ -849,6 +849,42 @@ fn ssh_dispatch_rejects_host_side_transfer_commands_when_policy_disallows_them()
 }
 
 #[test]
+fn ssh_dispatch_transfer_gate_uses_defaults_not_user_default_target_override() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    let workspace = dir.path().join("workspace");
+    let home = dir.path().join("home");
+    let sample = gateway_sample_for_test(&dir, &workspace)
+        .replace("sftp = \"allow\"", "sftp = \"deny\"")
+        .replace("legacy_scp = \"allow\"", "legacy_scp = \"deny\"")
+        + r#"
+
+[targets.permissive]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "ubuntu-dev-permissive"
+
+[targets.permissive.container_ssh.transfer]
+sftp = "allow"
+legacy_scp = "allow"
+"#;
+    std::fs::write(&config, sample).unwrap();
+    let default_dir = home.join(".config/aw-gateway");
+    std::fs::create_dir_all(&default_dir).unwrap();
+    std::fs::write(default_dir.join("default-target"), "permissive\n").unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .env("SSH_ORIGINAL_COMMAND", "internal-sftp")
+        .env("AW_GATEWAY_TEST_HOME", &home)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("sftp is not allowed"));
+}
+
+#[test]
 fn ssh_dispatch_accepts_session_id_forms_before_runtime_validation() {
     let dir = tempdir().unwrap();
     let config = dir.path().join("gateway.toml");
