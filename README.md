@@ -50,7 +50,7 @@ bridge.
   client configuration.
 - SSH-compatible attach for interactive shells, direct commands, SCP, SFTP,
   and gateway management actions.
-- Optional JSON HTTP API for status, target, readiness, launch, and run
+- Optional JSON HTTP API for status, targets, readiness, launch, and run
   automation.
 - Container lifecycle management for fixed and ephemeral targets.
 - Runtime support for Podman, Docker, and Colima.

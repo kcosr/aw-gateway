@@ -1,14 +1,17 @@
 # aw-gateway Agent Instructions
 
 This repository contains `aw-gateway`, a gateway for disposable or reusable
-container workspaces that users access through SSH-compatible clients.
+container workspaces exposed through the host CLI, SSH-compatible clients, and
+an optional JSON HTTP API.
 
 ## What This Repo Is
 
 `aw-gateway` is a Rust gateway for disposable or reusable container workspaces.
-It uses SSH as the user-facing interface, starts or reuses a configured
-container target, supervises in-container services, and bridges SSH-compatible
-clients to container-local SSH instead of the host shell or host filesystem.
+It starts or reuses a configured container target, supervises in-container
+services, exposes lifecycle and command operations through the host CLI and
+optional JSON HTTP API, and uses SSH-compatible clients as the standard
+interactive attach path to container-local SSH instead of the host shell or
+host filesystem.
 
 ## Fast Bootstrap
 
@@ -38,8 +41,9 @@ clients to container-local SSH instead of the host shell or host filesystem.
 - `src/config.rs` owns TOML schema and validation.
 - `src/gateway.rs` owns host-side CLI dispatch and lifecycle orchestration.
 - `src/gateway/` contains focused gateway support modules for client config,
-  file utilities, health checks, identity/key handling, listener proxying,
-  status models, and session marker state.
+  file utilities, health checks, HTTP API surface, identity/key handling,
+  listener proxying, shared operation dispatch, status models, and session
+  marker state.
 - `src/agent.rs` owns in-container service supervision and socket APIs.
 - `src/ssh_dispatch.rs` owns `SSH_ORIGINAL_COMMAND` parsing.
 - `src/runtime.rs` owns Podman, Docker, and Colima command construction.
