@@ -1,11 +1,19 @@
 use super::model::{
     AllStatusEntry, GatewayStatus, LaunchDetail, LaunchSummary, ReadyStatus, TargetEntry,
 };
+use super::{
+    Runtime, client, launch_detail, launch_execute_with_config, launch_summaries, load_config,
+    run_container_command_with_runtime, status_all_entries, target_entries,
+};
 use crate::cli::{
     ClientConfigArgs, LaunchShowArgs, LaunchesArgs, RunArgs, SetDefaultArgs, StatusArg, StopArgs,
-    TargetArg, TargetsArgs, UpArgs,
+    TargetArg, TargetsArgs,
 };
+use crate::config::LocalSshMode;
+use crate::paths::{self, UserContext};
+use crate::runtime::ContainerRuntime;
 use crate::ssh_dispatch::{GatewayAction, RunAction, StatusAction};
+use anyhow::Context;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,13 +120,6 @@ impl GatewayOperation {
                 target: args.target,
                 session_id: args.session_id,
             }
-        }
-    }
-
-    pub(super) fn from_up_args(args: UpArgs) -> Self {
-        Self::Up {
-            target: args.target,
-            session_id: args.session_id,
         }
     }
 
@@ -240,6 +241,248 @@ impl GatewayOperation {
             }
         }
     }
+}
+
+pub(super) async fn execute_gateway_operation(
+    config_path: Option<PathBuf>,
+    operation: GatewayOperation,
+) -> anyhow::Result<GatewayOperationResult> {
+    match operation {
+        GatewayOperation::Targets => {
+            let cfg = load_config(config_path)?;
+            Ok(GatewayOperationResult::Targets(target_entries(&cfg)?))
+        }
+        GatewayOperation::Status { target, session_id } => Ok(GatewayOperationResult::Status(
+            operation_status(config_path, target, session_id).await?,
+        )),
+        GatewayOperation::StatusAll => Ok(GatewayOperationResult::StatusAll(
+            operation_status_all(config_path).await?,
+        )),
+        GatewayOperation::Up { target, session_id } => Ok(GatewayOperationResult::Up(
+            operation_up(config_path, target, session_id).await?,
+        )),
+        GatewayOperation::Run {
+            target,
+            session_id,
+            cwd,
+            command,
+        } => Ok(GatewayOperationResult::Run(
+            operation_run(config_path, target, session_id, cwd, command).await?,
+        )),
+        GatewayOperation::Launches => {
+            let cfg = load_config(config_path)?;
+            Ok(GatewayOperationResult::Launches(launch_summaries(&cfg)?))
+        }
+        GatewayOperation::LaunchShow { name } => {
+            let cfg = load_config(config_path)?;
+            let launch = cfg.effective_launch(&name)?;
+            Ok(GatewayOperationResult::LaunchShow(launch_detail(
+                &name, &launch,
+            )))
+        }
+        GatewayOperation::Launch {
+            name,
+            session_id,
+            vars,
+        } => {
+            let cfg = load_config(config_path)?;
+            Ok(GatewayOperationResult::Launch(
+                launch_execute_with_config(cfg, &name, session_id, vars).await?,
+            ))
+        }
+        GatewayOperation::Stop { target, session_id } => Ok(GatewayOperationResult::Stop(
+            operation_stop(config_path, target, session_id).await?,
+        )),
+        GatewayOperation::Remove { target } => Ok(GatewayOperationResult::Remove(
+            operation_remove(config_path, target).await?,
+        )),
+        GatewayOperation::SetDefault { target_or_image } => {
+            Ok(GatewayOperationResult::DefaultSelection(
+                operation_set_default(config_path, target_or_image)?,
+            ))
+        }
+        GatewayOperation::ShowDefault => Ok(GatewayOperationResult::DefaultSelection(
+            operation_show_default(config_path)?,
+        )),
+        GatewayOperation::ResetDefault => Ok(GatewayOperationResult::DefaultSelection(
+            operation_reset_default(config_path)?,
+        )),
+        GatewayOperation::ClientConfig {
+            target,
+            identity_file,
+        } => {
+            let (rendered, written_path) =
+                operation_client_config(config_path, target, identity_file).await?;
+            Ok(GatewayOperationResult::ClientConfig {
+                rendered,
+                written_path: Some(written_path),
+            })
+        }
+    }
+}
+
+async fn operation_run(
+    config_path: Option<PathBuf>,
+    target: Option<String>,
+    session_id: Option<String>,
+    cwd: Option<String>,
+    command: Vec<String>,
+) -> anyhow::Result<ExecutionOutcome> {
+    let runtime = Runtime::load(config_path, target.as_deref(), session_id, true).await?;
+    run_container_command_with_runtime(runtime, cwd, command).await
+}
+
+fn operation_set_default(
+    config_path: Option<PathBuf>,
+    target_or_image: String,
+) -> anyhow::Result<String> {
+    let cfg = load_config(config_path)?;
+    let user = UserContext::current()?;
+    let _ = client::resolve_target_selection(&cfg, Some(&target_or_image))
+        .with_context(|| format!("validate default selection {target_or_image:?}"))?;
+    paths::ensure_private_dir(&user.config_dir())?;
+    let path = user.config_dir().join("default-target");
+    std::fs::write(&path, format!("{target_or_image}\n"))?;
+    Ok(target_or_image)
+}
+
+fn operation_show_default(config_path: Option<PathBuf>) -> anyhow::Result<String> {
+    let cfg = load_config(config_path)?;
+    let user = UserContext::current()?;
+    let selection = client::read_default_selection(&user)
+        .transpose()?
+        .unwrap_or_else(|| client::configured_default_display(&cfg));
+    let _ = client::resolve_target_selection(&cfg, Some(&selection))
+        .with_context(|| format!("validate default selection {selection:?}"))?;
+    Ok(selection)
+}
+
+fn operation_reset_default(config_path: Option<PathBuf>) -> anyhow::Result<String> {
+    let cfg = load_config(config_path)?;
+    let user = UserContext::current()?;
+    let path = user.config_dir().join("default-target");
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("remove {}", path.display())),
+    }
+    Ok(client::configured_default_display(&cfg))
+}
+
+async fn operation_client_config(
+    config_path: Option<PathBuf>,
+    target: Option<String>,
+    identity_file: Option<PathBuf>,
+) -> anyhow::Result<(String, PathBuf)> {
+    let runtime = Runtime::load(config_path, target.as_deref(), None, false).await?;
+    let config = runtime.render_client_config(identity_file.as_deref())?;
+    let written_path = runtime.write_inner_config(&config)?;
+    Ok((config, written_path))
+}
+
+async fn operation_up(
+    config_path: Option<PathBuf>,
+    target: Option<String>,
+    session_id: Option<String>,
+) -> anyhow::Result<ReadyStatus> {
+    let runtime = Runtime::load(config_path, target.as_deref(), session_id, true).await?;
+    operation_up_with_runtime(runtime).await
+}
+
+pub(super) async fn operation_up_with_runtime(runtime: Runtime) -> anyhow::Result<ReadyStatus> {
+    if let Some(local_ssh) = &runtime.target.local_ssh
+        && local_ssh.mode == LocalSshMode::Listen
+    {
+        anyhow::bail!(
+            "gateway action \"up\" over SSH is not supported for local_ssh.mode = \"listen\" targets; use connect or run aw-gateway up locally"
+        );
+    }
+    runtime.ensure_ready().await
+}
+
+async fn operation_stop(
+    config_path: Option<PathBuf>,
+    target: Option<String>,
+    session_id: Option<String>,
+) -> anyhow::Result<StopResult> {
+    let runtime = Runtime::load(config_path, target.as_deref(), session_id, false).await?;
+    let _lock = runtime.acquire_lifecycle_lock().await?;
+    let Some(inspect) = runtime
+        .container_runtime
+        .inspect(&runtime.container_name)
+        .await?
+    else {
+        return Ok(StopResult {
+            container: runtime.container_name,
+            stopped: false,
+        });
+    };
+    runtime.stop_inspected_container(&inspect).await?;
+    Ok(StopResult {
+        container: runtime.container_name,
+        stopped: true,
+    })
+}
+
+async fn operation_remove(
+    config_path: Option<PathBuf>,
+    target: Option<String>,
+) -> anyhow::Result<RemoveResult> {
+    let runtime = Runtime::load(config_path, target.as_deref(), None, false).await?;
+    let _lock = runtime.acquire_lifecycle_lock().await?;
+    let Some(inspect) = runtime
+        .container_runtime
+        .inspect(&runtime.container_name)
+        .await?
+    else {
+        runtime.cleanup_control_socket_dir();
+        return Ok(RemoveResult {
+            container: runtime.container_name,
+            removed: false,
+        });
+    };
+    runtime.validate_labels(&inspect)?;
+    let was_running = inspect.state.running;
+    if inspect.state.running {
+        runtime.stop_inspected_container(&inspect).await?;
+    }
+    if let Some(current) = runtime
+        .container_runtime
+        .inspect(&runtime.container_name)
+        .await?
+    {
+        runtime.validate_labels(&current)?;
+        runtime
+            .container_runtime
+            .rm(&runtime.container_name)
+            .await?;
+    }
+    if !was_running {
+        runtime.cleanup_control_socket_dir();
+    }
+    Ok(RemoveResult {
+        container: runtime.container_name,
+        removed: true,
+    })
+}
+
+async fn operation_status(
+    config_path: Option<PathBuf>,
+    target: Option<String>,
+    session_id: Option<String>,
+) -> anyhow::Result<GatewayStatus> {
+    let runtime = Runtime::load(config_path, target.as_deref(), session_id, false).await?;
+    runtime.status().await
+}
+
+async fn operation_status_all(config_path: Option<PathBuf>) -> anyhow::Result<Vec<AllStatusEntry>> {
+    let cfg = load_config(config_path)?;
+    let user = UserContext::current()?;
+    let container_runtime = ContainerRuntime::from_config(&cfg.runtime, &user.user, &user.home)?;
+    let containers = container_runtime
+        .list_managed_containers(&user.user, user.uid)
+        .await?;
+    Ok(status_all_entries(&cfg, containers))
 }
 
 #[cfg(test)]
