@@ -1,14 +1,17 @@
 # Agent Workspaces Gateway
 
-`aw-gateway` is a convenience utility for managing disposable or reusable
-container workspaces. Users can work normally inside the workspace, while
-operators keep the host filesystem out of reach and attach policy hooks around
-the container, especially at the container network layer.
+`aw-gateway` is a gateway for disposable or reusable container workspaces. It
+starts or reuses configured containers, supervises required in-container
+services, and exposes workspace operations through the host CLI,
+SSH-compatible clients, and an optional JSON HTTP API. Users can work normally
+inside the workspace, while operators keep the host filesystem out of reach and
+attach policy hooks around the container, especially at the container network
+layer.
 
-The gateway uses SSH as the standard interface into those sandboxes. It starts
-or reuses a configured container, supervises required in-container services,
-and connects SSH/SCP/SFTP clients to container-local SSH instead of to the host
-shell or host filesystem.
+SSH remains the standard interactive attach path: OpenSSH, SCP, SFTP, and
+desktop tools connect to container-local SSH instead of to the host shell or
+host filesystem. The CLI and HTTP API expose the same managed lifecycle and
+operation model for automation and non-interactive integrations.
 
 It is a standalone gateway for managed hosts and local workstation profiles
 that use Podman, Docker, or Colima.
@@ -31,18 +34,24 @@ such as autonomous coding agents or untrusted build steps, and should feel like
 a normal development box without reaching the host filesystem or unrestricted
 network.
 
-Standard development tools still need a familiar connection model. OpenSSH,
-SCP, SFTP, and desktop tools like VS Code, Codex, and Claude Code all know how
-to talk SSH, so `aw-gateway` provides an SSH bridge into the
-sandbox. On managed hosts, host SSHD authenticates the user and starts
-`aw-gateway`; the gateway prepares the target container, waits for required
-services, and connects the client to the container-local SSH daemon through a
-controlled bridge.
+Standard development tools still need a familiar interactive connection model.
+OpenSSH, SCP, SFTP, and desktop tools like VS Code, Codex, and Claude Code all
+know how to talk SSH, so `aw-gateway` provides an SSH bridge into the sandbox.
+Automation needs a stable control surface too, so the same gateway operations
+are available from the host CLI and, when enabled, the JSON HTTP API. On
+managed hosts, host SSHD authenticates the user and starts `aw-gateway`; the
+gateway prepares the target container, waits for required services, and
+connects the client to the container-local SSH daemon through a controlled
+bridge.
 
 ## Features
 
-- Host-side SSH dispatch for interactive shells, direct commands, and gateway
-  management actions.
+- Host-side CLI for target lifecycle, status, launches, run commands, and
+  client configuration.
+- SSH-compatible attach for interactive shells, direct commands, SCP, SFTP,
+  and gateway management actions.
+- Optional JSON HTTP API for status, target, readiness, launch, and run
+  automation.
 - Container lifecycle management for fixed and ephemeral targets.
 - Runtime support for Podman, Docker, and Colima.
 - Config-driven lifecycle steps before container start and host steps after
@@ -59,7 +68,7 @@ controlled bridge.
   services.
 - Optional idle cleanup that can stop a container or reap non-preserved
   processes after the last gateway session exits.
-- Protocol-safe logging for SSH proxy modes and rotating JSON logs for
+- Protocol-safe logging for proxy modes and rotating JSON logs for
   diagnostics.
 
 ## Lifecycle Diagrams
@@ -186,8 +195,8 @@ sequenceDiagram
 
 This repository builds four binaries:
 
-- `aw-gateway`: host-side CLI, SSH dispatcher, runtime lifecycle manager, and
-  client-config generator.
+- `aw-gateway`: host-side CLI, SSH dispatcher, optional HTTP API daemon,
+  runtime lifecycle manager, and client-config generator.
 - `aw-container-bootstrap`: optional in-container bootstrap entrypoint that
   prepares identity/state and then execs the agent.
 - `aw-container-agent`: container-side supervisor, control socket, service
