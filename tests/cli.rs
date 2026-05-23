@@ -91,13 +91,13 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[[lifecycle_steps]]
+[[target_defaults.lifecycle_steps]]
 phase = "pre_start"
 name = "prep"
 command = ["/bin/true"]
 timeout = "250ms"
 
-[[host_steps]]
+[[target_defaults.host_steps]]
 name = "firewall"
 command = ["/bin/true"]
 timeout = "1m"
@@ -124,7 +124,7 @@ fn gateway_config_validate_accepts_control_socket_overrides() {
         r#"
 schema_version = "1"
 
-[control_sockets]
+[target_defaults.control_sockets]
 host_dir = "/tmp/aw-gateway/{runtime_id}"
 container_dir = "/run/global-aw"
 
@@ -164,8 +164,10 @@ image = "ubuntu/dev"
 mode = "ephemeral"
 ephemeral_name = "worker-{session_id}"
 stop_when_idle = true
-workspace = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
-workspace_cleanup = "always"
+
+[targets.default.workspace]
+path = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
+cleanup = "always"
 
 [targets.default.idle_cleanup]
 owner = "gateway"
@@ -200,14 +202,14 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 "#,
-            "container_agent.control_socket path values are managed by control_sockets.container_dir",
+            "unknown field `container_agent`",
         ),
         (
             "ssh-bridge.toml",
             r#"
 schema_version = "1"
 
-[container_agent.ssh_bridge]
+[target_defaults.container_agent.ssh_bridge]
 enabled = true
 socket = "/run/aw-gateway/ssh.sock"
 target = "127.0.0.1:22"

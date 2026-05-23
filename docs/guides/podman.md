@@ -142,7 +142,7 @@ podman build \
 ## Container SSH Files
 
 Full file: `examples/podman/start-container-sshd`. The helper copies the
-mounted base SSHD config to a runtime file, applies `[container_ssh]` transfer
+mounted base SSHD config to a runtime file, applies `[target_defaults.container_ssh]` transfer
 policy, validates it with `sshd -t`, and starts container `sshd`.
 
 Full file: `examples/podman/sshd_config_agent`
@@ -196,7 +196,7 @@ max_bytes = 104857600
 max_files = 5
 console = false
 
-[workspace]
+[target_defaults.workspace]
 path = "workspace"
 state_dir = ".aw-gateway"
 
@@ -250,50 +250,50 @@ preserve_processes = ["tmux", "screen"]
 poll_interval = "30s"
 shutdown_timeout = "20s"
 
-[[lifecycle_steps]]
+[[target_defaults.lifecycle_steps]]
 phase = "pre_start"
 name = "ensure-workspace"
 required = true
 command = ["/usr/bin/mkdir", "-p", "{workspace}"]
 
-[[container_mounts]]
+[[target_defaults.container_mounts]]
 source = "/opt/aw-gateway/runtime/linux/aw-container-bootstrap"
 target = "/opt/aw-gateway/bin/aw-container-bootstrap"
 mode = "ro"
 
-[[container_mounts]]
+[[target_defaults.container_mounts]]
 source = "/opt/aw-gateway/runtime/linux/aw-container-agent"
 target = "/opt/aw-gateway/bin/aw-container-agent"
 mode = "ro"
 
-[[container_mounts]]
+[[target_defaults.container_mounts]]
 source = "/opt/aw-gateway/runtime/linux/aw-ssh-command-filter"
 target = "/opt/aw-gateway/bin/aw-ssh-command-filter"
 mode = "ro"
 
-[[container_mounts]]
+[[target_defaults.container_mounts]]
 source = "/opt/aw-gateway/runtime/linux/start-container-sshd"
 target = "/opt/aw-gateway/bin/start-container-sshd"
 mode = "ro"
 
-[[container_mounts]]
+[[target_defaults.container_mounts]]
 source = "/opt/aw-gateway/runtime/linux/sshd_config_agent"
 target = "/etc/ssh/sshd_config_agent"
 mode = "ro"
 
-[container_bootstrap]
+[target_defaults.container_bootstrap]
 enabled = true
 entrypoint = "/opt/aw-gateway/bin/aw-container-bootstrap"
 agent_program = "/opt/aw-gateway/bin/aw-container-agent"
 
-[container_ssh.transfer]
+[target_defaults.container_ssh.transfer]
 sftp = "allow"
 legacy_scp = "allow"
 
-[container_agent]
+[target_defaults.container_agent]
 enabled = true
 
-[[container_agent.services]]
+[[target_defaults.container_agent.services]]
 name = "container-sshd"
 required = true
 user = "root"
@@ -301,14 +301,14 @@ command = ["/opt/aw-gateway/bin/start-container-sshd"]
 restart = "always"
 depends_on = []
 
-[container_agent.services.health_check]
+[target_defaults.container_agent.services.health_check]
 type = "tcp"
 host = "127.0.0.1"
 port = 22
 interval = "2s"
 timeout = "1s"
 
-[container_agent.ssh_bridge]
+[target_defaults.container_agent.ssh_bridge]
 enabled = true
 target = "127.0.0.1:22"
 mode = "0600"
@@ -494,13 +494,13 @@ If a deployment needs network policy, model it as a host step or bootstrap step
 that calls a site-managed script:
 
 ```toml
-[[host_steps]]
+[[target_defaults.host_steps]]
 name = "network-policy"
 required = true
 timeout = "30s"
 command = ["/opt/aw-gateway/bin/network-policy", "add", "{container_pid}"]
 
-[host_steps.health_check]
+[target_defaults.host_steps.health_check]
 type = "command"
 command = ["/opt/aw-gateway/bin/network-policy", "check", "{container_pid}"]
 ```

@@ -28,13 +28,13 @@ Use a required `host_steps` entry when a privileged host-side helper owns the
 rules:
 
 ```toml
-[[host_steps]]
+[[target_defaults.host_steps]]
 name = "network-policy"
 required = true
 timeout = "30s"
 command = ["/opt/aw-gateway/bin/container-firewall", "add", "{container_pid}"]
 
-[host_steps.health_check]
+[target_defaults.host_steps.health_check]
 type = "command"
 command = ["/opt/aw-gateway/bin/container-firewall", "check", "{container_pid}"]
 ```
@@ -51,7 +51,7 @@ Use a `container_bootstrap_steps` entry when the rules are intentionally
 container-owned:
 
 ```toml
-[[container_bootstrap_steps]]
+[[target_defaults.container_bootstrap_steps]]
 name = "container-firewall"
 required = true
 user = "root"

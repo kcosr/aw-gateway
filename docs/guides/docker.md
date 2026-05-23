@@ -117,7 +117,7 @@ docker build \
 ## Container SSH Files
 
 Full file: `examples/docker/start-container-sshd`. The helper copies the
-mounted base SSHD config to a runtime file, applies `[container_ssh]` transfer
+mounted base SSHD config to a runtime file, applies `[target_defaults.container_ssh]` transfer
 policy, validates it with `sshd -t`, and starts container `sshd`.
 
 Full file: `examples/docker/sshd_config_agent`

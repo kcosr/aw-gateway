@@ -181,7 +181,7 @@ docker build \
 ## Container SSH Files
 
 Full file: `examples/colima/start-container-sshd`. The helper copies the
-mounted base SSHD config to a runtime file, applies `[container_ssh]` transfer
+mounted base SSHD config to a runtime file, applies `[target_defaults.container_ssh]` transfer
 policy, validates it with `sshd -t`, and starts container `sshd`.
 
 Full file: `examples/colima/sshd_config_agent`
@@ -251,7 +251,7 @@ session_gid = "{gid}"
 session_home = "/home/{user}"
 session_shell = "/bin/bash"
 
-[container_agent]
+[target_defaults.container_agent]
 enabled = true
 control_socket = false
 ```
@@ -342,7 +342,7 @@ Durable conclusions kept here:
 - Match container-side binary architecture to the Colima VM architecture.
 - Prefer `published_port` for local SSH because host-visible Unix-domain socket
   paths do not naturally cross from macOS into the Colima VM.
-- Disable `container_agent.control_socket` for published-port `ssh_only`
+- Disable `target_defaults.container_agent.control_socket` for published-port `ssh_only`
   targets unless another host-visible control channel is configured.
 - Keep persistent workspace and gateway state under a user-owned local root.
 

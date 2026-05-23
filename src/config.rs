@@ -24,31 +24,17 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
-    pub workspace: WorkspaceConfig,
-    #[serde(default)]
-    pub control_sockets: ControlSocketsConfig,
-    #[serde(default)]
     pub ssh_dispatch: SshDispatchConfig,
     #[serde(default)]
     pub client_config: ClientConfig,
     #[serde(default)]
-    pub targets: BTreeMap<String, TargetConfig>,
+    pub target_defaults: TargetConfigInput,
     #[serde(default)]
-    pub lifecycle_steps: Vec<LifecycleStep>,
+    pub launch_defaults: LaunchConfigInput,
     #[serde(default)]
-    pub host_steps: Vec<HostStep>,
+    pub targets: BTreeMap<String, TargetConfigInput>,
     #[serde(default)]
-    pub container_mounts: Vec<ContainerMountConfig>,
-    #[serde(default)]
-    pub container_bootstrap: ContainerBootstrapConfig,
-    #[serde(default)]
-    pub container_bootstrap_steps: Vec<ContainerBootstrapStep>,
-    #[serde(default)]
-    pub container_agent: ContainerAgentConfig,
-    #[serde(default)]
-    pub container_ssh: ContainerSshConfig,
-    #[serde(default)]
-    pub launches: BTreeMap<String, LaunchConfig>,
+    pub launches: BTreeMap<String, LaunchConfigInput>,
 }
 
 impl GatewayConfig {
@@ -94,6 +80,7 @@ impl GatewayConfig {
                 GATEWAY_SCHEMA_VERSION
             );
         }
+        self.target_defaults.validate_partial("target_defaults")?;
         validate_name("default_target", &self.default_target)?;
         if !self.targets.contains_key(&self.default_target) {
             anyhow::bail!(
@@ -106,17 +93,9 @@ impl GatewayConfig {
         }
         for (name, target) in &self.targets {
             validate_name("target", name)?;
-            target.validate(name)?;
-        }
-        for (name, launch) in &self.launches {
-            validate_name("launch", name)?;
-            if name == "show" {
-                anyhow::bail!("launch name \"show\" is reserved for launch show");
-            }
-            launch.validate(name, self)?;
+            target.validate_partial(name)?;
         }
         self.runtime.validate()?;
-        self.control_sockets.validate("control_sockets")?;
         validate_template(
             "client_config.inner_alias_template",
             &self.client_config.inner_alias_template,
@@ -137,55 +116,28 @@ impl GatewayConfig {
             "client_config.gateway_path",
             &self.client_config.gateway_path,
         )?;
-        for step in &self.lifecycle_steps {
-            step.validate("lifecycle_steps")?;
-        }
-        for step in &self.host_steps {
-            step.validate("host_steps")?;
-        }
-        for mount in &self.container_mounts {
-            mount.validate()?;
-        }
-        self.container_bootstrap.validate()?;
-        for step in &self.container_bootstrap_steps {
-            step.validate()?;
-        }
         self.logging
             .validate_templates("logging", GATEWAY_LOGGING_TEMPLATE_VARS)?;
-        self.container_ssh.validate()?;
-        self.container_agent.validate_gateway()?;
-        for (name, target) in &self.targets {
-            self.effective_container_ssh(target)
-                .with_context(|| format!("validate effective container_ssh for target {name:?}"))?;
-            self.effective_control_sockets(target).with_context(|| {
-                format!("validate effective control_sockets for target {name:?}")
-            })?;
-            self.effective_lifecycle_steps(target).with_context(|| {
-                format!("validate effective lifecycle_steps for target {name:?}")
-            })?;
-            self.effective_host_steps(target)
-                .with_context(|| format!("validate effective host_steps for target {name:?}"))?;
-            self.effective_container_bootstrap(target)
-                .with_context(|| {
-                    format!("validate effective container_bootstrap for target {name:?}")
-                })?;
-            self.effective_container_bootstrap_steps(target)
-                .with_context(|| {
-                    format!("validate effective container_bootstrap_steps for target {name:?}")
-                })?;
-            self.effective_container_agent(target).with_context(|| {
-                format!("validate effective container_agent for target {name:?}")
-            })?;
+        let effective_targets = self.effective_targets()?;
+        for (name, launch) in &self.launches {
+            validate_name("launch", name)?;
+            if name == "show" {
+                anyhow::bail!("launch name \"show\" is reserved for launch show");
+            }
+            self.effective_launch_with_targets(name, launch, &effective_targets)
+                .with_context(|| format!("validate effective launch {name:?}"))?;
         }
-        self.validate_target_agent_compatibility()?;
+        self.validate_target_agent_compatibility(&effective_targets)?;
         self.ssh_dispatch.validate()?;
         Ok(())
     }
 
-    fn validate_target_agent_compatibility(&self) -> anyhow::Result<()> {
-        for (name, target) in &self.targets {
-            let container_agent = self.effective_container_agent(target)?;
-            if container_agent.enabled {
+    fn validate_target_agent_compatibility(
+        &self,
+        targets: &BTreeMap<String, TargetConfig>,
+    ) -> anyhow::Result<()> {
+        for (name, target) in targets {
+            if target.container_agent.enabled {
                 continue;
             }
             if target
@@ -201,142 +153,124 @@ impl GatewayConfig {
         Ok(())
     }
 
+    pub fn effective_targets(&self) -> anyhow::Result<BTreeMap<String, TargetConfig>> {
+        self.targets
+            .iter()
+            .map(|(name, target)| {
+                self.effective_target_from_input(name, target)
+                    .map(|target| (name.clone(), target))
+            })
+            .collect()
+    }
+
+    pub fn effective_target(&self, name: &str) -> anyhow::Result<TargetConfig> {
+        let target = self
+            .targets
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown target {name:?}"))?;
+        self.effective_target_from_input(name, target)
+    }
+
+    fn effective_target_from_input(
+        &self,
+        name: &str,
+        target: &TargetConfigInput,
+    ) -> anyhow::Result<TargetConfig> {
+        let effective = TargetConfigInput::builtin_defaults()
+            .overlay(&self.target_defaults)?
+            .overlay(target)?
+            .into_effective(name)?;
+        effective.validate(name)?;
+        Ok(effective)
+    }
+
+    pub fn effective_workspace_defaults(&self) -> anyhow::Result<WorkspaceConfig> {
+        Ok(TargetConfigInput::builtin_defaults()
+            .overlay(&self.target_defaults)?
+            .workspace
+            .unwrap_or_default()
+            .into_effective())
+    }
+
+    pub fn effective_launches(&self) -> anyhow::Result<BTreeMap<String, LaunchConfig>> {
+        let targets = self.effective_targets()?;
+        self.launches
+            .iter()
+            .map(|(name, launch)| {
+                self.effective_launch_with_targets(name, launch, &targets)
+                    .map(|launch| (name.clone(), launch))
+            })
+            .collect()
+    }
+
+    pub fn effective_launch(&self, name: &str) -> anyhow::Result<LaunchConfig> {
+        let targets = self.effective_targets()?;
+        let launch = self
+            .launches
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown launch {name:?}"))?;
+        self.effective_launch_with_targets(name, launch, &targets)
+    }
+
+    fn effective_launch_with_targets(
+        &self,
+        name: &str,
+        launch: &LaunchConfigInput,
+        targets: &BTreeMap<String, TargetConfig>,
+    ) -> anyhow::Result<LaunchConfig> {
+        let effective = self
+            .launch_defaults
+            .clone()
+            .overlay(launch)?
+            .into_effective(name)?;
+        effective.validate(name, targets)?;
+        Ok(effective)
+    }
+
     pub fn effective_container_ssh(
         &self,
         target: &TargetConfig,
     ) -> anyhow::Result<ContainerSshConfig> {
-        let mut container_ssh = self.container_ssh.clone();
-        if let Some(target_container_ssh) = &target.container_ssh
-            && let Some(transfer) = &target_container_ssh.transfer
-        {
-            container_ssh.transfer = transfer.to_effective()?;
-        }
-        container_ssh.validate()?;
-        Ok(container_ssh)
+        Ok(target.container_ssh.clone())
     }
 
     pub fn effective_control_sockets(
         &self,
         target: &TargetConfig,
     ) -> anyhow::Result<ControlSocketsConfig> {
-        let mut control_sockets = self.control_sockets.clone();
-        if let Some(target_control_sockets) = &target.control_sockets {
-            if let Some(host_dir) = &target_control_sockets.host_dir {
-                control_sockets.host_dir = host_dir.clone();
-            }
-            if let Some(container_dir) = &target_control_sockets.container_dir {
-                control_sockets.container_dir = container_dir.clone();
-            }
-        }
-        control_sockets.validate("control_sockets")?;
-        Ok(control_sockets)
+        Ok(target.control_sockets.clone())
     }
 
     pub fn effective_lifecycle_steps(
         &self,
         target: &TargetConfig,
     ) -> anyhow::Result<Vec<LifecycleStep>> {
-        let steps = merge_raw_steps(
-            "lifecycle_steps",
-            self.lifecycle_steps.clone(),
-            &target.lifecycle_steps,
-            |step| LifecycleStepKey {
-                phase: Some(step.phase),
-                name: step.name.clone(),
-            },
-            |step| LifecycleStepKey {
-                phase: Some(step.phase),
-                name: step.name.clone(),
-            },
-            RawLifecycleStep::to_effective,
-        )?;
-        for step in &steps {
-            step.validate("lifecycle_steps")?;
-        }
-        Ok(steps)
+        Ok(target.lifecycle_steps.clone())
     }
 
     pub fn effective_host_steps(&self, target: &TargetConfig) -> anyhow::Result<Vec<HostStep>> {
-        let steps = merge_raw_steps(
-            "host_steps",
-            self.host_steps.clone(),
-            &target.host_steps,
-            |step| StepKey {
-                name: step.name.clone(),
-            },
-            |step| StepKey {
-                name: step.name.clone(),
-            },
-            RawHostStep::to_effective,
-        )?;
-        for step in &steps {
-            step.validate("host_steps")?;
-        }
-        Ok(steps)
+        Ok(target.host_steps.clone())
     }
 
     pub fn effective_container_bootstrap(
         &self,
         target: &TargetConfig,
     ) -> anyhow::Result<ContainerBootstrapConfig> {
-        let mut bootstrap = self.container_bootstrap.clone();
-        if let Some(target_bootstrap) = &target.container_bootstrap {
-            if let Some(enabled) = target_bootstrap.enabled {
-                bootstrap.enabled = enabled;
-            }
-            if let Some(entrypoint) = &target_bootstrap.entrypoint {
-                bootstrap.entrypoint = entrypoint.clone();
-            }
-            if let Some(agent_program) = &target_bootstrap.agent_program {
-                bootstrap.agent_program = agent_program.clone();
-            }
-        }
-        bootstrap.validate()?;
-        Ok(bootstrap)
+        Ok(target.container_bootstrap.clone())
     }
 
     pub fn effective_container_bootstrap_steps(
         &self,
         target: &TargetConfig,
     ) -> anyhow::Result<Vec<ContainerBootstrapStep>> {
-        let steps = merge_raw_steps(
-            "container_bootstrap_steps",
-            self.container_bootstrap_steps.clone(),
-            &target.container_bootstrap_steps,
-            |step| StepKey {
-                name: step.name.clone(),
-            },
-            |step| StepKey {
-                name: step.name.clone(),
-            },
-            |step, _| RawContainerBootstrapStep::to_effective(step),
-        )?;
-        for step in &steps {
-            step.validate()?;
-        }
-        Ok(steps)
+        Ok(target.container_bootstrap_steps.clone())
     }
 
     pub fn effective_container_agent(
         &self,
         target: &TargetConfig,
     ) -> anyhow::Result<ContainerAgentConfig> {
-        let mut container_agent = self.container_agent.clone();
-        if let Some(target_container_agent) = &target.container_agent {
-            for override_service in &target_container_agent.services {
-                if let Some(existing) = container_agent
-                    .services
-                    .iter_mut()
-                    .find(|service| service.name == override_service.name)
-                {
-                    *existing = override_service.clone();
-                } else {
-                    container_agent.services.push(override_service.clone());
-                }
-            }
-        }
-        container_agent.validate_gateway()?;
-        Ok(container_agent)
+        Ok(target.container_agent.clone())
     }
 }
 
@@ -346,7 +280,7 @@ struct TargetIncludeFile {
     #[serde(default)]
     target_includes: Vec<String>,
     #[serde(default)]
-    targets: BTreeMap<String, TargetConfig>,
+    targets: BTreeMap<String, TargetConfigInput>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -355,7 +289,7 @@ struct LaunchIncludeFile {
     #[serde(default)]
     launch_includes: Vec<String>,
     #[serde(default)]
-    launches: BTreeMap<String, LaunchConfig>,
+    launches: BTreeMap<String, LaunchConfigInput>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -374,8 +308,12 @@ pub struct LaunchConfig {
 }
 
 impl LaunchConfig {
-    pub fn validate(&self, launch_name: &str, cfg: &GatewayConfig) -> anyhow::Result<()> {
-        if !cfg.targets.contains_key(&self.target) {
+    pub fn validate(
+        &self,
+        launch_name: &str,
+        targets: &BTreeMap<String, TargetConfig>,
+    ) -> anyhow::Result<()> {
+        if !targets.contains_key(&self.target) {
             anyhow::bail!(
                 "launch {launch_name:?} references unknown target {:?}",
                 self.target
@@ -432,6 +370,58 @@ impl LaunchConfig {
             .collect::<Vec<_>>();
         allowed.extend(self.vars.keys().map(|name| format!("var.{name}")));
         allowed
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchConfigInput {
+    pub target: Option<String>,
+    pub description: Option<String>,
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub command: Option<Vec<String>>,
+    #[serde(default)]
+    pub vars: BTreeMap<String, LaunchVarConfig>,
+    #[serde(default)]
+    pub steps: Vec<LaunchStep>,
+}
+
+impl LaunchConfigInput {
+    fn overlay(mut self, later: &Self) -> anyhow::Result<Self> {
+        if let Some(target) = &later.target {
+            self.target = Some(target.clone());
+        }
+        if let Some(description) = &later.description {
+            self.description = Some(description.clone());
+        }
+        if let Some(cwd) = &later.cwd {
+            self.cwd = Some(cwd.clone());
+        }
+        self.env.extend(later.env.clone());
+        if let Some(command) = &later.command {
+            self.command = Some(command.clone());
+        }
+        self.vars.extend(later.vars.clone());
+        self.steps = merge_launch_steps(self.steps, &later.steps)?;
+        Ok(self)
+    }
+
+    fn into_effective(self, launch_name: &str) -> anyhow::Result<LaunchConfig> {
+        Ok(LaunchConfig {
+            target: self.target.ok_or_else(|| {
+                anyhow::anyhow!("launch {launch_name:?} target is required after defaults")
+            })?,
+            description: self.description,
+            cwd: self.cwd,
+            env: self.env,
+            command: self.command.ok_or_else(|| {
+                anyhow::anyhow!("launch {launch_name:?} command is required after defaults")
+            })?,
+            vars: self.vars,
+            steps: self.steps,
+        })
     }
 }
 
@@ -617,7 +607,7 @@ pub enum LaunchStepLocation {
 }
 
 fn compose_target_includes(
-    targets: &mut BTreeMap<String, TargetConfig>,
+    targets: &mut BTreeMap<String, TargetConfigInput>,
     patterns: &[String],
     base_dir: &Path,
     seen: &mut BTreeSet<PathBuf>,
@@ -649,7 +639,7 @@ fn compose_target_includes(
 }
 
 fn compose_launch_includes(
-    launches: &mut BTreeMap<String, LaunchConfig>,
+    launches: &mut BTreeMap<String, LaunchConfigInput>,
     patterns: &[String],
     base_dir: &Path,
     seen: &mut BTreeSet<PathBuf>,
@@ -819,6 +809,8 @@ pub struct WorkspaceConfig {
     pub path: String,
     #[serde(default = "default_workspace_state_dir")]
     pub state_dir: String,
+    #[serde(default)]
+    pub cleanup: WorkspaceCleanup,
 }
 
 impl Default for WorkspaceConfig {
@@ -826,6 +818,38 @@ impl Default for WorkspaceConfig {
         Self {
             path: default_workspace_path(),
             state_dir: default_workspace_state_dir(),
+            cleanup: WorkspaceCleanup::Never,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceConfigInput {
+    pub path: Option<String>,
+    pub state_dir: Option<String>,
+    pub cleanup: Option<WorkspaceCleanup>,
+}
+
+impl WorkspaceConfigInput {
+    fn overlay(mut self, later: &Self) -> Self {
+        if let Some(path) = &later.path {
+            self.path = Some(path.clone());
+        }
+        if let Some(state_dir) = &later.state_dir {
+            self.state_dir = Some(state_dir.clone());
+        }
+        if let Some(cleanup) = later.cleanup {
+            self.cleanup = Some(cleanup);
+        }
+        self
+    }
+
+    fn into_effective(self) -> WorkspaceConfig {
+        WorkspaceConfig {
+            path: self.path.unwrap_or_else(default_workspace_path),
+            state_dir: self.state_dir.unwrap_or_else(default_workspace_state_dir),
+            cleanup: self.cleanup.unwrap_or_default(),
         }
     }
 }
@@ -949,16 +973,309 @@ impl Default for ClientConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetConfigInput {
+    pub image: Option<String>,
+    pub mode: Option<TargetMode>,
+    pub name: Option<String>,
+    pub ephemeral_name: Option<String>,
+    pub workspace: Option<WorkspaceConfigInput>,
+    pub runtime: Option<TargetRuntimeConfigInput>,
+    pub identity: Option<TargetIdentityConfig>,
+    pub container_user: Option<String>,
+    pub container_home: Option<PathBuf>,
+    #[serde(default)]
+    pub container_env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub session_env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub container_mounts: Vec<ContainerMountConfig>,
+    pub stop_when_idle: Option<bool>,
+    pub remove_on_stop: Option<bool>,
+    pub idle_cleanup: Option<IdleCleanupConfigInput>,
+    pub local_ssh: Option<LocalSshConfigInput>,
+    pub container_ssh: Option<TargetContainerSshConfig>,
+    pub control_sockets: Option<TargetControlSocketsConfig>,
+    pub container_bootstrap: Option<TargetContainerBootstrapConfig>,
+    #[serde(default)]
+    pub lifecycle_steps: Vec<RawLifecycleStep>,
+    #[serde(default)]
+    pub host_steps: Vec<RawHostStep>,
+    #[serde(default)]
+    pub container_bootstrap_steps: Vec<RawContainerBootstrapStep>,
+    pub container_agent: Option<ContainerAgentConfigInput>,
+}
+
+impl TargetConfigInput {
+    fn builtin_defaults() -> Self {
+        Self {
+            mode: Some(TargetMode::Fixed),
+            workspace: Some(WorkspaceConfigInput {
+                path: Some(default_workspace_path()),
+                state_dir: Some(default_workspace_state_dir()),
+                cleanup: Some(WorkspaceCleanup::Never),
+            }),
+            runtime: Some(TargetRuntimeConfigInput {
+                extra_run_args: Some(Vec::new()),
+            }),
+            stop_when_idle: Some(false),
+            remove_on_stop: Some(false),
+            control_sockets: Some(TargetControlSocketsConfig {
+                host_dir: Some(default_control_socket_host_dir()),
+                container_dir: Some(default_control_socket_container_dir()),
+            }),
+            container_bootstrap: Some(TargetContainerBootstrapConfig {
+                enabled: Some(false),
+                entrypoint: Some(default_bootstrap_entrypoint()),
+                agent_program: Some(default_bootstrap_agent_program()),
+            }),
+            container_agent: Some(ContainerAgentConfigInput {
+                enabled: Some(true),
+                services: Vec::new(),
+                ssh_bridge: None,
+                control_socket: None,
+                idle_cleanup: None,
+            }),
+            container_ssh: Some(TargetContainerSshConfig {
+                transfer: Some(TargetContainerSshTransferConfig {
+                    sftp: Some(SftpTransferMode::Allow),
+                    legacy_scp: Some(LegacyScpTransferMode::Allow),
+                }),
+            }),
+            ..Self::default()
+        }
+    }
+
+    fn overlay(mut self, later: &Self) -> anyhow::Result<Self> {
+        if let Some(image) = &later.image {
+            self.image = Some(image.clone());
+        }
+        if let Some(mode) = later.mode {
+            self.mode = Some(mode);
+        }
+        if let Some(name) = &later.name {
+            self.name = Some(name.clone());
+        }
+        if let Some(ephemeral_name) = &later.ephemeral_name {
+            self.ephemeral_name = Some(ephemeral_name.clone());
+        }
+        if let Some(workspace) = &later.workspace {
+            self.workspace = Some(self.workspace.take().unwrap_or_default().overlay(workspace));
+        }
+        if let Some(runtime) = &later.runtime {
+            self.runtime = Some(self.runtime.take().unwrap_or_default().overlay(runtime));
+        }
+        if let Some(identity) = &later.identity {
+            self.identity = Some(overlay_identity(self.identity.take(), identity));
+        }
+        if let Some(container_user) = &later.container_user {
+            self.container_user = Some(container_user.clone());
+        }
+        if let Some(container_home) = &later.container_home {
+            self.container_home = Some(container_home.clone());
+        }
+        self.container_env.extend(later.container_env.clone());
+        self.session_env.extend(later.session_env.clone());
+        self.container_mounts.extend(later.container_mounts.clone());
+        if let Some(stop_when_idle) = later.stop_when_idle {
+            self.stop_when_idle = Some(stop_when_idle);
+        }
+        if let Some(remove_on_stop) = later.remove_on_stop {
+            self.remove_on_stop = Some(remove_on_stop);
+        }
+        if let Some(idle_cleanup) = &later.idle_cleanup {
+            self.idle_cleanup = Some(
+                self.idle_cleanup
+                    .take()
+                    .unwrap_or_default()
+                    .overlay(idle_cleanup),
+            );
+        }
+        if let Some(local_ssh) = &later.local_ssh {
+            self.local_ssh = Some(self.local_ssh.take().unwrap_or_default().overlay(local_ssh));
+        }
+        if let Some(container_ssh) = &later.container_ssh {
+            self.container_ssh = Some(overlay_target_container_ssh(
+                self.container_ssh.take(),
+                container_ssh,
+            ));
+        }
+        if let Some(control_sockets) = &later.control_sockets {
+            self.control_sockets = Some(overlay_control_sockets(
+                self.control_sockets.take(),
+                control_sockets,
+            ));
+        }
+        if let Some(container_bootstrap) = &later.container_bootstrap {
+            self.container_bootstrap = Some(overlay_container_bootstrap(
+                self.container_bootstrap.take(),
+                container_bootstrap,
+            ));
+        }
+        self.lifecycle_steps = merge_raw_steps(
+            "lifecycle_steps",
+            self.lifecycle_steps
+                .iter()
+                .map(RawLifecycleStep::to_effective_without_inherited)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            &later.lifecycle_steps,
+            |step| LifecycleStepKey {
+                phase: Some(step.phase),
+                name: step.name.clone(),
+            },
+            |step| LifecycleStepKey {
+                phase: Some(step.phase),
+                name: step.name.clone(),
+            },
+            RawLifecycleStep::to_effective,
+        )?
+        .into_iter()
+        .map(RawLifecycleStep::from_effective)
+        .collect();
+        self.host_steps = merge_raw_steps(
+            "host_steps",
+            self.host_steps
+                .iter()
+                .map(RawHostStep::to_effective_without_inherited)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            &later.host_steps,
+            |step| StepKey {
+                name: step.name.clone(),
+            },
+            |step| StepKey {
+                name: step.name.clone(),
+            },
+            RawHostStep::to_effective,
+        )?
+        .into_iter()
+        .map(RawHostStep::from_effective)
+        .collect();
+        self.container_bootstrap_steps = merge_raw_steps(
+            "container_bootstrap_steps",
+            self.container_bootstrap_steps
+                .iter()
+                .map(RawContainerBootstrapStep::to_effective)
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            &later.container_bootstrap_steps,
+            |step| StepKey {
+                name: step.name.clone(),
+            },
+            |step| StepKey {
+                name: step.name.clone(),
+            },
+            |step, _| RawContainerBootstrapStep::to_effective(step),
+        )?
+        .into_iter()
+        .map(RawContainerBootstrapStep::from_effective)
+        .collect();
+        if let Some(container_agent) = &later.container_agent {
+            self.container_agent = Some(
+                self.container_agent
+                    .take()
+                    .unwrap_or_default()
+                    .overlay(container_agent)?,
+            );
+        }
+        Ok(self)
+    }
+
+    fn validate_partial(&self, target_name: &str) -> anyhow::Result<()> {
+        validate_raw_target_steps(
+            target_name,
+            "lifecycle_steps",
+            &self.lifecycle_steps,
+            |step| LifecycleStepKey {
+                phase: Some(step.phase),
+                name: step.name.clone(),
+            },
+        )?;
+        validate_raw_target_steps(target_name, "host_steps", &self.host_steps, |step| {
+            StepKey {
+                name: step.name.clone(),
+            }
+        })?;
+        validate_raw_target_steps(
+            target_name,
+            "container_bootstrap_steps",
+            &self.container_bootstrap_steps,
+            |step| StepKey {
+                name: step.name.clone(),
+            },
+        )?;
+        if let Some(control_sockets) = &self.control_sockets {
+            control_sockets.validate(target_name)?;
+        }
+        if let Some(container_bootstrap) = &self.container_bootstrap {
+            container_bootstrap.validate(target_name)?;
+        }
+        Ok(())
+    }
+
+    fn into_effective(self, target_name: &str) -> anyhow::Result<TargetConfig> {
+        let lifecycle_steps = self
+            .lifecycle_steps
+            .iter()
+            .map(RawLifecycleStep::to_effective_without_inherited)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let host_steps = self
+            .host_steps
+            .iter()
+            .map(RawHostStep::to_effective_without_inherited)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let container_bootstrap_steps = self
+            .container_bootstrap_steps
+            .iter()
+            .map(RawContainerBootstrapStep::to_effective)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let container_agent = self.container_agent.unwrap_or_default().into_effective()?;
+        Ok(TargetConfig {
+            image: self.image.ok_or_else(|| {
+                anyhow::anyhow!("target {target_name:?} image is required after defaults")
+            })?,
+            mode: self.mode.unwrap_or_default(),
+            name: self.name,
+            ephemeral_name: self.ephemeral_name,
+            workspace: self.workspace.unwrap_or_default().into_effective(),
+            runtime: self.runtime.unwrap_or_default().into_effective(),
+            identity: self.identity,
+            container_user: self.container_user,
+            container_home: self.container_home,
+            container_env: self.container_env,
+            session_env: self.session_env,
+            container_mounts: self.container_mounts,
+            stop_when_idle: self.stop_when_idle.unwrap_or(false),
+            remove_on_stop: self.remove_on_stop.unwrap_or(false),
+            idle_cleanup: self
+                .idle_cleanup
+                .map(IdleCleanupConfigInput::into_effective)
+                .transpose()?,
+            local_ssh: self.local_ssh.map(LocalSshConfigInput::into_effective),
+            container_ssh: self
+                .container_ssh
+                .unwrap_or_default()
+                .to_effective_config()?,
+            control_sockets: self.control_sockets.unwrap_or_default().to_effective(),
+            container_bootstrap: self
+                .container_bootstrap
+                .unwrap_or_default()
+                .to_effective_config(),
+            lifecycle_steps,
+            host_steps,
+            container_bootstrap_steps,
+            container_agent,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetConfig {
     pub image: String,
-    #[serde(default)]
     pub mode: TargetMode,
     pub name: Option<String>,
     pub ephemeral_name: Option<String>,
-    pub workspace: Option<String>,
-    #[serde(default)]
+    pub workspace: WorkspaceConfig,
     pub runtime: TargetRuntimeConfig,
     pub identity: Option<TargetIdentityConfig>,
     pub container_user: Option<String>,
@@ -969,24 +1286,17 @@ pub struct TargetConfig {
     pub session_env: BTreeMap<String, String>,
     #[serde(default)]
     pub container_mounts: Vec<ContainerMountConfig>,
-    #[serde(default)]
     pub stop_when_idle: bool,
-    #[serde(default)]
     pub remove_on_stop: bool,
-    #[serde(default)]
-    pub workspace_cleanup: WorkspaceCleanup,
     pub idle_cleanup: Option<IdleCleanupConfig>,
     pub local_ssh: Option<LocalSshConfig>,
-    pub container_ssh: Option<TargetContainerSshConfig>,
-    pub control_sockets: Option<TargetControlSocketsConfig>,
-    pub container_bootstrap: Option<TargetContainerBootstrapConfig>,
-    #[serde(default)]
-    pub lifecycle_steps: Vec<RawLifecycleStep>,
-    #[serde(default)]
-    pub host_steps: Vec<RawHostStep>,
-    #[serde(default)]
-    pub container_bootstrap_steps: Vec<RawContainerBootstrapStep>,
-    pub container_agent: Option<TargetContainerAgentConfig>,
+    pub container_ssh: ContainerSshConfig,
+    pub control_sockets: ControlSocketsConfig,
+    pub container_bootstrap: ContainerBootstrapConfig,
+    pub lifecycle_steps: Vec<LifecycleStep>,
+    pub host_steps: Vec<HostStep>,
+    pub container_bootstrap_steps: Vec<ContainerBootstrapStep>,
+    pub container_agent: ContainerAgentConfig,
 }
 
 impl TargetConfig {
@@ -1005,16 +1315,22 @@ impl TargetConfig {
         if let Some(identity) = &self.identity {
             identity.validate(target_name)?;
         }
-        if let Some(workspace) = &self.workspace {
-            if workspace.trim().is_empty() {
-                anyhow::bail!("target {target_name:?} workspace must not be empty");
-            }
-            validate_template(
-                "target.workspace",
-                workspace,
-                TARGET_WORKSPACE_TEMPLATE_VARS,
-            )?;
+        if self.workspace.path.trim().is_empty() {
+            anyhow::bail!("target {target_name:?} workspace.path must not be empty");
         }
+        validate_template(
+            "target.workspace.path",
+            &self.workspace.path,
+            TARGET_WORKSPACE_TEMPLATE_VARS,
+        )?;
+        if self.workspace.state_dir.trim().is_empty() {
+            anyhow::bail!("target {target_name:?} workspace.state_dir must not be empty");
+        }
+        validate_template(
+            "target.workspace.state_dir",
+            &self.workspace.state_dir,
+            GATEWAY_TEMPLATE_VARS_NO_PID,
+        )?;
         self.runtime.validate(target_name)?;
         validate_env_map("target.container_env", &self.container_env)?;
         validate_env_map("target.session_env", &self.session_env)?;
@@ -1046,46 +1362,41 @@ impl TargetConfig {
                 }
             }
         }
-        if self.workspace_cleanup != WorkspaceCleanup::Never {
+        if self.workspace.cleanup != WorkspaceCleanup::Never {
             if self.mode != TargetMode::Ephemeral {
                 anyhow::bail!(
-                    "target {target_name:?} workspace_cleanup requires mode = \"ephemeral\""
+                    "target {target_name:?} workspace.cleanup requires mode = \"ephemeral\""
                 );
             }
-            let Some(workspace) = &self.workspace else {
-                anyhow::bail!(
-                    "target {target_name:?} workspace_cleanup requires target-specific workspace"
-                );
-            };
-            let refs = template::referenced_keys(workspace)?;
+            let refs = template::referenced_keys(&self.workspace.path)?;
             if !refs.contains(&"session_id") {
                 anyhow::bail!(
-                    "target {target_name:?} workspace_cleanup requires workspace to reference {{session_id}}"
+                    "target {target_name:?} workspace.cleanup requires workspace.path to reference {{session_id}}"
                 );
             }
-            if !Path::new(workspace)
+            if !Path::new(&self.workspace.path)
                 .components()
                 .any(|component| component.as_os_str() == "aw-gateway")
             {
                 anyhow::bail!(
-                    "target {target_name:?} workspace_cleanup requires workspace under an aw-gateway path component"
+                    "target {target_name:?} workspace.cleanup requires workspace.path under an aw-gateway path component"
                 );
             }
             let Some(cleanup) = &self.idle_cleanup else {
                 anyhow::bail!(
-                    "target {target_name:?} workspace_cleanup requires gateway-owned idle_cleanup"
+                    "target {target_name:?} workspace.cleanup requires gateway-owned idle_cleanup"
                 );
             };
             if cleanup.owner != IdleCleanupOwner::Gateway
                 || cleanup.action != IdleCleanupAction::ExitContainer
             {
                 anyhow::bail!(
-                    "target {target_name:?} workspace_cleanup requires gateway-owned exit_container idle_cleanup"
+                    "target {target_name:?} workspace.cleanup requires gateway-owned exit_container idle_cleanup"
                 );
             }
             if !cleanup.preserve_processes.is_empty() {
                 anyhow::bail!(
-                    "target {target_name:?} workspace_cleanup does not support preserve_processes"
+                    "target {target_name:?} workspace.cleanup does not support preserve_processes"
                 );
             }
         }
@@ -1102,40 +1413,19 @@ impl TargetConfig {
         if let Some(local_ssh) = &self.local_ssh {
             local_ssh.validate()?;
         }
-        if let Some(container_ssh) = &self.container_ssh {
-            container_ssh.validate(target_name)?;
+        self.container_ssh.validate()?;
+        self.control_sockets.validate("target.control_sockets")?;
+        self.container_bootstrap.validate()?;
+        for step in &self.lifecycle_steps {
+            step.validate("target.lifecycle_steps")?;
         }
-        if let Some(control_sockets) = &self.control_sockets {
-            control_sockets.validate(target_name)?;
+        for step in &self.host_steps {
+            step.validate("target.host_steps")?;
         }
-        if let Some(container_bootstrap) = &self.container_bootstrap {
-            container_bootstrap.validate(target_name)?;
+        for step in &self.container_bootstrap_steps {
+            step.validate()?;
         }
-        validate_raw_target_steps(
-            target_name,
-            "lifecycle_steps",
-            &self.lifecycle_steps,
-            |step| LifecycleStepKey {
-                phase: Some(step.phase),
-                name: step.name.clone(),
-            },
-        )?;
-        validate_raw_target_steps(target_name, "host_steps", &self.host_steps, |step| {
-            StepKey {
-                name: step.name.clone(),
-            }
-        })?;
-        validate_raw_target_steps(
-            target_name,
-            "container_bootstrap_steps",
-            &self.container_bootstrap_steps,
-            |step| StepKey {
-                name: step.name.clone(),
-            },
-        )?;
-        if let Some(container_agent) = &self.container_agent {
-            container_agent.validate(target_name)?;
-        }
+        self.container_agent.validate_gateway()?;
         Ok(())
     }
 
@@ -1191,22 +1481,69 @@ impl TargetControlSocketsConfig {
         }
         Ok(())
     }
+
+    fn overlay(mut self, later: &Self) -> Self {
+        if let Some(host_dir) = &later.host_dir {
+            self.host_dir = Some(host_dir.clone());
+        }
+        if let Some(container_dir) = &later.container_dir {
+            self.container_dir = Some(container_dir.clone());
+        }
+        self
+    }
+
+    fn to_effective(&self) -> ControlSocketsConfig {
+        ControlSocketsConfig {
+            host_dir: self
+                .host_dir
+                .clone()
+                .unwrap_or_else(default_control_socket_host_dir),
+            container_dir: self
+                .container_dir
+                .clone()
+                .unwrap_or_else(default_control_socket_container_dir),
+        }
+    }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+fn overlay_control_sockets(
+    current: Option<TargetControlSocketsConfig>,
+    later: &TargetControlSocketsConfig,
+) -> TargetControlSocketsConfig {
+    current.unwrap_or_default().overlay(later)
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetContainerSshConfig {
     pub transfer: Option<TargetContainerSshTransferConfig>,
 }
 
-impl TargetContainerSshConfig {
-    fn validate(&self, target_name: &str) -> anyhow::Result<()> {
-        if let Some(transfer) = &self.transfer {
-            transfer
-                .to_effective()
-                .with_context(|| format!("target {target_name:?} container_ssh.transfer"))?;
+impl Default for TargetContainerSshConfig {
+    fn default() -> Self {
+        Self {
+            transfer: Some(TargetContainerSshTransferConfig {
+                sftp: Some(SftpTransferMode::Allow),
+                legacy_scp: Some(LegacyScpTransferMode::Allow),
+            }),
         }
-        Ok(())
+    }
+}
+
+impl TargetContainerSshConfig {
+    fn overlay(mut self, later: &Self) -> Self {
+        if let Some(transfer) = &later.transfer {
+            self.transfer = Some(self.transfer.take().unwrap_or_default().overlay(transfer));
+        }
+        self
+    }
+
+    fn to_effective_config(&self) -> anyhow::Result<ContainerSshConfig> {
+        let transfer = match &self.transfer {
+            Some(transfer) => transfer.to_effective()?,
+            None => TargetContainerSshTransferConfig::default().to_effective()?,
+        };
+        Ok(ContainerSshConfig { transfer })
     }
 }
 
@@ -1217,7 +1554,26 @@ pub struct TargetContainerSshTransferConfig {
     pub legacy_scp: Option<LegacyScpTransferMode>,
 }
 
+impl Default for TargetContainerSshTransferConfig {
+    fn default() -> Self {
+        Self {
+            sftp: Some(SftpTransferMode::Allow),
+            legacy_scp: Some(LegacyScpTransferMode::Allow),
+        }
+    }
+}
+
 impl TargetContainerSshTransferConfig {
+    fn overlay(mut self, later: &Self) -> Self {
+        if let Some(sftp) = later.sftp {
+            self.sftp = Some(sftp);
+        }
+        if let Some(legacy_scp) = later.legacy_scp {
+            self.legacy_scp = Some(legacy_scp);
+        }
+        self
+    }
+
     fn to_effective(&self) -> anyhow::Result<ContainerSshTransferConfig> {
         let sftp = self
             .sftp
@@ -1227,6 +1583,13 @@ impl TargetContainerSshTransferConfig {
         })?;
         Ok(ContainerSshTransferConfig { sftp, legacy_scp })
     }
+}
+
+fn overlay_target_container_ssh(
+    current: Option<TargetContainerSshConfig>,
+    later: &TargetContainerSshConfig,
+) -> TargetContainerSshConfig {
+    current.unwrap_or_default().overlay(later)
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1265,29 +1628,40 @@ impl TargetContainerBootstrapConfig {
         }
         Ok(())
     }
-}
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TargetContainerAgentConfig {
-    #[serde(default)]
-    pub services: Vec<ServiceConfig>,
-}
-
-impl TargetContainerAgentConfig {
-    fn validate(&self, target_name: &str) -> anyhow::Result<()> {
-        let mut names = BTreeSet::new();
-        for service in &self.services {
-            service.validate()?;
-            if !names.insert(service.name.clone()) {
-                anyhow::bail!(
-                    "target {target_name:?} defines duplicate container_agent service {:?}",
-                    service.name
-                );
-            }
+    fn overlay(mut self, later: &Self) -> Self {
+        if let Some(enabled) = later.enabled {
+            self.enabled = Some(enabled);
         }
-        Ok(())
+        if let Some(entrypoint) = &later.entrypoint {
+            self.entrypoint = Some(entrypoint.clone());
+        }
+        if let Some(agent_program) = &later.agent_program {
+            self.agent_program = Some(agent_program.clone());
+        }
+        self
     }
+
+    fn to_effective_config(&self) -> ContainerBootstrapConfig {
+        ContainerBootstrapConfig {
+            enabled: self.enabled.unwrap_or(false),
+            entrypoint: self
+                .entrypoint
+                .clone()
+                .unwrap_or_else(default_bootstrap_entrypoint),
+            agent_program: self
+                .agent_program
+                .clone()
+                .unwrap_or_else(default_bootstrap_agent_program),
+        }
+    }
+}
+
+fn overlay_container_bootstrap(
+    current: Option<TargetContainerBootstrapConfig>,
+    later: &TargetContainerBootstrapConfig,
+) -> TargetContainerBootstrapConfig {
+    current.unwrap_or_default().overlay(later)
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -1312,6 +1686,27 @@ impl TargetRuntimeConfig {
             )?;
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetRuntimeConfigInput {
+    pub extra_run_args: Option<Vec<String>>,
+}
+
+impl TargetRuntimeConfigInput {
+    fn overlay(mut self, later: &Self) -> Self {
+        if let Some(extra_run_args) = &later.extra_run_args {
+            self.extra_run_args = Some(extra_run_args.clone());
+        }
+        self
+    }
+
+    fn into_effective(self) -> TargetRuntimeConfig {
+        TargetRuntimeConfig {
+            extra_run_args: self.extra_run_args.unwrap_or_default(),
+        }
     }
 }
 
@@ -1358,6 +1753,32 @@ impl TargetIdentityConfig {
         }
         Ok(())
     }
+}
+
+fn overlay_identity(
+    current: Option<TargetIdentityConfig>,
+    later: &TargetIdentityConfig,
+) -> TargetIdentityConfig {
+    let mut identity = current.unwrap_or_default();
+    if let Some(value) = &later.bootstrap_user {
+        identity.bootstrap_user = Some(value.clone());
+    }
+    if let Some(value) = &later.session_user {
+        identity.session_user = Some(value.clone());
+    }
+    if let Some(value) = &later.session_uid {
+        identity.session_uid = Some(value.clone());
+    }
+    if let Some(value) = &later.session_gid {
+        identity.session_gid = Some(value.clone());
+    }
+    if let Some(value) = &later.session_home {
+        identity.session_home = Some(value.clone());
+    }
+    if let Some(value) = &later.session_shell {
+        identity.session_shell = Some(value.clone());
+    }
+    identity
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1433,6 +1854,64 @@ impl IdleCleanupConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdleCleanupConfigInput {
+    pub owner: Option<IdleCleanupOwner>,
+    pub action: Option<IdleCleanupAction>,
+    pub idle_grace: Option<String>,
+    pub preserve_processes: Option<Vec<String>>,
+    pub poll_interval: Option<String>,
+    pub shutdown_timeout: Option<String>,
+    pub reap_signal: Option<String>,
+    pub reap_kill_after: Option<String>,
+}
+
+impl IdleCleanupConfigInput {
+    fn overlay(mut self, later: &Self) -> Self {
+        if let Some(owner) = later.owner {
+            self.owner = Some(owner);
+        }
+        if let Some(action) = later.action {
+            self.action = Some(action);
+        }
+        if let Some(idle_grace) = &later.idle_grace {
+            self.idle_grace = Some(idle_grace.clone());
+        }
+        if let Some(preserve_processes) = &later.preserve_processes {
+            self.preserve_processes = Some(preserve_processes.clone());
+        }
+        if let Some(poll_interval) = &later.poll_interval {
+            self.poll_interval = Some(poll_interval.clone());
+        }
+        if let Some(shutdown_timeout) = &later.shutdown_timeout {
+            self.shutdown_timeout = Some(shutdown_timeout.clone());
+        }
+        if let Some(reap_signal) = &later.reap_signal {
+            self.reap_signal = Some(reap_signal.clone());
+        }
+        if let Some(reap_kill_after) = &later.reap_kill_after {
+            self.reap_kill_after = Some(reap_kill_after.clone());
+        }
+        self
+    }
+
+    fn into_effective(self) -> anyhow::Result<IdleCleanupConfig> {
+        let cleanup = IdleCleanupConfig {
+            owner: self.owner.unwrap_or_default(),
+            action: self.action.unwrap_or_default(),
+            idle_grace: self.idle_grace,
+            preserve_processes: self.preserve_processes.unwrap_or_default(),
+            poll_interval: self.poll_interval,
+            shutdown_timeout: self.shutdown_timeout,
+            reap_signal: self.reap_signal.unwrap_or_else(default_reap_signal),
+            reap_kill_after: self.reap_kill_after,
+        };
+        cleanup.validate()?;
+        Ok(cleanup)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IdleCleanupOwner {
@@ -1479,6 +1958,47 @@ impl LocalSshConfig {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalSshConfigInput {
+    pub mode: Option<LocalSshMode>,
+    pub backend: Option<LocalSshBackend>,
+    pub readiness: Option<LocalSshReadiness>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+}
+
+impl LocalSshConfigInput {
+    fn overlay(mut self, later: &Self) -> Self {
+        if let Some(mode) = later.mode {
+            self.mode = Some(mode);
+        }
+        if let Some(backend) = later.backend {
+            self.backend = Some(backend);
+        }
+        if let Some(readiness) = later.readiness {
+            self.readiness = Some(readiness);
+        }
+        if let Some(host) = &later.host {
+            self.host = Some(host.clone());
+        }
+        if let Some(port) = later.port {
+            self.port = Some(port);
+        }
+        self
+    }
+
+    fn into_effective(self) -> LocalSshConfig {
+        LocalSshConfig {
+            mode: self.mode.unwrap_or_default(),
+            backend: self.backend.unwrap_or_default(),
+            readiness: self.readiness.unwrap_or_default(),
+            host: self.host.unwrap_or_else(default_listen_host),
+            port: self.port,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalSshMode {
@@ -1518,6 +2038,23 @@ pub struct RawLifecycleStep {
 }
 
 impl RawLifecycleStep {
+    fn to_effective_without_inherited(&self) -> anyhow::Result<LifecycleStep> {
+        self.to_effective(None)
+    }
+
+    fn from_effective(step: LifecycleStep) -> Self {
+        Self {
+            phase: step.phase,
+            name: step.name,
+            enabled: true,
+            before: None,
+            after: None,
+            required: Some(step.required),
+            command: Some(step.command),
+            timeout: step.timeout,
+        }
+    }
+
     fn to_effective(&self, inherited: Option<&LifecycleStep>) -> anyhow::Result<LifecycleStep> {
         let inherit_payload =
             self.timeout.is_some() && self.command.is_none() && self.required.is_none();
@@ -1602,6 +2139,23 @@ pub struct RawHostStep {
 }
 
 impl RawHostStep {
+    fn to_effective_without_inherited(&self) -> anyhow::Result<HostStep> {
+        self.to_effective(None)
+    }
+
+    fn from_effective(step: HostStep) -> Self {
+        Self {
+            name: step.name,
+            enabled: true,
+            before: None,
+            after: None,
+            required: Some(step.required),
+            command: Some(step.command),
+            health_check: step.health_check,
+            timeout: step.timeout,
+        }
+    }
+
     fn to_effective(&self, inherited: Option<&HostStep>) -> anyhow::Result<HostStep> {
         let inherit_payload = self.timeout.is_some()
             && self.command.is_none()
@@ -1765,6 +2319,19 @@ pub struct RawContainerBootstrapStep {
 }
 
 impl RawContainerBootstrapStep {
+    fn from_effective(step: ContainerBootstrapStep) -> Self {
+        Self {
+            name: step.name,
+            enabled: true,
+            before: None,
+            after: None,
+            required: Some(step.required),
+            user: Some(step.user),
+            command: Some(step.command),
+            timeout: step.timeout,
+        }
+    }
+
     fn to_effective(&self) -> anyhow::Result<ContainerBootstrapStep> {
         Ok(ContainerBootstrapStep {
             name: self.name.clone(),
@@ -2103,6 +2670,61 @@ impl ContainerAgentConfig {
                         .is_some_and(|name| name == "AW_IDENTITY_TOKEN")
                 })
             })
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerAgentConfigInput {
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub services: Vec<ServiceConfig>,
+    pub ssh_bridge: Option<SshBridgeConfigInput>,
+    pub control_socket: Option<ControlSocketConfig>,
+    pub idle_cleanup: Option<IdleCleanupConfigInput>,
+}
+
+impl ContainerAgentConfigInput {
+    fn overlay(mut self, later: &Self) -> anyhow::Result<Self> {
+        if let Some(enabled) = later.enabled {
+            self.enabled = Some(enabled);
+        }
+        self.services = merge_services(self.services, &later.services)?;
+        if let Some(ssh_bridge) = &later.ssh_bridge {
+            self.ssh_bridge = Some(
+                self.ssh_bridge
+                    .take()
+                    .unwrap_or_default()
+                    .overlay(ssh_bridge),
+            );
+        }
+        if let Some(control_socket) = &later.control_socket {
+            self.control_socket = Some(control_socket.clone());
+        }
+        if let Some(idle_cleanup) = &later.idle_cleanup {
+            self.idle_cleanup = Some(
+                self.idle_cleanup
+                    .take()
+                    .unwrap_or_default()
+                    .overlay(idle_cleanup),
+            );
+        }
+        Ok(self)
+    }
+
+    fn into_effective(self) -> anyhow::Result<ContainerAgentConfig> {
+        let cfg = ContainerAgentConfig {
+            enabled: self.enabled.unwrap_or(true),
+            services: self.services,
+            ssh_bridge: self.ssh_bridge.map(SshBridgeConfigInput::into_effective),
+            control_socket: self.control_socket,
+            idle_cleanup: self
+                .idle_cleanup
+                .map(IdleCleanupConfigInput::into_effective)
+                .transpose()?,
+        };
+        cfg.validate_gateway()?;
+        Ok(cfg)
     }
 }
 
@@ -2460,6 +3082,42 @@ impl SshBridgeConfig {
             anyhow::bail!("ssh_bridge target must be host:port");
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshBridgeConfigInput {
+    pub enabled: Option<bool>,
+    pub socket: Option<String>,
+    pub target: Option<String>,
+    pub mode: Option<String>,
+}
+
+impl SshBridgeConfigInput {
+    fn overlay(mut self, later: &Self) -> Self {
+        if let Some(enabled) = later.enabled {
+            self.enabled = Some(enabled);
+        }
+        if let Some(socket) = &later.socket {
+            self.socket = Some(socket.clone());
+        }
+        if let Some(target) = &later.target {
+            self.target = Some(target.clone());
+        }
+        if let Some(mode) = &later.mode {
+            self.mode = Some(mode.clone());
+        }
+        self
+    }
+
+    fn into_effective(self) -> SshBridgeConfig {
+        SshBridgeConfig {
+            enabled: self.enabled.unwrap_or(true),
+            socket: self.socket,
+            target: self.target.unwrap_or_else(default_bridge_target),
+            mode: self.mode.unwrap_or_else(default_socket_mode),
+        }
     }
 }
 
@@ -2863,6 +3521,47 @@ where
     Ok(result)
 }
 
+fn merge_services(
+    mut inherited: Vec<ServiceConfig>,
+    later: &[ServiceConfig],
+) -> anyhow::Result<Vec<ServiceConfig>> {
+    let mut keys: Vec<String> = inherited
+        .iter()
+        .map(|service| service.name.clone())
+        .collect();
+    if keys.iter().collect::<BTreeSet<_>>().len() != keys.len() {
+        anyhow::bail!("container_agent.services contains duplicate inherited keys");
+    }
+    for service in later {
+        if let Some(index) = keys.iter().position(|key| key == &service.name) {
+            inherited[index] = service.clone();
+        } else {
+            keys.push(service.name.clone());
+            inherited.push(service.clone());
+        }
+    }
+    Ok(inherited)
+}
+
+fn merge_launch_steps(
+    mut inherited: Vec<LaunchStep>,
+    later: &[LaunchStep],
+) -> anyhow::Result<Vec<LaunchStep>> {
+    let mut keys: Vec<String> = inherited.iter().map(|step| step.name.clone()).collect();
+    if keys.iter().collect::<BTreeSet<_>>().len() != keys.len() {
+        anyhow::bail!("launch.steps contains duplicate inherited keys");
+    }
+    for step in later {
+        if let Some(index) = keys.iter().position(|key| key == &step.name) {
+            inherited[index] = step.clone();
+        } else {
+            keys.push(step.name.clone());
+            inherited.push(step.clone());
+        }
+    }
+    Ok(inherited)
+}
+
 fn lifecycle_phase_name(phase: LifecyclePhase) -> &'static str {
     match phase {
         LifecyclePhase::PreStart => "pre_start",
@@ -3125,7 +3824,7 @@ name = "{image_slug}"
         cfg.validate().unwrap();
 
         assert_eq!(
-            cfg.targets.get("default").unwrap().workspace_cleanup,
+            cfg.effective_target("default").unwrap().workspace.cleanup,
             WorkspaceCleanup::Never
         );
     }
@@ -3142,8 +3841,9 @@ image = "ubuntu/dev"
 mode = "ephemeral"
 ephemeral_name = "worker-{{session_id}}"
 stop_when_idle = true
-workspace = "{{home}}/.cache/aw-gateway/workspaces/{{target}}-{{session_id}}"
-workspace_cleanup = "{value}"
+[targets.default.workspace]
+path = "{{home}}/.cache/aw-gateway/workspaces/{{target}}-{{session_id}}"
+cleanup = "{value}"
 
 [targets.default.idle_cleanup]
 owner = "gateway"
@@ -3165,8 +3865,9 @@ schema_version = "1"
 image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
-workspace = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
-workspace_cleanup = "always"
+[targets.default.workspace]
+path = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
+cleanup = "always"
 
 [targets.default.idle_cleanup]
 owner = "gateway"
@@ -3177,33 +3878,32 @@ action = "exit_container"
 
         let err = format!("{:#}", cfg.validate().unwrap_err());
         assert!(
-            err.contains("workspace_cleanup requires mode = \"ephemeral\""),
+            err.contains("workspace.cleanup requires mode = \"ephemeral\""),
             "{err}"
         );
     }
 
     #[test]
-    fn target_workspace_cleanup_rejects_inherited_workspace() {
+    fn fixed_target_rejects_inherited_cleanup_default() {
         let cfg: GatewayConfig = toml::from_str(
             r#"
 schema_version = "1"
 
-[workspace]
+[target_defaults.workspace]
 path = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
+cleanup = "always"
 
 [targets.default]
 image = "ubuntu/dev"
-mode = "ephemeral"
-ephemeral_name = "worker-{session_id}"
-stop_when_idle = true
-workspace_cleanup = "always"
+mode = "fixed"
+name = "{image_slug}"
 "#,
         )
         .unwrap();
 
         let err = format!("{:#}", cfg.validate().unwrap_err());
         assert!(
-            err.contains("workspace_cleanup requires target-specific workspace"),
+            err.contains("workspace.cleanup requires mode = \"ephemeral\""),
             "{err}"
         );
     }
@@ -3219,8 +3919,9 @@ image = "ubuntu/dev"
 mode = "ephemeral"
 ephemeral_name = "worker-{session_id}"
 stop_when_idle = true
-workspace = "{home}/.cache/aw-gateway/workspaces/{target}"
-workspace_cleanup = "success"
+[targets.default.workspace]
+path = "{home}/.cache/aw-gateway/workspaces/{target}"
+cleanup = "success"
 
 [targets.default.idle_cleanup]
 owner = "gateway"
@@ -3231,7 +3932,7 @@ action = "exit_container"
 
         let err = format!("{:#}", cfg.validate().unwrap_err());
         assert!(
-            err.contains("workspace_cleanup requires workspace to reference {session_id}"),
+            err.contains("workspace.cleanup requires workspace.path to reference {session_id}"),
             "{err}"
         );
     }
@@ -3247,8 +3948,9 @@ image = "ubuntu/dev"
 mode = "ephemeral"
 ephemeral_name = "worker-{session_id}"
 stop_when_idle = true
-workspace = "{home}/sessions/{target}-{session_id}"
-workspace_cleanup = "always"
+[targets.default.workspace]
+path = "{home}/sessions/{target}-{session_id}"
+cleanup = "always"
 
 [targets.default.idle_cleanup]
 owner = "gateway"
@@ -3259,7 +3961,9 @@ action = "exit_container"
 
         let err = format!("{:#}", cfg.validate().unwrap_err());
         assert!(
-            err.contains("workspace_cleanup requires workspace under an aw-gateway path component"),
+            err.contains(
+                "workspace.cleanup requires workspace.path under an aw-gateway path component"
+            ),
             "{err}"
         );
     }
@@ -3270,7 +3974,7 @@ action = "exit_container"
             (
                 "missing",
                 "",
-                "workspace_cleanup requires gateway-owned idle_cleanup",
+                "workspace.cleanup requires gateway-owned idle_cleanup",
             ),
             (
                 "agent",
@@ -3279,7 +3983,7 @@ action = "exit_container"
 owner = "agent"
 action = "exit_container"
 "#,
-                "workspace_cleanup requires gateway-owned exit_container idle_cleanup",
+                "workspace.cleanup requires gateway-owned exit_container idle_cleanup",
             ),
             (
                 "none-action",
@@ -3288,7 +3992,7 @@ action = "exit_container"
 owner = "gateway"
 action = "none"
 "#,
-                "workspace_cleanup requires gateway-owned exit_container idle_cleanup",
+                "workspace.cleanup requires gateway-owned exit_container idle_cleanup",
             ),
             (
                 "preserve",
@@ -3298,7 +4002,7 @@ owner = "gateway"
 action = "exit_container"
 preserve_processes = ["tmux"]
 "#,
-                "workspace_cleanup does not support preserve_processes",
+                "workspace.cleanup does not support preserve_processes",
             ),
         ] {
             let cfg: GatewayConfig = toml::from_str(&format!(
@@ -3310,8 +4014,9 @@ image = "ubuntu/dev"
 mode = "ephemeral"
 ephemeral_name = "worker-{{session_id}}"
 stop_when_idle = true
-workspace = "{{home}}/.cache/aw-gateway/workspaces/{{target}}-{{session_id}}"
-workspace_cleanup = "always"
+[targets.default.workspace]
+path = "{{home}}/.cache/aw-gateway/workspaces/{{target}}-{{session_id}}"
+cleanup = "always"
 {idle_cleanup}
 "#
             ))
@@ -3352,15 +4057,13 @@ name = "{image_slug}"
         .unwrap();
         cfg.validate().unwrap();
 
-        let default = cfg
-            .effective_control_sockets(cfg.targets.get("default").unwrap())
-            .unwrap();
+        let default_target = cfg.effective_target("default").unwrap();
+        let default = cfg.effective_control_sockets(&default_target).unwrap();
         assert_eq!(default.host_dir, "/run/user/{uid}/aw-gateway/{runtime_id}");
         assert_eq!(default.container_dir, "/run/aw-gateway");
 
-        let custom = cfg
-            .effective_control_sockets(cfg.targets.get("custom").unwrap())
-            .unwrap();
+        let custom_target = cfg.effective_target("custom").unwrap();
+        let custom = cfg.effective_control_sockets(&custom_target).unwrap();
         assert_eq!(custom.host_dir, "/run/user/{uid}/aw-gateway/{runtime_id}");
         assert_eq!(custom.container_dir, "/tmp/aw-gateway");
     }
@@ -3371,7 +4074,7 @@ name = "{image_slug}"
             r#"
 schema_version = "1"
 
-[control_sockets]
+[target_defaults.control_sockets]
 host_dir = "/tmp/aw/{runtime_id}"
 container_dir = "/run/global"
 
@@ -3387,9 +4090,8 @@ host_dir = "/var/run/aw/{runtime_id}"
         .unwrap();
         cfg.validate().unwrap();
 
-        let effective = cfg
-            .effective_control_sockets(cfg.targets.get("default").unwrap())
-            .unwrap();
+        let target = cfg.effective_target("default").unwrap();
+        let effective = cfg.effective_control_sockets(&target).unwrap();
         assert_eq!(effective.host_dir, "/var/run/aw/{runtime_id}");
         assert_eq!(effective.container_dir, "/run/global");
     }
@@ -3409,13 +4111,13 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 "#,
-                "container_agent.control_socket path values are managed by control_sockets.container_dir",
+                "unknown field `container_agent`",
             ),
             (
                 r#"
 schema_version = "1"
 
-[container_agent.ssh_bridge]
+[target_defaults.container_agent.ssh_bridge]
 enabled = true
 socket = "/run/aw-gateway/ssh.sock"
 target = "127.0.0.1:22"
@@ -3429,8 +4131,10 @@ name = "{image_slug}"
                 "container_agent.ssh_bridge.socket is managed by control_sockets.container_dir",
             ),
         ] {
-            let cfg: GatewayConfig = toml::from_str(config).unwrap();
-            let err = format!("{:#}", cfg.validate().unwrap_err());
+            let err = match toml::from_str::<GatewayConfig>(config) {
+                Ok(cfg) => format!("{:#}", cfg.validate().unwrap_err()),
+                Err(err) => err.to_string(),
+            };
             assert!(err.contains(expected), "{err}");
         }
     }
@@ -3468,9 +4172,10 @@ name = "{image_slug}"
 "#,
         )
         .unwrap();
-        assert_eq!(cfg.container_ssh.transfer.sftp, SftpTransferMode::Allow);
+        let target = cfg.effective_target("default").unwrap();
+        assert_eq!(target.container_ssh.transfer.sftp, SftpTransferMode::Allow);
         assert_eq!(
-            cfg.container_ssh.transfer.legacy_scp,
+            target.container_ssh.transfer.legacy_scp,
             LegacyScpTransferMode::Allow
         );
         cfg.validate().unwrap();
@@ -3489,7 +4194,7 @@ name = "{image_slug}"
                 r#"
 schema_version = "1"
 
-[container_ssh.transfer]
+[target_defaults.container_ssh.transfer]
 sftp = "{}"
 legacy_scp = "{}"
 
@@ -3503,8 +4208,9 @@ name = "{{image_slug}}"
             ))
             .unwrap();
             cfg.validate().unwrap();
-            assert_eq!(cfg.container_ssh.transfer.sftp, sftp);
-            assert_eq!(cfg.container_ssh.transfer.legacy_scp, legacy_scp);
+            let target = cfg.effective_target("default").unwrap();
+            assert_eq!(target.container_ssh.transfer.sftp, sftp);
+            assert_eq!(target.container_ssh.transfer.legacy_scp, legacy_scp);
         }
     }
 
@@ -3529,7 +4235,7 @@ name = "{{image_slug}}"
         let cfg = r#"
 schema_version = "1"
 
-[[container_mounts]]
+[[target_defaults.container_mounts]]
 source = "{state_dir}/bootstrap/aw-container-agent"
 target = "/opt/aw-gateway/bin/aw-container-agent"
 mode = "ro"
@@ -3539,12 +4245,12 @@ source = "{state_dir}/bootstrap/target-only"
 target = "/opt/aw-gateway/target-only"
 mode = "ro"
 
-[container_bootstrap]
+[target_defaults.container_bootstrap]
 enabled = true
 entrypoint = "/opt/aw-gateway/bin/aw-container-bootstrap"
 agent_program = "/opt/aw-gateway/bin/aw-container-agent"
 
-[[container_bootstrap_steps]]
+[[target_defaults.container_bootstrap_steps]]
 name = "validate-agent"
 required = true
 user = "root"
@@ -3823,7 +4529,7 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[[host_steps]]
+[[target_defaults.host_steps]]
 name = "bad"
 command = ["/bin/true"]
 health_check = { type = "process" }
@@ -3844,13 +4550,13 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[[lifecycle_steps]]
+[[target_defaults.lifecycle_steps]]
 phase = "pre_start"
 name = "prep"
 command = ["/bin/true"]
 timeout = "250ms"
 
-[[host_steps]]
+[[target_defaults.host_steps]]
 name = "firewall"
 command = ["/bin/true"]
 timeout = "2m"
@@ -3858,15 +4564,15 @@ timeout = "2m"
         )
         .unwrap();
         cfg.validate().unwrap();
-        let target = cfg.targets.get("default").unwrap();
+        let target = cfg.effective_target("default").unwrap();
         assert_eq!(
-            cfg.effective_lifecycle_steps(target).unwrap()[0]
+            cfg.effective_lifecycle_steps(&target).unwrap()[0]
                 .timeout
                 .as_deref(),
             Some("250ms")
         );
         assert_eq!(
-            cfg.effective_host_steps(target).unwrap()[0]
+            cfg.effective_host_steps(&target).unwrap()[0]
                 .timeout
                 .as_deref(),
             Some("2m")
@@ -3885,7 +4591,7 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[[lifecycle_steps]]
+[[target_defaults.lifecycle_steps]]
 phase = "pre_start"
 name = "prep"
 command = ["/bin/true"]
@@ -3902,7 +4608,7 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[[host_steps]]
+[[target_defaults.host_steps]]
 name = "firewall"
 command = ["/bin/true"]
 timeout = "1d"
@@ -3946,10 +4652,10 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[container_agent]
+[target_defaults.container_agent]
 enabled = false
 
-[container_agent.ssh_bridge]
+[target_defaults.container_agent.ssh_bridge]
 enabled = false
 "#,
         )
@@ -4030,14 +4736,15 @@ schema_version = "1"
 image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
-workspace = "{home}/workspace-internal"
+[targets.default.workspace]
+path = "{home}/workspace-internal"
 "#,
         )
         .unwrap();
         cfg.validate().unwrap();
         assert_eq!(
-            cfg.targets.get("default").unwrap().workspace.as_deref(),
-            Some("{home}/workspace-internal")
+            cfg.effective_target("default").unwrap().workspace.path,
+            "{home}/workspace-internal"
         );
     }
 
@@ -4052,11 +4759,11 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[[container_agent.services]]
+[[target_defaults.container_agent.services]]
 name = "acl-proxy"
 command = ["acl-proxy", "--config", "/etc/acl-proxy/acl-proxy.toml"]
 
-[[container_agent.services]]
+[[target_defaults.container_agent.services]]
 name = "container-sshd"
 command = ["/opt/aw-gateway/bin/start-container-sshd"]
 depends_on = ["acl-proxy"]
@@ -4068,8 +4775,8 @@ command = ["acl-proxy", "--config", "/etc/acl-proxy/internal-acl-proxy.toml"]
         )
         .unwrap();
         cfg.validate().unwrap();
-        let target = cfg.targets.get("default").unwrap();
-        let effective = cfg.effective_container_agent(target).unwrap();
+        let target = cfg.effective_target("default").unwrap();
+        let effective = cfg.effective_container_agent(&target).unwrap();
         assert_eq!(effective.services.len(), 2);
         let acl_proxy = effective
             .services
@@ -4092,7 +4799,7 @@ command = ["acl-proxy", "--config", "/etc/acl-proxy/internal-acl-proxy.toml"]
             r#"
 schema_version = "1"
 
-[container_ssh.transfer]
+[target_defaults.container_ssh.transfer]
 sftp = "allow"
 legacy_scp = "allow"
 
@@ -4108,9 +4815,8 @@ legacy_scp = "outbound"
         )
         .unwrap();
         cfg.validate().unwrap();
-        let effective = cfg
-            .effective_container_ssh(cfg.targets.get("default").unwrap())
-            .unwrap();
+        let target = cfg.effective_target("default").unwrap();
+        let effective = cfg.effective_container_ssh(&target).unwrap();
         assert_eq!(effective.transfer.sftp, SftpTransferMode::Deny);
         assert_eq!(
             effective.transfer.legacy_scp,
@@ -4119,10 +4825,14 @@ legacy_scp = "outbound"
     }
 
     #[test]
-    fn target_container_ssh_transfer_requires_complete_policy() {
+    fn target_container_ssh_transfer_overlays_fields_independently() {
         let cfg: GatewayConfig = toml::from_str(
             r#"
 schema_version = "1"
+
+[target_defaults.container_ssh.transfer]
+sftp = "allow"
+legacy_scp = "inbound"
 
 [targets.default]
 image = "ubuntu/dev"
@@ -4134,8 +4844,13 @@ sftp = "deny"
 "#,
         )
         .unwrap();
-        let err = format!("{:#}", cfg.validate().unwrap_err());
-        assert!(err.contains("legacy_scp is required"), "{err}");
+        cfg.validate().unwrap();
+        let effective = cfg.effective_target("default").unwrap().container_ssh;
+        assert_eq!(effective.transfer.sftp, SftpTransferMode::Deny);
+        assert_eq!(
+            effective.transfer.legacy_scp,
+            LegacyScpTransferMode::Inbound
+        );
     }
 
     #[test]
@@ -4144,7 +4859,7 @@ sftp = "deny"
             r#"
 schema_version = "1"
 
-[container_bootstrap]
+[target_defaults.container_bootstrap]
 enabled = false
 entrypoint = "/global/bootstrap"
 agent_program = "/global/agent"
@@ -4161,9 +4876,8 @@ agent_program = "/target/agent"
         )
         .unwrap();
         cfg.validate().unwrap();
-        let effective = cfg
-            .effective_container_bootstrap(cfg.targets.get("default").unwrap())
-            .unwrap();
+        let target = cfg.effective_target("default").unwrap();
+        let effective = cfg.effective_container_bootstrap(&target).unwrap();
         assert!(effective.enabled);
         assert_eq!(effective.entrypoint, "/global/bootstrap");
         assert_eq!(effective.agent_program, "/target/agent");
@@ -4180,17 +4894,17 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[[lifecycle_steps]]
+[[target_defaults.lifecycle_steps]]
 phase = "pre_start"
 name = "first"
 command = ["/bin/first"]
 
-[[lifecycle_steps]]
+[[target_defaults.lifecycle_steps]]
 phase = "pre_start"
 name = "replace-me"
 command = ["/bin/old"]
 
-[[lifecycle_steps]]
+[[target_defaults.lifecycle_steps]]
 phase = "post_stop"
 name = "first"
 command = ["/bin/post"]
@@ -4220,9 +4934,8 @@ enabled = false
         )
         .unwrap();
         cfg.validate().unwrap();
-        let effective = cfg
-            .effective_lifecycle_steps(cfg.targets.get("default").unwrap())
-            .unwrap();
+        let target = cfg.effective_target("default").unwrap();
+        let effective = cfg.effective_lifecycle_steps(&target).unwrap();
         let pre_start: Vec<_> = effective
             .iter()
             .filter(|step| step.phase == LifecyclePhase::PreStart)
@@ -4255,13 +4968,13 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[[lifecycle_steps]]
+[[target_defaults.lifecycle_steps]]
 phase = "pre_start"
 name = "prep"
 command = ["/bin/prep"]
 timeout = "10s"
 
-[[host_steps]]
+[[target_defaults.host_steps]]
 name = "firewall"
 command = ["/bin/firewall"]
 timeout = "10s"
@@ -4278,11 +4991,11 @@ timeout = "30s"
         )
         .unwrap();
         cfg.validate().unwrap();
-        let target = cfg.targets.get("default").unwrap();
-        let lifecycle = cfg.effective_lifecycle_steps(target).unwrap();
+        let target = cfg.effective_target("default").unwrap();
+        let lifecycle = cfg.effective_lifecycle_steps(&target).unwrap();
         assert_eq!(lifecycle[0].command, ["/bin/prep"]);
         assert_eq!(lifecycle[0].timeout.as_deref(), Some("20s"));
-        let host = cfg.effective_host_steps(target).unwrap();
+        let host = cfg.effective_host_steps(&target).unwrap();
         assert_eq!(host[0].command, ["/bin/firewall"]);
         assert_eq!(host[0].timeout.as_deref(), Some("30s"));
     }
@@ -4314,7 +5027,7 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[[host_steps]]
+[[target_defaults.host_steps]]
 name = "firewall"
 command = ["/bin/old"]
 
@@ -4403,15 +5116,15 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[[host_steps]]
+[[target_defaults.host_steps]]
 name = "duplicate"
 command = ["/bin/one"]
 
-[[host_steps]]
+[[target_defaults.host_steps]]
 name = "duplicate"
 command = ["/bin/two"]
 "#,
-                "host_steps contains duplicate inherited keys",
+                "target \"target_defaults\" defines duplicate host_steps duplicate",
             ),
             (
                 r#"
@@ -4439,7 +5152,7 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[[host_steps]]
+[[target_defaults.host_steps]]
 name = "firewall"
 command = ["/bin/old"]
 
@@ -4459,7 +5172,7 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[[lifecycle_steps]]
+[[target_defaults.lifecycle_steps]]
 phase = "pre_start"
 name = "prep"
 command = ["/bin/old"]
@@ -4480,6 +5193,187 @@ timeout = "1s"
     }
 
     #[test]
+    fn target_defaults_overlay_into_effective_target_shape() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[target_defaults]
+image = "ubuntu/base"
+mode = "ephemeral"
+ephemeral_name = "worker-{session_id}"
+stop_when_idle = true
+
+[target_defaults.workspace]
+path = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
+state_dir = ".state"
+cleanup = "success"
+
+[target_defaults.runtime]
+extra_run_args = ["--default"]
+
+[target_defaults.container_env]
+KEEP = "default"
+OVERRIDE = "default"
+
+[target_defaults.session_env]
+SESSION = "default"
+
+[[target_defaults.container_mounts]]
+source = "/tmp/default"
+target = "/mnt/default"
+mode = "ro"
+
+[target_defaults.idle_cleanup]
+owner = "gateway"
+action = "exit_container"
+
+[target_defaults.container_ssh.transfer]
+sftp = "deny"
+legacy_scp = "inbound"
+
+[target_defaults.control_sockets]
+host_dir = "/tmp/aw/{runtime_id}"
+container_dir = "/run/default"
+
+[target_defaults.container_bootstrap]
+enabled = true
+entrypoint = "/default/bootstrap"
+agent_program = "/default/agent"
+
+[[target_defaults.lifecycle_steps]]
+phase = "pre_start"
+name = "prep"
+command = ["/bin/default-prep"]
+timeout = "10s"
+
+[[target_defaults.host_steps]]
+name = "host-prep"
+command = ["/bin/default-host"]
+
+[[target_defaults.container_bootstrap_steps]]
+name = "bootstrap-default"
+command = ["/bin/default-bootstrap"]
+
+[target_defaults.container_agent]
+enabled = true
+
+[[target_defaults.container_agent.services]]
+name = "svc"
+command = ["/bin/default-service"]
+
+[targets.default]
+image = "ubuntu/dev"
+name = "{image_slug}"
+
+[targets.default.container_env]
+OVERRIDE = "target"
+TARGET_ONLY = "target"
+
+[[targets.default.container_mounts]]
+source = "/tmp/target"
+target = "/mnt/target"
+mode = "rw"
+
+[targets.default.runtime]
+extra_run_args = ["--target"]
+
+[targets.default.workspace]
+cleanup = "always"
+
+[[targets.default.lifecycle_steps]]
+phase = "pre_start"
+name = "prep"
+timeout = "20s"
+
+[[targets.default.host_steps]]
+name = "host-prep"
+command = ["/bin/target-host"]
+
+[[targets.default.container_bootstrap_steps]]
+name = "bootstrap-default"
+enabled = false
+
+[[targets.default.container_agent.services]]
+name = "svc"
+command = ["/bin/target-service"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let target = cfg.effective_target("default").unwrap();
+        assert_eq!(target.image, "ubuntu/dev");
+        assert_eq!(target.mode, TargetMode::Ephemeral);
+        assert_eq!(target.workspace.state_dir, ".state");
+        assert_eq!(target.workspace.cleanup, WorkspaceCleanup::Always);
+        assert_eq!(target.runtime.extra_run_args, ["--target"]);
+        assert_eq!(target.container_env["KEEP"], "default");
+        assert_eq!(target.container_env["OVERRIDE"], "target");
+        assert_eq!(target.container_mounts.len(), 2);
+        assert_eq!(target.container_ssh.transfer.sftp, SftpTransferMode::Deny);
+        assert_eq!(target.control_sockets.container_dir, "/run/default");
+        assert_eq!(target.container_bootstrap.entrypoint, "/default/bootstrap");
+        assert_eq!(target.lifecycle_steps[0].command, ["/bin/default-prep"]);
+        assert_eq!(target.lifecycle_steps[0].timeout.as_deref(), Some("20s"));
+        assert_eq!(target.host_steps[0].command, ["/bin/target-host"]);
+        assert!(target.container_bootstrap_steps.is_empty());
+        assert_eq!(
+            target.container_agent.services[0].command,
+            ["/bin/target-service"]
+        );
+    }
+
+    #[test]
+    fn target_defaults_can_supply_required_image() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[target_defaults]
+image = "ubuntu/default"
+
+[targets.default]
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.effective_target("default").unwrap().image,
+            "ubuntu/default"
+        );
+    }
+
+    #[test]
+    fn root_only_rejects_target_shaped_sections_at_root() {
+        for config in [
+            r#"schema_version = "1"
+[workspace]
+path = "workspace"
+"#,
+            r#"schema_version = "1"
+[control_sockets]
+container_dir = "/run/aw-gateway"
+"#,
+            r#"schema_version = "1"
+[[lifecycle_steps]]
+phase = "pre_start"
+name = "prep"
+command = ["/bin/true"]
+"#,
+            r#"schema_version = "1"
+[container_agent]
+enabled = false
+"#,
+        ] {
+            let err = toml::from_str::<GatewayConfig>(config).unwrap_err();
+            assert!(err.to_string().contains("unknown field"), "{err}");
+        }
+    }
+
+    #[test]
     fn disabled_agent_rejects_published_port_ssh_backend() {
         let cfg: GatewayConfig = toml::from_str(
             r#"
@@ -4494,7 +5388,7 @@ name = "{image_slug}"
 backend = "published_port"
 readiness = "ssh_only"
 
-[container_agent]
+[target_defaults.container_agent]
 enabled = false
 "#,
         )
@@ -4513,7 +5407,7 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[container_agent.ssh_bridge]
+[target_defaults.container_agent.ssh_bridge]
 enabled = false
 target = "missing-port"
 "#,
@@ -4559,6 +5453,113 @@ command = ["prep", "{var.repo}"]
         )
         .unwrap();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn launch_defaults_overlay_into_effective_launch_shape() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launch_defaults]
+target = "default"
+description = "Default description"
+cwd = "{container_home}/default"
+env = { KEEP = "default", OVERRIDE = "default" }
+command = ["default-command"]
+
+[launch_defaults.vars]
+repo = { type = "string", required = true }
+mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
+
+[[launch_defaults.steps]]
+phase = "post_ready"
+location = "container"
+name = "prep"
+command = ["default-prep"]
+env = { STEP = "default" }
+
+[launches.agent]
+cwd = "{container_home}/agent"
+env = { OVERRIDE = "launch", LAUNCH_ONLY = "launch" }
+command = ["agent", "{var.repo}"]
+
+[launches.agent.vars]
+branch = { type = "string", default = "main" }
+
+[[launches.agent.steps]]
+phase = "post_ready"
+location = "container"
+name = "prep"
+command = ["launch-prep"]
+
+[[launches.agent.steps]]
+phase = "post_ready"
+location = "host"
+name = "host-prep"
+command = ["host-prep"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let launch = cfg.effective_launch("agent").unwrap();
+        assert_eq!(launch.target, "default");
+        assert_eq!(launch.description.as_deref(), Some("Default description"));
+        assert_eq!(launch.cwd.as_deref(), Some("{container_home}/agent"));
+        assert_eq!(launch.command, ["agent", "{var.repo}"]);
+        assert_eq!(launch.env["KEEP"], "default");
+        assert_eq!(launch.env["OVERRIDE"], "launch");
+        assert!(launch.vars.contains_key("repo"));
+        assert!(launch.vars.contains_key("branch"));
+        assert_eq!(launch.steps.len(), 2);
+        assert_eq!(launch.steps[0].name, "prep");
+        assert_eq!(launch.steps[0].command, ["launch-prep"]);
+        assert_eq!(launch.steps[1].name, "host-prep");
+    }
+
+    #[test]
+    fn launch_defaults_are_validated_after_overlay() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launch_defaults]
+target = "default"
+
+[launches.agent]
+command = ["true"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.agent]
+command = ["true"]
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("target is required after defaults"), "{err}");
     }
 
     #[test]
@@ -4738,12 +5739,12 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[[lifecycle_steps]]
+[[target_defaults.lifecycle_steps]]
 phase = "pre_start"
 name = "pre"
 command = ["echo", "{container_pid}"]
 "#,
-                "validate lifecycle_steps",
+                "target.lifecycle_steps",
             ),
         ] {
             let cfg: GatewayConfig = toml::from_str(config).unwrap();

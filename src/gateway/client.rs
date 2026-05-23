@@ -86,8 +86,8 @@ pub(super) fn resolve_target_selection(
         return Ok(selection.to_string());
     }
     let normalized = normalize_image_selection(selection);
-    let matches: Vec<_> = cfg
-        .targets
+    let targets = cfg.effective_targets()?;
+    let matches: Vec<_> = targets
         .iter()
         .filter(|(_, target)| normalize_image_selection(&target.image) == normalized)
         .map(|(name, _)| name.clone())

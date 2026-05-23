@@ -26,17 +26,17 @@ Keep proxy binaries, config, and CA material outside the user-writable
 workspace. Mount them read-only into the container:
 
 ```toml
-[[container_mounts]]
+[[target_defaults.container_mounts]]
 source = "/opt/site-policy/proxy/bin/site-proxy"
 target = "/opt/site-policy/bin/site-proxy"
 mode = "ro"
 
-[[container_mounts]]
+[[target_defaults.container_mounts]]
 source = "/opt/site-policy/proxy/etc"
 target = "/etc/site-proxy"
 mode = "ro"
 
-[[container_mounts]]
+[[target_defaults.container_mounts]]
 source = "/opt/site-policy/proxy/certs/site-proxy-ca.crt"
 target = "/etc/site-proxy/certs/site-proxy-ca.crt"
 mode = "ro"
@@ -53,7 +53,7 @@ for common image families:
 Debian or Ubuntu:
 
 ```toml
-[[container_bootstrap_steps]]
+[[target_defaults.container_bootstrap_steps]]
 name = "install-proxy-ca"
 required = true
 user = "root"
@@ -66,7 +66,7 @@ command = [
 RHEL, Rocky, or Fedora:
 
 ```toml
-[[container_bootstrap_steps]]
+[[target_defaults.container_bootstrap_steps]]
 name = "install-proxy-ca"
 required = true
 user = "root"
@@ -79,7 +79,7 @@ command = [
 Alpine:
 
 ```toml
-[[container_bootstrap_steps]]
+[[target_defaults.container_bootstrap_steps]]
 name = "install-proxy-ca"
 required = true
 user = "root"
@@ -111,7 +111,7 @@ Run the proxy as an `aw-container-agent` service when it should live inside the
 managed container:
 
 ```toml
-[[container_agent.services]]
+[[target_defaults.container_agent.services]]
 name = "egress-proxy"
 required = true
 user = "root"
@@ -122,7 +122,7 @@ command = [
 ]
 restart = "always"
 
-[container_agent.services.health_check]
+[target_defaults.container_agent.services.health_check]
 type = "tcp"
 host = "127.0.0.1"
 port = 8881
@@ -134,7 +134,7 @@ If SSH depends on the proxy for downloads or extension installation, add the
 dependency to the existing SSHD service:
 
 ```toml
-[[container_agent.services]]
+[[target_defaults.container_agent.services]]
 name = "container-sshd"
 command = ["/opt/aw-gateway/bin/start-container-sshd"]
 depends_on = ["egress-proxy"]
@@ -174,13 +174,13 @@ being redirected back into itself.
 Wire the firewall with a host step:
 
 ```toml
-[[host_steps]]
+[[target_defaults.host_steps]]
 name = "transparent-proxy-firewall"
 required = true
 timeout = "30s"
 command = ["/opt/site-policy/bin/proxy-firewall", "add", "{container_pid}"]
 
-[host_steps.health_check]
+[target_defaults.host_steps.health_check]
 type = "command"
 command = ["/opt/site-policy/bin/proxy-firewall", "check", "{container_pid}"]
 ```
