@@ -183,6 +183,7 @@ def render_gateway_config(
         text = text.replace('name = "{image_slug}"', 'ephemeral_name = "{image_slug}-{session_id}"', 1)
         text = text.replace("remove_on_stop = false", "remove_on_stop = true", 1)
     text = ensure_enabled_action(text, "run")
+    text = ensure_ssh_command_filter_env(text)
     text = append_http_smoke_config(text, host, http_actions=http_actions)
     text = append_smoke_launch(text, host)
     text = replace_toml_string(text, "host", host.ssh, section="client_config")
@@ -305,6 +306,52 @@ def append_control_socket_override(text: str, host: Host) -> str:
         text.rstrip()
         + "\n\n[target_defaults.control_sockets]\n"
         + f'host_dir = "{host.home_dir}/.cache/aw-gateway/sockets/{{runtime_id}}"\n'
+    )
+
+
+def ensure_ssh_command_filter_env(text: str) -> str:
+    filter_path: str | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("target = ") and "aw-ssh-command-filter" in stripped:
+            parts = stripped.split('"')
+            if len(parts) >= 3:
+                filter_path = parts[1]
+                break
+    if filter_path is None or "AW_SSH_COMMAND_FILTER" in text:
+        return text
+
+    lines = text.splitlines()
+    in_services = False
+    in_container_sshd = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == "[[target_defaults.container_agent.services]]":
+            if in_container_sshd:
+                lines.insert(index, ssh_command_filter_env_block(filter_path))
+                return "\n".join(lines) + "\n"
+            in_services = True
+            in_container_sshd = False
+            continue
+        if stripped.startswith("[") and not stripped.startswith("[target_defaults.container_agent.services."):
+            if in_container_sshd:
+                lines.insert(index, ssh_command_filter_env_block(filter_path))
+                return "\n".join(lines) + "\n"
+            in_services = False
+            in_container_sshd = False
+            continue
+        if in_services and stripped == 'name = "container-sshd"':
+            in_container_sshd = True
+    if in_container_sshd:
+        lines.append(ssh_command_filter_env_block(filter_path))
+        return "\n".join(lines) + "\n"
+    raise ValueError("did not find container-sshd service")
+
+
+def ssh_command_filter_env_block(filter_path: str) -> str:
+    return (
+        "\n[target_defaults.container_agent.services.env.AW_SSH_COMMAND_FILTER]"
+        f'\nvalue = "{filter_path}"'
     )
 
 

@@ -60,6 +60,29 @@ covered on the Linux hosts.
 | `client-config` generates a usable host-local SSH bundle | all enabled hosts |
 | Host-local `ssh -F <bundle> aw-<target> id` executes inside the container | all enabled hosts |
 
+## Container SSH Transfer Policy
+
+Implemented in `tests/test_25_transfer_policy.py`.
+
+These tests use the same host-local generated client bundle as the container
+SSH smoke test. Each case rewrites a temporary host config with a specific
+`[container_ssh.transfer]` policy, starts the target, and verifies upload and
+download behavior for SFTP, default OpenSSH `scp`, and legacy `scp -O`.
+
+| `sftp` | `legacy_scp` | Expected SFTP | Expected default `scp` | Expected legacy upload | Expected legacy download |
+| --- | --- | --- | --- | --- | --- |
+| `allow` | `allow` | allow | allow | allow | allow |
+| `allow` | `deny` | allow | allow | deny | deny |
+| `deny` | `allow` | deny | deny | allow | allow |
+| `allow` | `inbound` | allow | allow | allow | deny |
+| `allow` | `outbound` | allow | allow | deny | allow |
+| `deny` | `deny` | deny | deny | deny | deny |
+
+The default `scp` expectation assumes modern OpenSSH behavior, where default
+`scp` uses the SFTP protocol. Legacy direction checks use `scp -O`: upload into
+the container maps to `legacy_scp = "inbound"`, and download from the container
+maps to `legacy_scp = "outbound"`.
+
 ## Restricted SSH Users
 
 Implemented in `tests/test_20_restricted_user.py`.
@@ -102,7 +125,6 @@ HTTP requests to the forwarded local port.
 The current suite does not yet exercise every gateway behavior. The following
 areas are intentionally left out of the first in-repo smoke harness:
 
-- SCP/SFTP transfer policy combinations through generated container SSH config.
 - Idle timeout, agent-owned reaping, preserve-process, and workspace cleanup
   timing behavior.
 - Controller-side generated SSH config use from the controller into Linux
