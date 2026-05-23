@@ -6801,6 +6801,53 @@ includes = ["config.d/root-fragment.toml"]
     }
 
     #[test]
+    fn includes_load_shared_fragments_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config.d");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("frag1.toml"),
+            r#"
+includes = ["shared.toml"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("frag2.toml"),
+            r#"
+includes = ["shared.toml"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("shared.toml"),
+            r#"
+[targets.default]
+image = "ubuntu/shared"
+mode = "fixed"
+name = "shared"
+"#,
+        )
+        .unwrap();
+        let root = dir.path().join("gateway.toml");
+        std::fs::write(
+            &root,
+            r#"
+schema_version = "1"
+includes = ["config.d/frag1.toml", "config.d/frag2.toml"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = GatewayConfig::load(&root).unwrap();
+        assert_eq!(cfg.targets.len(), 1);
+        assert_eq!(
+            cfg.effective_target("default").unwrap().image,
+            "ubuntu/shared"
+        );
+    }
+
+    #[test]
     fn includes_expand_globs_sorted() {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("config.d");

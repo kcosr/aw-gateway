@@ -5,7 +5,7 @@ default_target = "default"
 # are resolved from the file that declares them. Included files may define
 # nested includes, [target_templates.<name>], [launch_templates.<name>],
 # [targets.<name>], and [launches.<name>] only.
-# Keep schema_version, default_target, runtime, logging, dispatch,
+# Keep schema_version, default_target, runtime, logging, ssh_dispatch,
 # client_config, target_defaults, and launch_defaults in this root file.
 # includes = ["/etc/aw-gateway/config.d/*.toml"]
 
