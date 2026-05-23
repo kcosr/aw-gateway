@@ -187,6 +187,56 @@ action = "exit_container"
 }
 
 #[test]
+fn gateway_config_validate_accepts_target_and_launch_templates() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        r#"
+schema_version = "1"
+
+[target_templates.base]
+image = "ubuntu/base"
+mode = "fixed"
+name = "base"
+
+[target_templates.worker]
+use = ["base"]
+container_user = "worker"
+
+[targets.default]
+use = ["worker"]
+name = "default"
+
+[launch_templates.repo]
+target = "default"
+cwd = "{container_home}/repo"
+
+[launch_templates.repo.vars]
+repo = { type = "string", required = true }
+
+[launch_templates.review]
+use = ["repo"]
+command = ["codex", "exec", "{var.repo}"]
+
+[launches.code-review]
+use = ["review"]
+command = ["codex", "exec", "review", "{var.repo}"]
+"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["config", "validate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ok"));
+}
+
+#[test]
 fn gateway_config_validate_rejects_legacy_gateway_socket_paths() {
     for (config_name, config_body, expected) in [
         (
