@@ -5,7 +5,7 @@ default_target = "default"
 # are resolved from the file that declares them. Included files may define
 # nested includes, [target_templates.<name>], [launch_templates.<name>],
 # [targets.<name>], and [launches.<name>] only.
-# Keep schema_version, default_target, runtime, logging, ssh_dispatch,
+# Keep schema_version, default_target, runtime, logging, http, ssh_dispatch,
 # client_config, target_defaults, and launch_defaults in this root file.
 # includes = ["/etc/aw-gateway/config.d/*.toml"]
 
@@ -29,6 +29,24 @@ directory = "{state}/logs/gateway"
 max_bytes = 104857600
 max_files = 5
 console = false
+
+# Optional JSON HTTP API daemon. Keep the listener on loopback or behind an
+# external authentication boundary, especially when auth.type = "none".
+#
+# [http]
+# enabled = true
+# listen = "127.0.0.1:8080"
+# enabled_actions = ["status", "targets", "launches", "launch", "up", "run"]
+#
+# [http.auth]
+# type = "none"
+#
+# Bearer auth reads the token from the configured file and requires
+# Authorization: Bearer <token> on /api/v1/* requests.
+#
+# [http.auth]
+# type = "bearer"
+# token_file = "~/.config/aw-gateway/http-token"
 
 [target_defaults.workspace]
 path = "workspace"

@@ -350,6 +350,38 @@ fn status_all_cli_parses_without_touching_up() {
 }
 
 #[test]
+fn http_cli_parses_and_rejects_disabled_config() {
+    let args = GatewayArgs::try_parse_from(["aw-gateway", "http"]).unwrap();
+    assert!(matches!(args.command, Some(GatewayCommand::Http)));
+
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("http")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "http listener is disabled in config",
+        ));
+}
+
+#[test]
 fn connect_and_run_cli_parse_session_id_forms() {
     for args in [
         vec![

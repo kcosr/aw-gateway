@@ -32,6 +32,10 @@
 
 ### Added
 
+- Added an initial JSON HTTP API daemon with explicit `[http]` config,
+  optional bearer auth, HTTP action allow-listing, metadata routes, wait/detach
+  run and launch execution, typed JSON launch variables, and stable JSON
+  success/error envelopes.
 - Added nested unified config includes for `[target_templates.<name>]`,
   `[launch_templates.<name>]`, `[targets.<name>]`, and `[launches.<name>]`,
   with relative path resolution, sorted glob expansion, cycle detection, and

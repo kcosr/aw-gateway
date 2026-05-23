@@ -280,6 +280,120 @@ aw-gateway.sample.toml
 container-agent.sample.toml
 ```
 
+## HTTP API
+
+`aw-gateway http` starts a JSON HTTP listener from the gateway config. The
+daemon starts only when `[http].enabled = true`; otherwise it exits nonzero
+with `http listener is disabled in config`. The listener address is a single
+socket string such as `127.0.0.1:8080` or `[::1]:8080`.
+
+```toml
+[http]
+enabled = true
+listen = "127.0.0.1:8080"
+enabled_actions = ["status", "targets", "launches", "launch", "up", "run"]
+
+[http.auth]
+type = "none"
+```
+
+When `auth.type = "none"`, no `Authorization` header is required. Bind to
+loopback or put the daemon behind an external auth boundary. Bearer auth reads
+a token from a file and requires `Authorization: Bearer <token>` on every
+`/api/v1/*` route:
+
+```toml
+[http.auth]
+type = "bearer"
+token_file = "~/.config/aw-gateway/http-token"
+```
+
+`http.enabled_actions` is an HTTP-specific allow list. Supported values are
+exactly `status`, `targets`, `launches`, `launch`, `up`, and `run`. Other
+gateway actions such as `connect`, `stop`, `remove`, key management,
+client-config/bundle, proxy/tunnel helpers, and default-target management are
+not HTTP API actions.
+
+Every success response is JSON. Metadata endpoints return:
+
+```json
+{"ok": true, "data": {}}
+```
+
+Wait-mode command and launch responses return HTTP 200 even when the command
+exit code is nonzero:
+
+```json
+{"ok": true, "mode": "wait", "exit_code": 0, "stdout": "...", "stderr": "..."}
+```
+
+Detach-mode command and launch responses return HTTP 202:
+
+```json
+{"ok": true, "mode": "detach", "status": "accepted", "operation_id": "abc123"}
+```
+
+There is no query-later result endpoint for detached operations. Detached
+operations run in the background through the same gateway operation layer and
+are observable only through existing lifecycle/status side effects.
+
+Errors use a stable envelope:
+
+```json
+{"ok": false, "error": {"code": "invalid_request", "message": "human-readable message"}}
+```
+
+| Method | Path | Action | Operation |
+| --- | --- | --- | --- |
+| `GET` | `/api/v1/status?target=default&session_id=abc` | `status` | `GatewayOperation::Status` |
+| `GET` | `/api/v1/status/all` | `status` | `GatewayOperation::StatusAll` |
+| `GET` | `/api/v1/targets` | `targets` | `GatewayOperation::Targets` |
+| `POST` | `/api/v1/up` | `up` | `GatewayOperation::Up` |
+| `GET` | `/api/v1/launches` | `launches` | `GatewayOperation::Launches` |
+| `GET` | `/api/v1/launches/{name}` | `launch` | `GatewayOperation::LaunchShow` |
+| `POST` | `/api/v1/launches/{name}/run` | `launch` | `GatewayOperation::Launch` |
+| `POST` | `/api/v1/run` | `run` | `GatewayOperation::Run` |
+
+Command-like POST bodies accept optional `mode` and `output` fields. `mode`
+defaults to `wait` and can be `wait` or `detach`; HTTP does not expose stream
+mode. `output` defaults to `["stdout", "stderr"]`, accepts only `stdout` and
+`stderr`, and applies only to wait responses.
+
+```json
+{
+  "target": "default",
+  "session_id": "optional",
+  "cwd": "~/workspace",
+  "command": ["bash", "-lc", "echo hello"],
+  "mode": "wait",
+  "output": ["stdout", "stderr"]
+}
+```
+
+Launch run requests accept typed JSON variables. Strings, booleans, integers,
+and finite numbers are passed to launch validation; nulls, arrays, objects,
+duplicate keys, unknown vars, missing required vars, enum/range/type failures,
+and non-finite numbers are rejected as `invalid_launch_var`.
+
+```json
+{
+  "session_id": "optional",
+  "vars": {
+    "repo": "https://example.test/repo.git",
+    "debug": true,
+    "count": 3,
+    "mode": "safe"
+  },
+  "mode": "wait",
+  "output": ["stdout", "stderr"]
+}
+```
+
+The initial HTTP API intentionally does not implement streaming, SSE/NDJSON,
+persistent jobs, TTY sessions, SSH key management, generated client config or
+bundles, proxy/tunnel helpers, stop/remove, default-target management, route
+aliases, or compatibility config shapes.
+
 ## Deployment Guides
 
 - [Podman](docs/guides/podman.md): generic local workstation and remote SSH
@@ -414,6 +528,8 @@ Gateway configs commonly include:
   workspace state directory.
 - `[ssh_dispatch]`: which host SSH commands are handled by the gateway and
   whether container command passthrough is enabled.
+- `[http]`: optional JSON HTTP daemon listener, auth mode, and HTTP action
+  allow list.
 - `[client_config]`: generated SSH alias templates, host name, gateway path,
   and default identity directory.
 - `[targets.<name>]`: container image, naming mode, container user/home,
@@ -762,7 +878,7 @@ partial object merge or override behavior. Include files may define nested
 
 Gateway-wide policy and defaults remain root-owned. Include files must not
 define `schema_version`, `default_target`, `[runtime]`, `[logging]`,
-`[ssh_dispatch]`, `[client_config]`, `[target_defaults]`, or
+`[http]`, `[ssh_dispatch]`, `[client_config]`, `[target_defaults]`, or
 `[launch_defaults]`.
 
 When `sftp = "deny"`, `start-container-sshd` removes the SFTP subsystem from
@@ -1085,8 +1201,9 @@ aliases such as `rm`.
 CLI and SSH management commands share the same operation handling for target
 discovery, status, launch discovery, launch execution, lifecycle actions,
 default selection, and client config rendering. That keeps text and JSON output
-aligned between transports. This does not add an HTTP server, HTTP routes,
-HTTP authentication, streaming, or background jobs; those remain future work.
+aligned between those transports. The HTTP API uses the same operation layer
+for its narrower action set, but it does not expose SSH-only actions,
+streaming, or background job retrieval.
 
 `add-key`, `add-host-key`, and `add-container-key` options:
 
