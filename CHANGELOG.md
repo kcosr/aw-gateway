@@ -27,7 +27,8 @@
   ([#8](https://github.com/kcosr/aw-gateway/pull/8)).
 - Renamed `[ssh_dispatch].enabled_gateway_actions` to
   `[ssh_dispatch].enabled_actions`. The retired key is rejected during config
-  validation.
+  validation
+  ([#11](https://github.com/kcosr/aw-gateway/pull/11)).
 
 ### Added
 
@@ -67,7 +68,8 @@
   ([#6](https://github.com/kcosr/aw-gateway/pull/6)).
 - Normalized CLI and SSH management actions through shared operation handling
   for target discovery, status, launch discovery, launch execution, lifecycle
-  actions, default selection, and client config rendering.
+  actions, default selection, and client config rendering
+  ([#11](https://github.com/kcosr/aw-gateway/pull/11)).
 - Lifecycle and host hook commands now use a finite `60s` default timeout when no per-step `timeout` is configured ([#2](https://github.com/kcosr/aw-gateway/pull/2)).
 
 ## [0.1.0] - 2026-05-21
