@@ -73,6 +73,9 @@ bridge.
 
 ## Lifecycle Diagrams
 
+The user-facing ingress paths differ, but they converge on the same target
+resolution, readiness, operation execution, and cleanup machinery.
+
 ### Managed SSH Attach
 
 In managed-server mode, host SSH authenticates the user and then invokes the
@@ -104,6 +107,34 @@ sequenceDiagram
     A->>S: Supervise container sshd service
     A-->>G: Expose SSH bridge socket
     G-->>C: Proxy bytes between client and container SSH
+```
+
+### HTTP API Operation
+
+The HTTP API is a non-interactive JSON ingress path into the same gateway
+operation layer used by CLI and SSH management actions.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as HTTP client
+    participant G as aw-gateway http
+    participant O as GatewayOperation
+    participant R as Container runtime
+    participant A as aw-container-agent
+
+    C->>G: POST /api/v1/run or /launches/{name}/run
+    G->>G: Authenticate request and check http.enabled_actions
+    G->>O: Build operation with wait or detach mode
+    O->>R: Resolve target and ensure container readiness
+    R->>A: Wait for configured services/control readiness
+    alt wait mode
+        O->>R: Execute command and capture stdout/stderr
+        G-->>C: 200 JSON with exit_code/stdout/stderr
+    else detach mode
+        O->>R: Start background operation with session guard
+        G-->>C: 202 JSON with operation_id
+    end
 ```
 
 ### Container Startup And Readiness
