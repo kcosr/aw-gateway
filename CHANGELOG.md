@@ -17,14 +17,17 @@
   `[[target_defaults.container_bootstrap_steps]]`,
   `[target_defaults.container_agent]`, and
   `[target_defaults.container_ssh]` instead of the former root sections.
+  ([#8](https://github.com/kcosr/aw-gateway/pull/8)).
 - Replaced flat target workspace fields with nested
   `[targets.<name>.workspace]` fields. Use `path`, `state_dir`, and `cleanup`
-  under the nested table instead of `workspace` and `workspace_cleanup`.
+  under the nested table instead of `workspace` and `workspace_cleanup`
+  ([#8](https://github.com/kcosr/aw-gateway/pull/8)).
 
 ### Added
 
 - Added explicit `[target_defaults]` and `[launch_defaults]` config sections
-  that overlay into concrete targets and launches before validation.
+  that overlay into concrete targets and launches before validation
+  ([#8](https://github.com/kcosr/aw-gateway/pull/8)).
 - Added target-level `workspace.cleanup` config for best-effort cleanup of
   resolved ephemeral session workspaces after success or after any outcome
   ([#7](https://github.com/kcosr/aw-gateway/pull/7)).
