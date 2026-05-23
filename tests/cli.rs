@@ -151,6 +151,36 @@ container_dir = "/tmp/aw-gateway"
 }
 
 #[test]
+fn gateway_config_validate_accepts_workspace_cleanup() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "ephemeral"
+ephemeral_name = "worker-{session_id}"
+stop_when_idle = true
+workspace = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
+workspace_cleanup = "always"
+"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["config", "validate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ok"));
+}
+
+#[test]
 fn gateway_config_validate_rejects_legacy_gateway_socket_paths() {
     for (config_name, config_body, expected) in [
         (

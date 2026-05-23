@@ -130,8 +130,10 @@ flowchart TD
 ### Session Exit, Grace Period, And Cleanup
 
 Cleanup is target policy. A target can keep running, stop after the last
-session, or ask the container agent to reap non-preserved processes. Preserve
-processes such as `tmux` or `screen` can keep a container alive when configured.
+session, ask the container agent to reap non-preserved processes, and for
+ephemeral target-specific workspaces optionally remove the resolved session
+workspace. Preserve processes such as `tmux` or `screen` can keep a container
+alive when configured.
 
 ```mermaid
 stateDiagram-v2
@@ -346,6 +348,29 @@ create a per-session container and require `mode = "ephemeral"`,
 `ephemeral_name` with `{session_id}`, and `stop_when_idle = true` so idle
 cleanup can remove each session container.
 
+Ephemeral targets can also opt into target workspace cleanup:
+
+```toml
+[targets.worker]
+image = "ubuntu/dev"
+mode = "ephemeral"
+ephemeral_name = "worker-{session_id}"
+stop_when_idle = true
+workspace = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
+workspace_cleanup = "always"
+```
+
+`workspace_cleanup` accepts `never` (the default), `success`, or `always`.
+Cleanup is supported only for ephemeral targets with a target-specific
+`workspace` that references `{session_id}`. The gateway deletes only the
+resolved workspace for that session after the session is done and after
+container cleanup has completed or been attempted. Missing workspaces are
+treated as success; cleanup failures are warnings and do not replace the
+command or launch exit status. Unsafe deletion roots, including `/`, the user
+home directory, paths without the current session id, and symlink roots, are
+refused before the session runs. Control socket runtime directories are managed
+by `[control_sockets]`, not by workspace cleanup.
+
 Podman managed-host targets default to the authenticated host user and home.
 Docker and Colima targets default to `root` and `/root`; set
 `container_user` and `container_home` when the image provides a different
@@ -375,8 +400,8 @@ Gateway configs commonly include:
 - `[client_config]`: generated SSH alias templates, host name, gateway path,
   and default identity directory.
 - `[targets.<name>]`: container image, naming mode, container user/home,
-  cleanup behavior, optional runtime args, environment, and local-listen
-  settings.
+  idle and workspace cleanup behavior, optional runtime args, environment, and
+  local-listen settings.
 - `[targets.<name>.identity]`: container bootstrap and session identity
   fields.
 - `[[lifecycle_steps]]`: phase-keyed host hooks for `pre_start`,

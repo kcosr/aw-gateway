@@ -78,6 +78,12 @@ name = "{image_slug}"
 # the authenticated user's home; absolute paths may use {home}, {user}, {uid},
 # {gid}, {target}, {image}, {image_slug}, and {session_id}.
 # workspace = "{home}/workspace-internal"
+#
+# Ephemeral targets with a target-specific workspace containing {session_id}
+# can delete the resolved session workspace after the session ends.
+# Allowed values: "never" (default), "success", and "always".
+# workspace = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
+# workspace_cleanup = "always"
 stop_when_idle = true
 remove_on_stop = false
 
