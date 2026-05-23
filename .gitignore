@@ -4,3 +4,10 @@
 *.swp
 *~
 .build-service/workspace-id
+smoke/.venv/
+smoke/.pytest_cache/
+smoke/aw_gateway_smoke.egg-info/
+smoke/generated/
+smoke/inventory.toml
+smoke/RESULTS.md
+smoke/**/__pycache__/

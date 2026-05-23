@@ -70,6 +70,13 @@ Use one deployment root. The examples use:
       start-container-sshd
 ```
 
+For rootless Podman on SELinux hosts, a user-owned deployment root can be more
+reliable than a root-owned `/opt/aw-gateway` tree. Podman may need to relabel
+bind-mounted runtime files for the container, and rootless Podman cannot
+relabel root-owned files in `/opt`. In that case, install the same layout under
+a private user path such as `$HOME/aw-gateway` and replace every
+`/opt/aw-gateway` path in the config with that install root.
+
 Install the host-side gateway:
 
 ```bash
@@ -104,6 +111,8 @@ Full file: `examples/podman/Containerfile.ubuntu`
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+
+RUN if id ubuntu >/dev/null 2>&1; then userdel ubuntu && rm -rf /home/ubuntu; fi
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

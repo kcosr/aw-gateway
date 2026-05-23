@@ -67,6 +67,18 @@ colima version
 docker version --client
 ```
 
+Non-interactive SSH sessions on macOS may not load the same shell startup files
+as an interactive terminal. If Colima or Docker live under a user-local bin
+directory such as `$HOME/.local/bin`, either make that path available to the
+SSH session or set the Docker CLI explicitly in gateway config:
+
+```toml
+[runtime]
+type = "colima"
+profile = "aw-gateway"
+program = "/Users/example/.local/bin/docker"
+```
+
 ## Start Colima
 
 Use a dedicated profile so gateway experiments do not affect other Docker
@@ -142,6 +154,8 @@ Full file: `examples/colima/Containerfile.ubuntu`
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+
+RUN if id ubuntu >/dev/null 2>&1; then userdel ubuntu && rm -rf /home/ubuntu; fi
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -224,6 +238,10 @@ Important Colima-specific fields:
 type = "colima"
 profile = "aw-gateway"
 
+[target_defaults.control_sockets]
+host_dir = "/Users/example/.cache/aw-gateway/sockets/{runtime_id}"
+container_dir = "/run/aw-gateway"
+
 [targets.ubuntu.local_ssh]
 mode = "listen"
 backend = "published_port"
@@ -256,6 +274,11 @@ enabled = true
 control_socket = false
 ```
 
+macOS does not normally provide Linux-style `/run/user/{uid}` directories. Set
+`target_defaults.control_sockets.host_dir` to a short, private, user-owned
+directory that ends in `{runtime_id}`, as shown above. The gateway removes only
+that runtime leaf directory during stop/remove cleanup.
+
 The published-port backend avoids relying on a Unix-domain socket crossing the
 macOS-to-Colima-VM boundary. Docker publishes container port 22 to a random
 loopback-only backend port on macOS, and the gateway's stable local listener
@@ -279,6 +302,17 @@ agent.
 The identity block starts bootstrap as root, then creates the session login
 from the host user, UID, and GID macros. That makes `ssh aw-ubuntu` land in the
 container as the same numeric identity that owns the bind-mounted workspace.
+If the macOS numeric uid or gid collides with an existing Linux account or
+group in your base image, set explicit in-container values instead:
+
+```toml
+[targets.ubuntu.identity]
+session_user = "{user}"
+session_uid = "24501"
+session_gid = "24501"
+session_home = "/home/{user}"
+session_shell = "/bin/bash"
+```
 
 The runtime `extra_run_args` shown above allow bubblewrap-based tools to create
 the namespaces they need under Docker/Colima. Those flags relax the container
@@ -310,6 +344,18 @@ Start the target and local listener:
 
 Keep the `up` process running while local SSH-compatible clients use the
 generated config.
+
+On a newly started Colima profile, Docker's loopback published port can take a
+short time to become reachable even after the container process starts. If
+`up`, `run`, or `connect` reports that the published container SSH port did not
+become ready, remove the fixed target and retry after confirming Colima and
+Docker are healthy:
+
+```bash
+colima status --profile aw-gateway
+DOCKER_HOST="unix://$HOME/.colima/aw-gateway/docker.sock" docker ps -a
+~/aw-gateway/bin/aw-gateway --config ~/aw-gateway/etc/gateway.toml remove ubuntu
+```
 
 Install your workstation public key into the container authorized-key file:
 

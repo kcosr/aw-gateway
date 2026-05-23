@@ -67,10 +67,7 @@ fn ensure_group_at(path: &Path, name: &str, gid: u32) -> anyhow::Result<()> {
                 return Ok(());
             }
             if fields[2] == gid.to_string() {
-                anyhow::bail!(
-                    "gid {gid} already used by group {:?}; session_gid must be unique or session group must match",
-                    fields[0]
-                );
+                return Ok(());
             }
         }
     }
@@ -326,13 +323,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ensure_group_rejects_gid_collision_with_different_name() {
+    fn ensure_group_allows_gid_collision_with_different_name() {
         let dir = tempfile::tempdir().unwrap();
         let group = dir.path().join("group");
         std::fs::write(&group, "root:x:0:\nwheel:x:2450:\n").unwrap();
 
-        let err = ensure_group_at(&group, "awuser", 2450).unwrap_err();
-        assert!(err.to_string().contains("gid 2450 already used"));
+        ensure_group_at(&group, "awuser", 2450).unwrap();
+
+        let raw = std::fs::read_to_string(&group).unwrap();
+        assert_eq!(raw, "root:x:0:\nwheel:x:2450:\n");
     }
 
     #[test]
@@ -363,6 +362,18 @@ mod tests {
             std::fs::metadata(&group).unwrap().permissions().mode() & 0o777,
             0o644
         );
+    }
+
+    #[test]
+    fn ensure_group_allows_existing_gid_with_different_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = dir.path().join("group");
+        std::fs::write(&group, "root:x:0:\ndialout:x:20:\n").unwrap();
+
+        ensure_group_at(&group, "staff", 20).unwrap();
+
+        let raw = std::fs::read_to_string(&group).unwrap();
+        assert_eq!(raw, "root:x:0:\ndialout:x:20:\n");
     }
 
     #[test]
