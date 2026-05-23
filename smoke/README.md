@@ -176,6 +176,8 @@ The current suite covers:
 - Target listing.
 - Clean fixed-target lifecycle.
 - Host-local container SSH through generated client bundles.
+- Container SSH transfer policy for `sftp`, default `scp`, and legacy
+  `scp -O` upload/download paths.
 - Linux restricted `ForceCommand` help, target listing, and `run`.
 - HTTP API bearer auth, metadata, lifecycle, command execution, launch
   execution, validation errors, and action allow-listing over SSH tunnels.

@@ -36,6 +36,9 @@
   and macOS/Colima hosts, covering unrestricted SSH, restricted forced-command
   SSH, host-local container SSH, lifecycle operations, and the JSON HTTP API
   ([#15](https://github.com/kcosr/aw-gateway/pull/15)).
+- Added live SCP/SFTP transfer-policy smoke coverage for default SFTP-backed
+  `scp`, legacy `scp -O`, and upload/download policy variants
+  ([#16](https://github.com/kcosr/aw-gateway/pull/16)).
 - Added an initial JSON HTTP API daemon with explicit `[http]` config,
   optional bearer auth, HTTP action allow-listing, metadata routes, wait/detach
   run and launch execution, typed JSON launch variables, and stable JSON
