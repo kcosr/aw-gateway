@@ -6,12 +6,14 @@
 
 - Gateway configs now reject direct `container_agent.control_socket = "/path"`
   and `container_agent.ssh_bridge.socket = "/path"` socket path settings; use
-  `[control_sockets]` for gateway-managed runtime socket directories.
+  `[control_sockets]` for gateway-managed runtime socket directories
+  ([#6](https://github.com/kcosr/aw-gateway/pull/6)).
 
 ### Added
 
 - Added `[control_sockets]` and `[targets.<name>.control_sockets]` config for
-  short runtime-only gateway control and SSH bridge socket directories.
+  short runtime-only gateway control and SSH bridge socket directories
+  ([#6](https://github.com/kcosr/aw-gateway/pull/6)).
 - Added explicit `--session-id` support to `connect`, `run`, and executable
   `launch` commands, including matching SSH-dispatch parsing for deterministic
   ephemeral target sessions
@@ -25,7 +27,8 @@
 ### Changed
 
 - Gateway-managed container-agent control and SSH bridge sockets now live in
-  the configured runtime socket directory instead of durable workspace state.
+  the configured runtime socket directory instead of durable workspace state
+  ([#6](https://github.com/kcosr/aw-gateway/pull/6)).
 - Lifecycle and host hook commands now use a finite `60s` default timeout when no per-step `timeout` is configured ([#2](https://github.com/kcosr/aw-gateway/pull/2)).
 
 ## [0.1.0] - 2026-05-21
