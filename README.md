@@ -1,14 +1,17 @@
 # Agent Workspaces Gateway
 
-`aw-gateway` is a convenience utility for managing disposable or reusable
-container workspaces. Users can work normally inside the workspace, while
-operators keep the host filesystem out of reach and attach policy hooks around
-the container, especially at the container network layer.
+`aw-gateway` is a gateway for disposable or reusable container workspaces. It
+starts or reuses configured containers, supervises required in-container
+services, and exposes workspace operations through the host CLI,
+SSH-compatible clients, and an optional JSON HTTP API. Users can work normally
+inside the workspace, while operators keep the host filesystem out of reach and
+attach policy hooks around the container, especially at the container network
+layer.
 
-The gateway uses SSH as the standard interface into those sandboxes. It starts
-or reuses a configured container, supervises required in-container services,
-and connects SSH/SCP/SFTP clients to container-local SSH instead of to the host
-shell or host filesystem.
+SSH remains the standard interactive attach path: OpenSSH, SCP, SFTP, and
+desktop tools connect to container-local SSH instead of to the host shell or
+host filesystem. The CLI and HTTP API expose the same managed lifecycle and
+operation model for automation and non-interactive integrations.
 
 It is a standalone gateway for managed hosts and local workstation profiles
 that use Podman, Docker, or Colima.
@@ -31,18 +34,24 @@ such as autonomous coding agents or untrusted build steps, and should feel like
 a normal development box without reaching the host filesystem or unrestricted
 network.
 
-Standard development tools still need a familiar connection model. OpenSSH,
-SCP, SFTP, and desktop tools like VS Code, Codex, and Claude Code all know how
-to talk SSH, so `aw-gateway` provides an SSH bridge into the
-sandbox. On managed hosts, host SSHD authenticates the user and starts
-`aw-gateway`; the gateway prepares the target container, waits for required
-services, and connects the client to the container-local SSH daemon through a
-controlled bridge.
+Standard development tools still need a familiar interactive connection model.
+OpenSSH, SCP, SFTP, and desktop tools like VS Code, Codex, and Claude Code all
+know how to talk SSH, so `aw-gateway` provides an SSH bridge into the sandbox.
+Automation needs a stable control surface too, so the same gateway operations
+are available from the host CLI and, when enabled, the JSON HTTP API. On
+managed hosts, host SSHD authenticates the user and starts `aw-gateway`; the
+gateway prepares the target container, waits for required services, and
+connects the client to the container-local SSH daemon through a controlled
+bridge.
 
 ## Features
 
-- Host-side SSH dispatch for interactive shells, direct commands, and gateway
-  management actions.
+- Host-side CLI for target lifecycle, status, launches, run commands, and
+  client configuration.
+- SSH-compatible attach for interactive shells, direct commands, SCP, SFTP,
+  and gateway management actions.
+- Optional JSON HTTP API for status, targets, readiness, launch, and run
+  automation.
 - Container lifecycle management for fixed and ephemeral targets.
 - Runtime support for Podman, Docker, and Colima.
 - Config-driven lifecycle steps before container start and host steps after
@@ -59,7 +68,7 @@ controlled bridge.
   services.
 - Optional idle cleanup that can stop a container or reap non-preserved
   processes after the last gateway session exits.
-- Protocol-safe logging for SSH proxy modes and rotating JSON logs for
+- Protocol-safe logging for proxy modes and rotating JSON logs for
   diagnostics.
 
 ## Lifecycle Diagrams
@@ -186,8 +195,8 @@ sequenceDiagram
 
 This repository builds four binaries:
 
-- `aw-gateway`: host-side CLI, SSH dispatcher, runtime lifecycle manager, and
-  client-config generator.
+- `aw-gateway`: host-side CLI, SSH dispatcher, optional HTTP API daemon,
+  runtime lifecycle manager, and client-config generator.
 - `aw-container-bootstrap`: optional in-container bootstrap entrypoint that
   prepares identity/state and then execs the agent.
 - `aw-container-agent`: container-side supervisor, control socket, service
@@ -279,6 +288,122 @@ The canonical sample configs are:
 aw-gateway.sample.toml
 container-agent.sample.toml
 ```
+
+## HTTP API
+
+`aw-gateway http` starts a JSON HTTP listener from the gateway config. The
+daemon starts only when `[http].enabled = true`; otherwise it exits nonzero
+with `http listener is disabled in config`. The listener address is a single
+socket string such as `127.0.0.1:8080` or `[::1]:8080`.
+
+```toml
+[http]
+enabled = true
+listen = "127.0.0.1:8080"
+enabled_actions = ["status", "targets", "launches", "launch", "up", "run"]
+
+[http.auth]
+type = "none"
+```
+
+When `auth.type = "none"`, no `Authorization` header is required. Bind to
+loopback or put the daemon behind an external auth boundary. Bearer auth reads
+a token from a file and requires `Authorization: Bearer <token>` on every
+`/api/v1/*` route. The HTTP listener does not terminate TLS; use loopback or a
+TLS-terminating reverse proxy for bearer auth. On Unix, the token file must not
+be group- or world-readable.
+
+```toml
+[http.auth]
+type = "bearer"
+token_file = "~/.config/aw-gateway/http-token"
+```
+
+`http.enabled_actions` is an HTTP-specific allow list. Supported values are
+exactly `status`, `targets`, `launches`, `launch`, `up`, and `run`. Other
+gateway actions such as `connect`, `stop`, `remove`, key management,
+client-config/bundle, proxy/tunnel helpers, and default-target management are
+not HTTP API actions.
+
+Every success response is JSON. Metadata endpoints return:
+
+```json
+{"ok": true, "data": {}}
+```
+
+Wait-mode command and launch responses return HTTP 200 even when the command
+exit code is nonzero:
+
+```json
+{"ok": true, "mode": "wait", "exit_code": 0, "stdout": "...", "stderr": "..."}
+```
+
+Detach-mode command and launch responses return HTTP 202:
+
+```json
+{"ok": true, "mode": "detach", "status": "accepted", "operation_id": "abc123"}
+```
+
+There is no query-later result endpoint for detached operations. Detached
+operations run in the background through the same gateway operation layer and
+are observable only through existing lifecycle/status side effects.
+
+Errors use a stable envelope:
+
+```json
+{"ok": false, "error": {"code": "invalid_request", "message": "human-readable message"}}
+```
+
+| Method | Path | Action | Operation |
+| --- | --- | --- | --- |
+| `GET` | `/api/v1/status?target=default&session_id=abc` | `status` | `GatewayOperation::Status` |
+| `GET` | `/api/v1/status/all` | `status` | `GatewayOperation::StatusAll` |
+| `GET` | `/api/v1/targets` | `targets` | `GatewayOperation::Targets` |
+| `POST` | `/api/v1/up` | `up` | `GatewayOperation::Up` |
+| `GET` | `/api/v1/launches` | `launches` | `GatewayOperation::Launches` |
+| `GET` | `/api/v1/launches/{name}` | `launch` | `GatewayOperation::LaunchShow` |
+| `POST` | `/api/v1/launches/{name}/run` | `launch` | `GatewayOperation::Launch` |
+| `POST` | `/api/v1/run` | `run` | `GatewayOperation::Run` |
+
+Command-like POST bodies accept optional `mode` and `output` fields. `mode`
+defaults to `wait` and can be `wait` or `detach`; HTTP does not expose stream
+mode. `output` defaults to `["stdout", "stderr"]`, accepts only `stdout` and
+`stderr`, and applies only to wait responses.
+
+```json
+{
+  "target": "default",
+  "session_id": "optional",
+  "cwd": "~/workspace",
+  "command": ["bash", "-lc", "echo hello"],
+  "mode": "wait",
+  "output": ["stdout", "stderr"]
+}
+```
+
+Launch run requests accept typed JSON variables. Strings, booleans, integers,
+and finite numbers are passed to launch validation; nulls, arrays, objects,
+duplicate keys, unknown vars, missing required vars, enum/range/type failures,
+and non-finite numbers are rejected as `invalid_launch_var`.
+
+```json
+{
+  "session_id": "optional",
+  "vars": {
+    "repo": "https://example.test/repo.git",
+    "debug": true,
+    "count": 3,
+    "mode": "safe"
+  },
+  "mode": "wait",
+  "output": ["stdout", "stderr"]
+}
+```
+
+The initial HTTP API intentionally does not implement streaming, SSE/NDJSON,
+persistent jobs, TTY sessions, SSH key management, generated client config or
+bundles, proxy/tunnel helpers, stop/remove, default-target management, route
+aliases, or compatibility config shapes.
 
 ## Deployment Guides
 
@@ -414,6 +539,8 @@ Gateway configs commonly include:
   workspace state directory.
 - `[ssh_dispatch]`: which host SSH commands are handled by the gateway and
   whether container command passthrough is enabled.
+- `[http]`: optional JSON HTTP daemon listener, auth mode, and HTTP action
+  allow list.
 - `[client_config]`: generated SSH alias templates, host name, gateway path,
   and default identity directory.
 - `[targets.<name>]`: container image, naming mode, container user/home,
@@ -762,7 +889,7 @@ partial object merge or override behavior. Include files may define nested
 
 Gateway-wide policy and defaults remain root-owned. Include files must not
 define `schema_version`, `default_target`, `[runtime]`, `[logging]`,
-`[ssh_dispatch]`, `[client_config]`, `[target_defaults]`, or
+`[http]`, `[ssh_dispatch]`, `[client_config]`, `[target_defaults]`, or
 `[launch_defaults]`.
 
 When `sftp = "deny"`, `start-container-sshd` removes the SFTP subsystem from
@@ -1085,8 +1212,9 @@ aliases such as `rm`.
 CLI and SSH management commands share the same operation handling for target
 discovery, status, launch discovery, launch execution, lifecycle actions,
 default selection, and client config rendering. That keeps text and JSON output
-aligned between transports. This does not add an HTTP server, HTTP routes,
-HTTP authentication, streaming, or background jobs; those remain future work.
+aligned between those transports. The HTTP API uses the same operation layer
+for its narrower action set, but it does not expose SSH-only actions,
+streaming, or background job retrieval.
 
 `add-key`, `add-host-key`, and `add-container-key` options:
 

@@ -3,6 +3,7 @@ use anyhow::Context;
 use glob::glob;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -21,6 +22,8 @@ pub struct GatewayConfig {
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub http: HttpConfig,
     #[serde(default)]
     pub ssh_dispatch: SshDispatchConfig,
     #[serde(default)]
@@ -126,6 +129,7 @@ impl GatewayConfig {
         )?;
         self.logging
             .validate_templates("logging", GATEWAY_LOGGING_TEMPLATE_VARS)?;
+        self.http.validate()?;
         let effective_targets = self.effective_targets()?;
         for (name, launch) in &self.launches {
             validate_name("launch", name)?;
@@ -457,6 +461,105 @@ struct ConfigIncludeFile {
     targets: BTreeMap<String, TargetConfigInput>,
     #[serde(default)]
     launches: BTreeMap<String, LaunchConfigInput>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_http_listen")]
+    pub listen: String,
+    #[serde(default)]
+    pub enabled_actions: Vec<String>,
+    #[serde(default)]
+    pub auth: HttpAuthConfig,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: default_http_listen(),
+            enabled_actions: Vec::new(),
+            auth: HttpAuthConfig::default(),
+        }
+    }
+}
+
+impl HttpConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.listen
+            .parse::<SocketAddr>()
+            .with_context(|| format!("parse http.listen {:?}", self.listen))?;
+        if self.enabled && self.enabled_actions.is_empty() {
+            anyhow::bail!("http.enabled_actions must not be empty when http.enabled = true");
+        }
+        for enabled_action in &self.enabled_actions {
+            if !action::is_http_action_name(enabled_action) {
+                anyhow::bail!(
+                    "unknown or unsupported http.enabled_actions entry {enabled_action:?}"
+                );
+            }
+        }
+        self.auth.validate()
+    }
+
+    pub fn listen_addr(&self) -> anyhow::Result<SocketAddr> {
+        self.listen
+            .parse::<SocketAddr>()
+            .with_context(|| format!("parse http.listen {:?}", self.listen))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpAuthConfig {
+    #[serde(default, rename = "type")]
+    pub auth_type: HttpAuthType,
+    pub token_file: Option<String>,
+}
+
+impl Default for HttpAuthConfig {
+    fn default() -> Self {
+        Self {
+            auth_type: HttpAuthType::None,
+            token_file: None,
+        }
+    }
+}
+
+impl HttpAuthConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self.auth_type {
+            HttpAuthType::None => {
+                if self.token_file.is_some() {
+                    anyhow::bail!(
+                        "http.auth.token_file is only valid when http.auth.type = \"bearer\""
+                    );
+                }
+            }
+            HttpAuthType::Bearer => {
+                let Some(token_file) = &self.token_file else {
+                    anyhow::bail!(
+                        "http.auth.token_file is required when http.auth.type = \"bearer\""
+                    );
+                };
+                if token_file.is_empty() {
+                    anyhow::bail!("http.auth.token_file must not be empty");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpAuthType {
+    #[default]
+    None,
+    Bearer,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -925,6 +1028,7 @@ fn reject_root_only_include_sections(raw: &str, path: &Path) -> anyhow::Result<(
         "default_target",
         "runtime",
         "logging",
+        "http",
         "ssh_dispatch",
         "client_config",
         "target_defaults",
@@ -4187,6 +4291,10 @@ fn default_enabled_actions() -> Vec<String> {
     action::default_enabled_actions()
 }
 
+fn default_http_listen() -> String {
+    "127.0.0.1:8080".into()
+}
+
 fn default_inner_alias_template() -> String {
     "aw-{target}".into()
 }
@@ -4243,6 +4351,192 @@ mod tests {
     fn sample_gateway_config_validates() {
         let cfg: GatewayConfig = toml::from_str(crate::gateway::DEFAULT_GATEWAY_CONFIG).unwrap();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn http_config_defaults_to_disabled_loopback_none_auth() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        assert!(!cfg.http.enabled);
+        assert_eq!(cfg.http.listen, "127.0.0.1:8080");
+        assert!(cfg.http.enabled_actions.is_empty());
+        assert_eq!(cfg.http.auth.auth_type, HttpAuthType::None);
+        assert!(cfg.http.auth.token_file.is_none());
+    }
+
+    #[test]
+    fn http_config_validates_bearer_token_file_rules() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[http]
+enabled = true
+listen = "127.0.0.1:8080"
+enabled_actions = ["status"]
+
+[http.auth]
+type = "bearer"
+token_file = "~/.config/aw-gateway/http-token"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let missing_file: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[http]
+enabled = true
+enabled_actions = ["status"]
+
+[http.auth]
+type = "bearer"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        )
+        .unwrap();
+        let err = missing_file.validate().unwrap_err().to_string();
+        assert!(err.contains("token_file is required"), "{err}");
+
+        let unexpected_file: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[http]
+enabled = true
+enabled_actions = ["status"]
+
+[http.auth]
+type = "none"
+token_file = "/tmp/token"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        )
+        .unwrap();
+        let err = unexpected_file.validate().unwrap_err().to_string();
+        assert!(err.contains("only valid"), "{err}");
+    }
+
+    #[test]
+    fn http_config_rejects_empty_actions_forbidden_actions_and_alias_fields() {
+        let empty_actions: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[http]
+enabled = true
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        )
+        .unwrap();
+        let err = empty_actions.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("http.enabled_actions must not be empty"),
+            "{err}"
+        );
+
+        for action in [
+            "connect",
+            "add-key",
+            "client-config",
+            "stop",
+            "remove",
+            "bogus",
+        ] {
+            let cfg: GatewayConfig = toml::from_str(&format!(
+                r#"
+schema_version = "1"
+
+[http]
+enabled = true
+enabled_actions = ["{action}"]
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+"#
+            ))
+            .unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("http.enabled_actions"), "{action}: {err}");
+        }
+
+        for alias in ["token", "bearer_token"] {
+            let err = toml::from_str::<GatewayConfig>(&format!(
+                r#"
+schema_version = "1"
+
+[http]
+enabled = true
+enabled_actions = ["status"]
+
+[http.auth]
+type = "bearer"
+token_file = "/tmp/token"
+{alias} = "secret"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+"#
+            ))
+            .unwrap_err();
+            assert!(err.to_string().contains("unknown field"), "{alias}: {err}");
+        }
+    }
+
+    #[test]
+    fn http_config_rejects_non_socket_listen() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[http]
+enabled = true
+listen = "localhost:8080"
+enabled_actions = ["status"]
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("parse http.listen"), "{err}");
     }
 
     #[test]
@@ -7059,6 +7353,7 @@ name = "{{image_slug}}"
             ),
             ("runtime", "[runtime]\ntype = \"podman\"\n", "root-only"),
             ("logging", "[logging]\nlevel = \"debug\"\n", "root-only"),
+            ("http", "[http]\nenabled = true\n", "root-only"),
             (
                 "ssh-dispatch",
                 "[ssh_dispatch]\nallow_interactive_shell = false\n",

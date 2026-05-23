@@ -34,6 +34,7 @@ pub enum GatewayCommand {
     Remove(TargetArg),
     Status(StatusArg),
     Targets(TargetsArgs),
+    Http,
     SetDefault(SetDefaultArgs),
     ShowDefault,
     ResetDefault,

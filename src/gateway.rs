@@ -61,6 +61,7 @@ const UNIX_SOCKET_PATH_MAX_BYTES: usize = 103;
 mod client;
 mod fileutil;
 mod health;
+mod http;
 mod identity;
 mod listener;
 mod model;
@@ -110,6 +111,7 @@ pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
         Some(GatewayCommand::Remove(target_arg)) => remove(args.config, target_arg).await,
         Some(GatewayCommand::Status(status_args)) => status(args.config, status_args).await,
         Some(GatewayCommand::Targets(targets_args)) => targets(args.config, targets_args).await,
+        Some(GatewayCommand::Http) => http_listener(args.config).await,
         Some(GatewayCommand::SetDefault(set_default_args)) => {
             set_default(args.config, set_default_args).await
         }
@@ -170,6 +172,10 @@ async fn run_config(command: ConfigCommand, config: Option<PathBuf>) -> anyhow::
             Ok(())
         }
     }
+}
+
+async fn http_listener(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+    http::serve(config_path).await
 }
 
 async fn dispatch_from_ssh(config_path: Option<PathBuf>) -> anyhow::Result<()> {
