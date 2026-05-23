@@ -10,7 +10,7 @@ use tokio::process::Command;
 
 impl Runtime {
     pub(super) fn workspace_state_dir(&self) -> PathBuf {
-        self.workspace.join(&self.cfg.workspace.state_dir)
+        self.workspace.join(&self.target.workspace.state_dir)
     }
 
     pub(super) fn ssh_dir(&self) -> PathBuf {

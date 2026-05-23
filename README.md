@@ -356,17 +356,19 @@ image = "ubuntu/dev"
 mode = "ephemeral"
 ephemeral_name = "worker-{session_id}"
 stop_when_idle = true
-workspace = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
-workspace_cleanup = "always"
+
+[targets.worker.workspace]
+path = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
+cleanup = "always"
 
 [targets.worker.idle_cleanup]
 owner = "gateway"
 action = "exit_container"
 ```
 
-`workspace_cleanup` accepts `never` (the default), `success`, or `always`.
+`workspace.cleanup` accepts `never` (the default), `success`, or `always`.
 Cleanup is supported only for ephemeral targets with a target-specific
-`workspace` under an `aw-gateway` path component that references
+`workspace.path` under an `aw-gateway` path component that references
 `{session_id}`. Cleanup also requires gateway-owned `exit_container` idle
 cleanup with no `preserve_processes`, so the session workspace is not deleted
 while the container is intentionally still alive. The gateway deletes only the
@@ -376,7 +378,8 @@ treated as success; cleanup failures are warnings and do not replace the
 command or launch exit status. Unsafe deletion roots are refused before the
 session runs (empty paths, `/`, the user home directory, paths missing the
 current session id) and again before deletion (symlink roots). Control socket
-runtime directories are managed by `[control_sockets]`, not by workspace
+runtime directories are managed by `[target_defaults.control_sockets]` or
+`[targets.<name>.control_sockets]`, not by workspace
 cleanup. Non-listen `up` remains a warm-up operation and does not trigger
 workspace cleanup.
 
@@ -400,8 +403,11 @@ session_shell = "/bin/bash"
 
 Gateway configs commonly include:
 
-- `[workspace]`: host workspace path and per-workspace state directory.
-- `[control_sockets]`: short runtime directories for gateway-managed Unix
+- `[target_defaults]`: partial target-shaped defaults inherited by every
+  target.
+- `[target_defaults.workspace]`: default host workspace path, state directory,
+  and cleanup policy.
+- `[target_defaults.control_sockets]`: short runtime directories for gateway-managed Unix
   sockets. Durable config, logs, state, and session metadata remain under the
   workspace state directory.
 - `[ssh_dispatch]`: which host SSH commands are handled by the gateway and
@@ -413,10 +419,10 @@ Gateway configs commonly include:
   local-listen settings.
 - `[targets.<name>.identity]`: container bootstrap and session identity
   fields.
-- `[[lifecycle_steps]]`: phase-keyed host hooks for `pre_start`,
+- `[[target_defaults.lifecycle_steps]]`: phase-keyed host hooks for `pre_start`,
   `post_start_host`, `pre_stop`, and `post_stop`, with per-step command
   timeouts.
-- `[[host_steps]]`: post-start host hooks that run after agent readiness, such
+- `[[target_defaults.host_steps]]`: post-start host hooks that run after agent readiness, such
   as firewall setup, with per-step command timeouts and optional command health
   checks.
 - `[launches.<name>]`: named command templates that select a target, validate
@@ -424,34 +430,34 @@ Gateway configs commonly include:
   command inside the ready container.
 - `target_includes` and `launch_includes`: section-specific include globs for
   splitting target and launch definitions into separate TOML files.
-- `[[container_mounts]]` and `[[targets.<name>.container_mounts]]`: extra
+- `[[target_defaults.container_mounts]]` and `[[targets.<name>.container_mounts]]`: extra
   host-to-container bind mounts, typically read-only bootstrap
   binaries/configs/certs.
-- `[container_bootstrap]`: optional bootstrap entrypoint configuration and
+- `[target_defaults.container_bootstrap]`: optional bootstrap entrypoint configuration and
   pre-agent container bootstrap steps. Targets may overlay
   `[targets.<name>.container_bootstrap]` field-by-field.
-- `[[container_bootstrap_steps]]`: optional container-side setup commands that
+- `[[target_defaults.container_bootstrap_steps]]`: optional container-side setup commands that
   run after identity preparation and before the agent starts. Targets may
   replace, remove, append, or order steps with
   `[[targets.<name>.container_bootstrap_steps]]`.
-- `[container_ssh.transfer]`: explicit container SSH file-transfer policy.
+- `[target_defaults.container_ssh.transfer]`: explicit container SSH file-transfer policy.
   Set `sftp = "deny"` to block SFTP and modern OpenSSH SCP. Set
   `legacy_scp = "deny"`, `"inbound"`, or `"outbound"` to control legacy
   `scp -t`/`scp -f` server mode through the container-side command filter.
-  A target may replace the full transfer table with
+  A target may overlay individual transfer fields with
   `[targets.<name>.container_ssh.transfer]`.
-- `[container_agent]`: optional in-container supervision and SSH bridge
+- `[target_defaults.container_agent]`: optional in-container supervision and SSH bridge
   support.
-- `[[container_agent.services]]`: in-container services supervised by
+- `[[target_defaults.container_agent.services]]`: in-container services supervised by
   `aw-container-agent`.
-- `[container_agent.ssh_bridge]`: Unix socket bridge to container SSH. In
-  gateway config, the socket path is generated from `[control_sockets]`.
+- `[target_defaults.container_agent.ssh_bridge]`: Unix socket bridge to container SSH. In
+  gateway config, the socket path is generated from target control sockets.
 
 By default, gateway-managed sockets use a short per-runtime host directory and
 a stable in-container mount point:
 
 ```toml
-[control_sockets]
+[target_defaults.control_sockets]
 host_dir = "/run/user/{uid}/aw-gateway/{runtime_id}"
 container_dir = "/run/aw-gateway"
 ```
@@ -467,8 +473,10 @@ container_dir = "/tmp/aw-gateway"
 The gateway creates the rendered host directory with private permissions before
 container startup, bind-mounts it into the container, and removes the leaf
 runtime directory during stop/remove cleanup. If the default `/run/user/{uid}`
-directory is unavailable or not writable, configure `control_sockets.host_dir`
-to another short absolute path.
+directory is unavailable or not writable, configure
+`target_defaults.control_sockets.host_dir` to another short absolute path under
+`[target_defaults.control_sockets]` or
+`[targets.<name>.control_sockets]`.
 
 Target-specific runtime and environment knobs are explicit:
 
@@ -491,13 +499,13 @@ container SSH helper.
 Container SSH transfer policy is independent for SFTP and legacy SCP:
 
 ```toml
-[container_ssh.transfer]
+[target_defaults.container_ssh.transfer]
 sftp = "allow"        # allow | deny
 legacy_scp = "allow"  # allow | deny | inbound | outbound
 ```
 
-Target transfer policy replaces the full global transfer table for that
-target, so every transfer field must be specified:
+Target transfer policy overlays the default transfer table field-by-field, so
+set only the fields that differ for that target:
 
 ```toml
 [targets.internal.container_ssh.transfer]
@@ -505,15 +513,15 @@ sftp = "deny"
 legacy_scp = "outbound"
 ```
 
-Global lifecycle, host, and bootstrap step lists are inherited by every target.
-Target entries use the same key as the global list (`phase + name` for
+Default lifecycle, host, and bootstrap step lists are inherited by every target.
+Target entries use the same key as the default list (`phase + name` for
 `lifecycle_steps`, `name` for `host_steps` and `container_bootstrap_steps`).
 A same-key target entry replaces the inherited entry in place, while
 `enabled = false` removes an inherited entry. New target-only entries append by
 default and can specify one of `before = "name"` or `after = "name"`; lifecycle
 ordering references are resolved only within the same phase.
 As a convenience, a target lifecycle or host step entry that sets only
-`timeout` inherits the missing fields from the matching global entry; any other
+`timeout` inherits the missing fields from the matching default entry; any other
 partial override must include the full replacement payload.
 
 Use `lifecycle_steps` for host hooks tied to a lifecycle phase, including stop
@@ -527,20 +535,20 @@ timed-out optional hooks warn and continue. `host_steps.health_check` timeouts
 are separate from the host step command timeout.
 
 ```toml
-[[lifecycle_steps]]
+[[target_defaults.lifecycle_steps]]
 phase = "pre_start"
 name = "ensure-workspace"
 required = true
 timeout = "60s"
 command = ["/usr/bin/mkdir", "-p", "{workspace}"]
 
-[[host_steps]]
+[[target_defaults.host_steps]]
 name = "network-policy"
 required = true
 timeout = "30s"
 command = ["/opt/site-policy/bin/network-policy", "add", "{container_pid}"]
 
-[host_steps.health_check]
+[target_defaults.host_steps.health_check]
 type = "command"
 command = ["/opt/site-policy/bin/network-policy", "check", "{container_pid}"]
 ```
@@ -581,6 +589,32 @@ required = true
 timeout = "5m"
 cwd = "{container_home}"
 command = ["git", "clone", "--branch", "{var.branch}", "--single-branch", "{var.repo}", "repo"]
+```
+
+Common launch behavior can be factored into `[launch_defaults]`. Defaults use
+the same partial launch shape as concrete launches: scalar fields such as
+`target`, `cwd`, `description`, and `command` are replaced by a concrete
+launch, `env` and `vars` merge by key, and `steps` merge by `name`.
+
+```toml
+[launch_defaults]
+target = "default"
+cwd = "{container_home}"
+env = { CODEX_HOME = "{container_home}/.codex" }
+
+[launch_defaults.vars]
+repo = { type = "string", required = true, description = "Git repository URL" }
+
+[[launch_defaults.steps]]
+phase = "post_ready"
+location = "container"
+name = "prepare"
+command = ["mkdir", "-p", "{container_home}/repo"]
+
+[launches.repo-shell]
+description = "Clone a repository and open a shell."
+cwd = "{container_home}/repo"
+command = ["/bin/bash", "-lc", "exec /bin/bash"]
 ```
 
 Supported variable types are `string`, `enum`, `boolean`, and `number`.
@@ -669,11 +703,12 @@ container (`scp -f`). SFTP has only allow/deny because the SFTP subsystem is a
 bidirectional protocol channel rather than separate upload/download server
 commands.
 
-`container_ssh.transfer` only applies to traffic that traverses the container
-SSHD. Gateway actions such as `run` execute through the host container runtime,
-so they do not pass through the container SSHD `ForceCommand` and are not
-controlled by SFTP/SCP transfer policy. Host-gateway SSH dispatch checks the
-global transfer table before dispatch; per-target transfer overrides apply to
+`target_defaults.container_ssh.transfer` only applies to traffic that
+traverses the container SSHD. Gateway actions such as `run` execute through the
+host container runtime, so they do not pass through the container SSHD
+`ForceCommand` and are not controlled by SFTP/SCP transfer policy.
+Host-gateway SSH dispatch checks the default transfer table before dispatch;
+per-target transfer overrides do not relax that host-side gate and only affect
 direct container-SSHD access. If a deployment intends to expose management-only
 SSH commands without arbitrary container exec, omit `run` from
 `ssh_dispatch.enabled_gateway_actions`; omit `launch` if users should not start
@@ -685,10 +720,12 @@ actions.
 
 ## Container Agent Services
 
-When `container_agent.enabled = true`, the gateway renders the embedded
-`[container_agent]` policy into the container state directory. By default it
+When `target_defaults.container_agent.enabled = true` or an effective target
+enables the agent, the gateway renders the effective container-agent policy
+into the container state directory. By default it
 starts `aw-container-agent` as the container entrypoint. If
-`container_bootstrap.enabled = true`, it starts `aw-container-bootstrap`
+`target_defaults.container_bootstrap.enabled = true` or an effective target
+enables bootstrap, it starts `aw-container-bootstrap`
 instead; bootstrap prepares passwd/group/home/state, runs configured bootstrap
 steps, and then execs `aw-container-agent` so the agent becomes PID 1. When the
 agent is disabled, the gateway can still manage container lifecycle and
@@ -700,15 +737,15 @@ answers gateway control requests over a private Unix-domain control socket.
 Disabling the control socket is useful for published-port SSH backends, but it
 also removes agent-control readiness and mutating control requests through that
 socket.
-Gateway-managed control and SSH bridge sockets live under `[control_sockets]`,
-not under durable workspace state. Before starting a container, the gateway
+Gateway-managed control and SSH bridge sockets live under target control socket
+config, not under durable workspace state. Before starting a container, the gateway
 checks the resolved host and in-container Unix socket paths and fails fast if
 any path exceeds the platform socket path limit.
 
 Service example:
 
 ```toml
-[[container_agent.services]]
+[[target_defaults.container_agent.services]]
 name = "container-sshd"
 required = true
 user = "root"
@@ -716,7 +753,7 @@ command = ["/usr/local/bin/start-container-sshd"]
 restart = "always"
 depends_on = ["acl-proxy"]
 
-[container_agent.services.health_check]
+[target_defaults.container_agent.services.health_check]
 type = "tcp"
 host = "127.0.0.1"
 port = 22
@@ -732,7 +769,7 @@ receives values such as `AW_IDENTITY_TOKEN` only when explicitly configured in
 the service `env` table:
 
 ```toml
-[container_agent.services.env]
+[target_defaults.container_agent.services.env]
 AW_IDENTITY_TOKEN = { inherit = "AW_IDENTITY_TOKEN" }
 STATIC_VALUE = { value = "example" }
 FROM_FILE = { file = "/run/secrets/example", required = false }
@@ -841,7 +878,7 @@ backend = "published_port"
 readiness = "ssh_only"
 host = "127.0.0.1"
 
-[container_agent]
+[target_defaults.container_agent]
 enabled = true
 control_socket = false
 ```

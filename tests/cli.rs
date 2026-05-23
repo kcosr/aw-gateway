@@ -91,13 +91,13 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 
-[[lifecycle_steps]]
+[[target_defaults.lifecycle_steps]]
 phase = "pre_start"
 name = "prep"
 command = ["/bin/true"]
 timeout = "250ms"
 
-[[host_steps]]
+[[target_defaults.host_steps]]
 name = "firewall"
 command = ["/bin/true"]
 timeout = "1m"
@@ -124,7 +124,7 @@ fn gateway_config_validate_accepts_control_socket_overrides() {
         r#"
 schema_version = "1"
 
-[control_sockets]
+[target_defaults.control_sockets]
 host_dir = "/tmp/aw-gateway/{runtime_id}"
 container_dir = "/run/global-aw"
 
@@ -164,8 +164,10 @@ image = "ubuntu/dev"
 mode = "ephemeral"
 ephemeral_name = "worker-{session_id}"
 stop_when_idle = true
-workspace = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
-workspace_cleanup = "always"
+
+[targets.default.workspace]
+path = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
+cleanup = "always"
 
 [targets.default.idle_cleanup]
 owner = "gateway"
@@ -200,14 +202,14 @@ image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
 "#,
-            "container_agent.control_socket path values are managed by control_sockets.container_dir",
+            "unknown field `container_agent`",
         ),
         (
             "ssh-bridge.toml",
             r#"
 schema_version = "1"
 
-[container_agent.ssh_bridge]
+[target_defaults.container_agent.ssh_bridge]
 enabled = true
 socket = "/run/aw-gateway/ssh.sock"
 target = "127.0.0.1:22"
@@ -841,6 +843,42 @@ fn ssh_dispatch_rejects_host_side_transfer_commands_when_policy_disallows_them()
         .arg("--config")
         .arg(&config)
         .env("SSH_ORIGINAL_COMMAND", "internal-sftp")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("sftp is not allowed"));
+}
+
+#[test]
+fn ssh_dispatch_transfer_gate_uses_defaults_not_user_default_target_override() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    let workspace = dir.path().join("workspace");
+    let home = dir.path().join("home");
+    let sample = gateway_sample_for_test(&dir, &workspace)
+        .replace("sftp = \"allow\"", "sftp = \"deny\"")
+        .replace("legacy_scp = \"allow\"", "legacy_scp = \"deny\"")
+        + r#"
+
+[targets.permissive]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "ubuntu-dev-permissive"
+
+[targets.permissive.container_ssh.transfer]
+sftp = "allow"
+legacy_scp = "allow"
+"#;
+    std::fs::write(&config, sample).unwrap();
+    let default_dir = home.join(".config/aw-gateway");
+    std::fs::create_dir_all(&default_dir).unwrap();
+    std::fs::write(default_dir.join("default-target"), "permissive\n").unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .env("SSH_ORIGINAL_COMMAND", "internal-sftp")
+        .env("AW_GATEWAY_TEST_HOME", &home)
         .assert()
         .failure()
         .stderr(predicate::str::contains("sftp is not allowed"));

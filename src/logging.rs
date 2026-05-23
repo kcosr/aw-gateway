@@ -19,8 +19,11 @@ pub fn init_gateway(
     let (config, render_error) = config_path
         .and_then(|path| GatewayConfig::load(path).ok())
         .map(|cfg| {
-            let mut logging = cfg.logging;
-            match render_gateway_logging_directory(&mut logging, &cfg.workspace) {
+            let mut logging = cfg.logging.clone();
+            match cfg
+                .effective_workspace_defaults()
+                .and_then(|workspace| render_gateway_logging_directory(&mut logging, &workspace))
+            {
                 Ok(()) => (logging, None),
                 Err(err) => (fallback_config(!protocol_mode), Some(err)),
             }

@@ -12,7 +12,7 @@ max_bytes = 104857600
 max_files = 5
 console = false
 
-[workspace]
+[target_defaults.workspace]
 path = "/Users/example/aw-gateway/workspace"
 state_dir = ".aw-gateway"
 
@@ -87,58 +87,58 @@ preserve_processes = ["tmux", "screen"]
 poll_interval = "10s"
 shutdown_timeout = "10s"
 
-[[lifecycle_steps]]
+[[target_defaults.lifecycle_steps]]
 phase = "pre_start"
 name = "ensure-workspace"
 required = true
 timeout = "60s"
 command = ["/bin/mkdir", "-p", "{workspace}"]
 
-[[container_bootstrap_steps]]
+[[target_defaults.container_bootstrap_steps]]
 name = "prepare-codex-home"
 required = true
 user = "root"
 command = ["/bin/sh", "-lc", "mkdir -p /var/lib/codex && chown {uid}:{gid} /var/lib/codex"]
 
-[[container_mounts]]
+[[target_defaults.container_mounts]]
 source = "/Users/example/aw-gateway/runtime/linux/aw-container-bootstrap"
 target = "/opt/aw-gateway/bin/aw-container-bootstrap"
 mode = "ro"
 
-[[container_mounts]]
+[[target_defaults.container_mounts]]
 source = "/Users/example/aw-gateway/runtime/linux/aw-container-agent"
 target = "/opt/aw-gateway/bin/aw-container-agent"
 mode = "ro"
 
-[[container_mounts]]
+[[target_defaults.container_mounts]]
 source = "/Users/example/aw-gateway/runtime/linux/aw-ssh-command-filter"
 target = "/opt/aw-gateway/bin/aw-ssh-command-filter"
 mode = "ro"
 
-[[container_mounts]]
+[[target_defaults.container_mounts]]
 source = "/Users/example/aw-gateway/runtime/linux/start-container-sshd"
 target = "/opt/aw-gateway/bin/start-container-sshd"
 mode = "ro"
 
-[[container_mounts]]
+[[target_defaults.container_mounts]]
 source = "/Users/example/aw-gateway/runtime/linux/sshd_config_agent"
 target = "/etc/ssh/sshd_config_agent"
 mode = "ro"
 
-[container_bootstrap]
+[target_defaults.container_bootstrap]
 enabled = true
 entrypoint = "/opt/aw-gateway/bin/aw-container-bootstrap"
 agent_program = "/opt/aw-gateway/bin/aw-container-agent"
 
-[container_ssh.transfer]
+[target_defaults.container_ssh.transfer]
 sftp = "allow"
 legacy_scp = "allow"
 
-[container_agent]
+[target_defaults.container_agent]
 enabled = true
 control_socket = false
 
-[[container_agent.services]]
+[[target_defaults.container_agent.services]]
 name = "container-sshd"
 required = true
 user = "root"
@@ -146,17 +146,17 @@ command = ["/opt/aw-gateway/bin/start-container-sshd"]
 restart = "always"
 depends_on = []
 
-[container_agent.services.health_check]
+[target_defaults.container_agent.services.health_check]
 type = "tcp"
 host = "127.0.0.1"
 port = 22
 interval = "2s"
 timeout = "1s"
 
-[container_agent.services.env.AW_SSHD_SETENV_CONFIG]
+[target_defaults.container_agent.services.env.AW_SSHD_SETENV_CONFIG]
 value = "{container_state_dir}/sshd-session-env.conf"
 
-[container_agent.ssh_bridge]
+[target_defaults.container_agent.ssh_bridge]
 enabled = false
 target = "127.0.0.1:22"
 mode = "0600"

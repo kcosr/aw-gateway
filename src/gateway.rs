@@ -163,12 +163,13 @@ async fn dispatch_from_ssh(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         anyhow::bail!("SSH_ORIGINAL_COMMAND exceeds {MAX_SSH_ORIGINAL_COMMAND_BYTES} bytes");
     }
     if let Some(command) = original.as_deref() {
+        let transfer = cfg.effective_container_ssh_defaults()?.transfer;
         if let Some(direction) = legacy_scp_server_direction(command)
-            && !legacy_scp_mode_allows(cfg.container_ssh.transfer.legacy_scp, direction)
+            && !legacy_scp_mode_allows(transfer.legacy_scp, direction)
         {
             anyhow::bail!("blocked by policy: legacy scp is not allowed");
         }
-        if !cfg.container_ssh.transfer.sftp.allows() && is_sftp_server_command(command) {
+        if !transfer.sftp.allows() && is_sftp_server_command(command) {
             anyhow::bail!("blocked by policy: sftp is not allowed");
         }
     }
@@ -664,7 +665,7 @@ async fn targets(config_path: Option<PathBuf>, args: TargetsArgs) -> anyhow::Res
 
 async fn launches(config_path: Option<PathBuf>, args: LaunchesArgs) -> anyhow::Result<()> {
     let cfg = load_config(config_path)?;
-    let entries = launch_summaries(&cfg);
+    let entries = launch_summaries(&cfg)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&entries)?);
     } else if entries.is_empty() {
@@ -764,11 +765,8 @@ fn parse_launch_run_args(
 
 async fn launch_show(config_path: Option<PathBuf>, name: &str, json: bool) -> anyhow::Result<()> {
     let cfg = load_config(config_path)?;
-    let launch = cfg
-        .launches
-        .get(name)
-        .ok_or_else(|| anyhow::anyhow!("unknown launch {name:?}"))?;
-    let detail = launch_detail(name, launch);
+    let launch = cfg.effective_launch(name)?;
+    let detail = launch_detail(name, &launch);
     if json {
         println!("{}", serde_json::to_string_pretty(&detail)?);
     } else {
@@ -793,20 +791,11 @@ async fn launch_execute_with_config(
     session_id: Option<String>,
     supplied: Vec<String>,
 ) -> anyhow::Result<()> {
-    let launch = cfg
-        .launches
-        .get(name)
-        .ok_or_else(|| anyhow::anyhow!("unknown launch {name:?}"))?
-        .clone();
+    let launch = cfg.effective_launch(name)?;
     let resolved_vars = resolve_launch_vars(name, &launch, supplied)?;
-    let runtime = Runtime::from_config(
-        cfg,
-        Some(&launch.target),
-        session_id,
-        true,
-        Some(name.to_string()),
-    )
-    .await?;
+    let target = launch.target.clone();
+    let runtime =
+        Runtime::from_config(cfg, Some(&target), session_id, true, Some(name.to_string())).await?;
     let session_kind = "launch";
     let session = runtime.create_launch_session_marker(session_kind)?;
     let result = async {
@@ -906,8 +895,9 @@ struct AllStatusEntry {
     status: String,
 }
 
-fn launch_summaries(cfg: &GatewayConfig) -> Vec<LaunchSummary> {
-    cfg.launches
+fn launch_summaries(cfg: &GatewayConfig) -> anyhow::Result<Vec<LaunchSummary>> {
+    Ok(cfg
+        .effective_launches()?
         .iter()
         .map(|(name, launch)| LaunchSummary {
             name: name.clone(),
@@ -915,7 +905,7 @@ fn launch_summaries(cfg: &GatewayConfig) -> Vec<LaunchSummary> {
             description: launch.description.clone(),
             vars: launch_var_metadata(&launch.vars),
         })
-        .collect()
+        .collect())
 }
 
 fn launch_detail(name: &str, launch: &LaunchConfig) -> LaunchDetail {
@@ -1360,7 +1350,7 @@ fn infer_status_all_mode(
     container_name: &str,
     session_id: Option<&str>,
 ) -> String {
-    let Some(target_cfg) = cfg.targets.get(target) else {
+    let Ok(target_cfg) = cfg.effective_target(target) else {
         return "unknown".into();
     };
     match target_cfg.mode {
@@ -1382,13 +1372,14 @@ fn target_entries(cfg: &GatewayConfig) -> anyhow::Result<Vec<TargetEntry>> {
         .with_context(|| format!("validate default selection {default_selection:?}"))?;
     let entries = cfg
         .targets
-        .iter()
-        .map(|(name, target)| {
+        .keys()
+        .map(|name| {
+            let target = cfg.effective_target(name)?;
             Ok(TargetEntry {
                 target: name.clone(),
                 image: target.image.clone(),
                 mode: format!("{:?}", target.mode).to_lowercase(),
-                container: target_container_display(target)?,
+                container: target_container_display(&target)?,
                 default: name == &default_target,
             })
         })
@@ -1495,10 +1486,7 @@ impl Runtime {
                 None => cfg.default_target.clone(),
             },
         };
-        let target_cfg = cfg
-            .targets
-            .get(&target_name)
-            .ok_or_else(|| anyhow::anyhow!("unknown target {target_name:?}"))?;
+        let target_cfg = cfg.effective_target(&target_name)?;
         let session_id = match target_cfg.mode {
             TargetMode::Fixed => {
                 if session_id.is_some() {
@@ -1516,7 +1504,6 @@ impl Runtime {
             },
         };
         let container_name = target_cfg.container_name(session_id.as_deref())?;
-        let target_cfg = target_cfg.clone();
         let effective_container_ssh = cfg.effective_container_ssh(&target_cfg)?;
         let effective_lifecycle_steps = cfg.effective_lifecycle_steps(&target_cfg)?;
         let effective_host_steps = cfg.effective_host_steps(&target_cfg)?;
@@ -1524,13 +1511,8 @@ impl Runtime {
         let effective_container_bootstrap_steps =
             cfg.effective_container_bootstrap_steps(&target_cfg)?;
         let effective_container_agent = cfg.effective_container_agent(&target_cfg)?;
-        let workspace = resolve_target_workspace(
-            &cfg,
-            &target_cfg,
-            &target_name,
-            &user,
-            session_id.as_deref(),
-        )?;
+        let workspace =
+            resolve_target_workspace(&target_cfg, &target_name, &user, session_id.as_deref())?;
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, &user.user, &user.home)?;
         let default_container_user = target_cfg.container_user.clone().unwrap_or_else(|| {
@@ -1608,12 +1590,12 @@ impl Runtime {
             ),
         };
         let container_state_dir = workspace
-            .join(&cfg.workspace.state_dir)
+            .join(&target_cfg.workspace.state_dir)
             .join(state_kind)
             .join(state_id);
         let container_state_dir_in_container = resolve_container_path(
             &container_home,
-            &cfg.workspace.state_dir,
+            &target_cfg.workspace.state_dir,
             [state_kind, state_id],
         );
         let runtime_id = match target_cfg.mode {
@@ -1890,7 +1872,7 @@ impl Runtime {
     }
 
     fn should_cleanup_workspace(&self, outcome: SessionOutcome) -> bool {
-        match self.target.workspace_cleanup {
+        match self.target.workspace.cleanup {
             WorkspaceCleanup::Never => false,
             WorkspaceCleanup::Success => outcome == SessionOutcome::Success,
             WorkspaceCleanup::Always => true,
@@ -2306,7 +2288,7 @@ impl Runtime {
         vars.insert(
             "state".into(),
             self.workspace
-                .join(&self.cfg.workspace.state_dir)
+                .join(&self.target.workspace.state_dir)
                 .display()
                 .to_string(),
         );
@@ -2619,10 +2601,9 @@ impl Runtime {
 
     fn container_mounts(&self) -> anyhow::Result<Vec<ContainerMountSpec>> {
         let mut mounts = self
-            .cfg
+            .target
             .container_mounts
             .iter()
-            .chain(self.target.container_mounts.iter())
             .enumerate()
             .map(|(index, mount)| {
                 let vars = self.vars(None);
@@ -2959,7 +2940,7 @@ impl Runtime {
     }
 
     async fn validate_workspace_cleanup_path(&self) -> anyhow::Result<()> {
-        if self.target.workspace_cleanup == WorkspaceCleanup::Never {
+        if self.target.workspace.cleanup == WorkspaceCleanup::Never {
             return Ok(());
         }
         let session_id = self
@@ -2970,7 +2951,7 @@ impl Runtime {
             &self.workspace,
             &self.user.home,
             session_id,
-            self.target.workspace.as_deref(),
+            Some(self.target.workspace.path.as_str()),
         )?;
         match tokio::fs::symlink_metadata(&self.workspace).await {
             Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -3271,7 +3252,6 @@ fn validate_control_socket_host_dir(
 }
 
 fn resolve_target_workspace(
-    cfg: &GatewayConfig,
     target: &TargetConfig,
     target_name: &str,
     user: &UserContext,
@@ -3288,8 +3268,7 @@ fn resolve_target_workspace(
     if let Some(session_id) = session_id {
         vars.insert("session_id".into(), session_id.to_string());
     }
-    let configured = target.workspace.as_deref().unwrap_or(&cfg.workspace.path);
-    let rendered = template::render(configured, &vars)?;
+    let rendered = template::render(&target.workspace.path, &vars)?;
     Ok(paths::resolve_workspace(&user.home, &rendered))
 }
 
@@ -3354,6 +3333,31 @@ mod tests {
         }
     }
 
+    fn disable_default_container_agent(cfg: &mut GatewayConfig) {
+        cfg.target_defaults.container_agent = Some(crate::config::ContainerAgentConfigInput {
+            enabled: Some(false),
+            services: Vec::new(),
+            ssh_bridge: None,
+            control_socket: None,
+            idle_cleanup: None,
+        });
+    }
+
+    fn enable_default_ssh_bridge(cfg: &mut GatewayConfig) {
+        cfg.target_defaults.container_agent = Some(crate::config::ContainerAgentConfigInput {
+            enabled: Some(true),
+            services: Vec::new(),
+            ssh_bridge: Some(crate::config::SshBridgeConfigInput {
+                enabled: Some(true),
+                socket: None,
+                target: Some("127.0.0.1:22".into()),
+                mode: Some("0600".into()),
+            }),
+            control_socket: None,
+            idle_cleanup: None,
+        });
+    }
+
     fn test_runtime(
         dir: &tempfile::TempDir,
         program: PathBuf,
@@ -3361,15 +3365,11 @@ mod tests {
     ) -> Runtime {
         let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
         cfg.runtime.program = Some(program.display().to_string());
-        cfg.container_agent.enabled = false;
-        cfg.container_agent.services.clear();
-        cfg.container_agent.ssh_bridge = None;
-        cfg.container_agent.control_socket = None;
-        cfg.container_agent.idle_cleanup = None;
+        disable_default_container_agent(&mut cfg);
         configure(&mut cfg);
         cfg.validate().unwrap();
 
-        let target = cfg.targets.get("default").unwrap().clone();
+        let target = cfg.effective_target("default").unwrap();
         let user = UserContext::current().unwrap();
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, &user.user, &user.home).unwrap();
@@ -3415,14 +3415,14 @@ mod tests {
         runtime.target.mode = TargetMode::Ephemeral;
         runtime.target.ephemeral_name = Some("ubuntu-dev-{session_id}".into());
         runtime.target.stop_when_idle = true;
-        runtime.target.workspace =
-            Some("{home}/.cache/aw-gateway/workspaces/{target}-{session_id}".into());
-        runtime.target.workspace_cleanup = cleanup;
+        runtime.target.workspace.path =
+            "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}".into();
+        runtime.target.workspace.cleanup = cleanup;
         runtime.session_id = Some(session_id.into());
         runtime.workspace = workspace;
         runtime.container_state_dir = runtime
             .workspace
-            .join(&runtime.cfg.workspace.state_dir)
+            .join(&runtime.target.workspace.state_dir)
             .join("sessions")
             .join(session_id);
         runtime.user.home = home;
@@ -3433,15 +3433,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
 
-        runtime.target.workspace_cleanup = WorkspaceCleanup::Never;
+        runtime.target.workspace.cleanup = WorkspaceCleanup::Never;
         assert!(!runtime.should_cleanup_workspace(SessionOutcome::Success));
         assert!(!runtime.should_cleanup_workspace(SessionOutcome::Failure));
 
-        runtime.target.workspace_cleanup = WorkspaceCleanup::Success;
+        runtime.target.workspace.cleanup = WorkspaceCleanup::Success;
         assert!(runtime.should_cleanup_workspace(SessionOutcome::Success));
         assert!(!runtime.should_cleanup_workspace(SessionOutcome::Failure));
 
-        runtime.target.workspace_cleanup = WorkspaceCleanup::Always;
+        runtime.target.workspace.cleanup = WorkspaceCleanup::Always;
         assert!(runtime.should_cleanup_workspace(SessionOutcome::Success));
         assert!(runtime.should_cleanup_workspace(SessionOutcome::Failure));
     }
@@ -3862,7 +3862,7 @@ mod tests {
     #[test]
     fn status_all_entries_project_multiple_ephemeral_containers() {
         let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
-        cfg.targets.get_mut("default").unwrap().mode = TargetMode::Ephemeral;
+        cfg.targets.get_mut("default").unwrap().mode = Some(TargetMode::Ephemeral);
         let mut first = managed_labels("default", "ubuntu-dev-1a2b3c4d5e6f");
         first.insert("io.aw-gateway.image".into(), "scratch/dev".into());
         first.insert("io.aw-gateway.mode".into(), "ephemeral".into());
@@ -4087,11 +4087,11 @@ exit 0
         );
         let runtime = test_runtime(&dir, fake_runtime, |cfg| {
             let target = cfg.targets.get_mut("default").unwrap();
-            target.stop_when_idle = true;
-            target.remove_on_stop = false;
-            target.idle_cleanup = Some(crate::config::IdleCleanupConfig {
-                owner: IdleCleanupOwner::Gateway,
-                action: IdleCleanupAction::ExitContainer,
+            target.stop_when_idle = Some(true);
+            target.remove_on_stop = Some(false);
+            target.idle_cleanup = Some(crate::config::IdleCleanupConfigInput {
+                owner: Some(IdleCleanupOwner::Gateway),
+                action: Some(IdleCleanupAction::ExitContainer),
                 ..Default::default()
             });
         });
@@ -4130,10 +4130,10 @@ mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
 "#,
         )
         .unwrap();
-        let launch = cfg.launches.get("agent").unwrap();
+        let launch = cfg.effective_launch("agent").unwrap();
         let vars = resolve_launch_vars(
             "agent",
-            launch,
+            &launch,
             vec![
                 "repo=https://example.test/repo.git".into(),
                 "count=2.0".into(),
@@ -4146,7 +4146,7 @@ mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
         assert_eq!(vars["debug"], "true");
         assert_eq!(vars["mode"], "safe");
 
-        let err = resolve_launch_vars("agent", launch, vec!["repo=a".into(), "repo=b".into()])
+        let err = resolve_launch_vars("agent", &launch, vec!["repo=a".into(), "repo=b".into()])
             .unwrap_err()
             .to_string();
         assert!(err.contains("duplicate launch variable"), "{err}");
@@ -4230,7 +4230,7 @@ schema_version = "1"
 [runtime]
 type = "podman"
 
-[workspace]
+[target_defaults.workspace]
 path = "{}"
 state_dir = ".aw-gateway"
 
@@ -4261,14 +4261,7 @@ name = "{{image_slug}}"
     fn unix_socket_path_inventory_includes_host_and_container_paths() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
-            cfg.container_agent.enabled = true;
-            cfg.container_agent.control_socket = None;
-            cfg.container_agent.ssh_bridge = Some(crate::config::SshBridgeConfig {
-                enabled: true,
-                socket: None,
-                target: "127.0.0.1:22".into(),
-                mode: "0600".into(),
-            });
+            enable_default_ssh_bridge(cfg);
         });
 
         let labels = runtime
@@ -4299,11 +4292,11 @@ schema_version = "1"
 [runtime]
 type = "podman"
 
-[workspace]
+[target_defaults.workspace]
 path = "{}"
 state_dir = ".aw-gateway"
 
-[control_sockets]
+[target_defaults.control_sockets]
 host_dir = "{}"
 
 [targets.default]
@@ -4342,7 +4335,7 @@ schema_version = "1"
 [runtime]
 type = "podman"
 
-[workspace]
+[target_defaults.workspace]
 path = "{}"
 state_dir = ".aw-gateway"
 
@@ -4412,7 +4405,7 @@ default_target = "dev-shell"
 [runtime]
 type = "podman"
 
-[workspace]
+[target_defaults.workspace]
 path = "{}"
 state_dir = ".aw-gateway"
 
@@ -4472,11 +4465,11 @@ default_target = "global"
 [runtime]
 type = "podman"
 
-[workspace]
+[target_defaults.workspace]
 path = "{}"
 state_dir = ".aw-gateway"
 
-[control_sockets]
+[target_defaults.control_sockets]
 host_dir = "{}"
 container_dir = "/run/global-aw"
 
@@ -4531,13 +4524,13 @@ container_dir = "/tmp/aw-gateway"
         for (field, config_fragment) in [
             (
                 "control_sockets.host_dir",
-                r#"[control_sockets]
+                r#"[target_defaults.control_sockets]
 host_dir = "relative/{runtime_id}"
 "#,
             ),
             (
                 "control_sockets.container_dir",
-                r#"[control_sockets]
+                r#"[target_defaults.control_sockets]
 container_dir = "relative-container"
 "#,
             ),
@@ -4553,7 +4546,7 @@ schema_version = "1"
 [runtime]
 type = "podman"
 
-[workspace]
+[target_defaults.workspace]
 path = "{}"
 state_dir = ".aw-gateway"
 
@@ -4590,7 +4583,7 @@ schema_version = "1"
 [runtime]
 type = "podman"
 
-[workspace]
+[target_defaults.workspace]
 path = "{}"
 state_dir = ".aw-gateway"
 
@@ -4631,11 +4624,11 @@ schema_version = "1"
 [runtime]
 type = "podman"
 
-[workspace]
+[target_defaults.workspace]
 path = "{}"
 state_dir = ".aw-gateway"
 
-[control_sockets]
+[target_defaults.control_sockets]
 host_dir = "{host_dir}"
 
 [targets.default]
@@ -4670,7 +4663,7 @@ schema_version = "1"
 [runtime]
 type = "podman"
 
-[workspace]
+[target_defaults.workspace]
 path = "{}"
 state_dir = ".aw-gateway"
 
@@ -4715,17 +4708,17 @@ schema_version = "1"
 [runtime]
 type = "podman"
 
-[workspace]
+[target_defaults.workspace]
 path = "{}"
 state_dir = ".aw-gateway"
 
-[control_sockets]
+[target_defaults.control_sockets]
 container_dir = "{container_dir}"
 
-[container_agent]
+[target_defaults.container_agent]
 control_socket = false
 
-[container_agent.ssh_bridge]
+[target_defaults.container_agent.ssh_bridge]
 enabled = true
 target = "127.0.0.1:22"
 mode = "0600"
@@ -4755,7 +4748,7 @@ name = "{{image_slug}}"
     fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
         let dir = tempfile::tempdir().unwrap();
         let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
-        let target = cfg.targets.get("default").unwrap().clone();
+        let target = cfg.effective_target("default").unwrap();
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
         let user = UserContext {
@@ -4852,14 +4845,7 @@ name = "{{image_slug}}"
     fn prepare_control_socket_dir_is_private_and_removes_stale_socket_files() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
-            cfg.container_agent.enabled = true;
-            cfg.container_agent.control_socket = None;
-            cfg.container_agent.ssh_bridge = Some(crate::config::SshBridgeConfig {
-                enabled: true,
-                socket: None,
-                target: "127.0.0.1:22".into(),
-                mode: "0600".into(),
-            });
+            enable_default_ssh_bridge(cfg);
         });
 
         std::fs::create_dir_all(&runtime.control_sockets.host_dir).unwrap();
@@ -4925,14 +4911,7 @@ name = "{{image_slug}}"
     fn cleanup_control_socket_dir_removes_only_runtime_leaf() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
-            cfg.container_agent.enabled = true;
-            cfg.container_agent.control_socket = None;
-            cfg.container_agent.ssh_bridge = Some(crate::config::SshBridgeConfig {
-                enabled: true,
-                socket: None,
-                target: "127.0.0.1:22".into(),
-                mode: "0600".into(),
-            });
+            enable_default_ssh_bridge(cfg);
         });
         let parent = runtime
             .control_sockets
@@ -4974,7 +4953,10 @@ name = "{{image_slug}}"
     fn target_workspace_override_resolves_relative_to_user_home() {
         let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
         let target = cfg.targets.get_mut("default").unwrap();
-        target.workspace = Some("{home}/workspace-internal".into());
+        target.workspace = Some(crate::config::WorkspaceConfigInput {
+            path: Some("{home}/workspace-internal".into()),
+            ..Default::default()
+        });
         let user = UserContext {
             uid: 2450,
             gid: 2450,
@@ -4983,8 +4965,7 @@ name = "{{image_slug}}"
         };
 
         let workspace = resolve_target_workspace(
-            &cfg,
-            cfg.targets.get("default").unwrap(),
+            &cfg.effective_target("default").unwrap(),
             "default",
             &user,
             None,
@@ -4999,6 +4980,8 @@ name = "{{image_slug}}"
         let dir = tempfile::tempdir().unwrap();
         let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
         let mut override_service = cfg
+            .effective_target("default")
+            .unwrap()
             .container_agent
             .services
             .iter()
@@ -5011,11 +4994,12 @@ name = "{{image_slug}}"
             "/etc/acl-proxy/internal-acl-proxy.toml".into(),
         ];
         cfg.targets.get_mut("default").unwrap().container_agent =
-            Some(crate::config::TargetContainerAgentConfig {
+            Some(crate::config::ContainerAgentConfigInput {
                 services: vec![override_service],
+                ..Default::default()
             });
         cfg.validate().unwrap();
-        let target = cfg.targets.get("default").unwrap().clone();
+        let target = cfg.effective_target("default").unwrap();
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
         let container_state_dir = dir
@@ -5100,7 +5084,7 @@ name = "{{image_slug}}"
             .unwrap()
             .session_env
             .insert("SESSION_ONLY".into(), "session".into());
-        let target = cfg.targets.get("default").unwrap().clone();
+        let target = cfg.effective_target("default").unwrap();
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
         let runtime = Runtime {
@@ -5152,12 +5136,8 @@ name = "{{image_slug}}"
     fn disabled_agent_run_spec_uses_plain_sleep_without_agent_tokens() {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
-        cfg.container_agent.enabled = false;
-        cfg.container_agent.services.clear();
-        cfg.container_agent.ssh_bridge = None;
-        cfg.container_agent.control_socket = None;
-        cfg.container_agent.idle_cleanup = None;
-        let target = cfg.targets.get("default").unwrap().clone();
+        disable_default_container_agent(&mut cfg);
+        let target = cfg.effective_target("default").unwrap();
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
         let runtime = Runtime {
@@ -5223,7 +5203,7 @@ name = "{{image_slug}}"
                     legacy_scp: Some(crate::config::LegacyScpTransferMode::Deny),
                 }),
             });
-        let target = cfg.targets.get("default").unwrap().clone();
+        let target = cfg.effective_target("default").unwrap();
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
         let container_state_dir = dir
@@ -5296,14 +5276,18 @@ name = "{{image_slug}}"
         std::fs::create_dir_all(bootstrap_agent.parent().unwrap()).unwrap();
         std::fs::write(&bootstrap_agent, "").unwrap();
         let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
-        cfg.container_bootstrap_steps
-            .push(crate::config::ContainerBootstrapStep {
+        cfg.target_defaults.container_bootstrap_steps.push(
+            crate::config::RawContainerBootstrapStep {
                 name: "global-bootstrap".into(),
-                required: true,
-                user: "root".into(),
-                command: vec!["/bin/global".into()],
+                enabled: true,
+                before: None,
+                after: None,
+                required: Some(true),
+                user: Some("root".into()),
+                command: Some(vec!["/bin/global".into()]),
                 timeout: None,
-            });
+            },
+        );
         let target_cfg = cfg.targets.get_mut("default").unwrap();
         target_cfg.container_bootstrap = Some(crate::config::TargetContainerBootstrapConfig {
             enabled: Some(true),
@@ -5332,13 +5316,14 @@ name = "{{image_slug}}"
                 timeout: Some("5s".into()),
             },
         ];
-        cfg.container_mounts
+        cfg.target_defaults
+            .container_mounts
             .push(crate::config::ContainerMountConfig {
                 source: bootstrap_agent.display().to_string(),
                 target: "/opt/aw-gateway/bin/aw-container-agent".into(),
                 mode: ContainerMountMode::Ro,
             });
-        let target = cfg.targets.get("default").unwrap().clone();
+        let target = cfg.effective_target("default").unwrap();
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
         let runtime = Runtime {
@@ -5418,13 +5403,14 @@ name = "{{image_slug}}"
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing-bootstrap-file");
         let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
-        cfg.container_mounts
+        cfg.target_defaults
+            .container_mounts
             .push(crate::config::ContainerMountConfig {
                 source: missing.display().to_string(),
                 target: "/opt/aw-gateway/bin/missing".into(),
                 mode: ContainerMountMode::Ro,
             });
-        let target = cfg.targets.get("default").unwrap().clone();
+        let target = cfg.effective_target("default").unwrap();
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
         let runtime = Runtime {
