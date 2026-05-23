@@ -35,7 +35,8 @@
 - Added an initial JSON HTTP API daemon with explicit `[http]` config,
   optional bearer auth, HTTP action allow-listing, metadata routes, wait/detach
   run and launch execution, typed JSON launch variables, and stable JSON
-  success/error envelopes.
+  success/error envelopes
+  ([#14](https://github.com/kcosr/aw-gateway/pull/14)).
 - Added nested unified config includes for `[target_templates.<name>]`,
   `[launch_templates.<name>]`, `[targets.<name>]`, and `[launches.<name>]`,
   with relative path resolution, sorted glob expansion, cycle detection, and
