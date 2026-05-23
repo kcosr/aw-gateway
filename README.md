@@ -417,6 +417,8 @@ aliases, or compatibility config shapes.
   firewall hooks for egress control.
 - [Proxy And CA Policy](docs/guides/proxy.md): optional proxy service, CA trust,
   session environment, and firewall redirect patterns.
+- [Smoke Test Harness](docs/guides/smoke.md): opt-in live tests for remote
+  Docker, rootless Podman, and Colima hosts.
 
 ## Gateway Config Shape
 
@@ -608,6 +610,15 @@ directory is unavailable or not writable, configure
 `target_defaults.control_sockets.host_dir` to another short absolute path under
 `[target_defaults.control_sockets]` or
 `[targets.<name>.control_sockets]`.
+
+For macOS/Colima, use a user-owned path because macOS does not normally provide
+`/run/user/{uid}`:
+
+```toml
+[target_defaults.control_sockets]
+host_dir = "/Users/alice/.cache/aw-gateway/sockets/{runtime_id}"
+container_dir = "/run/aw-gateway"
+```
 
 Target-specific runtime and environment knobs are explicit:
 
@@ -1084,6 +1095,10 @@ control_socket = false
 Use `control_socket = false` when the host gateway only needs the published
 SSH port. This lets `aw-container-agent` supervise services without creating an
 unused Unix socket on a Docker/Colima bind mount.
+
+On macOS, non-interactive SSH sessions may not include user-local package
+manager paths. If the Docker CLI used for Colima is not on the SSH session
+`PATH`, set `[runtime].program` to an absolute path.
 
 Common `local_ssh` options:
 
