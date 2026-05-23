@@ -224,6 +224,8 @@ impl Drop for LocalListenerGuard {
 pub(super) fn validate_session_id(value: &str) -> anyhow::Result<()> {
     if value.is_empty()
         || value.len() > 64
+        || value == "."
+        || value == ".."
         || !value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
@@ -319,5 +321,7 @@ mod tests {
     #[test]
     fn explicit_session_id_validation_keeps_existing_shape() {
         validate_session_id("x9k2p.custom_id").unwrap();
+        assert!(validate_session_id(".").is_err());
+        assert!(validate_session_id("..").is_err());
     }
 }

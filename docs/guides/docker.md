@@ -225,8 +225,8 @@ Host aw-ubuntu
 Use full file: `examples/docker/gateway-local.toml`
 
 Native Linux Docker can use the same socket bridge mode as Podman because the
-gateway and Docker daemon run on the same Linux host and the workspace bind
-mount is visible to both sides:
+gateway creates a short runtime socket directory on the Linux host and bind
+mounts it into the container:
 
 ```toml
 [targets.ubuntu.local_ssh]

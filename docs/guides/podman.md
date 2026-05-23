@@ -27,7 +27,7 @@ container:
 - `aw-container-bootstrap` is mounted into the container and prepares runtime
   state before execing `aw-container-agent`.
 - `aw-container-agent` supervises container `sshd` and exposes a host-visible
-  SSH bridge socket.
+  SSH bridge socket from the gateway runtime socket directory.
 - Generated SSH config supports `ssh`, `scp`, `sftp`, and VS Code Remote SSH
   into the container.
 - Remote hosts can optionally restrict selected users with OpenSSH
@@ -310,7 +310,6 @@ timeout = "1s"
 
 [container_agent.ssh_bridge]
 enabled = true
-socket = "{container_state_dir}/ssh.sock"
 target = "127.0.0.1:22"
 mode = "0600"
 ```

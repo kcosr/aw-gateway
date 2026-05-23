@@ -32,6 +32,10 @@ console = false
 path = "workspace"
 state_dir = ".aw-gateway"
 
+[control_sockets]
+host_dir = "/run/user/{uid}/aw-gateway/{runtime_id}"
+container_dir = "/run/aw-gateway"
+
 [ssh_dispatch]
 allow_interactive_shell = true
 allow_container_commands = true
@@ -343,6 +347,5 @@ timeout = "1s"
 
 [container_agent.ssh_bridge]
 enabled = true
-socket = "{container_state_dir}/ssh.sock"
 target = "127.0.0.1:22"
 mode = "0600"

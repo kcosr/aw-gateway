@@ -6,11 +6,12 @@ use crate::cli::{
 use crate::config::{
     AGENT_SCHEMA_VERSION, BootstrapIdentity, ContainerAgentConfig, ContainerAgentFile,
     ContainerBootstrapConfig, ContainerBootstrapFile, ContainerBootstrapStep, ContainerMountMode,
-    ContainerRuntimeType, ContainerSshConfig, ControlSocketConfig, GatewayConfig, HostStep,
-    IdleCleanupAction, IdleCleanupOwner, LaunchConfig, LaunchStep, LaunchStepLocation,
-    LaunchVarConfig, LaunchVarType, LifecyclePhase, LifecycleStep, LocalSshBackend, LocalSshMode,
-    LocalSshReadiness, LoggingConfig, RenderedContainerBootstrapStep, TargetConfig, TargetMode,
-    validate_name, validate_passwd_scalar,
+    ContainerRuntimeType, ContainerSshConfig, ControlSocketConfig, ControlSocketsConfig,
+    GatewayConfig, HostStep, IdleCleanupAction, IdleCleanupOwner, LaunchConfig, LaunchStep,
+    LaunchStepLocation, LaunchVarConfig, LaunchVarType, LifecyclePhase, LifecycleStep,
+    LocalSshBackend, LocalSshMode, LocalSshReadiness, LoggingConfig,
+    RenderedContainerBootstrapStep, TargetConfig, TargetMode, validate_name,
+    validate_passwd_scalar,
 };
 use crate::paths::{self, UserContext};
 use crate::runtime::{
@@ -27,7 +28,7 @@ use anyhow::Context;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::{Duration, Instant, sleep};
@@ -546,10 +547,12 @@ async fn remove(config_path: Option<PathBuf>, args: TargetArg) -> anyhow::Result
         .inspect(&runtime.container_name)
         .await?
     else {
+        runtime.cleanup_control_socket_dir();
         println!("not found");
         return Ok(());
     };
     runtime.validate_labels(&inspect)?;
+    let was_running = inspect.state.running;
     if inspect.state.running {
         runtime.stop_inspected_container(&inspect).await?;
     }
@@ -563,6 +566,9 @@ async fn remove(config_path: Option<PathBuf>, args: TargetArg) -> anyhow::Result
             .container_runtime
             .rm(&runtime.container_name)
             .await?;
+    }
+    if !was_running {
+        runtime.cleanup_control_socket_dir();
     }
     println!("removed {}", runtime.container_name);
     Ok(())
@@ -1416,6 +1422,7 @@ struct Runtime {
     workspace: PathBuf,
     container_state_dir: PathBuf,
     container_state_dir_in_container: PathBuf,
+    control_sockets: ControlSocketPaths,
     container_name: String,
     container_runtime: ContainerRuntime,
     effective_container_ssh: ContainerSshConfig,
@@ -1424,6 +1431,17 @@ struct Runtime {
     effective_container_bootstrap: ContainerBootstrapConfig,
     effective_container_bootstrap_steps: Vec<ContainerBootstrapStep>,
     effective_container_agent: ContainerAgentConfig,
+}
+
+#[derive(Debug, Clone)]
+struct ControlSocketPaths {
+    host_dir: PathBuf,
+    container_dir: PathBuf,
+    host_agent_socket: PathBuf,
+    host_ssh_socket: PathBuf,
+    container_agent_socket: PathBuf,
+    container_ssh_socket: PathBuf,
+    default_host_dir: bool,
 }
 
 impl Runtime {
@@ -1573,6 +1591,22 @@ impl Runtime {
             &cfg.workspace.state_dir,
             [state_kind, state_id],
         );
+        let runtime_id = match target_cfg.mode {
+            TargetMode::Fixed => target_name.clone(),
+            TargetMode::Ephemeral => session_id
+                .clone()
+                .expect("ephemeral target has a session id"),
+        };
+        let effective_control_sockets = cfg.effective_control_sockets(&target_cfg)?;
+        let control_sockets = render_control_socket_paths(
+            &effective_control_sockets,
+            &target_cfg,
+            &target_name,
+            &container_name,
+            session_id.as_deref(),
+            &runtime_id,
+            &user,
+        )?;
         let runtime = Runtime {
             cfg,
             target_name,
@@ -1589,6 +1623,7 @@ impl Runtime {
             workspace,
             container_state_dir,
             container_state_dir_in_container,
+            control_sockets,
             container_name,
             container_runtime,
             effective_container_ssh,
@@ -1605,8 +1640,10 @@ impl Runtime {
     async fn ensure_ready(&self) -> anyhow::Result<ReadyStatus> {
         let _lock = self.acquire_lifecycle_lock().await?;
         let mut started_container = false;
+        let mut attempted_container_start = false;
         let result = async {
             paths::ensure_private_dir(&self.container_state_dir)?;
+            self.prepare_control_socket_dir()?;
             self.write_sshd_session_env_config()?;
             self.write_ssh_command_filter_policy()?;
             if self.ssh_endpoint_configured() {
@@ -1634,6 +1671,7 @@ impl Runtime {
                     self.validate_labels(existing)?;
                     self.run_lifecycle_phase(LifecyclePhase::PreStart, None)
                         .await?;
+                    attempted_container_start = true;
                     self.container_runtime.start(&self.container_name).await?;
                     started_container = true;
                     inspect = self.container_runtime.inspect(&self.container_name).await?;
@@ -1641,6 +1679,7 @@ impl Runtime {
                 ContainerReadinessPlan::CreateMissing => {
                     self.run_lifecycle_phase(LifecyclePhase::PreStart, None)
                         .await?;
+                    attempted_container_start = true;
                     self.start_container().await?;
                     started_container = true;
                     inspect = self.container_runtime.inspect(&self.container_name).await?;
@@ -1676,8 +1715,9 @@ impl Runtime {
         let (inspect, status) = match result {
             Ok(value) => value,
             Err(err) => {
-                if started_container {
+                if started_container || attempted_container_start {
                     self.cleanup_failed_start().await;
+                    self.cleanup_control_socket_dir();
                 }
                 return Err(err);
             }
@@ -1797,6 +1837,7 @@ impl Runtime {
         }
         self.run_lifecycle_phase(LifecyclePhase::PostStop, Some(&container_pid))
             .await?;
+        self.cleanup_control_socket_dir();
         Ok(())
     }
 
@@ -2210,6 +2251,25 @@ impl Runtime {
 
     fn write_container_agent_config(&self) -> anyhow::Result<PathBuf> {
         let mut container_agent = self.effective_container_agent.clone();
+        if self.agent_control_enabled() {
+            container_agent.control_socket = Some(ControlSocketConfig::Path(
+                self.control_sockets
+                    .container_agent_socket
+                    .display()
+                    .to_string(),
+            ));
+        }
+        if let Some(bridge) = &mut container_agent.ssh_bridge
+            && self.agent_enabled()
+            && bridge.enabled
+        {
+            bridge.socket = Some(
+                self.control_sockets
+                    .container_ssh_socket
+                    .display()
+                    .to_string(),
+            );
+        }
         self.inject_container_sshd_env(&mut container_agent);
         if let Some(idle_cleanup) = &self.target.idle_cleanup {
             container_agent.idle_cleanup = match (idle_cleanup.owner, idle_cleanup.action) {
@@ -2393,6 +2453,69 @@ impl Runtime {
         Ok(path)
     }
 
+    fn prepare_control_socket_dir(&self) -> anyhow::Result<()> {
+        if self.control_sockets.default_host_dir {
+            let run_user_dir = PathBuf::from(format!("/run/user/{}", self.user.uid));
+            let metadata = std::fs::metadata(&run_user_dir).with_context(|| {
+                format!(
+                    "{} is required by the default control_sockets.host_dir; configure control_sockets.host_dir to a writable short absolute path if this host does not provide per-user runtime directories",
+                    run_user_dir.display()
+                )
+            })?;
+            if !metadata.is_dir() {
+                anyhow::bail!(
+                    "{} is not a directory; configure control_sockets.host_dir to a writable short absolute path",
+                    run_user_dir.display()
+                );
+            }
+            let probe = run_user_dir.join(format!(".aw-gateway-write-test-{}", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&probe)
+            {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&probe);
+                }
+                Err(err) => {
+                    anyhow::bail!(
+                        "{} is not writable: {err}; configure control_sockets.host_dir to a writable short absolute path",
+                        run_user_dir.display()
+                    );
+                }
+            }
+        }
+        ensure_control_socket_dir(&self.control_sockets.host_dir)?;
+        self.remove_stale_control_socket_files()
+    }
+
+    fn remove_stale_control_socket_files(&self) -> anyhow::Result<()> {
+        for socket in [
+            &self.control_sockets.host_agent_socket,
+            &self.control_sockets.host_ssh_socket,
+        ] {
+            match std::fs::symlink_metadata(socket) {
+                Ok(metadata) if metadata.is_dir() => {
+                    anyhow::bail!(
+                        "control socket path {} exists as a directory; remove it or configure a different control_sockets.host_dir",
+                        socket.display()
+                    );
+                }
+                Ok(_) => {
+                    std::fs::remove_file(socket).with_context(|| {
+                        format!("remove stale control socket {}", socket.display())
+                    })?;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("inspect control socket {}", socket.display()));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn passwd_entry(&self) -> String {
         format!(
             "{}:x:{}:{}:{}:{}:{}",
@@ -2406,7 +2529,8 @@ impl Runtime {
     }
 
     fn container_mounts(&self) -> anyhow::Result<Vec<ContainerMountSpec>> {
-        self.cfg
+        let mut mounts = self
+            .cfg
             .container_mounts
             .iter()
             .chain(self.target.container_mounts.iter())
@@ -2423,7 +2547,13 @@ impl Runtime {
                     readonly: mount.mode == ContainerMountMode::Ro,
                 })
             })
-            .collect()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        mounts.push(ContainerMountSpec {
+            source: self.control_sockets.host_dir.clone(),
+            target: self.control_sockets.container_dir.clone(),
+            readonly: false,
+        });
+        Ok(mounts)
     }
 
     fn warn_about_unsafe_container_mounts(&self) -> anyhow::Result<()> {
@@ -2492,28 +2622,22 @@ impl Runtime {
     }
 
     fn agent_socket(&self) -> PathBuf {
-        self.container_state_dir.join("agent.sock")
+        self.control_sockets.host_agent_socket.clone()
     }
 
     fn ssh_socket(&self) -> PathBuf {
-        self.container_state_dir.join("ssh.sock")
+        self.control_sockets.host_ssh_socket.clone()
     }
 
     fn container_agent_socket(&self) -> anyhow::Result<Option<PathBuf>> {
         if !self.agent_control_enabled() {
             return Ok(None);
         }
-        let template = self
-            .effective_container_agent
-            .control_socket
-            .as_ref()
-            .and_then(ControlSocketConfig::path)
-            .unwrap_or("{container_state_dir}/agent.sock");
-        Ok(Some(self.render_container_socket_template(template)?))
+        Ok(Some(self.control_sockets.container_agent_socket.clone()))
     }
 
     fn container_ssh_socket(&self) -> anyhow::Result<Option<PathBuf>> {
-        let Some(bridge) = self
+        let Some(_) = self
             .effective_container_agent
             .ssh_bridge
             .as_ref()
@@ -2521,20 +2645,7 @@ impl Runtime {
         else {
             return Ok(None);
         };
-        let socket = bridge
-            .socket
-            .as_deref()
-            .expect("validated enabled ssh_bridge must include socket");
-        Ok(Some(self.render_container_socket_template(socket)?))
-    }
-
-    fn render_container_socket_template(&self, value: &str) -> anyhow::Result<PathBuf> {
-        let mut vars = Vars::new();
-        vars.insert(
-            "container_state_dir".into(),
-            self.container_state_dir_in_container.display().to_string(),
-        );
-        Ok(PathBuf::from(template::render(value, &vars)?))
+        Ok(Some(self.control_sockets.container_ssh_socket.clone()))
     }
 
     fn effective_unix_socket_paths(&self) -> anyhow::Result<Vec<(&'static str, PathBuf)>> {
@@ -2559,8 +2670,9 @@ impl Runtime {
             let bytes = unix_socket_path_bytes(&path);
             if bytes > UNIX_SOCKET_PATH_MAX_BYTES {
                 anyhow::bail!(
-                    "{label} is too long for a Unix domain socket ({bytes} bytes, limit {UNIX_SOCKET_PATH_MAX_BYTES}): {}. Shorten target workspace, workspace.state_dir, target.identity.session_home, or explicit --session-id.",
-                    path.display()
+                    "{label} is too long for a Unix domain socket ({bytes} bytes, limit {UNIX_SOCKET_PATH_MAX_BYTES}): {}. Configure control_sockets.host_dir or control_sockets.container_dir to a shorter absolute path. For fixed targets, runtime_id is the target id {:?}; for ephemeral targets, runtime_id is the session id.",
+                    path.display(),
+                    self.target_name
                 );
             }
         }
@@ -2698,6 +2810,143 @@ impl Runtime {
             }
         }
     }
+
+    fn cleanup_control_socket_dir(&self) {
+        match std::fs::symlink_metadata(&self.control_sockets.host_dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                tracing::warn!(
+                    path = %self.control_sockets.host_dir.display(),
+                    "not removing symlink control socket runtime directory"
+                );
+                return;
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                tracing::warn!(
+                    path = %self.control_sockets.host_dir.display(),
+                    "not removing non-directory control socket runtime path"
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => {
+                tracing::warn!(
+                    path = %self.control_sockets.host_dir.display(),
+                    error = %err,
+                    "failed to inspect control socket runtime directory before cleanup"
+                );
+                return;
+            }
+        }
+
+        for socket in [
+            &self.control_sockets.host_agent_socket,
+            &self.control_sockets.host_ssh_socket,
+        ] {
+            match std::fs::remove_file(socket) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(
+                        path = %socket.display(),
+                        error = %err,
+                        "failed to remove control socket file"
+                    );
+                }
+            }
+        }
+
+        match std::fs::remove_dir(&self.control_sockets.host_dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(
+                    path = %self.control_sockets.host_dir.display(),
+                    error = %err,
+                    "failed to remove control socket runtime directory"
+                );
+            }
+        }
+    }
+}
+
+fn ensure_control_socket_dir(path: &Path) -> anyhow::Result<()> {
+    let created = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!(
+                "control_sockets.host_dir {} must not be a symlink",
+                path.display()
+            );
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            anyhow::bail!(
+                "control_sockets.host_dir {} exists but is not a directory",
+                path.display()
+            );
+        }
+        Ok(metadata) => {
+            validate_control_socket_dir_permissions(path, &metadata)?;
+            false
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)
+                .with_context(|| format!("create control_sockets.host_dir {}", path.display()))?;
+            true
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("inspect control_sockets.host_dir {}", path.display()));
+        }
+    };
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect control_sockets.host_dir {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "control_sockets.host_dir {} must not be a symlink",
+            path.display()
+        );
+    }
+    if !metadata.is_dir() {
+        anyhow::bail!(
+            "control_sockets.host_dir {} exists but is not a directory",
+            path.display()
+        );
+    }
+    if created {
+        set_control_socket_dir_permissions(path)?;
+    } else {
+        validate_control_socket_dir_permissions(path, &metadata)?;
+    }
+    Ok(())
+}
+
+fn set_control_socket_dir_permissions(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 0700 control_sockets.host_dir {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn validate_control_socket_dir_permissions(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "control_sockets.host_dir {} exists with permissions {mode:o}; use a private 0700 directory or remove it so aw-gateway can create it",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn resolve_container_path(home: &Path, configured: &str, suffix: [&str; 2]) -> PathBuf {
@@ -2711,6 +2960,103 @@ fn resolve_container_path(home: &Path, configured: &str, suffix: [&str; 2]) -> P
         path.push(part);
     }
     path
+}
+
+fn render_control_socket_paths(
+    cfg: &ControlSocketsConfig,
+    target: &TargetConfig,
+    target_name: &str,
+    container_name: &str,
+    session_id: Option<&str>,
+    runtime_id: &str,
+    user: &UserContext,
+) -> anyhow::Result<ControlSocketPaths> {
+    validate_name("control_sockets runtime_id", runtime_id)?;
+    let mut vars = Vars::new();
+    vars.insert("user".into(), user.user.clone());
+    vars.insert("uid".into(), user.uid.to_string());
+    vars.insert("gid".into(), user.gid.to_string());
+    vars.insert("home".into(), user.home.display().to_string());
+    vars.insert("target".into(), target_name.to_string());
+    vars.insert("image".into(), target.image.clone());
+    vars.insert("image_slug".into(), template::image_slug(&target.image));
+    vars.insert("container_name".into(), container_name.to_string());
+    vars.insert("runtime_id".into(), runtime_id.to_string());
+    if let Some(session_id) = session_id {
+        vars.insert("session_id".into(), session_id.to_string());
+    }
+
+    let host_dir = PathBuf::from(template::render(&cfg.host_dir, &vars)?);
+    if !host_dir.is_absolute() {
+        anyhow::bail!(
+            "control_sockets.host_dir must render to an absolute path, got {}",
+            host_dir.display()
+        );
+    }
+    validate_control_socket_host_dir(&host_dir, runtime_id, user)?;
+    let container_dir = PathBuf::from(template::render(&cfg.container_dir, &vars)?);
+    if !container_dir.is_absolute() {
+        anyhow::bail!(
+            "control_sockets.container_dir must render to an absolute path, got {}",
+            container_dir.display()
+        );
+    }
+
+    Ok(ControlSocketPaths {
+        host_agent_socket: host_dir.join("agent.sock"),
+        host_ssh_socket: host_dir.join("ssh.sock"),
+        container_agent_socket: container_dir.join("agent.sock"),
+        container_ssh_socket: container_dir.join("ssh.sock"),
+        default_host_dir: cfg.host_dir == "/run/user/{uid}/aw-gateway/{runtime_id}",
+        host_dir,
+        container_dir,
+    })
+}
+
+fn validate_control_socket_host_dir(
+    host_dir: &Path,
+    runtime_id: &str,
+    user: &UserContext,
+) -> anyhow::Result<()> {
+    if host_dir
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        anyhow::bail!(
+            "control_sockets.host_dir must not contain '.' or '..' path components: {}",
+            host_dir.display()
+        );
+    }
+
+    let dangerous = [
+        PathBuf::from("/"),
+        user.home.clone(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/run"),
+        PathBuf::from("/run/user"),
+        PathBuf::from(format!("/run/user/{}", user.uid)),
+    ];
+    if dangerous.iter().any(|path| path == host_dir) {
+        anyhow::bail!(
+            "control_sockets.host_dir must be an isolated runtime-specific leaf directory, got dangerous shared path {}",
+            host_dir.display()
+        );
+    }
+
+    let Some(leaf) = host_dir.file_name().and_then(|value| value.to_str()) else {
+        anyhow::bail!(
+            "control_sockets.host_dir must end with runtime_id {runtime_id:?}, got {}",
+            host_dir.display()
+        );
+    };
+    if leaf != runtime_id {
+        anyhow::bail!(
+            "control_sockets.host_dir must end with runtime_id {runtime_id:?} so cleanup only removes the runtime leaf, got {}",
+            host_dir.display()
+        );
+    }
+
+    Ok(())
 }
 
 fn resolve_target_workspace(
@@ -2783,6 +3129,20 @@ mod tests {
         }
     }
 
+    fn test_control_socket_paths(base: &Path) -> ControlSocketPaths {
+        let host_dir = base.join("runtime-sockets");
+        let container_dir = PathBuf::from("/run/aw-gateway");
+        ControlSocketPaths {
+            host_agent_socket: host_dir.join("agent.sock"),
+            host_ssh_socket: host_dir.join("ssh.sock"),
+            container_agent_socket: container_dir.join("agent.sock"),
+            container_ssh_socket: container_dir.join("ssh.sock"),
+            host_dir,
+            container_dir,
+            default_host_dir: false,
+        }
+    }
+
     fn test_runtime(
         dir: &tempfile::TempDir,
         program: PathBuf,
@@ -2827,6 +3187,7 @@ mod tests {
                 .path()
                 .join("workspace/.aw-gateway/containers/ubuntu-dev"),
             container_state_dir_in_container: user.home.join(".aw-gateway/containers/ubuntu-dev"),
+            control_sockets: test_control_socket_paths(dir.path()),
             container_name: "ubuntu-dev".into(),
             container_runtime,
             user,
@@ -3316,7 +3677,7 @@ name = "{{image_slug}}"
             cfg.container_agent.control_socket = None;
             cfg.container_agent.ssh_bridge = Some(crate::config::SshBridgeConfig {
                 enabled: true,
-                socket: Some("{container_state_dir}/ssh.sock".into()),
+                socket: None,
                 target: "127.0.0.1:22".into(),
                 mode: "0600".into(),
             });
@@ -3338,7 +3699,8 @@ name = "{{image_slug}}"
     #[tokio::test]
     async fn runtime_load_rejects_overlong_generated_host_socket_path() {
         let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("w".repeat(90));
+        let workspace = dir.path().join("workspace");
+        let host_dir = dir.path().join("h".repeat(120)).join("{runtime_id}");
         let config = dir.path().join("gateway.toml");
         std::fs::write(
             &config,
@@ -3353,6 +3715,9 @@ type = "podman"
 path = "{}"
 state_dir = ".aw-gateway"
 
+[control_sockets]
+host_dir = "{}"
+
 [targets.default]
 image = "ubuntu/dev"
 mode = "ephemeral"
@@ -3360,6 +3725,7 @@ ephemeral_name = "{{image_slug}}-{{session_id}}"
 stop_when_idle = true
 "#,
                 workspace.display(),
+                host_dir.display(),
             ),
         )
         .unwrap();
@@ -3371,8 +3737,7 @@ stop_when_idle = true
 
         assert!(err.contains("host agent socket path"), "{err}");
         assert!(err.contains("too long for a Unix domain socket"), "{err}");
-        assert!(err.contains("workspace.state_dir"), "{err}");
-        assert!(err.contains("explicit --session-id"), "{err}");
+        assert!(err.contains("control_sockets.host_dir"), "{err}");
     }
 
     #[tokio::test]
@@ -3420,6 +3785,287 @@ stop_when_idle = true
                 .container_state_dir
                 .ends_with(".aw-gateway/sessions/abc123def456")
         );
+        assert_eq!(
+            runtime.control_sockets.host_agent_socket,
+            PathBuf::from(format!(
+                "/run/user/{}/aw-gateway/abc123def456/agent.sock",
+                runtime.user.uid
+            ))
+        );
+        assert_eq!(
+            runtime.control_sockets.host_ssh_socket,
+            PathBuf::from(format!(
+                "/run/user/{}/aw-gateway/abc123def456/ssh.sock",
+                runtime.user.uid
+            ))
+        );
+        assert_eq!(
+            runtime.control_sockets.container_agent_socket,
+            PathBuf::from("/run/aw-gateway/agent.sock")
+        );
+        assert_eq!(
+            runtime.control_sockets.container_ssh_socket,
+            PathBuf::from("/run/aw-gateway/ssh.sock")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_load_uses_fixed_target_id_for_default_control_socket_runtime_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let config = dir.path().join("gateway.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+schema_version = "1"
+default_target = "dev-shell"
+
+[runtime]
+type = "podman"
+
+[workspace]
+path = "{}"
+state_dir = ".aw-gateway"
+
+[targets.dev-shell]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+"#,
+                workspace.display(),
+            ),
+        )
+        .unwrap();
+
+        let runtime = Runtime::load(Some(config), Some("dev-shell"), None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.session_id, None);
+        assert_eq!(
+            runtime.control_sockets.host_agent_socket,
+            PathBuf::from(format!(
+                "/run/user/{}/aw-gateway/dev-shell/agent.sock",
+                runtime.user.uid
+            ))
+        );
+        assert_eq!(
+            runtime.control_sockets.host_ssh_socket,
+            PathBuf::from(format!(
+                "/run/user/{}/aw-gateway/dev-shell/ssh.sock",
+                runtime.user.uid
+            ))
+        );
+        assert_eq!(
+            runtime.control_sockets.container_agent_socket,
+            PathBuf::from("/run/aw-gateway/agent.sock")
+        );
+        assert_eq!(
+            runtime.control_sockets.container_ssh_socket,
+            PathBuf::from("/run/aw-gateway/ssh.sock")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_load_applies_global_and_target_control_socket_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let global_host = dir.path().join("global/{runtime_id}");
+        let target_host = dir.path().join("target/{runtime_id}");
+        let config = dir.path().join("gateway.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+schema_version = "1"
+default_target = "global"
+
+[runtime]
+type = "podman"
+
+[workspace]
+path = "{}"
+state_dir = ".aw-gateway"
+
+[control_sockets]
+host_dir = "{}"
+container_dir = "/run/global-aw"
+
+[targets.global]
+image = "ubuntu/global"
+mode = "fixed"
+name = "{{image_slug}}"
+
+[targets.targeted]
+image = "ubuntu/targeted"
+mode = "fixed"
+name = "{{image_slug}}"
+
+[targets.targeted.control_sockets]
+host_dir = "{}"
+container_dir = "/tmp/aw-gateway"
+"#,
+                workspace.display(),
+                global_host.display(),
+                target_host.display(),
+            ),
+        )
+        .unwrap();
+
+        let global = Runtime::load(Some(config.clone()), Some("global"), None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            global.control_sockets.host_agent_socket,
+            dir.path().join("global/global/agent.sock")
+        );
+        assert_eq!(
+            global.control_sockets.container_ssh_socket,
+            PathBuf::from("/run/global-aw/ssh.sock")
+        );
+
+        let targeted = Runtime::load(Some(config), Some("targeted"), None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            targeted.control_sockets.host_agent_socket,
+            dir.path().join("target/targeted/agent.sock")
+        );
+        assert_eq!(
+            targeted.control_sockets.container_ssh_socket,
+            PathBuf::from("/tmp/aw-gateway/ssh.sock")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_load_rejects_relative_control_socket_dirs() {
+        for (field, config_fragment) in [
+            (
+                "control_sockets.host_dir",
+                r#"[control_sockets]
+host_dir = "relative/{runtime_id}"
+"#,
+            ),
+            (
+                "control_sockets.container_dir",
+                r#"[control_sockets]
+container_dir = "relative-container"
+"#,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("gateway.toml");
+            std::fs::write(
+                &config,
+                format!(
+                    r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+
+[workspace]
+path = "{}"
+state_dir = ".aw-gateway"
+
+{config_fragment}
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+"#,
+                    dir.path().join("workspace").display(),
+                ),
+            )
+            .unwrap();
+
+            let err = Runtime::load(Some(config), Some("default"), None, true)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(field), "{err}");
+            assert!(err.contains("absolute path"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_load_rejects_unsafe_control_socket_runtime_ids_and_host_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("gateway.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+
+[workspace]
+path = "{}"
+state_dir = ".aw-gateway"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "ephemeral"
+ephemeral_name = "{{image_slug}}-{{session_id}}"
+stop_when_idle = true
+"#,
+                dir.path().join("workspace").display(),
+            ),
+        )
+        .unwrap();
+
+        let err = Runtime::load(Some(config), Some("default"), Some("..".into()), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid session id"), "{err}");
+
+        for (host_dir, expected) in [
+            ("/tmp", "dangerous shared path"),
+            ("/run/user/{uid}", "dangerous shared path"),
+            ("/run/user/{uid}/aw-gateway", "must end with runtime_id"),
+            (
+                "/run/user/{uid}/aw-gateway/../{runtime_id}",
+                "must not contain '.' or '..'",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("gateway.toml");
+            std::fs::write(
+                &config,
+                format!(
+                    r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+
+[workspace]
+path = "{}"
+state_dir = ".aw-gateway"
+
+[control_sockets]
+host_dir = "{host_dir}"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+"#,
+                    dir.path().join("workspace").display(),
+                ),
+            )
+            .unwrap();
+
+            let err = Runtime::load(Some(config), Some("default"), None, true)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{err}");
+        }
     }
 
     #[tokio::test]
@@ -3470,8 +4116,7 @@ name = "{{image_slug}}"
     async fn runtime_load_rejects_overlong_explicit_container_socket_path() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
-        let session_id = "a".repeat(64);
-        let container_home = format!("/home/{}", "b".repeat(80));
+        let container_dir = format!("/home/{}/aw-gateway", "b".repeat(100));
         let config = dir.path().join("gateway.toml");
         std::fs::write(
             &config,
@@ -3486,42 +4131,36 @@ type = "podman"
 path = "{}"
 state_dir = ".aw-gateway"
 
+[control_sockets]
+container_dir = "{container_dir}"
+
 [container_agent]
 control_socket = false
 
 [container_agent.ssh_bridge]
 enabled = true
-socket = "{{container_state_dir}}/ssh.sock"
 target = "127.0.0.1:22"
 mode = "0600"
 
 [targets.default]
 image = "ubuntu/dev"
-mode = "ephemeral"
-ephemeral_name = "{{image_slug}}-{{session_id}}"
-stop_when_idle = true
-
-[targets.default.identity]
-session_home = "{container_home}"
-
-[targets.default.local_ssh]
-backend = "published_port"
+mode = "fixed"
+name = "{{image_slug}}"
 "#,
                 workspace.display(),
             ),
         )
         .unwrap();
 
-        let err = Runtime::load(Some(config), Some("default"), Some(session_id), false)
+        let err = Runtime::load(Some(config), Some("default"), None, false)
             .await
             .unwrap_err()
             .to_string();
 
         assert!(err.contains("container ssh socket path"), "{err}");
         assert!(err.contains("too long for a Unix domain socket"), "{err}");
-        assert!(err.contains(&container_home), "{err}");
-        assert!(err.contains("target.identity.session_home"), "{err}");
-        assert!(err.contains("explicit --session-id"), "{err}");
+        assert!(err.contains(&container_dir), "{err}");
+        assert!(err.contains("control_sockets.container_dir"), "{err}");
     }
 
     #[test]
@@ -3565,6 +4204,7 @@ backend = "published_port"
             container_state_dir_in_container: PathBuf::from(
                 "/home/alice/.aw-gateway/containers/ubuntu-dev",
             ),
+            control_sockets: test_control_socket_paths(dir.path()),
             container_name: "ubuntu-dev".into(),
             container_runtime,
         };
@@ -3604,6 +4244,10 @@ backend = "published_port"
         assert!(args.contains(&"io.aw-gateway.gateway=true".to_string()));
         assert!(args.contains(&"io.aw-gateway.target=default".to_string()));
         assert!(args.contains(&"io.aw-gateway.mode=fixed".to_string()));
+        assert!(args.contains(&format!(
+            "{}:/run/aw-gateway:Z",
+            dir.path().join("runtime-sockets").display()
+        )));
         assert!(args.contains(&"localhost/ubuntu/dev:latest".to_string()));
         assert_eq!(
             &args[args.len() - 3..],
@@ -3614,6 +4258,128 @@ backend = "published_port"
             ]
         );
         assert!(args.iter().any(|arg| arg == "aw-container-agent"));
+    }
+
+    #[test]
+    fn prepare_control_socket_dir_is_private_and_removes_stale_socket_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+            cfg.container_agent.enabled = true;
+            cfg.container_agent.control_socket = None;
+            cfg.container_agent.ssh_bridge = Some(crate::config::SshBridgeConfig {
+                enabled: true,
+                socket: None,
+                target: "127.0.0.1:22".into(),
+                mode: "0600".into(),
+            });
+        });
+
+        std::fs::create_dir_all(&runtime.control_sockets.host_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &runtime.control_sockets.host_dir,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        std::fs::write(&runtime.control_sockets.host_agent_socket, "").unwrap();
+        std::fs::write(&runtime.control_sockets.host_ssh_socket, "").unwrap();
+
+        runtime.prepare_control_socket_dir().unwrap();
+
+        assert!(runtime.control_sockets.host_dir.is_dir());
+        assert!(!runtime.control_sockets.host_agent_socket.exists());
+        assert!(!runtime.control_sockets.host_ssh_socket.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_control_socket_dir_rejects_symlink_and_non_private_existing_dir() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+        let target = dir.path().join("real-runtime-dir");
+        std::fs::create_dir_all(&target).unwrap();
+        symlink(&target, &runtime.control_sockets.host_dir).unwrap();
+        let err = runtime
+            .prepare_control_socket_dir()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not be a symlink"), "{err}");
+        assert!(target.is_dir());
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+        std::fs::create_dir_all(&runtime.control_sockets.host_dir).unwrap();
+        std::fs::set_permissions(
+            &runtime.control_sockets.host_dir,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let err = runtime
+            .prepare_control_socket_dir()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exists with permissions 755"), "{err}");
+        let mode = std::fs::symlink_metadata(&runtime.control_sockets.host_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn cleanup_control_socket_dir_removes_only_runtime_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+            cfg.container_agent.enabled = true;
+            cfg.container_agent.control_socket = None;
+            cfg.container_agent.ssh_bridge = Some(crate::config::SshBridgeConfig {
+                enabled: true,
+                socket: None,
+                target: "127.0.0.1:22".into(),
+                mode: "0600".into(),
+            });
+        });
+        let parent = runtime
+            .control_sockets
+            .host_dir
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::create_dir_all(&runtime.control_sockets.host_dir).unwrap();
+        std::fs::write(parent.join("parent-marker"), "").unwrap();
+        std::fs::write(&runtime.control_sockets.host_agent_socket, "").unwrap();
+        std::fs::write(&runtime.control_sockets.host_ssh_socket, "").unwrap();
+
+        runtime.cleanup_control_socket_dir();
+
+        assert!(!runtime.control_sockets.host_dir.exists());
+        assert!(parent.join("parent-marker").exists());
+        assert!(parent.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_control_socket_dir_refuses_symlink_deletion_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+        let target = dir.path().join("real-runtime-dir");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("marker"), "").unwrap();
+        symlink(&target, &runtime.control_sockets.host_dir).unwrap();
+
+        runtime.cleanup_control_socket_dir();
+
+        assert!(target.join("marker").exists());
+        assert!(runtime.control_sockets.host_dir.exists());
     }
 
     #[test]
@@ -3699,6 +4465,7 @@ backend = "published_port"
             container_state_dir_in_container: PathBuf::from(
                 "/home/alice/.aw-gateway/containers/ubuntu-dev",
             ),
+            control_sockets: test_control_socket_paths(dir.path()),
             container_name: "ubuntu-dev".into(),
             container_runtime,
         };
@@ -3781,6 +4548,7 @@ backend = "published_port"
             container_state_dir_in_container: PathBuf::from(
                 "/home/alice/.aw-gateway/containers/ubuntu-dev",
             ),
+            control_sockets: test_control_socket_paths(dir.path()),
             container_name: "ubuntu-dev".into(),
             container_runtime,
         };
@@ -3837,6 +4605,7 @@ backend = "published_port"
             container_state_dir_in_container: PathBuf::from(
                 "/home/alice/.aw-gateway/containers/ubuntu-dev",
             ),
+            control_sockets: test_control_socket_paths(dir.path()),
             container_name: "ubuntu-dev".into(),
             container_runtime,
         };
@@ -3904,6 +4673,7 @@ backend = "published_port"
             container_state_dir_in_container: PathBuf::from(
                 "/home/alice/.aw-gateway/containers/ubuntu-dev",
             ),
+            control_sockets: test_control_socket_paths(dir.path()),
             container_name: "ubuntu-dev".into(),
             container_runtime,
         };
@@ -3925,6 +4695,10 @@ backend = "published_port"
             agent_config
                 .contains("/home/alice/.aw-gateway/containers/ubuntu-dev/sshd-session-env.conf")
         );
+        assert!(agent_config.contains("control_socket = \"/run/aw-gateway/agent.sock\""));
+        assert!(agent_config.contains("socket = \"/run/aw-gateway/ssh.sock\""));
+        assert!(!agent_config.contains("/home/alice/.aw-gateway/containers/ubuntu-dev/agent.sock"));
+        assert!(!agent_config.contains("/home/alice/.aw-gateway/containers/ubuntu-dev/ssh.sock"));
     }
 
     #[test]
@@ -4012,6 +4786,7 @@ backend = "published_port"
             container_state_dir_in_container: PathBuf::from(
                 "/home/alice/.aw-gateway/containers/ubuntu-dev",
             ),
+            control_sockets: test_control_socket_paths(dir.path()),
             container_name: "ubuntu-dev".into(),
             container_runtime,
         };
@@ -4097,6 +4872,7 @@ backend = "published_port"
             container_state_dir_in_container: PathBuf::from(
                 "/home/alice/.aw-gateway/containers/ubuntu-dev",
             ),
+            control_sockets: test_control_socket_paths(dir.path()),
             container_name: "ubuntu-dev".into(),
             container_runtime,
         };
