@@ -30,7 +30,11 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub target_defaults: TargetConfigInput,
     #[serde(default)]
+    pub target_templates: BTreeMap<String, TargetConfigInput>,
+    #[serde(default)]
     pub launch_defaults: LaunchConfigInput,
+    #[serde(default)]
+    pub launch_templates: BTreeMap<String, LaunchConfigInput>,
     #[serde(default)]
     pub targets: BTreeMap<String, TargetConfigInput>,
     #[serde(default)]
@@ -56,6 +60,7 @@ impl GatewayConfig {
         let mut target_stack = BTreeSet::from([root_canonical.clone()]);
         let mut launch_stack = BTreeSet::from([root_canonical]);
         compose_target_includes(
+            &mut self.target_templates,
             &mut self.targets,
             &self.target_includes,
             root_dir,
@@ -63,6 +68,7 @@ impl GatewayConfig {
             &mut target_stack,
         )?;
         compose_launch_includes(
+            &mut self.launch_templates,
             &mut self.launches,
             &self.launch_includes,
             root_dir,
@@ -80,8 +86,20 @@ impl GatewayConfig {
                 GATEWAY_SCHEMA_VERSION
             );
         }
+        reject_template_use("target_defaults", &self.target_defaults.use_templates)?;
         self.target_defaults.validate_partial("target_defaults")?;
+        for (name, template) in &self.target_templates {
+            validate_name("target template", name)?;
+            template.validate_partial(name)?;
+        }
+        self.validate_target_template_references()?;
+        reject_template_use("launch_defaults", &self.launch_defaults.use_templates)?;
         self.launch_defaults.validate_partial("launch_defaults")?;
+        for (name, template) in &self.launch_templates {
+            validate_name("launch template", name)?;
+            template.validate_partial(name)?;
+        }
+        self.validate_launch_template_references()?;
         validate_name("default_target", &self.default_target)?;
         if !self.targets.contains_key(&self.default_target) {
             anyhow::bail!(
@@ -178,10 +196,12 @@ impl GatewayConfig {
         name: &str,
         target: &TargetConfigInput,
     ) -> anyhow::Result<TargetConfig> {
-        let effective = TargetConfigInput::builtin_defaults()
-            .overlay(&self.target_defaults)?
-            .overlay(target)?
-            .into_effective(name)?;
+        let effective_input = self.overlay_target_templates(
+            TargetConfigInput::builtin_defaults().overlay(&self.target_defaults)?,
+            &format!("target {name:?}"),
+            &target.use_templates,
+        )?;
+        let effective = effective_input.overlay(target)?.into_effective(name)?;
         effective.validate(name)?;
         Ok(effective)
     }
@@ -228,13 +248,164 @@ impl GatewayConfig {
         launch: &LaunchConfigInput,
         targets: &BTreeMap<String, TargetConfig>,
     ) -> anyhow::Result<LaunchConfig> {
-        let effective = self
-            .launch_defaults
-            .clone()
-            .overlay(launch)?
-            .into_effective(name)?;
+        let effective_input = self.overlay_launch_templates(
+            self.launch_defaults.clone(),
+            &format!("launch {name:?}"),
+            &launch.use_templates,
+        )?;
+        let effective = effective_input.overlay(launch)?.into_effective(name)?;
         effective.validate(name, targets)?;
         Ok(effective)
+    }
+
+    fn validate_target_template_references(&self) -> anyhow::Result<()> {
+        for name in self.target_templates.keys() {
+            self.check_target_template_references(name, &mut Vec::new())?;
+        }
+        Ok(())
+    }
+
+    fn validate_launch_template_references(&self) -> anyhow::Result<()> {
+        for name in self.launch_templates.keys() {
+            self.check_launch_template_references(name, &mut Vec::new())?;
+        }
+        Ok(())
+    }
+
+    fn overlay_target_templates(
+        &self,
+        mut base: TargetConfigInput,
+        owner: &str,
+        templates: &[String],
+    ) -> anyhow::Result<TargetConfigInput> {
+        for template in templates {
+            base = self
+                .apply_target_template(base, template, &mut Vec::new())
+                .with_context(|| format!("{owner} uses target template {template:?}"))?;
+        }
+        Ok(base)
+    }
+
+    fn check_target_template_references(
+        &self,
+        name: &str,
+        stack: &mut Vec<String>,
+    ) -> anyhow::Result<()> {
+        if let Some(start) = stack.iter().position(|entry| entry == name) {
+            let mut cycle = stack[start..].to_vec();
+            cycle.push(name.to_string());
+            anyhow::bail!("target template cycle: {}", cycle.join(" -> "));
+        }
+        let template = self
+            .target_templates
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown target template {name:?}"))?;
+
+        stack.push(name.to_string());
+        for dependency in &template.use_templates {
+            self.check_target_template_references(dependency, stack)
+                .with_context(|| {
+                    format!("target template {name:?} uses target template {dependency:?}")
+                })?;
+        }
+        stack.pop();
+        Ok(())
+    }
+
+    fn apply_target_template(
+        &self,
+        mut base: TargetConfigInput,
+        name: &str,
+        stack: &mut Vec<String>,
+    ) -> anyhow::Result<TargetConfigInput> {
+        if let Some(start) = stack.iter().position(|entry| entry == name) {
+            let mut cycle = stack[start..].to_vec();
+            cycle.push(name.to_string());
+            anyhow::bail!("target template cycle: {}", cycle.join(" -> "));
+        }
+        let template = self
+            .target_templates
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown target template {name:?}"))?;
+
+        stack.push(name.to_string());
+        for dependency in &template.use_templates {
+            base = self
+                .apply_target_template(base, dependency, stack)
+                .with_context(|| {
+                    format!("target template {name:?} uses target template {dependency:?}")
+                })?;
+        }
+        stack.pop();
+        base.overlay(template)
+    }
+
+    fn overlay_launch_templates(
+        &self,
+        mut base: LaunchConfigInput,
+        owner: &str,
+        templates: &[String],
+    ) -> anyhow::Result<LaunchConfigInput> {
+        for template in templates {
+            base = self
+                .apply_launch_template(base, template, &mut Vec::new())
+                .with_context(|| format!("{owner} uses launch template {template:?}"))?;
+        }
+        Ok(base)
+    }
+
+    fn check_launch_template_references(
+        &self,
+        name: &str,
+        stack: &mut Vec<String>,
+    ) -> anyhow::Result<()> {
+        if let Some(start) = stack.iter().position(|entry| entry == name) {
+            let mut cycle = stack[start..].to_vec();
+            cycle.push(name.to_string());
+            anyhow::bail!("launch template cycle: {}", cycle.join(" -> "));
+        }
+        let template = self
+            .launch_templates
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown launch template {name:?}"))?;
+
+        stack.push(name.to_string());
+        for dependency in &template.use_templates {
+            self.check_launch_template_references(dependency, stack)
+                .with_context(|| {
+                    format!("launch template {name:?} uses launch template {dependency:?}")
+                })?;
+        }
+        stack.pop();
+        Ok(())
+    }
+
+    fn apply_launch_template(
+        &self,
+        mut base: LaunchConfigInput,
+        name: &str,
+        stack: &mut Vec<String>,
+    ) -> anyhow::Result<LaunchConfigInput> {
+        if let Some(start) = stack.iter().position(|entry| entry == name) {
+            let mut cycle = stack[start..].to_vec();
+            cycle.push(name.to_string());
+            anyhow::bail!("launch template cycle: {}", cycle.join(" -> "));
+        }
+        let template = self
+            .launch_templates
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("unknown launch template {name:?}"))?;
+
+        stack.push(name.to_string());
+        for dependency in &template.use_templates {
+            base = self
+                .apply_launch_template(base, dependency, stack)
+                .with_context(|| {
+                    format!("launch template {name:?} uses launch template {dependency:?}")
+                })?;
+        }
+        stack.pop();
+        base.overlay(template)
     }
 
     pub fn effective_container_ssh(
@@ -290,6 +461,8 @@ struct TargetIncludeFile {
     #[serde(default)]
     target_includes: Vec<String>,
     #[serde(default)]
+    target_templates: BTreeMap<String, TargetConfigInput>,
+    #[serde(default)]
     targets: BTreeMap<String, TargetConfigInput>,
 }
 
@@ -298,6 +471,8 @@ struct TargetIncludeFile {
 struct LaunchIncludeFile {
     #[serde(default)]
     launch_includes: Vec<String>,
+    #[serde(default)]
+    launch_templates: BTreeMap<String, LaunchConfigInput>,
     #[serde(default)]
     launches: BTreeMap<String, LaunchConfigInput>,
 }
@@ -386,6 +561,8 @@ impl LaunchConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LaunchConfigInput {
+    #[serde(default, rename = "use")]
+    pub use_templates: Vec<String>,
     pub target: Option<String>,
     pub description: Option<String>,
     pub cwd: Option<String>,
@@ -400,6 +577,9 @@ pub struct LaunchConfigInput {
 
 impl LaunchConfigInput {
     fn validate_partial(&self, launch_name: &str) -> anyhow::Result<()> {
+        for template in &self.use_templates {
+            validate_name("launch template reference", template)?;
+        }
         if let Some(target) = &self.target {
             validate_name("launch.target", target)?;
         }
@@ -677,6 +857,7 @@ pub enum LaunchStepLocation {
 }
 
 fn compose_target_includes(
+    target_templates: &mut BTreeMap<String, TargetConfigInput>,
     targets: &mut BTreeMap<String, TargetConfigInput>,
     patterns: &[String],
     base_dir: &Path,
@@ -697,7 +878,22 @@ fn compose_target_includes(
         let include: TargetIncludeFile =
             toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
         let include_dir = path.parent().unwrap_or(base_dir);
-        compose_target_includes(targets, &include.target_includes, include_dir, seen, stack)?;
+        compose_target_includes(
+            target_templates,
+            targets,
+            &include.target_includes,
+            include_dir,
+            seen,
+            stack,
+        )?;
+        for (name, template) in include.target_templates {
+            if target_templates.insert(name.clone(), template).is_some() {
+                anyhow::bail!(
+                    "duplicate target template {name:?} from include {}",
+                    path.display()
+                );
+            }
+        }
         for (name, target) in include.targets {
             if targets.insert(name.clone(), target).is_some() {
                 anyhow::bail!("duplicate target {name:?} from include {}", path.display());
@@ -709,6 +905,7 @@ fn compose_target_includes(
 }
 
 fn compose_launch_includes(
+    launch_templates: &mut BTreeMap<String, LaunchConfigInput>,
     launches: &mut BTreeMap<String, LaunchConfigInput>,
     patterns: &[String],
     base_dir: &Path,
@@ -729,7 +926,25 @@ fn compose_launch_includes(
         let include: LaunchIncludeFile =
             toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
         let include_dir = path.parent().unwrap_or(base_dir);
-        compose_launch_includes(launches, &include.launch_includes, include_dir, seen, stack)?;
+        compose_launch_includes(
+            launch_templates,
+            launches,
+            &include.launch_includes,
+            include_dir,
+            seen,
+            stack,
+        )?;
+        for (name, launch_template) in include.launch_templates {
+            if launch_templates
+                .insert(name.clone(), launch_template)
+                .is_some()
+            {
+                anyhow::bail!(
+                    "duplicate launch template {name:?} from include {}",
+                    path.display()
+                );
+            }
+        }
         for (name, launch) in include.launches {
             if launches.insert(name.clone(), launch).is_some() {
                 anyhow::bail!("duplicate launch {name:?} from include {}", path.display());
@@ -1070,6 +1285,8 @@ impl Default for ClientConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetConfigInput {
+    #[serde(default, rename = "use")]
+    pub use_templates: Vec<String>,
     pub image: Option<String>,
     pub mode: Option<TargetMode>,
     pub name: Option<String>,
@@ -1275,6 +1492,9 @@ impl TargetConfigInput {
     }
 
     fn validate_partial(&self, target_name: &str) -> anyhow::Result<()> {
+        for template in &self.use_templates {
+            validate_name("target template reference", template)?;
+        }
         if let Some(image) = &self.image
             && image.trim().is_empty()
         {
@@ -3851,6 +4071,13 @@ fn validate_command(field: &str, command: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn reject_template_use(field: &str, templates: &[String]) -> anyhow::Result<()> {
+    if !templates.is_empty() {
+        anyhow::bail!("{field} does not support use");
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_name(field: &str, value: &str) -> anyhow::Result<()> {
     if value.is_empty()
         || value == "."
@@ -5592,6 +5819,235 @@ command = ["/bin/target-service"]
     }
 
     #[test]
+    fn target_templates_overlay_in_use_order_and_allow_concrete_overrides() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[target_defaults]
+image = "ubuntu/default"
+mode = "fixed"
+name = "default-name"
+
+[target_defaults.container_env]
+KEEP = "default"
+OVERRIDE = "default"
+
+[target_templates.runtime]
+image = "ubuntu/runtime"
+container_user = "worker"
+
+[target_templates.runtime.container_env]
+RUNTIME = "true"
+OVERRIDE = "runtime"
+
+[target_templates.policy]
+name = "policy-name"
+
+[target_templates.policy.container_env]
+POLICY = "true"
+OVERRIDE = "policy"
+
+[targets.default]
+use = ["runtime", "policy"]
+image = "ubuntu/final"
+name = "final-name"
+
+[targets.default.container_env]
+TARGET = "true"
+OVERRIDE = "target"
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let target = cfg.effective_target("default").unwrap();
+        assert_eq!(target.image, "ubuntu/final");
+        assert_eq!(target.name.as_deref(), Some("final-name"));
+        assert_eq!(target.container_user.as_deref(), Some("worker"));
+        assert_eq!(target.container_env["KEEP"], "default");
+        assert_eq!(target.container_env["RUNTIME"], "true");
+        assert_eq!(target.container_env["POLICY"], "true");
+        assert_eq!(target.container_env["TARGET"], "true");
+        assert_eq!(target.container_env["OVERRIDE"], "target");
+    }
+
+    #[test]
+    fn target_templates_can_nest_and_override_inherited_steps() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[target_defaults]
+image = "ubuntu/default"
+mode = "fixed"
+name = "default-name"
+
+[[target_defaults.host_steps]]
+name = "firewall"
+command = ["/bin/firewall"]
+timeout = "10s"
+
+[target_templates.timeout-policy]
+
+[[target_templates.timeout-policy.host_steps]]
+name = "firewall"
+timeout = "30s"
+
+[target_templates.runtime]
+use = ["timeout-policy"]
+container_home = "/home/worker"
+
+[targets.default]
+use = ["runtime"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let target = cfg.effective_target("default").unwrap();
+        assert_eq!(
+            target.container_home.as_deref(),
+            Some(Path::new("/home/worker"))
+        );
+        assert_eq!(target.host_steps[0].command, ["/bin/firewall"]);
+        assert_eq!(target.host_steps[0].timeout.as_deref(), Some("30s"));
+    }
+
+    #[test]
+    fn target_template_cycles_and_unknown_names_are_rejected() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[target_templates.a]
+use = ["b"]
+
+[target_templates.b]
+use = ["a"]
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("target template cycle: a -> b -> a"), "{err}");
+
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+use = ["missing"]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(
+            err.contains("target \"default\" uses target template \"missing\""),
+            "{err}"
+        );
+        assert!(err.contains("unknown target template \"missing\""), "{err}");
+    }
+
+    #[test]
+    fn target_template_effective_validation_runs_after_overlay() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[target_templates.ephemeral]
+mode = "ephemeral"
+
+[targets.default]
+use = ["ephemeral"]
+image = "ubuntu/dev"
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(
+            err.contains("ephemeral target \"default\" requires ephemeral_name"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn target_defaults_do_not_support_use() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[target_defaults]
+use = ["base"]
+
+[target_templates.base]
+image = "ubuntu/dev"
+
+[targets.default]
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(
+            err.contains("target_defaults does not support use"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn template_names_use_target_and_launch_name_validation() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[target_templates."bad name"]
+image = "ubuntu/dev"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("target template"), "{err}");
+        assert!(err.contains("bad name"), "{err}");
+
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launch_templates."bad name"]
+target = "default"
+command = ["true"]
+
+[launches.agent]
+target = "default"
+command = ["true"]
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("launch template"), "{err}");
+        assert!(err.contains("bad name"), "{err}");
+    }
+
+    #[test]
     fn target_defaults_can_supply_required_image() {
         let cfg: GatewayConfig = toml::from_str(
             r#"
@@ -5815,6 +6271,206 @@ command = ["host-prep"]
         assert_eq!(launch.steps[0].name, "prep");
         assert_eq!(launch.steps[0].command, ["launch-prep"]);
         assert_eq!(launch.steps[1].name, "host-prep");
+    }
+
+    #[test]
+    fn launch_templates_overlay_in_use_order_and_allow_concrete_overrides() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launch_defaults]
+target = "default"
+description = "Default description"
+cwd = "{container_home}/default"
+env = { KEEP = "default", OVERRIDE = "default" }
+command = ["default-command"]
+
+[launch_templates.repo]
+cwd = "{container_home}/repo"
+env = { REPO = "{var.repo}", OVERRIDE = "repo" }
+
+[launch_templates.repo.vars]
+repo = { type = "string", required = true }
+
+[[launch_templates.repo.steps]]
+phase = "post_ready"
+location = "container"
+name = "prep"
+command = ["repo-prep", "{var.repo}"]
+
+[launch_templates.codex]
+command = ["codex", "exec", "{var.repo}"]
+env = { CODEX_HOME = "{container_home}/.codex", OVERRIDE = "codex" }
+
+[launches.review]
+use = ["repo", "codex"]
+description = "Review repo"
+command = ["codex", "exec", "review", "{var.repo}"]
+env = { OVERRIDE = "launch" }
+
+[[launches.review.steps]]
+phase = "post_ready"
+location = "container"
+name = "prep"
+command = ["launch-prep", "{var.repo}"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let launch = cfg.effective_launch("review").unwrap();
+        assert_eq!(launch.target, "default");
+        assert_eq!(launch.description.as_deref(), Some("Review repo"));
+        assert_eq!(launch.cwd.as_deref(), Some("{container_home}/repo"));
+        assert_eq!(launch.command, ["codex", "exec", "review", "{var.repo}"]);
+        assert_eq!(launch.env["KEEP"], "default");
+        assert_eq!(launch.env["REPO"], "{var.repo}");
+        assert_eq!(launch.env["CODEX_HOME"], "{container_home}/.codex");
+        assert_eq!(launch.env["OVERRIDE"], "launch");
+        assert!(launch.vars.contains_key("repo"));
+        assert_eq!(launch.steps.len(), 1);
+        assert_eq!(launch.steps[0].command, ["launch-prep", "{var.repo}"]);
+    }
+
+    #[test]
+    fn launch_templates_can_nest() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launch_templates.base]
+target = "default"
+
+[launch_templates.command]
+use = ["base"]
+command = ["true"]
+
+[launches.agent]
+use = ["command"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let launch = cfg.effective_launch("agent").unwrap();
+        assert_eq!(launch.target, "default");
+        assert_eq!(launch.command, ["true"]);
+    }
+
+    #[test]
+    fn launch_template_cycles_and_unknown_names_are_rejected() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launch_templates.a]
+use = ["b"]
+
+[launch_templates.b]
+use = ["a"]
+
+[launches.agent]
+target = "default"
+command = ["true"]
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("launch template cycle: a -> b -> a"), "{err}");
+
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.agent]
+use = ["missing"]
+target = "default"
+command = ["true"]
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(
+            err.contains("launch \"agent\" uses launch template \"missing\""),
+            "{err}"
+        );
+        assert!(err.contains("unknown launch template \"missing\""), "{err}");
+    }
+
+    #[test]
+    fn launch_template_effective_validation_runs_after_overlay() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launch_templates.target]
+target = "default"
+
+[launches.agent]
+use = ["target"]
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(
+            err.contains("launch \"agent\" command is required after defaults"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn launch_defaults_do_not_support_use() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launch_defaults]
+use = ["base"]
+
+[launch_templates.base]
+target = "default"
+command = ["true"]
+
+[launches.agent]
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(
+            err.contains("launch_defaults does not support use"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -6143,6 +6799,136 @@ name = "dup"
         .unwrap();
         let err = GatewayConfig::load(&root).unwrap_err().to_string();
         assert!(err.contains("duplicate target"), "{err}");
+    }
+
+    #[test]
+    fn include_composition_supports_same_kind_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        let targets = dir.path().join("targets");
+        let launches = dir.path().join("launches");
+        std::fs::create_dir_all(&targets).unwrap();
+        std::fs::create_dir_all(&launches).unwrap();
+        std::fs::write(
+            targets.join("templates.toml"),
+            r#"
+[target_templates.base]
+image = "ubuntu/base"
+mode = "fixed"
+name = "base"
+
+[targets.default]
+use = ["base"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            launches.join("templates.toml"),
+            r#"
+[launch_templates.base]
+target = "default"
+command = ["true"]
+
+[launches.agent]
+use = ["base"]
+"#,
+        )
+        .unwrap();
+        let root = dir.path().join("gateway.toml");
+        std::fs::write(
+            &root,
+            format!(
+                r#"
+schema_version = "1"
+target_includes = ["{}/*.toml"]
+launch_includes = ["{}/*.toml"]
+"#,
+                targets.display(),
+                launches.display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = GatewayConfig::load(&root).unwrap();
+        assert_eq!(
+            cfg.effective_target("default").unwrap().image,
+            "ubuntu/base"
+        );
+        assert_eq!(cfg.effective_launch("agent").unwrap().command, ["true"]);
+    }
+
+    #[test]
+    fn include_composition_rejects_duplicate_template_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let targets = dir.path().join("targets");
+        let launches = dir.path().join("launches");
+        std::fs::create_dir_all(&targets).unwrap();
+        std::fs::create_dir_all(&launches).unwrap();
+        std::fs::write(
+            targets.join("template.toml"),
+            r#"
+[target_templates.base]
+image = "ubuntu/include"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            launches.join("template.toml"),
+            r#"
+[launch_templates.base]
+command = ["include"]
+"#,
+        )
+        .unwrap();
+
+        let root = dir.path().join("gateway.toml");
+        std::fs::write(
+            &root,
+            format!(
+                r#"
+schema_version = "1"
+target_includes = ["{}/*.toml"]
+launch_includes = ["{}/*.toml"]
+
+[target_templates.base]
+image = "ubuntu/root"
+
+[launch_templates.base]
+command = ["root"]
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+"#,
+                targets.display(),
+                launches.display()
+            ),
+        )
+        .unwrap();
+        let err = GatewayConfig::load(&root).unwrap_err().to_string();
+        assert!(err.contains("duplicate target template"), "{err}");
+
+        std::fs::write(
+            &root,
+            format!(
+                r#"
+schema_version = "1"
+launch_includes = ["{}/*.toml"]
+
+[launch_templates.base]
+command = ["root"]
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+"#,
+                launches.display()
+            ),
+        )
+        .unwrap();
+        let err = GatewayConfig::load(&root).unwrap_err().to_string();
+        assert!(err.contains("duplicate launch template"), "{err}");
     }
 
     #[test]

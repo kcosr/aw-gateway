@@ -405,6 +405,8 @@ Gateway configs commonly include:
 
 - `[target_defaults]`: partial target-shaped defaults inherited by every
   target.
+- `[target_templates.<name>]`: reusable partial target-shaped templates that
+  targets opt into with ordered `use = [...]`.
 - `[target_defaults.workspace]`: default host workspace path, state directory,
   and cleanup policy.
 - `[target_defaults.control_sockets]`: short runtime directories for gateway-managed Unix
@@ -428,6 +430,8 @@ Gateway configs commonly include:
 - `[launches.<name>]`: named command templates that select a target, validate
   caller variables, optionally run post-ready setup steps, and execute a final
   command inside the ready container.
+- `[launch_templates.<name>]`: reusable partial launch-shaped templates that
+  launches opt into with ordered `use = [...]`.
 - `target_includes` and `launch_includes`: section-specific include globs for
   splitting target and launch definitions into separate TOML files.
 - `[[target_defaults.container_mounts]]` and `[[targets.<name>.container_mounts]]`: extra
@@ -553,6 +557,41 @@ type = "command"
 command = ["/opt/site-policy/bin/network-policy", "check", "{container_pid}"]
 ```
 
+Common target behavior can also be factored into named
+`[target_templates.<name>]` sections. Templates use the same partial target
+shape as `[target_defaults]` and `[targets.<name>]`. A target opts in with
+ordered `use = [...]`; effective target order is `[target_defaults]`, then each
+named template in order, then the concrete target. Templates may use other
+target templates, and cycles or unknown template names fail config validation.
+
+```toml
+[target_templates.rocky-runtime]
+image = "rocky8/base"
+container_user = "worker"
+container_home = "/home/worker"
+
+[target_templates.review-ephemeral]
+mode = "ephemeral"
+ephemeral_name = "review-{session_id}"
+stop_when_idle = true
+
+[target_templates.review-ephemeral.idle_cleanup]
+owner = "gateway"
+action = "exit_container"
+
+[target_templates.rocky-review]
+use = ["rocky-runtime", "review-ephemeral"]
+image = "rocky8/review"
+
+[targets.code-review-worker]
+use = ["rocky-review"]
+image = "rocky8/review-sip"
+
+[targets.code-review-worker.workspace]
+path = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
+cleanup = "always"
+```
+
 ## Launches
 
 Launches are stateless, configured command templates. They do not add a job
@@ -615,6 +654,32 @@ command = ["mkdir", "-p", "{container_home}/repo"]
 description = "Clone a repository and open a shell."
 cwd = "{container_home}/repo"
 command = ["/bin/bash", "-lc", "exec /bin/bash"]
+```
+
+Named launch templates provide additional reusable partial launch layers.
+Launches opt in with ordered `use = [...]`; effective launch order is
+`[launch_defaults]`, then each named launch template in order, then the
+concrete launch. Launch templates may use other launch templates, and cycles or
+unknown template names fail config validation. A launch `command` always
+replaces the earlier command; command fragments are not composed.
+
+```toml
+[launch_templates.repo-review]
+target = "default"
+cwd = "{container_home}/repo"
+
+[launch_templates.repo-review.vars]
+repo = { type = "string", required = true, description = "Git repository URL" }
+
+[launch_templates.codex-review]
+use = ["repo-review"]
+env = { CODEX_HOME = "{container_home}/.codex" }
+command = ["codex", "exec", "{var.repo}"]
+
+[launches.code-review]
+use = ["codex-review"]
+description = "Run a Codex review."
+command = ["codex", "exec", "review", "{var.repo}"]
 ```
 
 Supported variable types are `string`, `enum`, `boolean`, and `number`.
@@ -691,8 +756,11 @@ launch_includes = ["/etc/aw-gateway/launches/*.toml"]
 ```
 
 Include glob matches are sorted lexicographically before composition. Includes
-reject cycles, duplicate target or launch names, unknown fields, and partial
-object merge or override behavior.
+reject cycles, duplicate target/template or launch/template names, unknown
+fields, and partial object merge or override behavior. Target include files may
+define `target_includes`, `[target_templates.<name>]`, and `[targets.<name>]`;
+launch include files may define `launch_includes`,
+`[launch_templates.<name>]`, and `[launches.<name>]`.
 
 When `sftp = "deny"`, `start-container-sshd` removes the SFTP subsystem from
 the runtime SSHD config. Modern OpenSSH SCP uses SFTP, so that blocks both.

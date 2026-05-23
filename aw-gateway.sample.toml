@@ -2,8 +2,10 @@ schema_version = "1"
 default_target = "default"
 
 # Optional section-specific include globs. Matches are sorted before loading.
-# Included target files may define target_includes and [targets.<name>] only.
-# Included launch files may define launch_includes and [launches.<name>] only.
+# Included target files may define target_includes, [target_templates.<name>],
+# and [targets.<name>] only.
+# Included launch files may define launch_includes, [launch_templates.<name>],
+# and [launches.<name>] only.
 # target_includes = ["/etc/aw-gateway/targets/*.toml"]
 # launch_includes = ["/etc/aw-gateway/launches/*.toml"]
 
@@ -67,6 +69,27 @@ host = "gateway.example.com"
 gateway_path = "/opt/aw-gateway/bin/aw-gateway"
 default_identity_dir = "~/.ssh/aw-gateway"
 
+# Reusable target templates use the same partial target shape as
+# target_defaults and concrete targets. Targets opt in with ordered
+# use = ["template-a", "template-b"]. Templates may use other templates.
+#
+# [target_templates.common-runtime]
+# image = "ubuntu/dev"
+# container_user = "agentuser"
+# container_home = "/home/agentuser"
+#
+# [target_templates.ephemeral-worker]
+# mode = "ephemeral"
+# ephemeral_name = "worker-{session_id}"
+# stop_when_idle = true
+#
+# [target_templates.ephemeral-worker.idle_cleanup]
+# owner = "gateway"
+# action = "exit_container"
+#
+# [targets.default]
+# use = ["common-runtime", "ephemeral-worker"]
+#
 [targets.default]
 image = "ubuntu/dev"
 mode = "fixed"
@@ -220,7 +243,22 @@ health_check = { type = "command", command = ["sudo", "/opt/aw-gateway/bin/aw-ip
 # {container_home}, {workspace}, {session_id}, {target}, and {container_name}
 # stay unprefixed.
 #
+# Reusable launch templates use the same partial launch shape as launch_defaults
+# and concrete launches. Launches opt in with ordered use = ["template-a"].
+#
+# [launch_templates.repo-review]
+# target = "default"
+# cwd = "{container_home}/repo"
+#
+# [launch_templates.repo-review.vars]
+# repo = { type = "string", required = true, description = "Git repository URL" }
+#
+# [launch_templates.codex-review]
+# use = ["repo-review"]
+# command = ["codex", "exec", "{var.repo}"]
+#
 # [launches.repo-shell]
+# use = ["repo-review"]
 # target = "default"
 # description = "Clone a repository and open a shell."
 # cwd = "{container_home}/repo"
