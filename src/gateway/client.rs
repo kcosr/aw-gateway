@@ -1,9 +1,6 @@
+use super::Runtime;
 use super::identity::{ensure_authorized_key, validate_public_key_content};
-use super::{Runtime, load_config};
-use crate::cli::{
-    AddContainerKeyArgs, AddHostKeyArgs, AddKeyArgs, ClientBundleArgs, ClientConfigArgs,
-    SetDefaultArgs,
-};
+use crate::cli::{AddContainerKeyArgs, AddHostKeyArgs, AddKeyArgs, ClientBundleArgs};
 use crate::config::{GatewayConfig, LocalSshMode};
 use crate::paths::{self, UserContext};
 use crate::template::{self, Vars};
@@ -13,46 +10,6 @@ use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 
 const MAX_PUBLIC_KEY_BYTES: u64 = 16 * 1024;
-
-pub(super) async fn set_default(
-    config_path: Option<PathBuf>,
-    args: SetDefaultArgs,
-) -> anyhow::Result<()> {
-    let cfg = load_config(config_path)?;
-    let user = UserContext::current()?;
-    if args.reset {
-        let path = user.config_dir().join("default-target");
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err).with_context(|| format!("remove {}", path.display())),
-        }
-        println!("{}", configured_default_display(&cfg));
-        return Ok(());
-    }
-    let default = args
-        .target_or_image
-        .ok_or_else(|| anyhow::anyhow!("target or image is required unless --reset is used"))?;
-    let _ = resolve_target_selection(&cfg, Some(&default))
-        .with_context(|| format!("validate default selection {default:?}"))?;
-    paths::ensure_private_dir(&user.config_dir())?;
-    let path = user.config_dir().join("default-target");
-    std::fs::write(&path, format!("{default}\n"))?;
-    println!("{default}");
-    Ok(())
-}
-
-pub(super) async fn show_default(config_path: Option<PathBuf>) -> anyhow::Result<()> {
-    let cfg = load_config(config_path)?;
-    let user = UserContext::current()?;
-    let selection = read_default_selection(&user)
-        .transpose()?
-        .unwrap_or_else(|| configured_default_display(&cfg));
-    let _ = resolve_target_selection(&cfg, Some(&selection))
-        .with_context(|| format!("validate default selection {selection:?}"))?;
-    println!("{selection}");
-    Ok(())
-}
 
 pub(super) fn configured_default_display(cfg: &GatewayConfig) -> String {
     cfg.default_target.clone()
@@ -159,17 +116,6 @@ fn install_host_public_key(user: &UserContext, key: &str) -> anyhow::Result<bool
 
 fn key_status(added: bool) -> &'static str {
     if added { "added" } else { "duplicate" }
-}
-
-pub(super) async fn client_config(
-    config_path: Option<PathBuf>,
-    args: ClientConfigArgs,
-) -> anyhow::Result<()> {
-    let runtime = Runtime::load(config_path, args.target.as_deref(), None, false).await?;
-    let config = runtime.render_client_config(args.identity_file.as_deref())?;
-    runtime.write_inner_config(&config)?;
-    println!("{config}");
-    Ok(())
 }
 
 pub(super) async fn client_bundle(

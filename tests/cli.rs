@@ -489,6 +489,83 @@ port = 40222
 }
 
 #[test]
+fn ssh_up_rejects_local_listen_mode_before_serving_listener() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    let workspace = dir.path().join("workspace");
+    let mut sample = gateway_sample_for_test(&dir, &workspace);
+    sample.push_str(
+        r#"
+[targets.default.local_ssh]
+mode = "listen"
+host = "127.0.0.1"
+port = 40222
+"#,
+    );
+    std::fs::write(&config, sample).unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .env("SSH_ORIGINAL_COMMAND", "up default")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "gateway action \"up\" over SSH is not supported for local_ssh.mode = \"listen\" targets",
+        ));
+}
+
+#[test]
+fn default_selection_commands_use_operation_results() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    let workspace = dir.path().join("workspace");
+    let home = dir.path().join("home");
+    let mut sample = gateway_sample_for_test(&dir, &workspace);
+    sample.push_str(
+        r#"
+[targets.other]
+image = "fedora/dev"
+mode = "fixed"
+name = "fedora-dev"
+"#,
+    );
+    std::fs::write(&config, sample).unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["set-default", "other"])
+        .env("AW_GATEWAY_TEST_HOME", &home)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("other"));
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("show-default")
+        .env("AW_GATEWAY_TEST_HOME", &home)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("other"));
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .arg("reset-default")
+        .env("AW_GATEWAY_TEST_HOME", &home)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default"));
+    assert!(!home.join(".config/aw-gateway/default-target").exists());
+}
+
+#[test]
 fn client_config_default_managed_server_uses_single_proxy_command() {
     let dir = tempdir().unwrap();
     let config = dir.path().join("gateway.toml");
@@ -512,6 +589,8 @@ fn client_config_default_managed_server_uses_single_proxy_command() {
         .stdout(predicate::str::contains("IdentityFile").not())
         .stdout(predicate::str::contains("    User ").not())
         .stdout(predicate::str::contains("Port 40222").not());
+    let inner_config = std::fs::read_to_string(workspace.join(".aw-gateway/ssh/config")).unwrap();
+    assert!(inner_config.contains("Host aw-default"));
 }
 
 #[test]
@@ -1125,6 +1204,54 @@ fn targets_over_ssh_supports_json() {
 }
 
 #[test]
+fn targets_json_uses_effective_targets_from_templates_and_includes() {
+    let dir = tempdir().unwrap();
+    let config_dir = dir.path().join("config.d");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("targets.toml"),
+        r#"
+[target_templates.base]
+image = "ubuntu/base"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default]
+use = ["base"]
+"#,
+    )
+    .unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        r#"
+schema_version = "1"
+includes = ["config.d/*.toml"]
+"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["targets", "--json"])
+        .env("AW_GATEWAY_TEST_HOME", &home)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value[0]["target"], "default");
+    assert_eq!(value[0]["image"], "ubuntu/base");
+    assert_eq!(value[0]["mode"], "fixed");
+    assert_eq!(value[0]["container"], "ubuntu-base");
+    assert_eq!(value[0]["default"], true);
+}
+
+#[test]
 fn launches_cli_lists_and_serializes_var_metadata() {
     let dir = tempdir().unwrap();
     let config = dir.path().join("gateway.toml");
@@ -1224,6 +1351,88 @@ fn launch_show_text_and_json_include_execution_details() {
     assert_eq!(value["cwd"], "{container_home}/repo");
     assert_eq!(value["env"]["AGENT_PACK_ID"], "{var.pack_id}");
     assert_eq!(value["command"][0], "codex");
+}
+
+#[test]
+fn launch_discovery_uses_effective_templates_from_includes() {
+    let dir = tempdir().unwrap();
+    let config_dir = dir.path().join("config.d");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("launches.toml"),
+        r#"
+[target_templates.base]
+image = "ubuntu/base"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default]
+use = ["base"]
+
+[launch_templates.repo]
+target = "default"
+description = "Templated launch"
+cwd = "{container_home}/repo"
+env = { REPO = "{var.repo}" }
+command = ["sh", "-lc", "echo {var.repo}"]
+
+[launch_templates.repo.vars]
+repo = { type = "string", required = true }
+model = { type = "enum", values = ["gpt-5.5", "gpt-5.4"], default = "gpt-5.5" }
+
+[[launch_templates.repo.steps]]
+phase = "post_ready"
+location = "container"
+name = "prepare"
+command = ["mkdir", "-p", "{container_home}/repo"]
+
+[launches.templated]
+use = ["repo"]
+"#,
+    )
+    .unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        r#"
+schema_version = "1"
+includes = ["config.d/*.toml"]
+"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["launches", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value[0]["name"], "templated");
+    assert_eq!(value[0]["target"], "default");
+    assert_eq!(value[0]["description"], "Templated launch");
+    assert_eq!(value[0]["vars"]["repo"]["required"], true);
+    assert_eq!(value[0]["vars"]["model"]["default"], "gpt-5.5");
+
+    let output = Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["launch", "show", "templated", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(value["cwd"], "{container_home}/repo");
+    assert_eq!(value["env"]["REPO"], "{var.repo}");
+    assert_eq!(value["command"][2], "echo {var.repo}");
+    assert_eq!(value["steps"][0]["name"], "prepare");
 }
 
 #[test]

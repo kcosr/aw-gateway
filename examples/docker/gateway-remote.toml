@@ -19,7 +19,7 @@ state_dir = ".aw-gateway"
 [ssh_dispatch]
 allow_interactive_shell = true
 allow_container_commands = true
-enabled_gateway_actions = [
+enabled_actions = [
   "connect",
   "up",
   "status",

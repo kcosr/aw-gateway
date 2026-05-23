@@ -699,7 +699,7 @@ aw-gateway launch repo-shell --session-id abc123def456 --var repo=https://exampl
 ```
 
 When `launches` and `launch` are present in
-`ssh_dispatch.enabled_gateway_actions`, the same commands can be invoked
+`ssh_dispatch.enabled_actions`, the same commands can be invoked
 through the host SSH gateway:
 
 ```bash
@@ -709,7 +709,7 @@ ssh host 'launch repo-shell --var repo=https://example.test/repo.git --var branc
 ssh host 'launch repo-shell --session-id=abc123def456 --var=repo=https://example.test/repo.git'
 ```
 
-Omit `launch` from `ssh_dispatch.enabled_gateway_actions` if SSH users should
+Omit `launch` from `ssh_dispatch.enabled_actions` if SSH users should
 not start configured launch workflows. Omit `launches` if SSH users should not
 list configured launches.
 
@@ -782,7 +782,7 @@ Host-gateway SSH dispatch checks the default transfer table before dispatch;
 per-target transfer overrides do not relax that host-side gate and only affect
 direct container-SSHD access. If a deployment intends to expose management-only
 SSH commands without arbitrary container exec, omit `run` from
-`ssh_dispatch.enabled_gateway_actions`; omit `launch` if users should not start
+`ssh_dispatch.enabled_actions`; omit `launch` if users should not start
 configured launch workflows; omit `launches` if users should not discover
 configured launches; also omit `connect` if users should not receive a full
 container SSH session. `allow_container_commands = false` blocks non-gateway
@@ -1014,7 +1014,9 @@ remove [target]
 status [target] [--json] [--session-id ID]
 status --all [--json]
 targets [--json]
-set-default [target-or-image] [--reset]
+set-default <target-or-image>
+show-default
+reset-default
 add-key [target] [--public-key PATH|-]
 add-host-key [--public-key PATH|-]
 add-container-key [target] [--public-key PATH|-]
@@ -1059,8 +1061,9 @@ Gateway command behavior:
 - `targets [--json]`: list configured targets without starting or inspecting
   containers.
 - `set-default <target-or-image>`: set the user's default target.
-- `set-default --reset`: clear the user's default and fall back to the
-  configured default.
+- `show-default`: show the user's effective default target.
+- `reset-default`: clear the user's default and fall back to the configured
+  default.
 - `add-key [target]`: add one SSH public key to both the user's host
   `~/.ssh/authorized_keys` file and the target container authorized-key file.
 - `add-host-key`: add one SSH public key to the user's host
@@ -1077,9 +1080,13 @@ Gateway command behavior:
 When invoked by OpenSSH `ForceCommand`, the gateway parses
 `SSH_ORIGINAL_COMMAND` and exposes the restricted SSH command set. That set
 uses the same command names for most actions, and also accepts SSH-oriented
-actions and aliases such as `show-default`, `reset-default`, and `rm`. In the
-native CLI, use `set-default --reset` to reset the default target and `remove`
-to delete a fixed target container.
+aliases such as `rm`.
+
+CLI and SSH management commands share the same operation handling for target
+discovery, status, launch discovery, launch execution, lifecycle actions,
+default selection, and client config rendering. That keeps text and JSON output
+aligned between transports. This does not add an HTTP server, HTTP routes,
+HTTP authentication, streaming, or background jobs; those remain future work.
 
 `add-key`, `add-host-key`, and `add-container-key` options:
 

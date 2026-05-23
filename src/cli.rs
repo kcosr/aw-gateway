@@ -35,6 +35,8 @@ pub enum GatewayCommand {
     Status(StatusArg),
     Targets(TargetsArgs),
     SetDefault(SetDefaultArgs),
+    ShowDefault,
+    ResetDefault,
     AddKey(AddKeyArgs),
     AddHostKey(AddHostKeyArgs),
     AddContainerKey(AddContainerKeyArgs),

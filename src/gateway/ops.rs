@@ -1,0 +1,657 @@
+use super::model::{
+    AllStatusEntry, GatewayStatus, LaunchDetail, LaunchSummary, ReadyStatus, TargetEntry,
+};
+use super::{
+    Runtime, client, launch_detail, launch_execute_with_config, launch_summaries, load_config,
+    run_container_command_with_runtime, status_all_entries, target_entries,
+};
+use crate::cli::{
+    ClientConfigArgs, LaunchShowArgs, LaunchesArgs, RunArgs, SetDefaultArgs, StatusArg, StopArgs,
+    TargetArg, TargetsArgs,
+};
+use crate::config::LocalSshMode;
+use crate::paths::{self, UserContext};
+use crate::runtime::ContainerRuntime;
+use crate::ssh_dispatch::{GatewayAction, RunAction, StatusAction};
+use anyhow::Context;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum GatewayOperation {
+    Targets,
+    Status {
+        target: Option<String>,
+        session_id: Option<String>,
+    },
+    StatusAll,
+    Up {
+        target: Option<String>,
+        session_id: Option<String>,
+    },
+    Run {
+        target: Option<String>,
+        session_id: Option<String>,
+        cwd: Option<String>,
+        command: Vec<String>,
+    },
+    Launches,
+    LaunchShow {
+        name: String,
+    },
+    Launch {
+        name: String,
+        session_id: Option<String>,
+        vars: Vec<String>,
+    },
+    Stop {
+        target: Option<String>,
+        session_id: Option<String>,
+    },
+    Remove {
+        target: Option<String>,
+    },
+    SetDefault {
+        target_or_image: String,
+    },
+    ShowDefault,
+    ResetDefault,
+    ClientConfig {
+        target: Option<String>,
+        identity_file: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug)]
+pub(super) enum GatewayOperationResult {
+    Targets(Vec<TargetEntry>),
+    Status(GatewayStatus),
+    StatusAll(Vec<AllStatusEntry>),
+    Up(ReadyStatus),
+    Run(ExecutionOutcome),
+    Launches(Vec<LaunchSummary>),
+    LaunchShow(LaunchDetail),
+    Launch(ExecutionOutcome),
+    Stop(StopResult),
+    Remove(RemoveResult),
+    DefaultSelection(String),
+    ClientConfig {
+        rendered: String,
+        written_path: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ExecutionOutcome {
+    exit_code: i32,
+}
+
+impl ExecutionOutcome {
+    pub(super) fn new(exit_code: i32) -> Self {
+        Self { exit_code }
+    }
+
+    pub(super) fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StopResult {
+    pub(super) container: String,
+    pub(super) stopped: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RemoveResult {
+    pub(super) container: String,
+    pub(super) removed: bool,
+}
+
+impl GatewayOperation {
+    pub(super) fn from_targets_args(_args: TargetsArgs) -> Self {
+        Self::Targets
+    }
+
+    pub(super) fn from_status_args(args: StatusArg) -> Self {
+        if args.all {
+            Self::StatusAll
+        } else {
+            Self::Status {
+                target: args.target,
+                session_id: args.session_id,
+            }
+        }
+    }
+
+    pub(super) fn from_run_args(args: RunArgs) -> anyhow::Result<Self> {
+        if args.command.is_empty() {
+            anyhow::bail!(
+                "run requires -- followed by a command; use up to start or hold a target"
+            );
+        }
+        Ok(Self::Run {
+            target: args.target,
+            session_id: args.session_id,
+            cwd: args.cwd,
+            command: args.command,
+        })
+    }
+
+    pub(super) fn from_launches_args(_args: LaunchesArgs) -> Self {
+        Self::Launches
+    }
+
+    pub(super) fn from_launch_show_args(args: LaunchShowArgs) -> Self {
+        Self::LaunchShow { name: args.name }
+    }
+
+    pub(super) fn launch_run(name: String, session_id: Option<String>, vars: Vec<String>) -> Self {
+        Self::Launch {
+            name,
+            session_id,
+            vars,
+        }
+    }
+
+    pub(super) fn from_stop_args(args: StopArgs) -> Self {
+        Self::Stop {
+            target: args.target,
+            session_id: args.session_id,
+        }
+    }
+
+    pub(super) fn from_remove_args(args: TargetArg) -> Self {
+        Self::Remove {
+            target: args.target,
+        }
+    }
+
+    pub(super) fn from_set_default_args(args: SetDefaultArgs) -> anyhow::Result<Self> {
+        if args.reset {
+            return Ok(Self::ResetDefault);
+        }
+        let target_or_image = args
+            .target_or_image
+            .ok_or_else(|| anyhow::anyhow!("target or image is required unless --reset is used"))?;
+        Ok(Self::SetDefault { target_or_image })
+    }
+
+    pub(super) fn from_client_config_args(args: ClientConfigArgs) -> Self {
+        Self::ClientConfig {
+            target: args.target,
+            identity_file: args.identity_file,
+        }
+    }
+
+    pub(super) fn from_ssh_action(action: GatewayAction) -> Option<Self> {
+        match action {
+            GatewayAction::Up(target) => Some(Self::Up {
+                target,
+                session_id: None,
+            }),
+            GatewayAction::Run(action) => Some(Self::from_run_action(action)),
+            GatewayAction::Launches { .. } => Some(Self::Launches),
+            GatewayAction::LaunchShow { name, .. } => Some(Self::LaunchShow { name }),
+            GatewayAction::LaunchRun {
+                name,
+                session_id,
+                vars,
+            } => Some(Self::launch_run(name, session_id, vars)),
+            GatewayAction::Status(action) => Some(Self::from_status_action(action)),
+            GatewayAction::Targets { .. } => Some(Self::Targets),
+            GatewayAction::Stop(target) => Some(Self::Stop {
+                target,
+                session_id: None,
+            }),
+            GatewayAction::Remove(target) => Some(Self::Remove { target }),
+            GatewayAction::SetDefault(target_or_image) => {
+                Some(Self::SetDefault { target_or_image })
+            }
+            GatewayAction::ShowDefault => Some(Self::ShowDefault),
+            GatewayAction::ResetDefault => Some(Self::ResetDefault),
+            GatewayAction::ClientConfig(action) => Some(Self::ClientConfig {
+                target: action.target,
+                identity_file: action.identity_file.map(PathBuf::from),
+            }),
+            GatewayAction::Connect(_)
+            | GatewayAction::AddKey(_)
+            | GatewayAction::AddHostKey(_)
+            | GatewayAction::AddContainerKey(_)
+            | GatewayAction::ClientBundle(_)
+            | GatewayAction::Help => None,
+        }
+    }
+
+    fn from_run_action(action: RunAction) -> Self {
+        Self::Run {
+            target: action.target,
+            session_id: action.session_id,
+            cwd: action.cwd,
+            command: action.command,
+        }
+    }
+
+    fn from_status_action(action: StatusAction) -> Self {
+        if action.all {
+            Self::StatusAll
+        } else {
+            Self::Status {
+                target: action.target,
+                session_id: None,
+            }
+        }
+    }
+}
+
+pub(super) async fn execute_gateway_operation(
+    config_path: Option<PathBuf>,
+    operation: GatewayOperation,
+) -> anyhow::Result<GatewayOperationResult> {
+    match operation {
+        GatewayOperation::Targets => {
+            let cfg = load_config(config_path)?;
+            Ok(GatewayOperationResult::Targets(target_entries(&cfg)?))
+        }
+        GatewayOperation::Status { target, session_id } => Ok(GatewayOperationResult::Status(
+            operation_status(config_path, target, session_id).await?,
+        )),
+        GatewayOperation::StatusAll => Ok(GatewayOperationResult::StatusAll(
+            operation_status_all(config_path).await?,
+        )),
+        GatewayOperation::Up { target, session_id } => Ok(GatewayOperationResult::Up(
+            operation_up(config_path, target, session_id).await?,
+        )),
+        GatewayOperation::Run {
+            target,
+            session_id,
+            cwd,
+            command,
+        } => Ok(GatewayOperationResult::Run(
+            operation_run(config_path, target, session_id, cwd, command).await?,
+        )),
+        GatewayOperation::Launches => {
+            let cfg = load_config(config_path)?;
+            Ok(GatewayOperationResult::Launches(launch_summaries(&cfg)?))
+        }
+        GatewayOperation::LaunchShow { name } => {
+            let cfg = load_config(config_path)?;
+            let launch = cfg.effective_launch(&name)?;
+            Ok(GatewayOperationResult::LaunchShow(launch_detail(
+                &name, &launch,
+            )))
+        }
+        GatewayOperation::Launch {
+            name,
+            session_id,
+            vars,
+        } => {
+            let cfg = load_config(config_path)?;
+            Ok(GatewayOperationResult::Launch(
+                launch_execute_with_config(cfg, &name, session_id, vars).await?,
+            ))
+        }
+        GatewayOperation::Stop { target, session_id } => Ok(GatewayOperationResult::Stop(
+            operation_stop(config_path, target, session_id).await?,
+        )),
+        GatewayOperation::Remove { target } => Ok(GatewayOperationResult::Remove(
+            operation_remove(config_path, target).await?,
+        )),
+        GatewayOperation::SetDefault { target_or_image } => {
+            Ok(GatewayOperationResult::DefaultSelection(
+                operation_set_default(config_path, target_or_image)?,
+            ))
+        }
+        GatewayOperation::ShowDefault => Ok(GatewayOperationResult::DefaultSelection(
+            operation_show_default(config_path)?,
+        )),
+        GatewayOperation::ResetDefault => Ok(GatewayOperationResult::DefaultSelection(
+            operation_reset_default(config_path)?,
+        )),
+        GatewayOperation::ClientConfig {
+            target,
+            identity_file,
+        } => {
+            let (rendered, written_path) =
+                operation_client_config(config_path, target, identity_file).await?;
+            Ok(GatewayOperationResult::ClientConfig {
+                rendered,
+                written_path: Some(written_path),
+            })
+        }
+    }
+}
+
+async fn operation_run(
+    config_path: Option<PathBuf>,
+    target: Option<String>,
+    session_id: Option<String>,
+    cwd: Option<String>,
+    command: Vec<String>,
+) -> anyhow::Result<ExecutionOutcome> {
+    let runtime = Runtime::load(config_path, target.as_deref(), session_id, true).await?;
+    run_container_command_with_runtime(runtime, cwd, command).await
+}
+
+fn operation_set_default(
+    config_path: Option<PathBuf>,
+    target_or_image: String,
+) -> anyhow::Result<String> {
+    let cfg = load_config(config_path)?;
+    let user = UserContext::current()?;
+    let _ = client::resolve_target_selection(&cfg, Some(&target_or_image))
+        .with_context(|| format!("validate default selection {target_or_image:?}"))?;
+    paths::ensure_private_dir(&user.config_dir())?;
+    let path = user.config_dir().join("default-target");
+    std::fs::write(&path, format!("{target_or_image}\n"))?;
+    Ok(target_or_image)
+}
+
+fn operation_show_default(config_path: Option<PathBuf>) -> anyhow::Result<String> {
+    let cfg = load_config(config_path)?;
+    let user = UserContext::current()?;
+    let selection = client::read_default_selection(&user)
+        .transpose()?
+        .unwrap_or_else(|| client::configured_default_display(&cfg));
+    let _ = client::resolve_target_selection(&cfg, Some(&selection))
+        .with_context(|| format!("validate default selection {selection:?}"))?;
+    Ok(selection)
+}
+
+fn operation_reset_default(config_path: Option<PathBuf>) -> anyhow::Result<String> {
+    let cfg = load_config(config_path)?;
+    let user = UserContext::current()?;
+    let path = user.config_dir().join("default-target");
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("remove {}", path.display())),
+    }
+    Ok(client::configured_default_display(&cfg))
+}
+
+async fn operation_client_config(
+    config_path: Option<PathBuf>,
+    target: Option<String>,
+    identity_file: Option<PathBuf>,
+) -> anyhow::Result<(String, PathBuf)> {
+    let runtime = Runtime::load(config_path, target.as_deref(), None, false).await?;
+    let config = runtime.render_client_config(identity_file.as_deref())?;
+    let written_path = runtime.write_inner_config(&config)?;
+    Ok((config, written_path))
+}
+
+async fn operation_up(
+    config_path: Option<PathBuf>,
+    target: Option<String>,
+    session_id: Option<String>,
+) -> anyhow::Result<ReadyStatus> {
+    let runtime = Runtime::load(config_path, target.as_deref(), session_id, true).await?;
+    operation_up_with_runtime(runtime).await
+}
+
+pub(super) async fn operation_up_with_runtime(runtime: Runtime) -> anyhow::Result<ReadyStatus> {
+    if let Some(local_ssh) = &runtime.target.local_ssh
+        && local_ssh.mode == LocalSshMode::Listen
+    {
+        anyhow::bail!(
+            "gateway action \"up\" over SSH is not supported for local_ssh.mode = \"listen\" targets; use connect or run aw-gateway up locally"
+        );
+    }
+    runtime.ensure_ready().await
+}
+
+async fn operation_stop(
+    config_path: Option<PathBuf>,
+    target: Option<String>,
+    session_id: Option<String>,
+) -> anyhow::Result<StopResult> {
+    let runtime = Runtime::load(config_path, target.as_deref(), session_id, false).await?;
+    let _lock = runtime.acquire_lifecycle_lock().await?;
+    let Some(inspect) = runtime
+        .container_runtime
+        .inspect(&runtime.container_name)
+        .await?
+    else {
+        return Ok(StopResult {
+            container: runtime.container_name,
+            stopped: false,
+        });
+    };
+    runtime.stop_inspected_container(&inspect).await?;
+    Ok(StopResult {
+        container: runtime.container_name,
+        stopped: true,
+    })
+}
+
+async fn operation_remove(
+    config_path: Option<PathBuf>,
+    target: Option<String>,
+) -> anyhow::Result<RemoveResult> {
+    let runtime = Runtime::load(config_path, target.as_deref(), None, false).await?;
+    let _lock = runtime.acquire_lifecycle_lock().await?;
+    let Some(inspect) = runtime
+        .container_runtime
+        .inspect(&runtime.container_name)
+        .await?
+    else {
+        runtime.cleanup_control_socket_dir();
+        return Ok(RemoveResult {
+            container: runtime.container_name,
+            removed: false,
+        });
+    };
+    runtime.validate_labels(&inspect)?;
+    let was_running = inspect.state.running;
+    if inspect.state.running {
+        runtime.stop_inspected_container(&inspect).await?;
+    }
+    if let Some(current) = runtime
+        .container_runtime
+        .inspect(&runtime.container_name)
+        .await?
+    {
+        runtime.validate_labels(&current)?;
+        runtime
+            .container_runtime
+            .rm(&runtime.container_name)
+            .await?;
+    }
+    if !was_running {
+        runtime.cleanup_control_socket_dir();
+    }
+    Ok(RemoveResult {
+        container: runtime.container_name,
+        removed: true,
+    })
+}
+
+async fn operation_status(
+    config_path: Option<PathBuf>,
+    target: Option<String>,
+    session_id: Option<String>,
+) -> anyhow::Result<GatewayStatus> {
+    let runtime = Runtime::load(config_path, target.as_deref(), session_id, false).await?;
+    runtime.status().await
+}
+
+async fn operation_status_all(config_path: Option<PathBuf>) -> anyhow::Result<Vec<AllStatusEntry>> {
+    let cfg = load_config(config_path)?;
+    let user = UserContext::current()?;
+    let container_runtime = ContainerRuntime::from_config(&cfg.runtime, &user.user, &user.home)?;
+    let containers = container_runtime
+        .list_managed_containers(&user.user, user.uid)
+        .await?;
+    Ok(status_all_entries(&cfg, containers))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{LaunchShowArgs, LaunchesArgs, RunArgs, StatusArg, TargetsArgs};
+
+    #[test]
+    fn constructs_targets_request_without_rendering_flags() {
+        assert_eq!(
+            GatewayOperation::from_targets_args(TargetsArgs { json: true }),
+            GatewayOperation::Targets
+        );
+    }
+
+    #[test]
+    fn constructs_status_and_status_all_requests_without_json() {
+        assert_eq!(
+            GatewayOperation::from_status_args(StatusArg {
+                target: Some("dev".into()),
+                all: false,
+                json: true,
+                session_id: Some("abc123".into()),
+            }),
+            GatewayOperation::Status {
+                target: Some("dev".into()),
+                session_id: Some("abc123".into()),
+            }
+        );
+        assert_eq!(
+            GatewayOperation::from_status_args(StatusArg {
+                target: None,
+                all: true,
+                json: true,
+                session_id: None,
+            }),
+            GatewayOperation::StatusAll
+        );
+    }
+
+    #[test]
+    fn constructs_run_request() {
+        let operation = GatewayOperation::from_run_args(RunArgs {
+            target: Some("dev".into()),
+            session_id: Some("abc123".into()),
+            cwd: Some("/work".into()),
+            command: vec!["cargo".into(), "test".into()],
+        })
+        .unwrap();
+        assert_eq!(
+            operation,
+            GatewayOperation::Run {
+                target: Some("dev".into()),
+                session_id: Some("abc123".into()),
+                cwd: Some("/work".into()),
+                command: vec!["cargo".into(), "test".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn constructs_launch_discovery_requests_without_json() {
+        assert_eq!(
+            GatewayOperation::from_launches_args(LaunchesArgs { json: true }),
+            GatewayOperation::Launches
+        );
+        assert_eq!(
+            GatewayOperation::from_launch_show_args(LaunchShowArgs {
+                name: "repo-shell".into(),
+                json: true,
+            }),
+            GatewayOperation::LaunchShow {
+                name: "repo-shell".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn constructs_launch_run_request() {
+        assert_eq!(
+            GatewayOperation::launch_run(
+                "repo-shell".into(),
+                Some("abc123".into()),
+                vec!["repo=https://example.test/repo.git".into()],
+            ),
+            GatewayOperation::Launch {
+                name: "repo-shell".into(),
+                session_id: Some("abc123".into()),
+                vars: vec!["repo=https://example.test/repo.git".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn constructs_requests_from_ssh_actions_without_transport_flags() {
+        assert_eq!(
+            GatewayOperation::from_ssh_action(GatewayAction::Run(RunAction {
+                target: Some("dev".into()),
+                session_id: Some("abc123".into()),
+                cwd: Some("/work".into()),
+                command: vec!["cargo".into(), "test".into()],
+            })),
+            Some(
+                GatewayOperation::from_run_args(RunArgs {
+                    target: Some("dev".into()),
+                    session_id: Some("abc123".into()),
+                    cwd: Some("/work".into()),
+                    command: vec!["cargo".into(), "test".into()],
+                })
+                .unwrap()
+            )
+        );
+        assert_eq!(
+            GatewayOperation::from_ssh_action(GatewayAction::LaunchRun {
+                name: "repo-shell".into(),
+                session_id: Some("abc123".into()),
+                vars: vec!["repo=https://example.test/repo.git".into()],
+            }),
+            Some(GatewayOperation::launch_run(
+                "repo-shell".into(),
+                Some("abc123".into()),
+                vec!["repo=https://example.test/repo.git".into()],
+            ))
+        );
+        assert_eq!(
+            GatewayOperation::from_ssh_action(GatewayAction::Launches { json: true }),
+            Some(GatewayOperation::from_launches_args(LaunchesArgs {
+                json: false
+            }))
+        );
+        assert_eq!(
+            GatewayOperation::from_ssh_action(GatewayAction::Targets { json: true }),
+            Some(GatewayOperation::from_targets_args(TargetsArgs {
+                json: false
+            }))
+        );
+        assert_eq!(
+            GatewayOperation::from_ssh_action(GatewayAction::LaunchShow {
+                name: "repo-shell".into(),
+                json: true,
+            }),
+            Some(GatewayOperation::from_launch_show_args(LaunchShowArgs {
+                name: "repo-shell".into(),
+                json: false,
+            }))
+        );
+        assert_eq!(
+            GatewayOperation::from_ssh_action(GatewayAction::Status(StatusAction {
+                target: Some("dev".into()),
+                all: false,
+            })),
+            Some(GatewayOperation::from_status_args(StatusArg {
+                target: Some("dev".into()),
+                all: false,
+                json: false,
+                session_id: None,
+            }))
+        );
+        assert_eq!(
+            GatewayOperation::from_ssh_action(GatewayAction::Status(StatusAction {
+                target: None,
+                all: true,
+            })),
+            Some(GatewayOperation::from_status_args(StatusArg {
+                target: None,
+                all: true,
+                json: false,
+                session_id: None,
+            }))
+        );
+    }
+}

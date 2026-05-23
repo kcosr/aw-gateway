@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -63,6 +64,80 @@ pub(super) struct GatewayStatus {
     pub(super) ssh_socket: PathBuf,
     pub(super) status: String,
     pub(super) agent: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct TargetEntry {
+    pub(super) target: String,
+    pub(super) image: String,
+    pub(super) mode: String,
+    pub(super) container: String,
+    pub(super) default: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct LaunchSummary {
+    pub(super) name: String,
+    pub(super) target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) description: Option<String>,
+    pub(super) vars: BTreeMap<String, LaunchVarMetadata>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct LaunchDetail {
+    pub(super) name: String,
+    pub(super) target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) description: Option<String>,
+    pub(super) vars: BTreeMap<String, LaunchVarMetadata>,
+    pub(super) steps: Vec<LaunchStepDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cwd: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) env: BTreeMap<String, String>,
+    pub(super) command: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct LaunchStepDetail {
+    pub(super) name: String,
+    pub(super) phase: String,
+    pub(super) location: String,
+    pub(super) required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) timeout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cwd: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(super) env: BTreeMap<String, String>,
+    pub(super) command: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct LaunchVarMetadata {
+    #[serde(rename = "type")]
+    pub(super) var_type: &'static str,
+    pub(super) required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) default: Option<crate::config::LaunchVarValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) values: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(super) struct AllStatusEntry {
+    pub(super) target: String,
+    pub(super) session_id: Option<String>,
+    pub(super) launch: Option<String>,
+    pub(super) mode: String,
+    pub(super) user: String,
+    pub(super) uid: String,
+    pub(super) image: String,
+    pub(super) container: String,
+    pub(super) status: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

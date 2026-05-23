@@ -453,9 +453,7 @@ where
 }
 
 fn action_enabled(cfg: &SshDispatchConfig, name: &str) -> bool {
-    cfg.enabled_gateway_actions
-        .iter()
-        .any(|value| value == name)
+    cfg.enabled_actions.iter().any(|value| value == name)
 }
 
 fn parse_client_config_action(words: &[String]) -> anyhow::Result<GatewayAction> {
@@ -868,7 +866,7 @@ mod tests {
     #[test]
     fn disabled_launch_actions_are_rejected() {
         let mut cfg = SshDispatchConfig::default();
-        cfg.enabled_gateway_actions
+        cfg.enabled_actions
             .retain(|action| action != "launch" && action != "launches");
         for command in [
             "launches",
@@ -888,7 +886,7 @@ mod tests {
     #[test]
     fn disabled_session_actions_are_rejected() {
         let mut cfg = SshDispatchConfig::default();
-        cfg.enabled_gateway_actions
+        cfg.enabled_actions
             .retain(|action| action != "connect" && action != "run" && action != "launch");
         for command in [
             "connect default --session-id abc123def456",
