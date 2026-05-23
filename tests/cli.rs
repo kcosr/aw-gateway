@@ -237,6 +237,51 @@ command = ["codex", "exec", "review", "{var.repo}"]
 }
 
 #[test]
+fn gateway_config_validate_accepts_unified_includes() {
+    let dir = tempdir().unwrap();
+    let config_dir = dir.path().join("config.d");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("workspace.toml"),
+        r#"
+[target_templates.base]
+image = "ubuntu/base"
+mode = "fixed"
+name = "base"
+
+[targets.default]
+use = ["base"]
+
+[launch_templates.shell]
+target = "default"
+command = ["true"]
+
+[launches.agent]
+use = ["shell"]
+"#,
+    )
+    .unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        r#"
+schema_version = "1"
+includes = ["config.d/*.toml"]
+"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["config", "validate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ok"));
+}
+
+#[test]
 fn gateway_config_validate_rejects_legacy_gateway_socket_paths() {
     for (config_name, config_body, expected) in [
         (
