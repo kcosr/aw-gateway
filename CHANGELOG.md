@@ -27,7 +27,8 @@
 
 - Added named `[target_templates.<name>]` and `[launch_templates.<name>]`
   config sections with ordered `use = [...]` composition for concrete targets,
-  concrete launches, and same-kind nested templates.
+  concrete launches, and same-kind nested templates
+  ([#9](https://github.com/kcosr/aw-gateway/pull/9)).
 - Added explicit `[target_defaults]` and `[launch_defaults]` config sections
   that overlay into concrete targets and launches before validation
   ([#8](https://github.com/kcosr/aw-gateway/pull/8)).
