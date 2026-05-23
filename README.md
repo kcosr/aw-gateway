@@ -51,7 +51,8 @@ controlled bridge.
   ready target and then run a final in-container command.
 - In-container service supervision with dependency ordering, restart policy,
   service health checks, and graceful shutdown.
-- Built-in Unix-socket bridge from the host workspace to container SSH.
+- Built-in Unix-socket bridge from short runtime socket directories to
+  container SSH.
 - Generated SSH client configuration for SSH, SCP, and SFTP clients.
 - Per-user default target selection.
 - First-run identity-token generation and controlled forwarding to selected
@@ -366,6 +367,9 @@ session_shell = "/bin/bash"
 Gateway configs commonly include:
 
 - `[workspace]`: host workspace path and per-workspace state directory.
+- `[control_sockets]`: short runtime directories for gateway-managed Unix
+  sockets. Durable config, logs, state, and session metadata remain under the
+  workspace state directory.
 - `[ssh_dispatch]`: which host SSH commands are handled by the gateway and
   whether container command passthrough is enabled.
 - `[client_config]`: generated SSH alias templates, host name, gateway path,
@@ -406,7 +410,31 @@ Gateway configs commonly include:
   support.
 - `[[container_agent.services]]`: in-container services supervised by
   `aw-container-agent`.
-- `[container_agent.ssh_bridge]`: Unix socket bridge to container SSH.
+- `[container_agent.ssh_bridge]`: Unix socket bridge to container SSH. In
+  gateway config, the socket path is generated from `[control_sockets]`.
+
+By default, gateway-managed sockets use a short per-runtime host directory and
+a stable in-container mount point:
+
+```toml
+[control_sockets]
+host_dir = "/run/user/{uid}/aw-gateway/{runtime_id}"
+container_dir = "/run/aw-gateway"
+```
+
+Fixed targets use the target id as `{runtime_id}`. Ephemeral targets use the
+session id. Target-specific overrides are available for unusual runtimes:
+
+```toml
+[targets.code-review.control_sockets]
+container_dir = "/tmp/aw-gateway"
+```
+
+The gateway creates the rendered host directory with private permissions before
+container startup, bind-mounts it into the container, and removes the leaf
+runtime directory during stop/remove cleanup. If the default `/run/user/{uid}`
+directory is unavailable or not writable, configure `control_sockets.host_dir`
+to another short absolute path.
 
 Target-specific runtime and environment knobs are explicit:
 
@@ -638,9 +666,10 @@ answers gateway control requests over a private Unix-domain control socket.
 Disabling the control socket is useful for published-port SSH backends, but it
 also removes agent-control readiness and mutating control requests through that
 socket.
-Before starting a container, the gateway checks the resolved host and
-in-container Unix socket paths and fails fast if any path exceeds the platform
-socket path limit.
+Gateway-managed control and SSH bridge sockets live under `[control_sockets]`,
+not under durable workspace state. Before starting a container, the gateway
+checks the resolved host and in-container Unix socket paths and fails fast if
+any path exceeds the platform socket path limit.
 
 Service example:
 
@@ -1000,8 +1029,8 @@ private state files:
 - `AW_AUTHENTICATED_UID` and `AW_AUTHENTICATED_GID`: authenticated host user
   identity used by the container agent for peer validation and service-user
   handling.
-- `AW_CONTAINER_STATE_DIR`: in-container state path for agent config, control
-  socket, SSH bridge socket, logs, and session data.
+- `AW_CONTAINER_STATE_DIR`: in-container durable state path for generated agent
+  config, logs, SSH policy snippets, and session data.
 - `AW_CONTAINER_AGENT_ALLOW_PROCESS_REAP=1`: enables actual process reaping;
   without it, reaping reports remain dry-run.
 - `AW_SSHD_POLICY_CONFIG`: generated SSH transfer-policy file consumed by
@@ -1032,6 +1061,9 @@ configured log files. Gateway log directories can interpolate `{user}`, `{uid}`,
 directories can interpolate `{container_state_dir}`. Container service
 stdout/stderr is captured under the container state log directory with the
 configured rotation limits.
+Control socket directories can interpolate `{user}`, `{uid}`, `{gid}`,
+`{home}`, `{target}`, `{image}`, `{image_slug}`, `{container_name}`,
+`{session_id}`, and `{runtime_id}`.
 
 ## Development
 

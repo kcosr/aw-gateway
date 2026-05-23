@@ -126,6 +126,5 @@ timeout = "1s"
 
 [container_agent.ssh_bridge]
 enabled = true
-socket = "{container_state_dir}/ssh.sock"
 target = "127.0.0.1:22"
 mode = "0600"

@@ -158,6 +158,5 @@ value = "{container_state_dir}/sshd-session-env.conf"
 
 [container_agent.ssh_bridge]
 enabled = false
-socket = "{container_state_dir}/ssh.sock"
 target = "127.0.0.1:22"
 mode = "0600"

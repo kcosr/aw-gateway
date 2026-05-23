@@ -4,6 +4,8 @@
 
 ### Added
 
+- Added `[control_sockets]` and `[targets.<name>.control_sockets]` config for
+  short runtime-only gateway control and SSH bridge socket directories.
 - Added explicit `--session-id` support to `connect`, `run`, and executable
   `launch` commands, including matching SSH-dispatch parsing for deterministic
   ephemeral target sessions
@@ -16,6 +18,8 @@
 
 ### Changed
 
+- Gateway-managed container-agent control and SSH bridge sockets now live in
+  the configured runtime socket directory instead of durable workspace state.
 - Lifecycle and host hook commands now use a finite `60s` default timeout when no per-step `timeout` is configured ([#2](https://github.com/kcosr/aw-gateway/pull/2)).
 
 ## [0.1.0] - 2026-05-21

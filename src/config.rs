@@ -26,6 +26,8 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub workspace: WorkspaceConfig,
     #[serde(default)]
+    pub control_sockets: ControlSocketsConfig,
+    #[serde(default)]
     pub ssh_dispatch: SshDispatchConfig,
     #[serde(default)]
     pub client_config: ClientConfig,
@@ -114,6 +116,7 @@ impl GatewayConfig {
             launch.validate(name, self)?;
         }
         self.runtime.validate()?;
+        self.control_sockets.validate("control_sockets")?;
         validate_template(
             "client_config.inner_alias_template",
             &self.client_config.inner_alias_template,
@@ -150,10 +153,13 @@ impl GatewayConfig {
         self.logging
             .validate_templates("logging", GATEWAY_LOGGING_TEMPLATE_VARS)?;
         self.container_ssh.validate()?;
-        self.container_agent.validate()?;
+        self.container_agent.validate_gateway()?;
         for (name, target) in &self.targets {
             self.effective_container_ssh(target)
                 .with_context(|| format!("validate effective container_ssh for target {name:?}"))?;
+            self.effective_control_sockets(target).with_context(|| {
+                format!("validate effective control_sockets for target {name:?}")
+            })?;
             self.effective_lifecycle_steps(target).with_context(|| {
                 format!("validate effective lifecycle_steps for target {name:?}")
             })?;
@@ -207,6 +213,23 @@ impl GatewayConfig {
         }
         container_ssh.validate()?;
         Ok(container_ssh)
+    }
+
+    pub fn effective_control_sockets(
+        &self,
+        target: &TargetConfig,
+    ) -> anyhow::Result<ControlSocketsConfig> {
+        let mut control_sockets = self.control_sockets.clone();
+        if let Some(target_control_sockets) = &target.control_sockets {
+            if let Some(host_dir) = &target_control_sockets.host_dir {
+                control_sockets.host_dir = host_dir.clone();
+            }
+            if let Some(container_dir) = &target_control_sockets.container_dir {
+                control_sockets.container_dir = container_dir.clone();
+            }
+        }
+        control_sockets.validate("control_sockets")?;
+        Ok(control_sockets)
     }
 
     pub fn effective_lifecycle_steps(
@@ -312,7 +335,7 @@ impl GatewayConfig {
                 }
             }
         }
-        container_agent.validate()?;
+        container_agent.validate_gateway()?;
         Ok(container_agent)
     }
 }
@@ -752,7 +775,7 @@ impl ContainerAgentFile {
         }
         self.logging
             .validate_templates("logging", AGENT_TEMPLATE_VARS)?;
-        self.container_agent.validate()
+        self.container_agent.validate_agent_file()
     }
 }
 
@@ -804,6 +827,46 @@ impl Default for WorkspaceConfig {
             path: default_workspace_path(),
             state_dir: default_workspace_state_dir(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlSocketsConfig {
+    #[serde(default = "default_control_socket_host_dir")]
+    pub host_dir: String,
+    #[serde(default = "default_control_socket_container_dir")]
+    pub container_dir: String,
+}
+
+impl Default for ControlSocketsConfig {
+    fn default() -> Self {
+        Self {
+            host_dir: default_control_socket_host_dir(),
+            container_dir: default_control_socket_container_dir(),
+        }
+    }
+}
+
+impl ControlSocketsConfig {
+    fn validate(&self, field: &str) -> anyhow::Result<()> {
+        if self.host_dir.trim().is_empty() {
+            anyhow::bail!("{field}.host_dir must not be empty");
+        }
+        if self.container_dir.trim().is_empty() {
+            anyhow::bail!("{field}.container_dir must not be empty");
+        }
+        validate_template(
+            &format!("{field}.host_dir"),
+            &self.host_dir,
+            CONTROL_SOCKET_TEMPLATE_VARS,
+        )?;
+        validate_template(
+            &format!("{field}.container_dir"),
+            &self.container_dir,
+            CONTROL_SOCKET_TEMPLATE_VARS,
+        )?;
+        Ok(())
     }
 }
 
@@ -913,6 +976,7 @@ pub struct TargetConfig {
     pub idle_cleanup: Option<IdleCleanupConfig>,
     pub local_ssh: Option<LocalSshConfig>,
     pub container_ssh: Option<TargetContainerSshConfig>,
+    pub control_sockets: Option<TargetControlSocketsConfig>,
     pub container_bootstrap: Option<TargetContainerBootstrapConfig>,
     #[serde(default)]
     pub lifecycle_steps: Vec<RawLifecycleStep>,
@@ -996,6 +1060,9 @@ impl TargetConfig {
         if let Some(container_ssh) = &self.container_ssh {
             container_ssh.validate(target_name)?;
         }
+        if let Some(control_sockets) = &self.control_sockets {
+            control_sockets.validate(target_name)?;
+        }
         if let Some(container_bootstrap) = &self.container_bootstrap {
             container_bootstrap.validate(target_name)?;
         }
@@ -1043,6 +1110,41 @@ impl TargetConfig {
         let rendered = template::render(pattern, &vars)?;
         validate_container_name(&rendered)?;
         Ok(rendered)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetControlSocketsConfig {
+    pub host_dir: Option<String>,
+    pub container_dir: Option<String>,
+}
+
+impl TargetControlSocketsConfig {
+    fn validate(&self, target_name: &str) -> anyhow::Result<()> {
+        if let Some(host_dir) = &self.host_dir {
+            if host_dir.trim().is_empty() {
+                anyhow::bail!("target {target_name:?} control_sockets.host_dir must not be empty");
+            }
+            validate_template(
+                "target.control_sockets.host_dir",
+                host_dir,
+                CONTROL_SOCKET_TEMPLATE_VARS,
+            )?;
+        }
+        if let Some(container_dir) = &self.container_dir {
+            if container_dir.trim().is_empty() {
+                anyhow::bail!(
+                    "target {target_name:?} control_sockets.container_dir must not be empty"
+                );
+            }
+            validate_template(
+                "target.control_sockets.container_dir",
+                container_dir,
+                CONTROL_SOCKET_TEMPLATE_VARS,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -1846,10 +1948,41 @@ impl Default for ContainerAgentConfig {
 }
 
 impl ContainerAgentConfig {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        if let Some(bridge) = &self.ssh_bridge {
-            bridge.validate()?;
+    pub fn validate_gateway(&self) -> anyhow::Result<()> {
+        if self
+            .control_socket
+            .as_ref()
+            .is_some_and(|control_socket| matches!(control_socket, ControlSocketConfig::Path(_)))
+        {
+            anyhow::bail!(
+                "container_agent.control_socket path values are managed by control_sockets.container_dir in gateway config; use false to disable the control socket"
+            );
         }
+        if let Some(bridge) = &self.ssh_bridge {
+            bridge.validate_gateway()?;
+        }
+        self.validate_common()
+    }
+
+    pub fn validate_agent_file(&self) -> anyhow::Result<()> {
+        if let Some(bridge) = &self.ssh_bridge {
+            bridge.validate_agent_file()?;
+        }
+        if let Some(control_socket) = self
+            .control_socket
+            .as_ref()
+            .and_then(ControlSocketConfig::path)
+        {
+            validate_template(
+                "container_agent.control_socket",
+                control_socket,
+                AGENT_TEMPLATE_VARS,
+            )?;
+        }
+        self.validate_common()
+    }
+
+    fn validate_common(&self) -> anyhow::Result<()> {
         if !self.enabled {
             if !self.services.is_empty() {
                 anyhow::bail!("container_agent services require container_agent.enabled = true");
@@ -1896,17 +2029,6 @@ impl ContainerAgentConfig {
             }
         }
         validate_service_dependency_graph(&self.services)?;
-        if let Some(control_socket) = self
-            .control_socket
-            .as_ref()
-            .and_then(ControlSocketConfig::path)
-        {
-            validate_template(
-                "container_agent.control_socket",
-                control_socket,
-                AGENT_TEMPLATE_VARS,
-            )?;
-        }
         if let Some(cleanup) = &self.idle_cleanup {
             cleanup.validate()?;
         }
@@ -2252,7 +2374,16 @@ pub struct SshBridgeConfig {
 }
 
 impl SshBridgeConfig {
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate_gateway(&self) -> anyhow::Result<()> {
+        if self.socket.is_some() {
+            anyhow::bail!(
+                "container_agent.ssh_bridge.socket is managed by control_sockets.container_dir in gateway config"
+            );
+        }
+        self.validate_common()
+    }
+
+    pub fn validate_agent_file(&self) -> anyhow::Result<()> {
         match self.socket.as_deref() {
             Some(socket) if socket.trim().is_empty() => {
                 anyhow::bail!("ssh_bridge socket must not be empty when provided");
@@ -2263,6 +2394,10 @@ impl SshBridgeConfig {
             }
             None => {}
         }
+        self.validate_common()
+    }
+
+    fn validate_common(&self) -> anyhow::Result<()> {
         let mode = parse_socket_mode(&self.mode)?;
         if mode != 0o600 {
             anyhow::bail!("ssh_bridge mode currently supports only 0600");
@@ -2372,6 +2507,19 @@ const TARGET_WORKSPACE_TEMPLATE_VARS: &[&str] = &[
     "image",
     "image_slug",
     "session_id",
+];
+
+const CONTROL_SOCKET_TEMPLATE_VARS: &[&str] = &[
+    "user",
+    "uid",
+    "gid",
+    "home",
+    "target",
+    "image",
+    "image_slug",
+    "container_name",
+    "session_id",
+    "runtime_id",
 ];
 
 const AGENT_TEMPLATE_VARS: &[&str] = &["container_state_dir"];
@@ -2809,6 +2957,14 @@ fn default_workspace_state_dir() -> String {
     ".aw-gateway".into()
 }
 
+fn default_control_socket_host_dir() -> String {
+    "/run/user/{uid}/aw-gateway/{runtime_id}".into()
+}
+
+fn default_control_socket_container_dir() -> String {
+    "/run/aw-gateway".into()
+}
+
 fn default_true() -> bool {
     true
 }
@@ -2894,6 +3050,132 @@ mod tests {
     #[test]
     fn sample_gateway_config_validates() {
         let cfg: GatewayConfig = toml::from_str(crate::gateway::DEFAULT_GATEWAY_CONFIG).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn control_sockets_defaults_and_overrides_are_effective() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.custom.control_sockets]
+container_dir = "/tmp/aw-gateway"
+
+[targets.custom]
+image = "ubuntu/custom"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let default = cfg
+            .effective_control_sockets(cfg.targets.get("default").unwrap())
+            .unwrap();
+        assert_eq!(default.host_dir, "/run/user/{uid}/aw-gateway/{runtime_id}");
+        assert_eq!(default.container_dir, "/run/aw-gateway");
+
+        let custom = cfg
+            .effective_control_sockets(cfg.targets.get("custom").unwrap())
+            .unwrap();
+        assert_eq!(custom.host_dir, "/run/user/{uid}/aw-gateway/{runtime_id}");
+        assert_eq!(custom.container_dir, "/tmp/aw-gateway");
+    }
+
+    #[test]
+    fn control_sockets_global_override_can_be_overlaid_per_target() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[control_sockets]
+host_dir = "/tmp/aw/{runtime_id}"
+container_dir = "/run/global"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.control_sockets]
+host_dir = "/var/run/aw/{runtime_id}"
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let effective = cfg
+            .effective_control_sockets(cfg.targets.get("default").unwrap())
+            .unwrap();
+        assert_eq!(effective.host_dir, "/var/run/aw/{runtime_id}");
+        assert_eq!(effective.container_dir, "/run/global");
+    }
+
+    #[test]
+    fn gateway_config_rejects_old_socket_path_sources() {
+        for (config, expected) in [
+            (
+                r#"
+schema_version = "1"
+
+[container_agent]
+control_socket = "/run/aw-gateway/agent.sock"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+                "container_agent.control_socket path values are managed by control_sockets.container_dir",
+            ),
+            (
+                r#"
+schema_version = "1"
+
+[container_agent.ssh_bridge]
+enabled = true
+socket = "/run/aw-gateway/ssh.sock"
+target = "127.0.0.1:22"
+mode = "0600"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+                "container_agent.ssh_bridge.socket is managed by control_sockets.container_dir",
+            ),
+        ] {
+            let cfg: GatewayConfig = toml::from_str(config).unwrap();
+            let err = format!("{:#}", cfg.validate().unwrap_err());
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn standalone_agent_config_still_accepts_explicit_socket_paths() {
+        let cfg: ContainerAgentFile = toml::from_str(
+            r#"
+schema_version = "1"
+
+[container_agent]
+control_socket = "/run/aw-gateway/agent.sock"
+
+[container_agent.ssh_bridge]
+enabled = true
+socket = "/run/aw-gateway/ssh.sock"
+target = "127.0.0.1:22"
+mode = "0600"
+"#,
+        )
+        .unwrap();
         cfg.validate().unwrap();
     }
 

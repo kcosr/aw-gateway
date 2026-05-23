@@ -116,6 +116,93 @@ timeout = "1m"
 }
 
 #[test]
+fn gateway_config_validate_accepts_control_socket_overrides() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        r#"
+schema_version = "1"
+
+[control_sockets]
+host_dir = "/tmp/aw-gateway/{runtime_id}"
+container_dir = "/run/global-aw"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.control_sockets]
+host_dir = "/var/tmp/aw-gateway/{runtime_id}"
+container_dir = "/tmp/aw-gateway"
+"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["config", "validate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ok"));
+}
+
+#[test]
+fn gateway_config_validate_rejects_legacy_gateway_socket_paths() {
+    for (config_name, config_body, expected) in [
+        (
+            "control-socket.toml",
+            r#"
+schema_version = "1"
+
+[container_agent]
+control_socket = "/run/aw-gateway/agent.sock"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+            "container_agent.control_socket path values are managed by control_sockets.container_dir",
+        ),
+        (
+            "ssh-bridge.toml",
+            r#"
+schema_version = "1"
+
+[container_agent.ssh_bridge]
+enabled = true
+socket = "/run/aw-gateway/ssh.sock"
+target = "127.0.0.1:22"
+mode = "0600"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+            "container_agent.ssh_bridge.socket is managed by control_sockets.container_dir",
+        ),
+    ] {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join(config_name);
+        std::fs::write(&config, config_body).unwrap();
+
+        Command::cargo_bin("aw-gateway")
+            .unwrap()
+            .arg("--config")
+            .arg(&config)
+            .args(["config", "validate"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(expected));
+    }
+}
+
+#[test]
 fn status_all_cli_parses_without_touching_up() {
     let args = GatewayArgs::try_parse_from(["aw-gateway", "status", "--all", "--json"]).unwrap();
     match args.command {
