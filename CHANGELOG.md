@@ -4,6 +4,9 @@
 
 ### Breaking Changes
 
+- Replaced `target_includes` and `launch_includes` with a unified `includes`
+  config array for target/launch templates and concrete definitions
+  ([#10](https://github.com/kcosr/aw-gateway/pull/10)).
 - Gateway configs now reject direct `container_agent.control_socket = "/path"`
   and `container_agent.ssh_bridge.socket = "/path"` socket path settings; use
   `[target_defaults.control_sockets]` or `[targets.<name>.control_sockets]`
@@ -25,6 +28,11 @@
 
 ### Added
 
+- Added nested unified config includes for `[target_templates.<name>]`,
+  `[launch_templates.<name>]`, `[targets.<name>]`, and `[launches.<name>]`,
+  with relative path resolution, sorted glob expansion, cycle detection, and
+  duplicate definition rejection
+  ([#10](https://github.com/kcosr/aw-gateway/pull/10)).
 - Added named `[target_templates.<name>]` and `[launch_templates.<name>]`
   config sections with ordered `use = [...]` composition for concrete targets,
   concrete launches, and same-kind nested templates

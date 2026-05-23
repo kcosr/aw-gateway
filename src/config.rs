@@ -16,9 +16,7 @@ pub struct GatewayConfig {
     #[serde(default = "default_target")]
     pub default_target: String,
     #[serde(default)]
-    pub target_includes: Vec<String>,
-    #[serde(default)]
-    pub launch_includes: Vec<String>,
+    pub includes: Vec<String>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
     #[serde(default)]
@@ -53,28 +51,19 @@ impl GatewayConfig {
     }
 
     fn compose_includes(&mut self, root_path: &Path) -> anyhow::Result<()> {
-        let mut target_seen = BTreeSet::new();
-        let mut launch_seen = BTreeSet::new();
+        let mut seen = BTreeSet::new();
         let root_dir = root_path.parent().unwrap_or_else(|| Path::new("."));
         let root_canonical = canonical_existing_path(root_path)?;
-        let mut target_stack = BTreeSet::from([root_canonical.clone()]);
-        let mut launch_stack = BTreeSet::from([root_canonical]);
-        compose_target_includes(
-            &mut self.target_templates,
-            &mut self.targets,
-            &self.target_includes,
-            root_dir,
-            &mut target_seen,
-            &mut target_stack,
-        )?;
-        compose_launch_includes(
-            &mut self.launch_templates,
-            &mut self.launches,
-            &self.launch_includes,
-            root_dir,
-            &mut launch_seen,
-            &mut launch_stack,
-        )?;
+        let mut stack = BTreeSet::from([root_canonical]);
+        IncludeComposer {
+            target_templates: &mut self.target_templates,
+            launch_templates: &mut self.launch_templates,
+            targets: &mut self.targets,
+            launches: &mut self.launches,
+            seen: &mut seen,
+            stack: &mut stack,
+        }
+        .compose(&self.includes, root_dir)?;
         Ok(())
     }
 
@@ -457,22 +446,15 @@ impl GatewayConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TargetIncludeFile {
+struct ConfigIncludeFile {
     #[serde(default)]
-    target_includes: Vec<String>,
+    includes: Vec<String>,
     #[serde(default)]
     target_templates: BTreeMap<String, TargetConfigInput>,
     #[serde(default)]
-    targets: BTreeMap<String, TargetConfigInput>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LaunchIncludeFile {
-    #[serde(default)]
-    launch_includes: Vec<String>,
-    #[serde(default)]
     launch_templates: BTreeMap<String, LaunchConfigInput>,
+    #[serde(default)]
+    targets: BTreeMap<String, TargetConfigInput>,
     #[serde(default)]
     launches: BTreeMap<String, LaunchConfigInput>,
 }
@@ -856,86 +838,59 @@ pub enum LaunchStepLocation {
     Container,
 }
 
-fn compose_target_includes(
-    target_templates: &mut BTreeMap<String, TargetConfigInput>,
-    targets: &mut BTreeMap<String, TargetConfigInput>,
-    patterns: &[String],
-    base_dir: &Path,
-    seen: &mut BTreeSet<PathBuf>,
-    stack: &mut BTreeSet<PathBuf>,
-) -> anyhow::Result<()> {
-    for path in expand_include_patterns(patterns, base_dir)? {
-        let canonical = canonical_existing_path(&path)?;
-        if stack.contains(&canonical) {
-            anyhow::bail!("target_includes cycle detected at {}", path.display());
+struct IncludeComposer<'a> {
+    target_templates: &'a mut BTreeMap<String, TargetConfigInput>,
+    launch_templates: &'a mut BTreeMap<String, LaunchConfigInput>,
+    targets: &'a mut BTreeMap<String, TargetConfigInput>,
+    launches: &'a mut BTreeMap<String, LaunchConfigInput>,
+    seen: &'a mut BTreeSet<PathBuf>,
+    stack: &'a mut BTreeSet<PathBuf>,
+}
+
+impl IncludeComposer<'_> {
+    fn compose(&mut self, patterns: &[String], base_dir: &Path) -> anyhow::Result<()> {
+        for path in expand_include_patterns(patterns, base_dir)? {
+            let canonical = canonical_existing_path(&path)?;
+            if self.stack.contains(&canonical) {
+                anyhow::bail!("includes cycle detected at {}", path.display());
+            }
+            if !self.seen.insert(canonical.clone()) {
+                continue;
+            }
+            self.stack.insert(canonical.clone());
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("read {}", path.display()))?;
+            reject_root_only_include_sections(&raw, &path)?;
+            let include: ConfigIncludeFile =
+                toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+            let include_dir = path.parent().unwrap_or(base_dir);
+            self.compose(&include.includes, include_dir)?;
+            self.insert_definitions(include, &path)?;
+            self.stack.remove(&canonical);
         }
-        if !seen.insert(canonical.clone()) {
-            continue;
-        }
-        stack.insert(canonical.clone());
-        let raw =
-            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let include: TargetIncludeFile =
-            toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
-        let include_dir = path.parent().unwrap_or(base_dir);
-        compose_target_includes(
-            target_templates,
-            targets,
-            &include.target_includes,
-            include_dir,
-            seen,
-            stack,
-        )?;
+        Ok(())
+    }
+
+    fn insert_definitions(
+        &mut self,
+        include: ConfigIncludeFile,
+        path: &Path,
+    ) -> anyhow::Result<()> {
         for (name, template) in include.target_templates {
-            if target_templates.insert(name.clone(), template).is_some() {
+            if self
+                .target_templates
+                .insert(name.clone(), template)
+                .is_some()
+            {
                 anyhow::bail!(
                     "duplicate target template {name:?} from include {}",
                     path.display()
                 );
             }
         }
-        for (name, target) in include.targets {
-            if targets.insert(name.clone(), target).is_some() {
-                anyhow::bail!("duplicate target {name:?} from include {}", path.display());
-            }
-        }
-        stack.remove(&canonical);
-    }
-    Ok(())
-}
-
-fn compose_launch_includes(
-    launch_templates: &mut BTreeMap<String, LaunchConfigInput>,
-    launches: &mut BTreeMap<String, LaunchConfigInput>,
-    patterns: &[String],
-    base_dir: &Path,
-    seen: &mut BTreeSet<PathBuf>,
-    stack: &mut BTreeSet<PathBuf>,
-) -> anyhow::Result<()> {
-    for path in expand_include_patterns(patterns, base_dir)? {
-        let canonical = canonical_existing_path(&path)?;
-        if stack.contains(&canonical) {
-            anyhow::bail!("launch_includes cycle detected at {}", path.display());
-        }
-        if !seen.insert(canonical.clone()) {
-            continue;
-        }
-        stack.insert(canonical.clone());
-        let raw =
-            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let include: LaunchIncludeFile =
-            toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
-        let include_dir = path.parent().unwrap_or(base_dir);
-        compose_launch_includes(
-            launch_templates,
-            launches,
-            &include.launch_includes,
-            include_dir,
-            seen,
-            stack,
-        )?;
         for (name, launch_template) in include.launch_templates {
-            if launch_templates
+            if self
+                .launch_templates
                 .insert(name.clone(), launch_template)
                 .is_some()
             {
@@ -945,12 +900,42 @@ fn compose_launch_includes(
                 );
             }
         }
+        for (name, target) in include.targets {
+            if self.targets.insert(name.clone(), target).is_some() {
+                anyhow::bail!("duplicate target {name:?} from include {}", path.display());
+            }
+        }
         for (name, launch) in include.launches {
-            if launches.insert(name.clone(), launch).is_some() {
+            if self.launches.insert(name.clone(), launch).is_some() {
                 anyhow::bail!("duplicate launch {name:?} from include {}", path.display());
             }
         }
-        stack.remove(&canonical);
+        Ok(())
+    }
+}
+
+fn reject_root_only_include_sections(raw: &str, path: &Path) -> anyhow::Result<()> {
+    let value: toml::Value =
+        toml::from_str(raw).with_context(|| format!("parse {}", path.display()))?;
+    let Some(table) = value.as_table() else {
+        return Ok(());
+    };
+    for key in [
+        "schema_version",
+        "default_target",
+        "runtime",
+        "logging",
+        "ssh_dispatch",
+        "client_config",
+        "target_defaults",
+        "launch_defaults",
+    ] {
+        if table.contains_key(key) {
+            anyhow::bail!(
+                "include {} defines root-only config section or field {key:?}",
+                path.display()
+            );
+        }
     }
     Ok(())
 }
@@ -6729,122 +6714,38 @@ command = ["echo", "{container_pid}"]
     }
 
     #[test]
-    fn include_composition_expands_sorted_and_rejects_duplicates() {
+    fn includes_parse_and_compose_targets_and_launches() {
         let dir = tempfile::tempdir().unwrap();
-        let targets = dir.path().join("targets");
-        let launches = dir.path().join("launches");
-        std::fs::create_dir_all(&targets).unwrap();
-        std::fs::create_dir_all(&launches).unwrap();
+        let config_dir = dir.path().join("config.d");
+        std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
-            targets.join("b.toml"),
-            r#"
-[targets.b]
-image = "ubuntu/b"
-mode = "fixed"
-name = "b"
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            targets.join("a.toml"),
-            r#"
-[targets.a]
-image = "ubuntu/a"
-mode = "fixed"
-name = "a"
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            launches.join("agent.toml"),
-            r#"
-[launches.agent]
-target = "a"
-command = ["true"]
-"#,
-        )
-        .unwrap();
-        let root = dir.path().join("gateway.toml");
-        std::fs::write(
-            &root,
-            format!(
-                r#"
-schema_version = "1"
-default_target = "a"
-target_includes = ["{}/*.toml"]
-launch_includes = ["{}/*.toml"]
-"#,
-                targets.display(),
-                launches.display()
-            ),
-        )
-        .unwrap();
-
-        let cfg = GatewayConfig::load(&root).unwrap();
-        assert_eq!(
-            cfg.targets.keys().cloned().collect::<Vec<_>>(),
-            vec!["a".to_string(), "b".to_string()]
-        );
-        assert!(cfg.launches.contains_key("agent"));
-
-        std::fs::write(
-            targets.join("dup.toml"),
-            r#"
-[targets.a]
-image = "ubuntu/dup"
-mode = "fixed"
-name = "dup"
-"#,
-        )
-        .unwrap();
-        let err = GatewayConfig::load(&root).unwrap_err().to_string();
-        assert!(err.contains("duplicate target"), "{err}");
-    }
-
-    #[test]
-    fn include_composition_supports_same_kind_templates() {
-        let dir = tempfile::tempdir().unwrap();
-        let targets = dir.path().join("targets");
-        let launches = dir.path().join("launches");
-        std::fs::create_dir_all(&targets).unwrap();
-        std::fs::create_dir_all(&launches).unwrap();
-        std::fs::write(
-            targets.join("templates.toml"),
+            config_dir.join("workspace.toml"),
             r#"
 [target_templates.base]
 image = "ubuntu/base"
 mode = "fixed"
 name = "base"
 
-[targets.default]
-use = ["base"]
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            launches.join("templates.toml"),
-            r#"
-[launch_templates.base]
+[launch_templates.shell]
 target = "default"
 command = ["true"]
 
-[launches.agent]
+[targets.default]
 use = ["base"]
+name = "default"
+
+[launches.agent]
+use = ["shell"]
 "#,
         )
         .unwrap();
         let root = dir.path().join("gateway.toml");
         std::fs::write(
             &root,
-            format!(
-                r#"
+            r#"
 schema_version = "1"
-target_includes = ["{}/*.toml"]
-launch_includes = ["{}/*.toml"]
+includes = ["config.d/*.toml"]
 "#,
-                targets.display(),
-                launches.display()
-            ),
         )
         .unwrap();
 
@@ -6857,82 +6758,240 @@ launch_includes = ["{}/*.toml"]
     }
 
     #[test]
-    fn include_composition_rejects_duplicate_template_names() {
+    fn includes_resolve_relative_to_declaring_file_and_support_nested() {
         let dir = tempfile::tempdir().unwrap();
-        let targets = dir.path().join("targets");
-        let launches = dir.path().join("launches");
-        std::fs::create_dir_all(&targets).unwrap();
-        std::fs::create_dir_all(&launches).unwrap();
+        let config_dir = dir.path().join("config.d");
+        let nested_dir = config_dir.join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
         std::fs::write(
-            targets.join("template.toml"),
+            config_dir.join("root-fragment.toml"),
             r#"
-[target_templates.base]
-image = "ubuntu/include"
-"#,
-        )
-        .unwrap();
-        std::fs::write(
-            launches.join("template.toml"),
-            r#"
-[launch_templates.base]
-command = ["include"]
-"#,
-        )
-        .unwrap();
+includes = ["nested/*.toml"]
 
+[target_templates.base]
+image = "ubuntu/base"
+mode = "fixed"
+name = "base"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            nested_dir.join("target.toml"),
+            r#"
+[targets.default]
+use = ["base"]
+"#,
+        )
+        .unwrap();
         let root = dir.path().join("gateway.toml");
         std::fs::write(
             &root,
-            format!(
-                r#"
+            r#"
 schema_version = "1"
-target_includes = ["{}/*.toml"]
-launch_includes = ["{}/*.toml"]
-
-[target_templates.base]
-image = "ubuntu/root"
-
-[launch_templates.base]
-command = ["root"]
-
-[targets.default]
-image = "ubuntu/dev"
-mode = "fixed"
-name = "{{image_slug}}"
+includes = ["config.d/root-fragment.toml"]
 "#,
-                targets.display(),
-                launches.display()
-            ),
         )
         .unwrap();
-        let err = GatewayConfig::load(&root).unwrap_err().to_string();
-        assert!(err.contains("duplicate target template"), "{err}");
 
-        std::fs::write(
-            &root,
-            format!(
-                r#"
-schema_version = "1"
-launch_includes = ["{}/*.toml"]
-
-[launch_templates.base]
-command = ["root"]
-
-[targets.default]
-image = "ubuntu/dev"
-mode = "fixed"
-name = "{{image_slug}}"
-"#,
-                launches.display()
-            ),
-        )
-        .unwrap();
-        let err = GatewayConfig::load(&root).unwrap_err().to_string();
-        assert!(err.contains("duplicate launch template"), "{err}");
+        let cfg = GatewayConfig::load(&root).unwrap();
+        assert_eq!(
+            cfg.effective_target("default").unwrap().image,
+            "ubuntu/base"
+        );
     }
 
     #[test]
-    fn includes_reject_cycles_and_unknown_fields() {
+    fn includes_load_shared_fragments_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config.d");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("frag1.toml"),
+            r#"
+includes = ["shared.toml"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("frag2.toml"),
+            r#"
+includes = ["shared.toml"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("shared.toml"),
+            r#"
+[targets.default]
+image = "ubuntu/shared"
+mode = "fixed"
+name = "shared"
+"#,
+        )
+        .unwrap();
+        let root = dir.path().join("gateway.toml");
+        std::fs::write(
+            &root,
+            r#"
+schema_version = "1"
+includes = ["config.d/frag1.toml", "config.d/frag2.toml"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = GatewayConfig::load(&root).unwrap();
+        assert_eq!(cfg.targets.len(), 1);
+        assert_eq!(
+            cfg.effective_target("default").unwrap().image,
+            "ubuntu/shared"
+        );
+    }
+
+    #[test]
+    fn includes_expand_globs_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config.d");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("a.toml"),
+            r#"
+[targets.dup]
+image = "ubuntu/a"
+mode = "fixed"
+name = "a"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("b.toml"),
+            r#"
+[targets.dup]
+image = "ubuntu/b"
+mode = "fixed"
+name = "b"
+"#,
+        )
+        .unwrap();
+        let root = dir.path().join("gateway.toml");
+        std::fs::write(
+            &root,
+            r#"
+schema_version = "1"
+default_target = "dup"
+includes = ["config.d/*.toml"]
+"#,
+        )
+        .unwrap();
+
+        let err = GatewayConfig::load(&root).unwrap_err().to_string();
+        assert!(err.contains("duplicate target"), "{err}");
+        assert!(
+            err.contains(config_dir.join("b.toml").to_str().unwrap()),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn included_templates_can_be_used_by_root_definitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config.d");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("templates.toml"),
+            r#"
+[target_templates.base]
+image = "ubuntu/base"
+mode = "fixed"
+name = "base"
+
+[launch_templates.base]
+target = "default"
+command = ["true"]
+"#,
+        )
+        .unwrap();
+        let root = dir.path().join("gateway.toml");
+        std::fs::write(
+            &root,
+            r#"
+schema_version = "1"
+includes = ["config.d/*.toml"]
+
+[targets.default]
+use = ["base"]
+
+[launches.agent]
+use = ["base"]
+"#,
+        )
+        .unwrap();
+
+        let cfg = GatewayConfig::load(&root).unwrap();
+        assert_eq!(
+            cfg.effective_target("default").unwrap().image,
+            "ubuntu/base"
+        );
+        assert_eq!(cfg.effective_launch("agent").unwrap().command, ["true"]);
+    }
+
+    #[test]
+    fn includes_reject_duplicate_names() {
+        let dir = tempfile::tempdir().unwrap();
+        for (case, root_definition, include_definition, expected) in [
+            (
+                "target-template",
+                "[target_templates.base]\nimage = \"ubuntu/root\"\n",
+                "[target_templates.base]\nimage = \"ubuntu/include\"\n",
+                "duplicate target template",
+            ),
+            (
+                "launch-template",
+                "[launch_templates.base]\ncommand = [\"root\"]\n",
+                "[launch_templates.base]\ncommand = [\"include\"]\n",
+                "duplicate launch template",
+            ),
+            (
+                "target",
+                "[targets.extra]\nimage = \"ubuntu/root\"\nmode = \"fixed\"\nname = \"root\"\n",
+                "[targets.extra]\nimage = \"ubuntu/include\"\nmode = \"fixed\"\nname = \"include\"\n",
+                "duplicate target",
+            ),
+            (
+                "launch",
+                "[launches.agent]\ntarget = \"default\"\ncommand = [\"root\"]\n",
+                "[launches.agent]\ntarget = \"default\"\ncommand = [\"include\"]\n",
+                "duplicate launch",
+            ),
+        ] {
+            let case_dir = dir.path().join(case);
+            let config_dir = case_dir.join("config.d");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            std::fs::write(config_dir.join("fragment.toml"), include_definition).unwrap();
+            let root = case_dir.join("gateway.toml");
+            std::fs::write(
+                &root,
+                format!(
+                    r#"
+schema_version = "1"
+includes = ["config.d/*.toml"]
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "default"
+
+{root_definition}
+"#
+                ),
+            )
+            .unwrap();
+            let err = GatewayConfig::load(&root).unwrap_err().to_string();
+            assert!(err.contains(expected), "{case}: {err}");
+        }
+    }
+
+    #[test]
+    fn includes_reject_cycles() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.toml");
         let b = dir.path().join("b.toml");
@@ -6940,7 +6999,7 @@ name = "{{image_slug}}"
             &a,
             format!(
                 r#"
-target_includes = ["{}"]
+includes = ["{}"]
 "#,
                 b.display()
             ),
@@ -6950,7 +7009,7 @@ target_includes = ["{}"]
             &b,
             format!(
                 r#"
-target_includes = ["{}"]
+includes = ["{}"]
 "#,
                 a.display()
             ),
@@ -6962,7 +7021,7 @@ target_includes = ["{}"]
             format!(
                 r#"
 schema_version = "1"
-target_includes = ["{}"]
+includes = ["{}"]
 
 [targets.default]
 image = "ubuntu/dev"
@@ -6975,10 +7034,101 @@ name = "{{image_slug}}"
         .unwrap();
         let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
         assert!(err.contains("cycle"), "{err}");
+    }
 
-        std::fs::write(&a, "unknown = true\n").unwrap();
-        let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
-        assert!(err.contains("unknown field"), "{err}");
+    #[test]
+    fn includes_reject_root_only_sections_and_unknown_fields() {
+        for (case, fragment, expected) in [
+            ("schema-version", "schema_version = \"1\"\n", "root-only"),
+            (
+                "default-target",
+                "default_target = \"other\"\n",
+                "root-only",
+            ),
+            ("runtime", "[runtime]\ntype = \"podman\"\n", "root-only"),
+            ("logging", "[logging]\nlevel = \"debug\"\n", "root-only"),
+            (
+                "ssh-dispatch",
+                "[ssh_dispatch]\nallow_interactive_shell = false\n",
+                "root-only",
+            ),
+            (
+                "client-config",
+                "[client_config]\nhost = \"example.test\"\n",
+                "root-only",
+            ),
+            (
+                "target-defaults",
+                "[target_defaults]\nimage = \"ubuntu\"\n",
+                "root-only",
+            ),
+            (
+                "launch-defaults",
+                "[launch_defaults]\ntarget = \"default\"\n",
+                "root-only",
+            ),
+            ("unknown", "unknown = true\n", "unknown field"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config_dir = dir.path().join("config.d");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            std::fs::write(config_dir.join("fragment.toml"), fragment).unwrap();
+            let root = dir.path().join("gateway.toml");
+            std::fs::write(
+                &root,
+                r#"
+schema_version = "1"
+includes = ["config.d/*.toml"]
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "default"
+"#,
+            )
+            .unwrap();
+
+            let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
+            assert!(err.contains(expected), "{case}: {err}");
+        }
+    }
+
+    #[test]
+    fn legacy_split_include_keys_are_rejected() {
+        for (case, root_extra, include_extra) in [
+            ("root-target", "target_includes = []\n", ""),
+            ("root-launch", "launch_includes = []\n", ""),
+            ("include-target", "", "target_includes = []\n"),
+            ("include-launch", "", "launch_includes = []\n"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config_dir = dir.path().join("config.d");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            std::fs::write(config_dir.join("fragment.toml"), include_extra).unwrap();
+            let root = dir.path().join("gateway.toml");
+            std::fs::write(
+                &root,
+                format!(
+                    r#"
+schema_version = "1"
+{root_extra}
+includes = ["config.d/*.toml"]
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "default"
+"#
+                ),
+            )
+            .unwrap();
+
+            let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
+            assert!(
+                err.contains("target_includes") || err.contains("launch_includes"),
+                "{case}: {err}"
+            );
+        }
     }
 
     #[test]

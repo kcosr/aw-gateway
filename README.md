@@ -432,8 +432,8 @@ Gateway configs commonly include:
   command inside the ready container.
 - `[launch_templates.<name>]`: reusable partial launch-shaped templates that
   launches opt into with ordered `use = [...]`.
-- `target_includes` and `launch_includes`: section-specific include globs for
-  splitting target and launch definitions into separate TOML files.
+- `includes`: strict include globs for splitting target templates, launch
+  templates, targets, and launches into separate TOML files.
 - `[[target_defaults.container_mounts]]` and `[[targets.<name>.container_mounts]]`: extra
   host-to-container bind mounts, typically read-only bootstrap
   binaries/configs/certs.
@@ -747,20 +747,23 @@ include nullable `launch` fields. Text `status <target>` prints
 `launch: <name>` only when present, and `status --all` includes a compact
 `LAUNCH` column.
 
-Target and launch definitions can be split into strict section-specific include
-files:
+Target and launch definitions can be split into strict include files:
 
 ```toml
-target_includes = ["/etc/aw-gateway/targets/*.toml"]
-launch_includes = ["/etc/aw-gateway/launches/*.toml"]
+includes = ["/etc/aw-gateway/config.d/*.toml"]
 ```
 
 Include glob matches are sorted lexicographically before composition. Includes
-reject cycles, duplicate target/template or launch/template names, unknown
-fields, and partial object merge or override behavior. Target include files may
-define `target_includes`, `[target_templates.<name>]`, and `[targets.<name>]`;
-launch include files may define `launch_includes`,
-`[launch_templates.<name>]`, and `[launches.<name>]`.
+are resolved relative to the file that declares them, may be nested, and reject
+cycles, duplicate target/template or launch/template names, unknown fields, and
+partial object merge or override behavior. Include files may define nested
+`includes`, `[target_templates.<name>]`, `[launch_templates.<name>]`,
+`[targets.<name>]`, and `[launches.<name>]`.
+
+Gateway-wide policy and defaults remain root-owned. Include files must not
+define `schema_version`, `default_target`, `[runtime]`, `[logging]`,
+`[ssh_dispatch]`, `[client_config]`, `[target_defaults]`, or
+`[launch_defaults]`.
 
 When `sftp = "deny"`, `start-container-sshd` removes the SFTP subsystem from
 the runtime SSHD config. Modern OpenSSH SCP uses SFTP, so that blocks both.

@@ -1,13 +1,13 @@
 schema_version = "1"
 default_target = "default"
 
-# Optional section-specific include globs. Matches are sorted before loading.
-# Included target files may define target_includes, [target_templates.<name>],
-# and [targets.<name>] only.
-# Included launch files may define launch_includes, [launch_templates.<name>],
-# and [launches.<name>] only.
-# target_includes = ["/etc/aw-gateway/targets/*.toml"]
-# launch_includes = ["/etc/aw-gateway/launches/*.toml"]
+# Optional include globs. Matches are sorted before loading, and relative paths
+# are resolved from the file that declares them. Included files may define
+# nested includes, [target_templates.<name>], [launch_templates.<name>],
+# [targets.<name>], and [launches.<name>] only.
+# Keep schema_version, default_target, runtime, logging, ssh_dispatch,
+# client_config, target_defaults, and launch_defaults in this root file.
+# includes = ["/etc/aw-gateway/config.d/*.toml"]
 
 [runtime]
 # Supported values: "podman", "docker", "colima".
