@@ -3052,8 +3052,8 @@ fn validate_workspace_cleanup_path(
             workspace.display()
         );
     }
-    if session_id.len() < 8 {
-        anyhow::bail!("workspace_cleanup session_id {session_id:?} must be at least 8 characters");
+    if session_id.len() < 3 {
+        anyhow::bail!("workspace_cleanup session_id {session_id:?} must be at least 3 characters");
     }
     let leaf = workspace
         .file_name()
@@ -3477,6 +3477,32 @@ mod tests {
             Some("{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn workspace_cleanup_path_allows_three_character_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join(".cache/aw-gateway/workspaces/default-abc");
+
+        validate_workspace_cleanup_path(
+            &workspace,
+            dir.path(),
+            "abc",
+            Some("{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"),
+        )
+        .unwrap();
+
+        let err = format!(
+            "{:#}",
+            validate_workspace_cleanup_path(
+                &workspace,
+                dir.path(),
+                "ab",
+                Some("{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"),
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("must be at least 3 characters"), "{err}");
     }
 
     #[test]
