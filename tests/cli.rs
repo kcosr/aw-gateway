@@ -166,6 +166,10 @@ ephemeral_name = "worker-{session_id}"
 stop_when_idle = true
 workspace = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
 workspace_cleanup = "always"
+
+[targets.default.idle_cleanup]
+owner = "gateway"
+action = "exit_container"
 "#,
     )
     .unwrap();

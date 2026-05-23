@@ -79,9 +79,11 @@ name = "{image_slug}"
 # {gid}, {target}, {image}, {image_slug}, and {session_id}.
 # workspace = "{home}/workspace-internal"
 #
-# Ephemeral targets with a target-specific workspace containing {session_id}
-# can delete the resolved session workspace after the session ends.
+# Ephemeral targets with gateway-owned exit_container idle cleanup and a
+# target-specific workspace under an aw-gateway path component containing
+# {session_id} can delete the resolved session workspace after the session ends.
 # Allowed values: "never" (default), "success", and "always".
+# Only valid for mode = "ephemeral" targets; see the README for a full example.
 # workspace = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
 # workspace_cleanup = "always"
 stop_when_idle = true

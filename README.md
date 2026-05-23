@@ -358,18 +358,27 @@ ephemeral_name = "worker-{session_id}"
 stop_when_idle = true
 workspace = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
 workspace_cleanup = "always"
+
+[targets.worker.idle_cleanup]
+owner = "gateway"
+action = "exit_container"
 ```
 
 `workspace_cleanup` accepts `never` (the default), `success`, or `always`.
 Cleanup is supported only for ephemeral targets with a target-specific
-`workspace` that references `{session_id}`. The gateway deletes only the
+`workspace` under an `aw-gateway` path component that references
+`{session_id}`. Cleanup also requires gateway-owned `exit_container` idle
+cleanup with no `preserve_processes`, so the session workspace is not deleted
+while the container is intentionally still alive. The gateway deletes only the
 resolved workspace for that session after the session is done and after
 container cleanup has completed or been attempted. Missing workspaces are
 treated as success; cleanup failures are warnings and do not replace the
-command or launch exit status. Unsafe deletion roots, including `/`, the user
-home directory, paths without the current session id, and symlink roots, are
-refused before the session runs. Control socket runtime directories are managed
-by `[control_sockets]`, not by workspace cleanup.
+command or launch exit status. Unsafe deletion roots are refused before the
+session runs (empty paths, `/`, the user home directory, paths missing the
+current session id) and again before deletion (symlink roots). Control socket
+runtime directories are managed by `[control_sockets]`, not by workspace
+cleanup. Non-listen `up` remains a warm-up operation and does not trigger
+workspace cleanup.
 
 Podman managed-host targets default to the authenticated host user and home.
 Docker and Colima targets default to `root` and `/root`; set

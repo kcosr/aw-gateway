@@ -1063,6 +1063,31 @@ impl TargetConfig {
                     "target {target_name:?} workspace_cleanup requires workspace to reference {{session_id}}"
                 );
             }
+            if !Path::new(workspace)
+                .components()
+                .any(|component| component.as_os_str() == "aw-gateway")
+            {
+                anyhow::bail!(
+                    "target {target_name:?} workspace_cleanup requires workspace under an aw-gateway path component"
+                );
+            }
+            let Some(cleanup) = &self.idle_cleanup else {
+                anyhow::bail!(
+                    "target {target_name:?} workspace_cleanup requires gateway-owned idle_cleanup"
+                );
+            };
+            if cleanup.owner != IdleCleanupOwner::Gateway
+                || cleanup.action != IdleCleanupAction::ExitContainer
+            {
+                anyhow::bail!(
+                    "target {target_name:?} workspace_cleanup requires gateway-owned exit_container idle_cleanup"
+                );
+            }
+            if !cleanup.preserve_processes.is_empty() {
+                anyhow::bail!(
+                    "target {target_name:?} workspace_cleanup does not support preserve_processes"
+                );
+            }
         }
         if let Some(cleanup) = &self.idle_cleanup {
             cleanup.validate()?;
@@ -3119,6 +3144,10 @@ ephemeral_name = "worker-{{session_id}}"
 stop_when_idle = true
 workspace = "{{home}}/.cache/aw-gateway/workspaces/{{target}}-{{session_id}}"
 workspace_cleanup = "{value}"
+
+[targets.default.idle_cleanup]
+owner = "gateway"
+action = "exit_container"
 "#
             ))
             .unwrap();
@@ -3138,6 +3167,10 @@ mode = "fixed"
 name = "{image_slug}"
 workspace = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
 workspace_cleanup = "always"
+
+[targets.default.idle_cleanup]
+owner = "gateway"
+action = "exit_container"
 "#,
         )
         .unwrap();
@@ -3188,6 +3221,10 @@ ephemeral_name = "worker-{session_id}"
 stop_when_idle = true
 workspace = "{home}/.cache/aw-gateway/workspaces/{target}"
 workspace_cleanup = "success"
+
+[targets.default.idle_cleanup]
+owner = "gateway"
+action = "exit_container"
 "#,
         )
         .unwrap();
@@ -3197,6 +3234,92 @@ workspace_cleanup = "success"
             err.contains("workspace_cleanup requires workspace to reference {session_id}"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn target_workspace_cleanup_rejects_workspace_outside_aw_gateway_component() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "ephemeral"
+ephemeral_name = "worker-{session_id}"
+stop_when_idle = true
+workspace = "{home}/sessions/{target}-{session_id}"
+workspace_cleanup = "always"
+
+[targets.default.idle_cleanup]
+owner = "gateway"
+action = "exit_container"
+"#,
+        )
+        .unwrap();
+
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(
+            err.contains("workspace_cleanup requires workspace under an aw-gateway path component"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn target_workspace_cleanup_requires_gateway_owned_exit_cleanup() {
+        for (name, idle_cleanup, expected) in [
+            (
+                "missing",
+                "",
+                "workspace_cleanup requires gateway-owned idle_cleanup",
+            ),
+            (
+                "agent",
+                r#"
+[targets.default.idle_cleanup]
+owner = "agent"
+action = "exit_container"
+"#,
+                "workspace_cleanup requires gateway-owned exit_container idle_cleanup",
+            ),
+            (
+                "none-action",
+                r#"
+[targets.default.idle_cleanup]
+owner = "gateway"
+action = "none"
+"#,
+                "workspace_cleanup requires gateway-owned exit_container idle_cleanup",
+            ),
+            (
+                "preserve",
+                r#"
+[targets.default.idle_cleanup]
+owner = "gateway"
+action = "exit_container"
+preserve_processes = ["tmux"]
+"#,
+                "workspace_cleanup does not support preserve_processes",
+            ),
+        ] {
+            let cfg: GatewayConfig = toml::from_str(&format!(
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "ephemeral"
+ephemeral_name = "worker-{{session_id}}"
+stop_when_idle = true
+workspace = "{{home}}/.cache/aw-gateway/workspaces/{{target}}-{{session_id}}"
+workspace_cleanup = "always"
+{idle_cleanup}
+"#
+            ))
+            .unwrap();
+
+            let err = format!("{:#}", cfg.validate().unwrap_err());
+            assert!(err.contains(expected), "{name}: {err}");
+        }
     }
 
     #[test]
