@@ -10,7 +10,7 @@ use crate::config::{
     GatewayConfig, HostStep, IdleCleanupAction, IdleCleanupOwner, LaunchConfig, LaunchStep,
     LaunchStepLocation, LaunchVarConfig, LaunchVarType, LifecyclePhase, LifecycleStep,
     LocalSshBackend, LocalSshMode, LocalSshReadiness, LoggingConfig,
-    RenderedContainerBootstrapStep, TargetConfig, TargetMode, validate_name,
+    RenderedContainerBootstrapStep, TargetConfig, TargetMode, WorkspaceCleanup, validate_name,
     validate_passwd_scalar,
 };
 use crate::paths::{self, UserContext};
@@ -437,13 +437,15 @@ async fn connect(config_path: Option<PathBuf>, args: ConnectArgs) -> anyhow::Res
     let runtime = Runtime::load(config_path, args.target.as_deref(), args.session_id, true).await?;
     runtime.ensure_ssh_endpoint_configured()?;
     let session = runtime.create_session_marker("connect")?;
-    let ready = runtime.ensure_ready().await?;
-    let proxy_result = listener::proxy_ready_to_stdio(&ready).await;
-    drop(session);
-    if let Err(err) = runtime.apply_gateway_idle_cleanup().await {
-        tracing::warn!(error = %err, "gateway-owned idle cleanup failed");
+    let proxy_result = async {
+        let ready = runtime.ensure_ready().await?;
+        listener::proxy_ready_to_stdio(&ready).await
     }
-    proxy_result
+    .await;
+    let outcome = SessionOutcome::from_result(&proxy_result);
+    runtime
+        .finish_post_session(session, proxy_result, outcome)
+        .await
 }
 
 async fn up(config_path: Option<PathBuf>, status: UpArgs) -> anyhow::Result<()> {
@@ -459,8 +461,8 @@ async fn up(config_path: Option<PathBuf>, status: UpArgs) -> anyhow::Result<()> 
     {
         runtime.ensure_ssh_endpoint_configured()?;
         let session = runtime.create_session_marker("local-listen")?;
-        let mut ready = runtime.ensure_ready().await?;
-        let up_result = {
+        let up_result = async {
+            let mut ready = runtime.ensure_ready().await?;
             let bound = listener::bind_local_ssh(&runtime).await?;
             ready.local_ssh = Some(bound.ready.clone());
             let config = runtime.render_client_config(None)?;
@@ -468,12 +470,12 @@ async fn up(config_path: Option<PathBuf>, status: UpArgs) -> anyhow::Result<()> 
             println!("{}", serde_json::to_string_pretty(&ready)?);
             let target = ready.ssh_target();
             listener::serve_local_ssh(bound, target).await
-        };
-        drop(session);
-        if let Err(err) = runtime.apply_gateway_idle_cleanup().await {
-            tracing::warn!(error = %err, "gateway-owned idle cleanup failed");
         }
-        return up_result;
+        .await;
+        let outcome = SessionOutcome::from_result(&up_result);
+        return runtime
+            .finish_post_session(session, up_result, outcome)
+            .await;
     }
     // Non-listen `up` is a warm-up operation: it starts or validates the
     // target and exits without holding an active session marker.
@@ -489,18 +491,20 @@ async fn run_container_command(config_path: Option<PathBuf>, args: RunArgs) -> a
     let runtime = Runtime::load(config_path, args.target.as_deref(), args.session_id, true).await?;
     let session_kind = "run-command";
     let session = runtime.create_session_marker(session_kind)?;
-    let _ready = runtime.ensure_ready().await?;
-    let _agent_session = runtime.agent_session_hold(session_kind).await?;
-    let command = args.command;
-    let cwd = args
-        .cwd
-        .as_deref()
-        .map(|cwd| paths::expand_home(&runtime.container_home, cwd));
-    let code = exec_final_container_command(&runtime, command, cwd, runtime.session_env()?).await?;
-    drop(session);
-    if let Err(err) = runtime.apply_gateway_idle_cleanup().await {
-        tracing::warn!(error = %err, "gateway-owned idle cleanup failed");
+    let result = async {
+        let _ready = runtime.ensure_ready().await?;
+        let _agent_session = runtime.agent_session_hold(session_kind).await?;
+        let command = args.command;
+        let cwd = args
+            .cwd
+            .as_deref()
+            .map(|cwd| paths::expand_home(&runtime.container_home, cwd));
+        exec_final_container_command(&runtime, command, cwd, runtime.session_env()?).await
     }
+    .await;
+    let outcome = SessionOutcome::from_exit_code_result(&result);
+    let result = runtime.finish_post_session(session, result, outcome).await;
+    let code = result?;
     std::process::exit(code);
 }
 
@@ -822,10 +826,8 @@ async fn launch_execute_with_config(
         exec_final_container_command(&runtime, command, cwd, env).await
     }
     .await;
-    drop(session);
-    if let Err(err) = runtime.apply_gateway_idle_cleanup().await {
-        tracing::warn!(error = %err, "gateway-owned idle cleanup failed");
-    }
+    let outcome = SessionOutcome::from_exit_code_result(&result);
+    let result = runtime.finish_post_session(session, result, outcome).await;
     let code = result?;
     std::process::exit(code);
 }
@@ -1444,6 +1446,29 @@ struct ControlSocketPaths {
     default_host_dir: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionOutcome {
+    Success,
+    Failure,
+}
+
+impl SessionOutcome {
+    fn from_result<T>(result: &anyhow::Result<T>) -> Self {
+        if result.is_ok() {
+            Self::Success
+        } else {
+            Self::Failure
+        }
+    }
+
+    fn from_exit_code_result(result: &anyhow::Result<i32>) -> Self {
+        match result {
+            Ok(0) => Self::Success,
+            Ok(_) | Err(_) => Self::Failure,
+        }
+    }
+}
+
 impl Runtime {
     async fn load(
         config_path: Option<PathBuf>,
@@ -1633,6 +1658,7 @@ impl Runtime {
             effective_container_bootstrap_steps,
             effective_container_agent,
         };
+        runtime.validate_workspace_cleanup_path().await?;
         runtime.validate_unix_socket_paths()?;
         Ok(runtime)
     }
@@ -1806,6 +1832,69 @@ impl Runtime {
             return Ok(());
         }
         self.stop_managed_container().await
+    }
+
+    async fn finish_post_session<T>(
+        &self,
+        session: session::SessionGuard,
+        result: anyhow::Result<T>,
+        outcome: SessionOutcome,
+    ) -> anyhow::Result<T> {
+        drop(session);
+        self.apply_post_session_cleanup(outcome).await;
+        result
+    }
+
+    async fn apply_post_session_cleanup(&self, outcome: SessionOutcome) {
+        if let Err(err) = self.apply_gateway_idle_cleanup().await {
+            tracing::warn!(error = %err, "gateway-owned idle cleanup failed");
+        }
+        if !self.should_cleanup_workspace(outcome) {
+            return;
+        }
+        let _lock = match self.acquire_lifecycle_lock().await {
+            Ok(lock) => lock,
+            Err(err) => {
+                tracing::warn!(error = %err, "workspace cleanup skipped because lifecycle lock failed");
+                return;
+            }
+        };
+        match self.active_session_markers() {
+            Ok(sessions) if sessions.is_empty() => {}
+            Ok(_) => {
+                tracing::warn!(
+                    target = %self.target_name,
+                    workspace = %self.workspace.display(),
+                    "workspace cleanup skipped because active sessions remain"
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target = %self.target_name,
+                    workspace = %self.workspace.display(),
+                    error = %err,
+                    "workspace cleanup skipped because active sessions could not be checked"
+                );
+                return;
+            }
+        }
+        if let Err(err) = self.remove_session_workspace().await {
+            tracing::warn!(
+                target = %self.target_name,
+                workspace = %self.workspace.display(),
+                error = %err,
+                "workspace cleanup failed"
+            );
+        }
+    }
+
+    fn should_cleanup_workspace(&self, outcome: SessionOutcome) -> bool {
+        match self.target.workspace_cleanup {
+            WorkspaceCleanup::Never => false,
+            WorkspaceCleanup::Success => outcome == SessionOutcome::Success,
+            WorkspaceCleanup::Always => true,
+        }
     }
 
     async fn stop_managed_container(&self) -> anyhow::Result<()> {
@@ -2868,6 +2957,128 @@ impl Runtime {
             }
         }
     }
+
+    async fn validate_workspace_cleanup_path(&self) -> anyhow::Result<()> {
+        if self.target.workspace_cleanup == WorkspaceCleanup::Never {
+            return Ok(());
+        }
+        let session_id = self
+            .session_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("workspace_cleanup requires an ephemeral session id"))?;
+        validate_workspace_cleanup_path(
+            &self.workspace,
+            &self.user.home,
+            session_id,
+            self.target.workspace.as_deref(),
+        )?;
+        match tokio::fs::symlink_metadata(&self.workspace).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "workspace_cleanup path {} must not be a symlink",
+                    self.workspace.display()
+                );
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "inspect workspace cleanup path {}",
+                        self.workspace.display()
+                    )
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn remove_session_workspace(&self) -> anyhow::Result<()> {
+        self.validate_workspace_cleanup_path().await?;
+        let metadata = match tokio::fs::symlink_metadata(&self.workspace).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "inspect workspace cleanup path {}",
+                        self.workspace.display()
+                    )
+                });
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "workspace cleanup path {} must not be a symlink",
+                self.workspace.display()
+            );
+        }
+        if !metadata.is_dir() {
+            anyhow::bail!(
+                "workspace cleanup path {} exists but is not a directory",
+                self.workspace.display()
+            );
+        }
+        tokio::fs::remove_dir_all(&self.workspace)
+            .await
+            .with_context(|| format!("remove workspace {}", self.workspace.display()))
+    }
+}
+
+fn validate_workspace_cleanup_path(
+    workspace: &Path,
+    home: &Path,
+    session_id: &str,
+    configured_workspace: Option<&str>,
+) -> anyhow::Result<()> {
+    if workspace.as_os_str().is_empty() {
+        anyhow::bail!("workspace_cleanup resolved workspace must not be empty");
+    }
+    if workspace
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        anyhow::bail!(
+            "workspace_cleanup path must not contain '.' or '..' components: {}",
+            workspace.display()
+        );
+    }
+    if workspace == Path::new("/") {
+        anyhow::bail!("workspace_cleanup refuses to delete /");
+    }
+    if workspace == home {
+        anyhow::bail!(
+            "workspace_cleanup refuses to delete user home directory {}",
+            workspace.display()
+        );
+    }
+    if session_id.len() < 3 {
+        anyhow::bail!("workspace_cleanup session_id {session_id:?} must be at least 3 characters");
+    }
+    let leaf = workspace
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if !leaf.contains(session_id) {
+        anyhow::bail!(
+            "workspace_cleanup path {} leaf must contain session_id {session_id:?}",
+            workspace.display()
+        );
+    }
+    if let Some(configured_workspace) = configured_workspace
+        && Path::new(configured_workspace)
+            .components()
+            .any(|component| component.as_os_str() == "aw-gateway")
+        && !workspace
+            .components()
+            .any(|component| component.as_os_str() == "aw-gateway")
+    {
+        anyhow::bail!(
+            "workspace_cleanup path {} is outside the configured aw-gateway workspace root",
+            workspace.display()
+        );
+    }
+    Ok(())
 }
 
 fn ensure_control_socket_dir(path: &Path) -> anyhow::Result<()> {
@@ -3192,6 +3403,383 @@ mod tests {
             container_runtime,
             user,
         }
+    }
+
+    fn configure_workspace_cleanup_runtime(
+        runtime: &mut Runtime,
+        cleanup: WorkspaceCleanup,
+        workspace: PathBuf,
+        home: PathBuf,
+        session_id: &str,
+    ) {
+        runtime.target.mode = TargetMode::Ephemeral;
+        runtime.target.ephemeral_name = Some("ubuntu-dev-{session_id}".into());
+        runtime.target.stop_when_idle = true;
+        runtime.target.workspace =
+            Some("{home}/.cache/aw-gateway/workspaces/{target}-{session_id}".into());
+        runtime.target.workspace_cleanup = cleanup;
+        runtime.session_id = Some(session_id.into());
+        runtime.workspace = workspace;
+        runtime.container_state_dir = runtime
+            .workspace
+            .join(&runtime.cfg.workspace.state_dir)
+            .join("sessions")
+            .join(session_id);
+        runtime.user.home = home;
+    }
+
+    #[test]
+    fn workspace_cleanup_policy_matches_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+
+        runtime.target.workspace_cleanup = WorkspaceCleanup::Never;
+        assert!(!runtime.should_cleanup_workspace(SessionOutcome::Success));
+        assert!(!runtime.should_cleanup_workspace(SessionOutcome::Failure));
+
+        runtime.target.workspace_cleanup = WorkspaceCleanup::Success;
+        assert!(runtime.should_cleanup_workspace(SessionOutcome::Success));
+        assert!(!runtime.should_cleanup_workspace(SessionOutcome::Failure));
+
+        runtime.target.workspace_cleanup = WorkspaceCleanup::Always;
+        assert!(runtime.should_cleanup_workspace(SessionOutcome::Success));
+        assert!(runtime.should_cleanup_workspace(SessionOutcome::Failure));
+    }
+
+    #[test]
+    fn session_outcome_maps_exit_code_results() {
+        assert_eq!(
+            SessionOutcome::from_exit_code_result(&Ok(0)),
+            SessionOutcome::Success
+        );
+        assert_eq!(
+            SessionOutcome::from_exit_code_result(&Ok(7)),
+            SessionOutcome::Failure
+        );
+        assert_eq!(
+            SessionOutcome::from_exit_code_result(&Err(anyhow::anyhow!("setup failed"))),
+            SessionOutcome::Failure
+        );
+    }
+
+    #[test]
+    fn workspace_cleanup_path_allows_missing_session_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "abc123def456";
+        let workspace = dir
+            .path()
+            .join(".cache/aw-gateway/workspaces/default-abc123def456");
+
+        validate_workspace_cleanup_path(
+            &workspace,
+            dir.path(),
+            session_id,
+            Some("{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn workspace_cleanup_path_allows_three_character_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join(".cache/aw-gateway/workspaces/default-abc");
+
+        validate_workspace_cleanup_path(
+            &workspace,
+            dir.path(),
+            "abc",
+            Some("{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"),
+        )
+        .unwrap();
+
+        let err = format!(
+            "{:#}",
+            validate_workspace_cleanup_path(
+                &workspace,
+                dir.path(),
+                "ab",
+                Some("{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"),
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("must be at least 3 characters"), "{err}");
+    }
+
+    #[test]
+    fn workspace_cleanup_path_rejects_unsafe_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "abc123def456";
+
+        let root_err = format!(
+            "{:#}",
+            validate_workspace_cleanup_path(
+                Path::new("/"),
+                dir.path(),
+                session_id,
+                Some("{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"),
+            )
+            .unwrap_err()
+        );
+        assert!(root_err.contains("refuses to delete /"), "{root_err}");
+
+        let home_err = format!(
+            "{:#}",
+            validate_workspace_cleanup_path(
+                dir.path(),
+                dir.path(),
+                session_id,
+                Some("{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"),
+            )
+            .unwrap_err()
+        );
+        assert!(
+            home_err.contains("refuses to delete user home directory"),
+            "{home_err}"
+        );
+    }
+
+    #[test]
+    fn workspace_cleanup_path_rejects_paths_without_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join(".cache/aw-gateway/workspaces/default");
+
+        let err = format!(
+            "{:#}",
+            validate_workspace_cleanup_path(
+                &workspace,
+                dir.path(),
+                "abc123def456",
+                Some("{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"),
+            )
+            .unwrap_err()
+        );
+
+        assert!(err.contains("must contain session_id"), "{err}");
+    }
+
+    #[test]
+    fn workspace_cleanup_path_rejects_empty_and_dot_components() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let empty_err = format!(
+            "{:#}",
+            validate_workspace_cleanup_path(
+                Path::new(""),
+                dir.path(),
+                "abc123def456",
+                Some("{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"),
+            )
+            .unwrap_err()
+        );
+        assert!(
+            empty_err.contains("resolved workspace must not be empty"),
+            "{empty_err}"
+        );
+
+        let dot_err = format!(
+            "{:#}",
+            validate_workspace_cleanup_path(
+                Path::new("/tmp/aw-gateway/../default-abc123def456"),
+                dir.path(),
+                "abc123def456",
+                Some("{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"),
+            )
+            .unwrap_err()
+        );
+        assert!(
+            dot_err.contains("must not contain '.' or '..' components"),
+            "{dot_err}"
+        );
+    }
+
+    #[test]
+    fn workspace_cleanup_path_rejects_aw_gateway_template_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspaces/default-abc123def456");
+
+        let err = format!(
+            "{:#}",
+            validate_workspace_cleanup_path(
+                &workspace,
+                dir.path(),
+                "abc123def456",
+                Some("{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"),
+            )
+            .unwrap_err()
+        );
+
+        assert!(
+            err.contains("outside the configured aw-gateway workspace root"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_cleanup_path_rejects_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "abc123def456";
+        let real_workspace = dir
+            .path()
+            .join(".cache/aw-gateway/workspaces/default-abc123def456-real");
+        let symlink_workspace = dir
+            .path()
+            .join(".cache/aw-gateway/workspaces/default-abc123def456");
+        std::fs::create_dir_all(&real_workspace).unwrap();
+        symlink(&real_workspace, &symlink_workspace).unwrap();
+        let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+        configure_workspace_cleanup_runtime(
+            &mut runtime,
+            WorkspaceCleanup::Always,
+            symlink_workspace,
+            dir.path().into(),
+            session_id,
+        );
+
+        let err = format!(
+            "{:#}",
+            runtime.validate_workspace_cleanup_path().await.unwrap_err()
+        );
+
+        assert!(err.contains("must not be a symlink"), "{err}");
+        assert!(real_workspace.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_session_workspace_treats_missing_workspace_as_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "abc123def456";
+        let workspace = dir
+            .path()
+            .join(".cache/aw-gateway/workspaces/default-abc123def456");
+        let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+        configure_workspace_cleanup_runtime(
+            &mut runtime,
+            WorkspaceCleanup::Always,
+            workspace,
+            dir.path().into(),
+            session_id,
+        );
+
+        runtime.remove_session_workspace().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_session_workspace_removes_only_resolved_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "abc123def456";
+        let workspace_root = dir.path().join(".cache/aw-gateway/workspaces");
+        let workspace = workspace_root.join("default-abc123def456");
+        let sibling = workspace_root.join("sibling-abc123def456");
+        std::fs::create_dir_all(workspace.join("nested")).unwrap();
+        std::fs::write(workspace.join("nested/file.txt"), "data").unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+        configure_workspace_cleanup_runtime(
+            &mut runtime,
+            WorkspaceCleanup::Always,
+            workspace.clone(),
+            dir.path().into(),
+            session_id,
+        );
+
+        runtime.remove_session_workspace().await.unwrap();
+
+        assert!(!workspace.exists());
+        assert!(workspace_root.exists());
+        assert!(sibling.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_session_workspace_rejects_non_directory_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "abc123def456";
+        let workspace = dir
+            .path()
+            .join(".cache/aw-gateway/workspaces/default-abc123def456");
+        std::fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+        std::fs::write(&workspace, "not a directory").unwrap();
+
+        let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+        configure_workspace_cleanup_runtime(
+            &mut runtime,
+            WorkspaceCleanup::Always,
+            workspace,
+            dir.path().into(),
+            session_id,
+        );
+
+        let err = format!(
+            "{:#}",
+            runtime.remove_session_workspace().await.unwrap_err()
+        );
+        assert!(err.contains("exists but is not a directory"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn finish_post_session_removes_workspace_for_failure_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "abc123def456";
+        let workspace = dir
+            .path()
+            .join(".cache/aw-gateway/workspaces/default-abc123def456");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+        configure_workspace_cleanup_runtime(
+            &mut runtime,
+            WorkspaceCleanup::Always,
+            workspace.clone(),
+            dir.path().into(),
+            session_id,
+        );
+        runtime.target.idle_cleanup = None;
+        let session = runtime.create_session_marker("test").unwrap();
+
+        let result = runtime
+            .finish_post_session::<()>(
+                session,
+                Err(anyhow::anyhow!("simulated readiness failure")),
+                SessionOutcome::Failure,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(!workspace.exists());
+    }
+
+    #[tokio::test]
+    async fn finish_post_session_preserves_success_when_workspace_cleanup_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "abc123def456";
+        let workspace = dir
+            .path()
+            .join(".cache/aw-gateway/workspaces/default-abc123def456");
+        std::fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+        std::fs::write(&workspace, "not a directory").unwrap();
+
+        let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+        configure_workspace_cleanup_runtime(
+            &mut runtime,
+            WorkspaceCleanup::Always,
+            workspace.clone(),
+            dir.path().into(),
+            session_id,
+        );
+        runtime.target.idle_cleanup = None;
+        runtime.container_state_dir = dir.path().join("state");
+        let session = runtime.create_session_marker("test").unwrap();
+
+        let code = runtime
+            .finish_post_session(session, Ok(0), SessionOutcome::Success)
+            .await
+            .unwrap();
+
+        assert_eq!(code, 0);
+        assert!(workspace.is_file());
     }
 
     fn inspect_with_running(running: bool) -> ContainerInspect {
