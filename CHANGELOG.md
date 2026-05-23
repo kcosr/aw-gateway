@@ -34,7 +34,8 @@
 
 - Added a live smoke test suite for Docker/Ubuntu, rootless Podman/Rocky 10,
   and macOS/Colima hosts, covering unrestricted SSH, restricted forced-command
-  SSH, host-local container SSH, lifecycle operations, and the JSON HTTP API.
+  SSH, host-local container SSH, lifecycle operations, and the JSON HTTP API
+  ([#15](https://github.com/kcosr/aw-gateway/pull/15)).
 - Added an initial JSON HTTP API daemon with explicit `[http]` config,
   optional bearer auth, HTTP action allow-listing, metadata routes, wait/detach
   run and launch execution, typed JSON launch variables, and stable JSON
@@ -84,10 +85,12 @@
 
 - Allowed container bootstrap to use an existing group with the requested
   session gid when creating the session passwd entry, which supports macOS
-  users whose primary gid collides with a default Linux group name.
+  users whose primary gid collides with a default Linux group name
+  ([#15](https://github.com/kcosr/aw-gateway/pull/15)).
 - Removed Ubuntu's default `ubuntu` account from the Podman and Colima example
   images so keep-id/user provisioning can create the configured session user
-  without a UID collision.
+  without a UID collision
+  ([#15](https://github.com/kcosr/aw-gateway/pull/15)).
 - Preserved live control socket paths when reusing already-running containers,
   while still removing stale paths before stopped or missing container startup
   ([#12](https://github.com/kcosr/aw-gateway/pull/12)).
