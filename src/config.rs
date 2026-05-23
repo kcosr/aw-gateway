@@ -2845,6 +2845,8 @@ fn validate_command(field: &str, command: &[String]) -> anyhow::Result<()> {
 
 pub(crate) fn validate_name(field: &str, value: &str) -> anyhow::Result<()> {
     if value.is_empty()
+        || value == "."
+        || value == ".."
         || !value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
@@ -3051,6 +3053,13 @@ mod tests {
     fn sample_gateway_config_validates() {
         let cfg: GatewayConfig = toml::from_str(crate::gateway::DEFAULT_GATEWAY_CONFIG).unwrap();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn path_segment_names_reject_dot_segments() {
+        assert!(validate_name("target", ".").is_err());
+        assert!(validate_name("target", "..").is_err());
+        validate_name("target", "dev.shell-1").unwrap();
     }
 
     #[test]

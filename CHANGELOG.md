@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Gateway configs now reject direct `container_agent.control_socket = "/path"`
+  and `container_agent.ssh_bridge.socket = "/path"` socket path settings; use
+  `[control_sockets]` for gateway-managed runtime socket directories.
+
 ### Added
 
 - Added `[control_sockets]` and `[targets.<name>.control_sockets]` config for

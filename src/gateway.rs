@@ -28,7 +28,7 @@ use anyhow::Context;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::time::{Duration, Instant, sleep};
@@ -552,6 +552,7 @@ async fn remove(config_path: Option<PathBuf>, args: TargetArg) -> anyhow::Result
         return Ok(());
     };
     runtime.validate_labels(&inspect)?;
+    let was_running = inspect.state.running;
     if inspect.state.running {
         runtime.stop_inspected_container(&inspect).await?;
     }
@@ -566,7 +567,9 @@ async fn remove(config_path: Option<PathBuf>, args: TargetArg) -> anyhow::Result
             .rm(&runtime.container_name)
             .await?;
     }
-    runtime.cleanup_control_socket_dir();
+    if !was_running {
+        runtime.cleanup_control_socket_dir();
+    }
     println!("removed {}", runtime.container_name);
     Ok(())
 }
@@ -2482,7 +2485,35 @@ impl Runtime {
                 }
             }
         }
-        paths::ensure_private_dir(&self.control_sockets.host_dir)
+        ensure_control_socket_dir(&self.control_sockets.host_dir)?;
+        self.remove_stale_control_socket_files()
+    }
+
+    fn remove_stale_control_socket_files(&self) -> anyhow::Result<()> {
+        for socket in [
+            &self.control_sockets.host_agent_socket,
+            &self.control_sockets.host_ssh_socket,
+        ] {
+            match std::fs::symlink_metadata(socket) {
+                Ok(metadata) if metadata.is_dir() => {
+                    anyhow::bail!(
+                        "control socket path {} exists as a directory; remove it or configure a different control_sockets.host_dir",
+                        socket.display()
+                    );
+                }
+                Ok(_) => {
+                    std::fs::remove_file(socket).with_context(|| {
+                        format!("remove stale control socket {}", socket.display())
+                    })?;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("inspect control socket {}", socket.display()));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn passwd_entry(&self) -> String {
@@ -2639,8 +2670,9 @@ impl Runtime {
             let bytes = unix_socket_path_bytes(&path);
             if bytes > UNIX_SOCKET_PATH_MAX_BYTES {
                 anyhow::bail!(
-                    "{label} is too long for a Unix domain socket ({bytes} bytes, limit {UNIX_SOCKET_PATH_MAX_BYTES}): {}. Configure control_sockets.host_dir or control_sockets.container_dir to a shorter absolute path, or use a shorter runtime_id.",
-                    path.display()
+                    "{label} is too long for a Unix domain socket ({bytes} bytes, limit {UNIX_SOCKET_PATH_MAX_BYTES}): {}. Configure control_sockets.host_dir or control_sockets.container_dir to a shorter absolute path. For fixed targets, runtime_id is the target id {:?}; for ephemeral targets, runtime_id is the session id.",
+                    path.display(),
+                    self.target_name
                 );
             }
         }
@@ -2780,7 +2812,51 @@ impl Runtime {
     }
 
     fn cleanup_control_socket_dir(&self) {
-        match std::fs::remove_dir_all(&self.control_sockets.host_dir) {
+        match std::fs::symlink_metadata(&self.control_sockets.host_dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                tracing::warn!(
+                    path = %self.control_sockets.host_dir.display(),
+                    "not removing symlink control socket runtime directory"
+                );
+                return;
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                tracing::warn!(
+                    path = %self.control_sockets.host_dir.display(),
+                    "not removing non-directory control socket runtime path"
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => {
+                tracing::warn!(
+                    path = %self.control_sockets.host_dir.display(),
+                    error = %err,
+                    "failed to inspect control socket runtime directory before cleanup"
+                );
+                return;
+            }
+        }
+
+        for socket in [
+            &self.control_sockets.host_agent_socket,
+            &self.control_sockets.host_ssh_socket,
+        ] {
+            match std::fs::remove_file(socket) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!(
+                        path = %socket.display(),
+                        error = %err,
+                        "failed to remove control socket file"
+                    );
+                }
+            }
+        }
+
+        match std::fs::remove_dir(&self.control_sockets.host_dir) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
@@ -2792,6 +2868,85 @@ impl Runtime {
             }
         }
     }
+}
+
+fn ensure_control_socket_dir(path: &Path) -> anyhow::Result<()> {
+    let created = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!(
+                "control_sockets.host_dir {} must not be a symlink",
+                path.display()
+            );
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            anyhow::bail!(
+                "control_sockets.host_dir {} exists but is not a directory",
+                path.display()
+            );
+        }
+        Ok(metadata) => {
+            validate_control_socket_dir_permissions(path, &metadata)?;
+            false
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)
+                .with_context(|| format!("create control_sockets.host_dir {}", path.display()))?;
+            true
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("inspect control_sockets.host_dir {}", path.display()));
+        }
+    };
+
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect control_sockets.host_dir {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "control_sockets.host_dir {} must not be a symlink",
+            path.display()
+        );
+    }
+    if !metadata.is_dir() {
+        anyhow::bail!(
+            "control_sockets.host_dir {} exists but is not a directory",
+            path.display()
+        );
+    }
+    if created {
+        set_control_socket_dir_permissions(path)?;
+    } else {
+        validate_control_socket_dir_permissions(path, &metadata)?;
+    }
+    Ok(())
+}
+
+fn set_control_socket_dir_permissions(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 0700 control_sockets.host_dir {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn validate_control_socket_dir_permissions(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "control_sockets.host_dir {} exists with permissions {mode:o}; use a private 0700 directory or remove it so aw-gateway can create it",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn resolve_container_path(home: &Path, configured: &str, suffix: [&str; 2]) -> PathBuf {
@@ -2838,6 +2993,7 @@ fn render_control_socket_paths(
             host_dir.display()
         );
     }
+    validate_control_socket_host_dir(&host_dir, runtime_id, user)?;
     let container_dir = PathBuf::from(template::render(&cfg.container_dir, &vars)?);
     if !container_dir.is_absolute() {
         anyhow::bail!(
@@ -2855,6 +3011,52 @@ fn render_control_socket_paths(
         host_dir,
         container_dir,
     })
+}
+
+fn validate_control_socket_host_dir(
+    host_dir: &Path,
+    runtime_id: &str,
+    user: &UserContext,
+) -> anyhow::Result<()> {
+    if host_dir
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        anyhow::bail!(
+            "control_sockets.host_dir must not contain '.' or '..' path components: {}",
+            host_dir.display()
+        );
+    }
+
+    let dangerous = [
+        PathBuf::from("/"),
+        user.home.clone(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/run"),
+        PathBuf::from("/run/user"),
+        PathBuf::from(format!("/run/user/{}", user.uid)),
+    ];
+    if dangerous.iter().any(|path| path == host_dir) {
+        anyhow::bail!(
+            "control_sockets.host_dir must be an isolated runtime-specific leaf directory, got dangerous shared path {}",
+            host_dir.display()
+        );
+    }
+
+    let Some(leaf) = host_dir.file_name().and_then(|value| value.to_str()) else {
+        anyhow::bail!(
+            "control_sockets.host_dir must end with runtime_id {runtime_id:?}, got {}",
+            host_dir.display()
+        );
+    };
+    if leaf != runtime_id {
+        anyhow::bail!(
+            "control_sockets.host_dir must end with runtime_id {runtime_id:?} so cleanup only removes the runtime leaf, got {}",
+            host_dir.display()
+        );
+    }
+
+    Ok(())
 }
 
 fn resolve_target_workspace(
@@ -3788,6 +3990,85 @@ name = "{{image_slug}}"
     }
 
     #[tokio::test]
+    async fn runtime_load_rejects_unsafe_control_socket_runtime_ids_and_host_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("gateway.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+
+[workspace]
+path = "{}"
+state_dir = ".aw-gateway"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "ephemeral"
+ephemeral_name = "{{image_slug}}-{{session_id}}"
+stop_when_idle = true
+"#,
+                dir.path().join("workspace").display(),
+            ),
+        )
+        .unwrap();
+
+        let err = Runtime::load(Some(config), Some("default"), Some("..".into()), true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid session id"), "{err}");
+
+        for (host_dir, expected) in [
+            ("/tmp", "dangerous shared path"),
+            ("/run/user/{uid}", "dangerous shared path"),
+            ("/run/user/{uid}/aw-gateway", "must end with runtime_id"),
+            (
+                "/run/user/{uid}/aw-gateway/../{runtime_id}",
+                "must not contain '.' or '..'",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("gateway.toml");
+            std::fs::write(
+                &config,
+                format!(
+                    r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+
+[workspace]
+path = "{}"
+state_dir = ".aw-gateway"
+
+[control_sockets]
+host_dir = "{host_dir}"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+"#,
+                    dir.path().join("workspace").display(),
+                ),
+            )
+            .unwrap();
+
+            let err = Runtime::load(Some(config), Some("default"), None, true)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[tokio::test]
     async fn runtime_load_rejects_explicit_session_id_for_fixed_target() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
@@ -3977,6 +4258,128 @@ name = "{{image_slug}}"
             ]
         );
         assert!(args.iter().any(|arg| arg == "aw-container-agent"));
+    }
+
+    #[test]
+    fn prepare_control_socket_dir_is_private_and_removes_stale_socket_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+            cfg.container_agent.enabled = true;
+            cfg.container_agent.control_socket = None;
+            cfg.container_agent.ssh_bridge = Some(crate::config::SshBridgeConfig {
+                enabled: true,
+                socket: None,
+                target: "127.0.0.1:22".into(),
+                mode: "0600".into(),
+            });
+        });
+
+        std::fs::create_dir_all(&runtime.control_sockets.host_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &runtime.control_sockets.host_dir,
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        std::fs::write(&runtime.control_sockets.host_agent_socket, "").unwrap();
+        std::fs::write(&runtime.control_sockets.host_ssh_socket, "").unwrap();
+
+        runtime.prepare_control_socket_dir().unwrap();
+
+        assert!(runtime.control_sockets.host_dir.is_dir());
+        assert!(!runtime.control_sockets.host_agent_socket.exists());
+        assert!(!runtime.control_sockets.host_ssh_socket.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_control_socket_dir_rejects_symlink_and_non_private_existing_dir() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+        let target = dir.path().join("real-runtime-dir");
+        std::fs::create_dir_all(&target).unwrap();
+        symlink(&target, &runtime.control_sockets.host_dir).unwrap();
+        let err = runtime
+            .prepare_control_socket_dir()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not be a symlink"), "{err}");
+        assert!(target.is_dir());
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+        std::fs::create_dir_all(&runtime.control_sockets.host_dir).unwrap();
+        std::fs::set_permissions(
+            &runtime.control_sockets.host_dir,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let err = runtime
+            .prepare_control_socket_dir()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exists with permissions 755"), "{err}");
+        let mode = std::fs::symlink_metadata(&runtime.control_sockets.host_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn cleanup_control_socket_dir_removes_only_runtime_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+            cfg.container_agent.enabled = true;
+            cfg.container_agent.control_socket = None;
+            cfg.container_agent.ssh_bridge = Some(crate::config::SshBridgeConfig {
+                enabled: true,
+                socket: None,
+                target: "127.0.0.1:22".into(),
+                mode: "0600".into(),
+            });
+        });
+        let parent = runtime
+            .control_sockets
+            .host_dir
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::create_dir_all(&runtime.control_sockets.host_dir).unwrap();
+        std::fs::write(parent.join("parent-marker"), "").unwrap();
+        std::fs::write(&runtime.control_sockets.host_agent_socket, "").unwrap();
+        std::fs::write(&runtime.control_sockets.host_ssh_socket, "").unwrap();
+
+        runtime.cleanup_control_socket_dir();
+
+        assert!(!runtime.control_sockets.host_dir.exists());
+        assert!(parent.join("parent-marker").exists());
+        assert!(parent.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_control_socket_dir_refuses_symlink_deletion_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+        let target = dir.path().join("real-runtime-dir");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("marker"), "").unwrap();
+        symlink(&target, &runtime.control_sockets.host_dir).unwrap();
+
+        runtime.cleanup_control_socket_dir();
+
+        assert!(target.join("marker").exists());
+        assert!(runtime.control_sockets.host_dir.exists());
     }
 
     #[test]
