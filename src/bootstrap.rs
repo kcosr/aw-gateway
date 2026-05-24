@@ -201,22 +201,7 @@ fn run_step(
             .with_context(|| format!("bootstrap user {:?} contains NUL", step.user))?;
         unsafe {
             command.pre_exec(move || {
-                #[cfg(target_os = "macos")]
-                let base_gid = libc::c_int::try_from(identity.gid).map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "gid exceeds c_int")
-                })?;
-                #[cfg(not(target_os = "macos"))]
-                let base_gid = identity.gid as libc::gid_t;
-                if libc::initgroups(user.as_ptr(), base_gid) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::setgid(identity.gid) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::setuid(identity.uid) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
+                crate::unix_priv::drop_to_user_pre_exec(&user, identity.uid, identity.gid)
             });
         }
     }
