@@ -400,52 +400,6 @@ impl GatewayConfig {
         stack.pop();
         base.overlay(template)
     }
-
-    pub fn effective_container_ssh(
-        &self,
-        target: &TargetConfig,
-    ) -> anyhow::Result<ContainerSshConfig> {
-        Ok(target.container_ssh.clone())
-    }
-
-    pub fn effective_control_sockets(
-        &self,
-        target: &TargetConfig,
-    ) -> anyhow::Result<ControlSocketsConfig> {
-        Ok(target.control_sockets.clone())
-    }
-
-    pub fn effective_lifecycle_steps(
-        &self,
-        target: &TargetConfig,
-    ) -> anyhow::Result<Vec<LifecycleStep>> {
-        Ok(target.lifecycle_steps.clone())
-    }
-
-    pub fn effective_host_steps(&self, target: &TargetConfig) -> anyhow::Result<Vec<HostStep>> {
-        Ok(target.host_steps.clone())
-    }
-
-    pub fn effective_container_bootstrap(
-        &self,
-        target: &TargetConfig,
-    ) -> anyhow::Result<ContainerBootstrapConfig> {
-        Ok(target.container_bootstrap.clone())
-    }
-
-    pub fn effective_container_bootstrap_steps(
-        &self,
-        target: &TargetConfig,
-    ) -> anyhow::Result<Vec<ContainerBootstrapStep>> {
-        Ok(target.container_bootstrap_steps.clone())
-    }
-
-    pub fn effective_container_agent(
-        &self,
-        target: &TargetConfig,
-    ) -> anyhow::Result<ContainerAgentConfig> {
-        Ok(target.container_agent.clone())
-    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -4789,12 +4743,12 @@ name = "{image_slug}"
         cfg.validate().unwrap();
 
         let default_target = cfg.effective_target("default").unwrap();
-        let default = cfg.effective_control_sockets(&default_target).unwrap();
+        let default = &default_target.control_sockets;
         assert_eq!(default.host_dir, "/run/user/{uid}/aw-gateway/{runtime_id}");
         assert_eq!(default.container_dir, "/run/aw-gateway");
 
         let custom_target = cfg.effective_target("custom").unwrap();
-        let custom = cfg.effective_control_sockets(&custom_target).unwrap();
+        let custom = &custom_target.control_sockets;
         assert_eq!(custom.host_dir, "/run/user/{uid}/aw-gateway/{runtime_id}");
         assert_eq!(custom.container_dir, "/tmp/aw-gateway");
     }
@@ -4822,7 +4776,7 @@ host_dir = "/var/run/aw/{runtime_id}"
         cfg.validate().unwrap();
 
         let target = cfg.effective_target("default").unwrap();
-        let effective = cfg.effective_control_sockets(&target).unwrap();
+        let effective = &target.control_sockets;
         assert_eq!(effective.host_dir, "/var/run/aw/{runtime_id}");
         assert_eq!(effective.container_dir, "/run/global");
     }
@@ -5296,18 +5250,8 @@ timeout = "2m"
         .unwrap();
         cfg.validate().unwrap();
         let target = cfg.effective_target("default").unwrap();
-        assert_eq!(
-            cfg.effective_lifecycle_steps(&target).unwrap()[0]
-                .timeout
-                .as_deref(),
-            Some("250ms")
-        );
-        assert_eq!(
-            cfg.effective_host_steps(&target).unwrap()[0]
-                .timeout
-                .as_deref(),
-            Some("2m")
-        );
+        assert_eq!(target.lifecycle_steps[0].timeout.as_deref(), Some("250ms"));
+        assert_eq!(target.host_steps[0].timeout.as_deref(), Some("2m"));
     }
 
     #[test]
@@ -5561,7 +5505,7 @@ command = ["acl-proxy", "--config", "/etc/acl-proxy/internal-acl-proxy.toml"]
         .unwrap();
         cfg.validate().unwrap();
         let target = cfg.effective_target("default").unwrap();
-        let effective = cfg.effective_container_agent(&target).unwrap();
+        let effective = &target.container_agent;
         assert_eq!(effective.services.len(), 2);
         let acl_proxy = effective
             .services
@@ -5601,7 +5545,7 @@ legacy_scp = "outbound"
         .unwrap();
         cfg.validate().unwrap();
         let target = cfg.effective_target("default").unwrap();
-        let effective = cfg.effective_container_ssh(&target).unwrap();
+        let effective = &target.container_ssh;
         assert_eq!(effective.transfer.sftp, SftpTransferMode::Deny);
         assert_eq!(
             effective.transfer.legacy_scp,
@@ -5662,7 +5606,7 @@ agent_program = "/target/agent"
         .unwrap();
         cfg.validate().unwrap();
         let target = cfg.effective_target("default").unwrap();
-        let effective = cfg.effective_container_bootstrap(&target).unwrap();
+        let effective = &target.container_bootstrap;
         assert!(effective.enabled);
         assert_eq!(effective.entrypoint, "/global/bootstrap");
         assert_eq!(effective.agent_program, "/target/agent");
@@ -5720,7 +5664,7 @@ enabled = false
         .unwrap();
         cfg.validate().unwrap();
         let target = cfg.effective_target("default").unwrap();
-        let effective = cfg.effective_lifecycle_steps(&target).unwrap();
+        let effective = &target.lifecycle_steps;
         let pre_start: Vec<_> = effective
             .iter()
             .filter(|step| step.phase == LifecyclePhase::PreStart)
@@ -5777,10 +5721,10 @@ timeout = "30s"
         .unwrap();
         cfg.validate().unwrap();
         let target = cfg.effective_target("default").unwrap();
-        let lifecycle = cfg.effective_lifecycle_steps(&target).unwrap();
+        let lifecycle = &target.lifecycle_steps;
         assert_eq!(lifecycle[0].command, ["/bin/prep"]);
         assert_eq!(lifecycle[0].timeout.as_deref(), Some("20s"));
-        let host = cfg.effective_host_steps(&target).unwrap();
+        let host = &target.host_steps;
         assert_eq!(host[0].command, ["/bin/firewall"]);
         assert_eq!(host[0].timeout.as_deref(), Some("30s"));
     }
