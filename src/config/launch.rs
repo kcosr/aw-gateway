@@ -116,6 +116,7 @@ struct LaunchValidationPolicy<'a> {
     template_policy: TemplatePolicy,
     targets: Option<&'a BTreeMap<String, TargetConfig>>,
     collect_references: bool,
+    validate_command_before_vars: bool,
 }
 
 impl<'a> LaunchValidationPolicy<'a> {
@@ -124,6 +125,7 @@ impl<'a> LaunchValidationPolicy<'a> {
             template_policy: TemplatePolicy::STRICT,
             targets: Some(targets),
             collect_references: true,
+            validate_command_before_vars: true,
         }
     }
 
@@ -132,6 +134,7 @@ impl<'a> LaunchValidationPolicy<'a> {
             template_policy: TemplatePolicy::ALLOW_UNBOUND_VAR_PREFIX,
             targets: None,
             collect_references: false,
+            validate_command_before_vars: false,
         }
     }
 }
@@ -151,14 +154,20 @@ fn validate_launch_shape(
     policy: LaunchValidationPolicy<'_>,
 ) -> anyhow::Result<()> {
     if let Some(targets) = policy.targets {
-        let target = shape
-            .target
-            .expect("effective launch validation requires target");
+        let Some(target) = shape.target else {
+            anyhow::bail!("launch {launch_name:?} target is required after defaults");
+        };
         if !targets.contains_key(target) {
             anyhow::bail!("launch {launch_name:?} references unknown target {target:?}");
         }
     } else if let Some(target) = shape.target {
         validate_name("launch.target", target)?;
+    }
+
+    if policy.validate_command_before_vars
+        && let Some(command) = shape.command
+    {
+        validate_command("launch.command", command)?;
     }
 
     for (name, var) in shape.vars {
@@ -177,7 +186,9 @@ fn validate_launch_shape(
         policy.template_policy,
     )?;
     if let Some(command) = shape.command {
-        validate_command("launch.command", command)?;
+        if !policy.validate_command_before_vars {
+            validate_command("launch.command", command)?;
+        }
         validate_command_templates_with_policy(
             "launch.command",
             command,
