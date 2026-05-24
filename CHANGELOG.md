@@ -17,6 +17,9 @@
 
 ### Fixed
 
+- Fixed gateway-side parsing of successful typed container-agent status
+  responses so agent readiness is detected correctly after container startup
+  ([#31](https://github.com/kcosr/aw-gateway/pull/31)).
 - Fixed rootless Podman session workspace cleanup for workspaces containing
   subuid-owned files by removing them through `podman unshare`
   ([#17](https://github.com/kcosr/aw-gateway/pull/17)).
