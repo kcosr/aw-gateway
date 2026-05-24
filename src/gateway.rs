@@ -1887,8 +1887,7 @@ impl Runtime {
 
     async fn ensure_ready(&self) -> anyhow::Result<ReadyStatus> {
         let _lock = self.acquire_lifecycle_lock().await?;
-        let mut started_container = false;
-        let mut attempted_container_start = false;
+        let mut failed_start_cleanup = FailedStartCleanup::default();
         let result = async {
             paths::ensure_private_dir(&self.paths.container_state_dir)?;
             self.prepare_control_socket_dir()?;
@@ -1904,50 +1903,13 @@ impl Runtime {
                     self.write_container_bootstrap_config()?;
                 }
             }
-            let mut inspect = self
+            let inspect = self
                 .container_runtime
                 .inspect(&self.identity.container_name)
                 .await?;
-            match readiness_plan(inspect.as_ref()) {
-                ContainerReadinessPlan::ReuseRunning => {
-                    let existing = inspect
-                        .as_ref()
-                        .expect("reuse plan requires existing inspect");
-                    self.validate_labels(existing)?;
-                }
-                ContainerReadinessPlan::StartStopped => {
-                    let existing = inspect
-                        .as_ref()
-                        .expect("start plan requires existing inspect");
-                    self.validate_labels(existing)?;
-                    self.run_lifecycle_phase(LifecyclePhase::PreStart, None)
-                        .await?;
-                    self.remove_stale_control_socket_files()?;
-                    attempted_container_start = true;
-                    self.container_runtime
-                        .start(&self.identity.container_name)
-                        .await?;
-                    started_container = true;
-                    inspect = self
-                        .container_runtime
-                        .inspect(&self.identity.container_name)
-                        .await?;
-                }
-                ContainerReadinessPlan::CreateMissing => {
-                    self.run_lifecycle_phase(LifecyclePhase::PreStart, None)
-                        .await?;
-                    self.remove_stale_control_socket_files()?;
-                    attempted_container_start = true;
-                    self.start_container().await?;
-                    started_container = true;
-                    inspect = self
-                        .container_runtime
-                        .inspect(&self.identity.container_name)
-                        .await?;
-                }
-            }
-            let inspect =
-                inspect.ok_or_else(|| anyhow::anyhow!("container did not exist after start"))?;
+            let inspect = self
+                .ensure_container_for_readiness_plan(inspect, &mut failed_start_cleanup)
+                .await?;
             self.validate_labels(&inspect)?;
             let container_pid = inspect.state.pid.to_string();
             self.run_lifecycle_phase(LifecyclePhase::PostStartHost, Some(&container_pid))
@@ -1976,10 +1938,7 @@ impl Runtime {
         let (inspect, status) = match result {
             Ok(value) => value,
             Err(err) => {
-                if started_container || attempted_container_start {
-                    self.cleanup_failed_start().await;
-                    self.cleanup_control_socket_dir();
-                }
+                failed_start_cleanup.run_if_needed(self).await;
                 return Err(err);
             }
         };
@@ -1997,6 +1956,46 @@ impl Runtime {
             local_ssh: None,
             client_config: None,
         })
+    }
+
+    async fn ensure_container_for_readiness_plan(
+        &self,
+        inspect: Option<ContainerInspect>,
+        failed_start_cleanup: &mut FailedStartCleanup,
+    ) -> anyhow::Result<ContainerInspect> {
+        match (readiness_plan(inspect.as_ref()), inspect) {
+            (ContainerReadinessPlan::ReuseRunning, Some(existing)) => {
+                self.validate_labels(&existing)?;
+                Ok(existing)
+            }
+            (ContainerReadinessPlan::StartStopped, Some(existing)) => {
+                self.validate_labels(&existing)?;
+                self.run_lifecycle_phase(LifecyclePhase::PreStart, None)
+                    .await?;
+                self.remove_stale_control_socket_files()?;
+                failed_start_cleanup.mark_runtime_start_attempted();
+                self.container_runtime
+                    .start(&self.identity.container_name)
+                    .await?;
+                self.inspect_container_after_start().await
+            }
+            (ContainerReadinessPlan::CreateMissing, None) => {
+                self.run_lifecycle_phase(LifecyclePhase::PreStart, None)
+                    .await?;
+                self.remove_stale_control_socket_files()?;
+                failed_start_cleanup.mark_runtime_start_attempted();
+                self.start_container().await?;
+                self.inspect_container_after_start().await
+            }
+            _ => unreachable!("readiness plan and inspect state should agree"),
+        }
+    }
+
+    async fn inspect_container_after_start(&self) -> anyhow::Result<ContainerInspect> {
+        self.container_runtime
+            .inspect(&self.identity.container_name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("container did not exist after start"))
     }
 
     async fn status(&self) -> anyhow::Result<GatewayStatus> {
@@ -3681,6 +3680,24 @@ enum ContainerReadinessPlan {
     ReuseRunning,
     StartStopped,
     CreateMissing,
+}
+
+#[derive(Debug, Default)]
+struct FailedStartCleanup {
+    runtime_start_attempted: bool,
+}
+
+impl FailedStartCleanup {
+    fn mark_runtime_start_attempted(&mut self) {
+        self.runtime_start_attempted = true;
+    }
+
+    async fn run_if_needed(self, runtime: &Runtime) {
+        if self.runtime_start_attempted {
+            runtime.cleanup_failed_start().await;
+            runtime.cleanup_control_socket_dir();
+        }
+    }
 }
 
 fn readiness_plan(inspect: Option<&ContainerInspect>) -> ContainerReadinessPlan {
@@ -5549,6 +5566,49 @@ exit 0
         assert_eq!(std::fs::read_to_string(log).unwrap(), "clean\n");
         assert!(!runtime.paths.control_sockets.host_agent_socket.exists());
         assert!(!runtime.paths.control_sockets.host_ssh_socket.exists());
+    }
+
+    #[tokio::test]
+    async fn ensure_ready_cleans_failed_runtime_start_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_runtime = dir.path().join("runtime");
+        let log = dir.path().join("cleanup.log");
+        let user = UserContext::current().unwrap();
+        write_fake_runtime(
+            &fake_runtime,
+            &format!(
+                r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<JSON
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":false,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  start)
+    echo start >> "{log}"
+    exit 7
+    ;;
+  stop)
+    echo stop >> "{log}"
+    ;;
+esac
+exit 0
+"#,
+                log = log.display(),
+                user = user.user,
+                uid = user.uid,
+            ),
+        );
+        let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+            cfg.target_defaults.lifecycle_steps.clear();
+            cfg.target_defaults.host_steps.clear();
+        });
+
+        let err = runtime.ensure_ready().await.unwrap_err();
+
+        assert!(err.to_string().contains("start"));
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "start\nstop\n");
+        assert!(!runtime.paths.control_sockets.host_dir.exists());
     }
 
     #[tokio::test]
