@@ -11,9 +11,15 @@ mod launch;
 mod resolver;
 mod validation;
 
-pub use agent::*;
-pub use http::*;
-pub use launch::*;
+pub use agent::{
+    ContainerAgentConfig, ContainerAgentConfigInput, ControlSocketConfig, EnvValue, HealthCheck,
+    RestartPolicy, ServiceConfig, SshBridgeConfig, SshBridgeConfigInput,
+};
+pub use http::{HttpAuthConfig, HttpAuthType, HttpConfig};
+pub use launch::{
+    LaunchConfig, LaunchConfigInput, LaunchStep, LaunchStepLocation, LaunchStepPhase,
+    LaunchVarConfig, LaunchVarType, LaunchVarValue,
+};
 use resolver::{
     TemplateChainResolver, launch_template_dependencies, overlay_launch_template,
     overlay_target_template, target_template_dependencies,
