@@ -211,13 +211,6 @@ impl ControlFailure {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(untagged)]
-pub(crate) enum ControlResponse<T> {
-    Success(ControlSuccess<T>),
-    Failure(ControlFailure),
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct SessionHoldResult {
     pub(crate) held: bool,
