@@ -1,7 +1,7 @@
 use super::ops::{
-    ExecutionOutcome, GatewayOperation, GatewayOperationResult, OperationError,
-    OperationExecutionOptions, OperationMode, OutputSelection, SuppliedLaunchVarValue,
-    SuppliedLaunchVars, execute_gateway_operation,
+    CanonicalLaunchVarValue, ExecutionOutcome, GatewayOperation, GatewayOperationResult,
+    OperationError, OperationExecutionOptions, OperationMode, OutputSelection, SuppliedLaunchVars,
+    execute_gateway_operation,
 };
 use crate::config::{GatewayConfig, HttpAuthType};
 use crate::paths::{self, UserContext};
@@ -602,19 +602,13 @@ impl<'de> Visitor<'de> for LaunchVarsVisitor {
         let mut vars = SuppliedLaunchVars::default();
         while let Some((key, value)) = map.next_entry::<String, serde_json::Value>()? {
             let value = match value {
-                serde_json::Value::String(value) => SuppliedLaunchVarValue::String(value),
-                serde_json::Value::Bool(value) => SuppliedLaunchVarValue::Boolean(value),
+                serde_json::Value::String(value) => {
+                    CanonicalLaunchVarValue::from_json_string(value)
+                }
+                serde_json::Value::Bool(value) => CanonicalLaunchVarValue::from_json_bool(value),
                 serde_json::Value::Number(value) => {
-                    if let Some(value) = value.as_i64() {
-                        SuppliedLaunchVarValue::Integer(value)
-                    } else {
-                        let value = value.as_f64().ok_or_else(|| {
-                            de::Error::custom(format!(
-                                "invalid launch variable {key:?}: number must be finite"
-                            ))
-                        })?;
-                        SuppliedLaunchVarValue::Float(value)
-                    }
+                    CanonicalLaunchVarValue::from_json_number(&key, value.as_i64(), value.as_f64())
+                        .map_err(de::Error::custom)?
                 }
                 serde_json::Value::Null
                 | serde_json::Value::Array(_)
@@ -809,7 +803,29 @@ stop_when_idle = false
 [launches.echo]
 target = "default"
 command = ["launch-command"]
-"#,
+
+[launches.typed]
+target = "default"
+cwd = "/repo-{{var.repo}}-{{var.count}}"
+env = {{ REPO = "{{var.repo}}", DEBUG = "{{var.debug}}", COUNT = "{{var.count}}", MODE = "{{var.mode}}", RATIO = "{{var.ratio}}" }}
+command = ["launch-command", "{{var.repo}}", "{{var.mode}}", "{{var.debug}}", "{{var.count}}", "{{var.ratio}}"]
+
+[launches.typed.vars]
+repo = {{ type = "string", required = true }}
+mode = {{ type = "enum", values = ["fast", "safe"], default = "fast" }}
+debug = {{ type = "boolean", default = false }}
+count = {{ type = "number", default = 1 }}
+ratio = {{ type = "number", default = 1 }}
+
+[[launches.typed.steps]]
+phase = "post_ready"
+location = "container"
+name = "prepare"
+required = false
+cwd = "/step-{{var.mode}}-{{var.count}}"
+env = {{ STEP_REPO = "{{var.repo}}", STEP_DEBUG = "{{var.debug}}", STEP_RATIO = "{{var.ratio}}" }}
+command = ["step-command", "{{var.repo}}", "{{var.count}}", "{{var.ratio}}"]
+            "#,
                 program = fake_runtime.display(),
                 workspace = dir.path().join("workspace").display()
             ),
@@ -1015,20 +1031,20 @@ command = ["launch-command"]
         let vars = parsed.vars.unwrap();
         assert!(matches!(
             vars.get("repo"),
-            Some(SuppliedLaunchVarValue::String(value))
+            Some(CanonicalLaunchVarValue::String(value))
                 if value == "https://example.test/repo.git"
         ));
         assert!(matches!(
             vars.get("debug"),
-            Some(SuppliedLaunchVarValue::Boolean(true))
+            Some(CanonicalLaunchVarValue::Boolean(true))
         ));
         assert!(matches!(
             vars.get("count"),
-            Some(SuppliedLaunchVarValue::Integer(3))
+            Some(CanonicalLaunchVarValue::Number(value)) if value == "3"
         ));
         assert!(matches!(
             vars.get("ratio"),
-            Some(SuppliedLaunchVarValue::Float(value)) if *value == 1.5
+            Some(CanonicalLaunchVarValue::Number(value)) if value == "1.5"
         ));
 
         let duplicate =
@@ -1266,6 +1282,57 @@ command = ["launch-command"]
         assert_eq!(body["mode"], "detach");
         assert_eq!(body["status"], "accepted");
         assert!(body["operation_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn launch_route_renders_typed_json_vars_into_steps_and_final_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_runtime = dir.path().join("runtime");
+        let log = dir.path().join("runtime.log");
+        write_fake_runtime(&fake_runtime, &fake_running_runtime_script(&log));
+        let app = app_for_config(http_operation_config(&dir, &fake_runtime));
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/api/v1/launches/typed/run",
+            r#"{"vars":{"repo":"alpha","mode":"safe","debug":true,"count":3,"ratio":1.5},"mode":"wait"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], true);
+
+        let log = std::fs::read_to_string(&log).unwrap();
+        assert!(log.contains("--workdir /step-safe-3"), "{log}");
+        assert!(log.contains("--env STEP_DEBUG=true"), "{log}");
+        assert!(log.contains("--env STEP_REPO=alpha"), "{log}");
+        assert!(log.contains("--env STEP_RATIO=1.5"), "{log}");
+        assert!(log.contains("ubuntu-dev step-command alpha 3 1.5"), "{log}");
+        assert!(log.contains("--workdir /repo-alpha-3"), "{log}");
+        assert!(log.contains("--env COUNT=3"), "{log}");
+        assert!(log.contains("--env DEBUG=true"), "{log}");
+        assert!(log.contains("--env MODE=safe"), "{log}");
+        assert!(log.contains("--env RATIO=1.5"), "{log}");
+        assert!(log.contains("--env REPO=alpha"), "{log}");
+        assert!(
+            log.contains("ubuntu-dev launch-command alpha safe true 3 1.5"),
+            "{log}"
+        );
+
+        let (status, body) = post_json(
+            app,
+            "/api/v1/launches/typed/run",
+            r#"{"vars":{"repo":"alpha","mode":"bad","debug":true,"count":3}}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_launch_var");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("invalid enum launch variable \"mode\""),
+            "{body}"
+        );
     }
 
     #[tokio::test]

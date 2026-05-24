@@ -80,9 +80,9 @@ use model::{
     LaunchVarMetadata, ReadyStatus, TargetEntry, TcpEndpoint, gateway_status_name,
 };
 use ops::{
-    ExecutionOutcome, GatewayOperation, GatewayOperationResult, OperationError,
-    OperationExecutionOptions, OperationMode, OperationResult, OutputSelection, RemoveResult,
-    SshGatewayOperation, SshRenderOptions, StopResult, SuppliedLaunchVarValue, SuppliedLaunchVars,
+    CanonicalLaunchVarValue, ExecutionOutcome, GatewayOperation, GatewayOperationResult,
+    OperationError, OperationExecutionOptions, OperationMode, OperationResult, OutputSelection,
+    RemoveResult, SshGatewayOperation, SshRenderOptions, StopResult, SuppliedLaunchVars,
     execute_gateway_operation, lookup_launch, operation_up_with_runtime,
 };
 use session::{generate_session_id_value, validate_session_id};
@@ -1298,15 +1298,18 @@ fn resolve_launch_vars(
         }
     }
     for (name, var) in &launch.vars {
-        if let Some(value) = supplied.get(name) {
-            resolved.insert(name.clone(), validate_launch_var_value(name, var, value)?);
-        } else if let Some(default) = var.default_rendered() {
-            resolved.insert(name.clone(), default);
+        let value = if let Some(value) = supplied.get(name) {
+            value.coerce_for_config(name, var)?
+        } else if let Some(default) = &var.default {
+            CanonicalLaunchVarValue::from_config_default(default).coerce_for_config(name, var)?
         } else if var.required {
             return Err(OperationError::invalid_launch_variable(format!(
                 "missing required launch variable {name:?}"
             )));
-        }
+        } else {
+            continue;
+        };
+        resolved.insert(name.clone(), value.rendered());
     }
     tracing::debug!(
         launch = launch_name,
@@ -1314,82 +1317,6 @@ fn resolve_launch_vars(
         "resolved launch variables"
     );
     Ok(resolved)
-}
-
-fn validate_launch_var_value(
-    name: &str,
-    var: &LaunchVarConfig,
-    value: &SuppliedLaunchVarValue,
-) -> OperationResult<String> {
-    match var.var_type {
-        LaunchVarType::String => match value {
-            SuppliedLaunchVarValue::String(value) => Ok(value.to_string()),
-            _ => Err(OperationError::invalid_launch_variable(format!(
-                "invalid string launch variable {name:?}; expected string"
-            ))),
-        },
-        LaunchVarType::Enum => {
-            let SuppliedLaunchVarValue::String(value) = value else {
-                return Err(OperationError::invalid_launch_variable(format!(
-                    "invalid enum launch variable {name:?}; expected string"
-                )));
-            };
-            let values = var.values.as_deref().unwrap_or(&[]);
-            if values.iter().any(|allowed| allowed == value) {
-                Ok(value.to_string())
-            } else {
-                Err(OperationError::invalid_launch_variable(format!(
-                    "invalid enum launch variable {name:?}; expected one of {}",
-                    values.join(", ")
-                )))
-            }
-        }
-        LaunchVarType::Boolean => match value {
-            SuppliedLaunchVarValue::Boolean(value) => Ok(value.to_string()),
-            SuppliedLaunchVarValue::String(value) if value == "true" || value == "false" => {
-                Ok(value.to_string())
-            }
-            _ => Err(OperationError::invalid_launch_variable(format!(
-                "invalid boolean launch variable {name:?}; expected true or false"
-            ))),
-        },
-        LaunchVarType::Number => match value {
-            SuppliedLaunchVarValue::Integer(value) => Ok(value.to_string()),
-            SuppliedLaunchVarValue::Float(value) => {
-                if !value.is_finite() {
-                    return Err(OperationError::invalid_launch_variable(format!(
-                        "invalid number launch variable {name:?}; expected finite number"
-                    )));
-                }
-                Ok(canonical_cli_number(&value.to_string(), *value))
-            }
-            SuppliedLaunchVarValue::String(value) => {
-                let parsed = value.parse::<f64>().map_err(|_| {
-                    OperationError::invalid_launch_variable(format!(
-                        "invalid number launch variable {name:?}"
-                    ))
-                })?;
-                if !parsed.is_finite() {
-                    return Err(OperationError::invalid_launch_variable(format!(
-                        "invalid number launch variable {name:?}; expected finite number"
-                    )));
-                }
-                Ok(canonical_cli_number(value, parsed))
-            }
-            SuppliedLaunchVarValue::Boolean(_) => Err(OperationError::invalid_launch_variable(
-                format!("invalid number launch variable {name:?}"),
-            )),
-        },
-    }
-}
-
-fn canonical_cli_number(raw: &str, parsed: f64) -> String {
-    if raw.parse::<i64>().is_ok() {
-        raw.trim_start_matches('+').to_string()
-    } else {
-        let text = parsed.to_string();
-        text.strip_suffix(".0").unwrap_or(&text).to_string()
-    }
 }
 
 async fn run_launch_steps(
@@ -5177,21 +5104,108 @@ mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
         typed
             .insert(
                 "repo".into(),
-                SuppliedLaunchVarValue::String("https://example.test/repo.git".into()),
+                CanonicalLaunchVarValue::String("https://example.test/repo.git".into()),
             )
             .unwrap();
         typed
-            .insert("count".into(), SuppliedLaunchVarValue::Integer(3))
+            .insert("count".into(), CanonicalLaunchVarValue::Number("3".into()))
             .unwrap();
         typed
-            .insert("debug".into(), SuppliedLaunchVarValue::Boolean(true))
+            .insert("debug".into(), CanonicalLaunchVarValue::Boolean(true))
             .unwrap();
         typed
-            .insert("mode".into(), SuppliedLaunchVarValue::String("safe".into()))
+            .insert(
+                "mode".into(),
+                CanonicalLaunchVarValue::String("safe".into()),
+            )
             .unwrap();
         let vars = resolve_launch_vars("agent", &launch, &typed).unwrap();
         assert_eq!(vars["count"], "3");
         assert_eq!(vars["debug"], "true");
+    }
+
+    #[test]
+    fn launch_var_resolution_renders_command_env_cwd_and_steps_from_canonical_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.agent]
+target = "default"
+cwd = "/repo-{var.repo}-{var.count}"
+env = { REPO = "{var.repo}", DEBUG = "{var.debug}", COUNT = "{var.count}", MODE = "{var.mode}" }
+command = ["launch-command", "{var.repo}", "{var.mode}", "{var.debug}", "{var.count}"]
+
+[launches.agent.vars]
+repo = { type = "string", required = true }
+count = { type = "number", default = 1 }
+debug = { type = "boolean", default = false }
+mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
+
+[[launches.agent.steps]]
+phase = "post_ready"
+location = "container"
+name = "prepare"
+cwd = "/step-{var.mode}-{var.count}"
+env = { STEP_REPO = "{var.repo}", STEP_DEBUG = "{var.debug}" }
+command = ["step-command", "{var.repo}", "{var.count}"]
+"#,
+        )
+        .unwrap();
+        let launch = cfg.effective_launch("agent").unwrap();
+        let supplied = SuppliedLaunchVars::from_cli_pairs(vec![
+            "repo=alpha".into(),
+            "count=2.0".into(),
+            "debug=true".into(),
+            "mode=safe".into(),
+        ])
+        .unwrap();
+        let resolved = resolve_launch_vars("agent", &launch, &supplied).unwrap();
+        let vars = launch_template_vars(&runtime, &resolved, Some("123"));
+
+        let launch_env = render_template_map(&launch.env, &vars).unwrap();
+        assert_eq!(launch_env["REPO"], "alpha");
+        assert_eq!(launch_env["DEBUG"], "true");
+        assert_eq!(launch_env["COUNT"], "2");
+        assert_eq!(launch_env["MODE"], "safe");
+
+        let step = &launch.steps[0];
+        let step_cwd = render_launch_cwd(
+            step.cwd.as_deref(),
+            &vars,
+            runtime.identity.container_home.as_path(),
+        )
+        .unwrap();
+        assert_eq!(step_cwd, Some(PathBuf::from("/step-safe-2")));
+        let step_env =
+            launch_container_step_env(&BTreeMap::new(), &launch_env, &step.env, &vars).unwrap();
+        assert_eq!(step_env["STEP_REPO"], "alpha");
+        assert_eq!(step_env["STEP_DEBUG"], "true");
+        assert_eq!(
+            template::render_argv(&step.command, &vars).unwrap(),
+            ["step-command", "alpha", "2"]
+        );
+
+        let final_cwd = render_launch_cwd(
+            launch.cwd.as_deref(),
+            &vars,
+            runtime.identity.container_home.as_path(),
+        )
+        .unwrap();
+        assert_eq!(final_cwd, Some(PathBuf::from("/repo-alpha-2")));
+        let final_env = launch_final_env(&BTreeMap::new(), &launch_env);
+        assert_eq!(final_env["COUNT"], "2");
+        assert_eq!(
+            template::render_argv(&launch.command, &vars).unwrap(),
+            ["launch-command", "alpha", "safe", "true", "2"]
+        );
     }
 
     #[tokio::test]
@@ -5267,7 +5281,7 @@ mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
 
         let mut invalid_type = SuppliedLaunchVars::default();
         invalid_type
-            .insert("repo".into(), SuppliedLaunchVarValue::Boolean(true))
+            .insert("repo".into(), CanonicalLaunchVarValue::Boolean(true))
             .unwrap();
         let err = launch_execute_with_config(
             cfg,
