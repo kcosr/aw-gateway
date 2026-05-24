@@ -2,7 +2,9 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
-use crate::helpers::{gateway_sample_for_test, launch_config_for_test};
+use crate::helpers::{
+    gateway_sample_for_test, gateway_sample_with_transfer_denied, launch_config_for_test,
+};
 
 #[test]
 fn ssh_up_rejects_local_listen_mode_before_serving_listener() {
@@ -67,9 +69,7 @@ fn ssh_dispatch_rejects_host_side_transfer_commands_when_policy_disallows_them()
     let dir = tempdir().unwrap();
     let config = dir.path().join("gateway.toml");
     let workspace = dir.path().join("workspace");
-    let sample = gateway_sample_for_test(&dir, &workspace)
-        .replace("sftp = \"allow\"", "sftp = \"deny\"")
-        .replace("legacy_scp = \"allow\"", "legacy_scp = \"deny\"");
+    let sample = gateway_sample_with_transfer_denied(&dir, &workspace);
     std::fs::write(&config, sample).unwrap();
 
     Command::cargo_bin("aw-gateway")
@@ -97,9 +97,7 @@ fn ssh_dispatch_transfer_gate_uses_defaults_not_user_default_target_override() {
     let config = dir.path().join("gateway.toml");
     let workspace = dir.path().join("workspace");
     let home = dir.path().join("home");
-    let sample = gateway_sample_for_test(&dir, &workspace)
-        .replace("sftp = \"allow\"", "sftp = \"deny\"")
-        .replace("legacy_scp = \"allow\"", "legacy_scp = \"deny\"")
+    let sample = gateway_sample_with_transfer_denied(&dir, &workspace)
         + r#"
 
 [targets.permissive]

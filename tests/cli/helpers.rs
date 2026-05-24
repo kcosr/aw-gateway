@@ -34,13 +34,33 @@ command = ["git", "clone", "--branch", "main", "--single-branch", "{var.repo}", 
 }
 
 pub(crate) fn gateway_sample_for_test(dir: &TempDir, workspace: &std::path::Path) -> String {
-    include_str!("../../aw-gateway.sample.toml")
-        .replace(
-            "directory = \"{state}/logs/gateway\"",
-            &format!("directory = \"{}\"", dir.path().join("logs").display()),
-        )
-        .replace(
-            "path = \"workspace\"",
-            &format!("path = \"{}\"", workspace.display()),
-        )
+    let sample = include_str!("../../aw-gateway.sample.toml").to_string();
+    let sample = replace_required(
+        sample,
+        "directory = \"{state}/logs/gateway\"",
+        &format!("directory = \"{}\"", dir.path().join("logs").display()),
+    );
+    replace_required(
+        sample,
+        "path = \"workspace\"",
+        &format!("path = \"{}\"", workspace.display()),
+    )
+}
+
+pub(crate) fn gateway_sample_with_transfer_denied(
+    dir: &TempDir,
+    workspace: &std::path::Path,
+) -> String {
+    let sample = gateway_sample_for_test(dir, workspace);
+    let sample = replace_required(sample, "sftp = \"allow\"", "sftp = \"deny\"");
+    replace_required(sample, "legacy_scp = \"allow\"", "legacy_scp = \"deny\"")
+}
+
+fn replace_required(input: String, needle: &str, replacement: &str) -> String {
+    let output = input.replace(needle, replacement);
+    assert_ne!(
+        output, input,
+        "expected aw-gateway sample fixture to contain {needle:?}"
+    );
+    output
 }
