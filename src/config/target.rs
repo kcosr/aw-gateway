@@ -1,3 +1,6 @@
+use super::steps::{
+    LifecycleStepKey, StepKey, merge_target_step_patches, validate_raw_target_steps,
+};
 use super::validation::*;
 use super::{
     ContainerAgentConfig, ContainerAgentConfigInput, ContainerBootstrapStep, HostStep,
@@ -266,7 +269,7 @@ impl TargetConfigInput {
                 container_bootstrap,
             ));
         }
-        self.lifecycle_steps = merge_raw_steps(
+        self.lifecycle_steps = merge_target_step_patches(
             "lifecycle_steps",
             self.lifecycle_steps
                 .iter()
@@ -286,7 +289,7 @@ impl TargetConfigInput {
         .into_iter()
         .map(RawLifecycleStep::from_effective)
         .collect();
-        self.host_steps = merge_raw_steps(
+        self.host_steps = merge_target_step_patches(
             "host_steps",
             self.host_steps
                 .iter()
@@ -304,7 +307,7 @@ impl TargetConfigInput {
         .into_iter()
         .map(RawHostStep::from_effective)
         .collect();
-        self.container_bootstrap_steps = merge_raw_steps(
+        self.container_bootstrap_steps = merge_target_step_patches(
             "container_bootstrap_steps",
             self.container_bootstrap_steps
                 .iter()
