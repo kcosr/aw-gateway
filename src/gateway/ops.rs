@@ -550,17 +550,17 @@ async fn operation_stop(
     let _lock = runtime.acquire_lifecycle_lock().await?;
     let Some(inspect) = runtime
         .container_runtime
-        .inspect(&runtime.container_name)
+        .inspect(&runtime.identity.container_name)
         .await?
     else {
         return Ok(StopResult {
-            container: runtime.container_name,
+            container: runtime.identity.container_name,
             stopped: false,
         });
     };
     runtime.stop_inspected_container(&inspect).await?;
     Ok(StopResult {
-        container: runtime.container_name,
+        container: runtime.identity.container_name,
         stopped: true,
     })
 }
@@ -573,12 +573,12 @@ async fn operation_remove(
     let _lock = runtime.acquire_lifecycle_lock().await?;
     let Some(inspect) = runtime
         .container_runtime
-        .inspect(&runtime.container_name)
+        .inspect(&runtime.identity.container_name)
         .await?
     else {
         runtime.cleanup_control_socket_dir();
         return Ok(RemoveResult {
-            container: runtime.container_name,
+            container: runtime.identity.container_name,
             removed: false,
         });
     };
@@ -589,20 +589,20 @@ async fn operation_remove(
     }
     if let Some(current) = runtime
         .container_runtime
-        .inspect(&runtime.container_name)
+        .inspect(&runtime.identity.container_name)
         .await?
     {
         runtime.validate_labels(&current)?;
         runtime
             .container_runtime
-            .rm(&runtime.container_name)
+            .rm(&runtime.identity.container_name)
             .await?;
     }
     if !was_running {
         runtime.cleanup_control_socket_dir();
     }
     Ok(RemoveResult {
-        container: runtime.container_name,
+        container: runtime.identity.container_name,
         removed: true,
     })
 }

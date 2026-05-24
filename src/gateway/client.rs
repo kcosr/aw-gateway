@@ -214,7 +214,7 @@ impl Runtime {
 "#,
                 alias = alias,
                 host_name = host_name,
-                target = self.target_name,
+                target = self.identity.target_name,
                 identity_lines = identity_lines,
                 gateway = self.cfg.client_config.gateway_path,
             ));
@@ -229,7 +229,7 @@ impl Runtime {
             host = self.cfg.client_config.host,
             host_name = host_name,
             alias = alias,
-            target = self.target_name,
+            target = self.identity.target_name,
             identity_lines = identity_lines,
             gateway = self.cfg.client_config.gateway_path,
         ))
@@ -237,7 +237,7 @@ impl Runtime {
 
     fn client_vars(&self) -> Vars {
         let mut vars = self.vars(None);
-        vars.insert("target".into(), self.target_name.clone());
+        vars.insert("target".into(), self.identity.target_name.clone());
         vars.insert("host".into(), self.cfg.client_config.host.clone());
         vars
     }
