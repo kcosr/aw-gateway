@@ -139,17 +139,25 @@ impl GatewayConfig {
             .validate_templates("logging", GATEWAY_LOGGING_TEMPLATE_VARS)?;
         self.http.validate()?;
         let effective_targets = self.effective_targets()?;
+        self.validate_launch_definitions(&effective_targets)?;
+        self.validate_target_agent_compatibility(&effective_targets)?;
+        self.ssh_dispatch.validate()?;
+        Ok(())
+    }
+
+    fn validate_launch_definitions(
+        &self,
+        targets: &BTreeMap<String, TargetConfig>,
+    ) -> anyhow::Result<()> {
         for (name, launch) in &self.launches {
             validate_name("launch", name)?;
             if name == "show" {
                 anyhow::bail!("launch name \"show\" is reserved for launch show");
             }
             launch.validate_partial(name)?;
-            self.effective_launch_with_targets(name, launch, &effective_targets)
+            self.resolve_effective_launch(name, launch, targets)
                 .with_context(|| format!("validate effective launch {name:?}"))?;
         }
-        self.validate_target_agent_compatibility(&effective_targets)?;
-        self.ssh_dispatch.validate()?;
         Ok(())
     }
 
@@ -228,7 +236,7 @@ impl GatewayConfig {
         self.launches
             .iter()
             .map(|(name, launch)| {
-                self.effective_launch_with_targets(name, launch, &targets)
+                self.resolve_effective_launch(name, launch, &targets)
                     .map(|launch| (name.clone(), launch))
             })
             .collect()
@@ -240,10 +248,10 @@ impl GatewayConfig {
             .launches
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown launch {name:?}"))?;
-        self.effective_launch_with_targets(name, launch, &targets)
+        self.resolve_effective_launch(name, launch, &targets)
     }
 
-    fn effective_launch_with_targets(
+    fn resolve_effective_launch(
         &self,
         name: &str,
         launch: &LaunchConfigInput,
@@ -4813,8 +4821,36 @@ use = ["target"]
         )
         .unwrap();
         let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("validate effective launch \"agent\""), "{err}");
         assert!(
             err.contains("launch \"agent\" command is required after defaults"),
+            "{err}"
+        );
+
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launch_defaults]
+command = ["true"]
+
+[launch_templates.target]
+target = "missing"
+
+[launches.agent]
+use = ["target"]
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("validate effective launch \"agent\""), "{err}");
+        assert!(
+            err.contains("launch \"agent\" references unknown target \"missing\""),
             "{err}"
         );
     }
@@ -4909,6 +4945,47 @@ type = "string"
         let err = format!("{:#}", cfg.validate().unwrap_err());
         assert!(err.contains("launch var"), "{err}");
         assert!(err.contains("bad name"), "{err}");
+    }
+
+    #[test]
+    fn launch_partial_allows_later_var_bindings_but_effective_rejects_unbound_vars() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launch_defaults]
+target = "default"
+command = ["echo", "{var.future}"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.bad]
+target = "default"
+command = ["echo", "{var.future}"]
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(
+            err.contains("unknown interpolation variable {var.future}"),
+            "{err}"
+        );
     }
 
     #[test]

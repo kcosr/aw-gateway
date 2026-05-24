@@ -23,63 +23,19 @@ impl LaunchConfig {
         launch_name: &str,
         targets: &BTreeMap<String, TargetConfig>,
     ) -> anyhow::Result<()> {
-        if !targets.contains_key(&self.target) {
-            anyhow::bail!(
-                "launch {launch_name:?} references unknown target {:?}",
-                self.target
-            );
-        }
-        validate_command("launch.command", &self.command)?;
-        for (name, var) in &self.vars {
-            validate_name("launch var", name)?;
-            var.validate(launch_name, name)?;
-        }
-        let allowed = self.allowed_template_vars();
-        let allowed_refs = allowed.iter().map(String::as_str).collect::<Vec<_>>();
-        if let Some(cwd) = &self.cwd {
-            validate_template("launch.cwd", cwd, &allowed_refs)?;
-        }
-        validate_env_keyed_template_map("launch.env", &self.env, &allowed_refs)?;
-        validate_command_templates("launch.command", &self.command, &allowed_refs)?;
-        let mut referenced_vars = BTreeSet::new();
-        collect_var_references(self.cwd.as_deref(), &mut referenced_vars)?;
-        collect_var_references_from_map(&self.env, &mut referenced_vars)?;
-        collect_var_references_from_command(&self.command, &mut referenced_vars)?;
-        let mut step_names = BTreeSet::new();
-        for step in &self.steps {
-            step.validate(launch_name, &allowed_refs)?;
-            if !step_names.insert(step.name.clone()) {
-                anyhow::bail!(
-                    "launch {launch_name:?} defines duplicate step {:?}",
-                    step.name
-                );
-            }
-            collect_var_references(step.cwd.as_deref(), &mut referenced_vars)?;
-            collect_var_references_from_map(&step.env, &mut referenced_vars)?;
-            collect_var_references_from_command(&step.command, &mut referenced_vars)?;
-        }
-        for var_name in referenced_vars {
-            let var = self.vars.get(&var_name).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "launch {launch_name:?} references undeclared variable {var_name:?}"
-                )
-            })?;
-            if !var.required && var.default.is_none() {
-                anyhow::bail!(
-                    "launch {launch_name:?} optional variable {var_name:?} is referenced by a template and must define default"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn allowed_template_vars(&self) -> Vec<String> {
-        let mut allowed = LAUNCH_TEMPLATE_BUILTINS
-            .iter()
-            .map(|value| value.to_string())
-            .collect::<Vec<_>>();
-        allowed.extend(self.vars.keys().map(|name| format!("var.{name}")));
-        allowed
+        let policy = LaunchValidationPolicy::effective(targets);
+        validate_launch_shape(
+            launch_name,
+            LaunchShape {
+                target: Some(&self.target),
+                cwd: self.cwd.as_deref(),
+                env: &self.env,
+                command: Some(&self.command),
+                vars: &self.vars,
+                steps: &self.steps,
+            },
+            policy,
+        )
     }
 }
 
@@ -105,43 +61,18 @@ impl LaunchConfigInput {
         for template in &self.use_templates {
             validate_name("launch template reference", template)?;
         }
-        if let Some(target) = &self.target {
-            validate_name("launch.target", target)?;
-        }
-        for (name, var) in &self.vars {
-            validate_name("launch var", name)?;
-            var.validate(launch_name, name)?;
-        }
-        let allowed = self.allowed_template_vars();
-        let allowed_refs = allowed.iter().map(String::as_str).collect::<Vec<_>>();
-        if let Some(cwd) = &self.cwd {
-            validate_partial_launch_template("launch.cwd", cwd, &allowed_refs)?;
-        }
-        validate_partial_launch_env_map("launch.env", &self.env, &allowed_refs)?;
-        if let Some(command) = &self.command {
-            validate_command("launch.command", command)?;
-            validate_partial_launch_command_templates("launch.command", command, &allowed_refs)?;
-        }
-        let mut step_names = BTreeSet::new();
-        for step in &self.steps {
-            step.validate_partial(launch_name, &allowed_refs)?;
-            if !step_names.insert(step.name.clone()) {
-                anyhow::bail!(
-                    "launch {launch_name:?} defines duplicate step {:?}",
-                    step.name
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn allowed_template_vars(&self) -> Vec<String> {
-        let mut allowed = LAUNCH_TEMPLATE_BUILTINS
-            .iter()
-            .map(|value| value.to_string())
-            .collect::<Vec<_>>();
-        allowed.extend(self.vars.keys().map(|name| format!("var.{name}")));
-        allowed
+        validate_launch_shape(
+            launch_name,
+            LaunchShape {
+                target: self.target.as_deref(),
+                cwd: self.cwd.as_deref(),
+                env: &self.env,
+                command: self.command.as_deref(),
+                vars: &self.vars,
+                steps: &self.steps,
+            },
+            LaunchValidationPolicy::partial(),
+        )
     }
 
     pub(super) fn overlay(mut self, later: &Self) -> anyhow::Result<Self> {
@@ -178,6 +109,139 @@ impl LaunchConfigInput {
             steps: self.steps,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LaunchValidationPolicy<'a> {
+    template_policy: TemplatePolicy,
+    targets: Option<&'a BTreeMap<String, TargetConfig>>,
+    collect_references: bool,
+    validate_command_before_vars: bool,
+}
+
+impl<'a> LaunchValidationPolicy<'a> {
+    fn effective(targets: &'a BTreeMap<String, TargetConfig>) -> Self {
+        Self {
+            template_policy: TemplatePolicy::STRICT,
+            targets: Some(targets),
+            collect_references: true,
+            validate_command_before_vars: true,
+        }
+    }
+
+    fn partial() -> Self {
+        Self {
+            template_policy: TemplatePolicy::ALLOW_UNBOUND_VAR_PREFIX,
+            targets: None,
+            collect_references: false,
+            validate_command_before_vars: false,
+        }
+    }
+}
+
+struct LaunchShape<'a> {
+    target: Option<&'a str>,
+    cwd: Option<&'a str>,
+    env: &'a BTreeMap<String, String>,
+    command: Option<&'a [String]>,
+    vars: &'a BTreeMap<String, LaunchVarConfig>,
+    steps: &'a [LaunchStep],
+}
+
+fn validate_launch_shape(
+    launch_name: &str,
+    shape: LaunchShape<'_>,
+    policy: LaunchValidationPolicy<'_>,
+) -> anyhow::Result<()> {
+    if let Some(targets) = policy.targets {
+        let Some(target) = shape.target else {
+            anyhow::bail!("launch {launch_name:?} target is required after defaults");
+        };
+        if !targets.contains_key(target) {
+            anyhow::bail!("launch {launch_name:?} references unknown target {target:?}");
+        }
+    } else if let Some(target) = shape.target {
+        validate_name("launch.target", target)?;
+    }
+
+    if policy.validate_command_before_vars
+        && let Some(command) = shape.command
+    {
+        validate_command("launch.command", command)?;
+    }
+
+    for (name, var) in shape.vars {
+        validate_name("launch var", name)?;
+        var.validate(launch_name, name)?;
+    }
+    let allowed = allowed_template_vars(shape.vars);
+    let allowed_refs = allowed.iter().map(String::as_str).collect::<Vec<_>>();
+    if let Some(cwd) = shape.cwd {
+        validate_template_with_policy("launch.cwd", cwd, &allowed_refs, policy.template_policy)?;
+    }
+    validate_env_keyed_template_map_with_policy(
+        "launch.env",
+        shape.env,
+        &allowed_refs,
+        policy.template_policy,
+    )?;
+    if let Some(command) = shape.command {
+        if !policy.validate_command_before_vars {
+            validate_command("launch.command", command)?;
+        }
+        validate_command_templates_with_policy(
+            "launch.command",
+            command,
+            &allowed_refs,
+            policy.template_policy,
+        )?;
+    }
+
+    let mut referenced_vars = BTreeSet::new();
+    if policy.collect_references {
+        collect_var_references(shape.cwd, &mut referenced_vars)?;
+        collect_var_references_from_map(shape.env, &mut referenced_vars)?;
+        if let Some(command) = shape.command {
+            collect_var_references_from_command(command, &mut referenced_vars)?;
+        }
+    }
+
+    let mut step_names = BTreeSet::new();
+    for step in shape.steps {
+        step.validate(launch_name, &allowed_refs, policy.template_policy)?;
+        if !step_names.insert(step.name.clone()) {
+            anyhow::bail!(
+                "launch {launch_name:?} defines duplicate step {:?}",
+                step.name
+            );
+        }
+        if policy.collect_references {
+            collect_var_references(step.cwd.as_deref(), &mut referenced_vars)?;
+            collect_var_references_from_map(&step.env, &mut referenced_vars)?;
+            collect_var_references_from_command(&step.command, &mut referenced_vars)?;
+        }
+    }
+
+    for var_name in referenced_vars {
+        let var = shape.vars.get(&var_name).ok_or_else(|| {
+            anyhow::anyhow!("launch {launch_name:?} references undeclared variable {var_name:?}")
+        })?;
+        if !var.required && var.default.is_none() {
+            anyhow::bail!(
+                "launch {launch_name:?} optional variable {var_name:?} is referenced by a template and must define default"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn allowed_template_vars(vars: &BTreeMap<String, LaunchVarConfig>) -> Vec<String> {
+    let mut allowed = LAUNCH_TEMPLATE_BUILTINS
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    allowed.extend(vars.keys().map(|name| format!("var.{name}")));
+    allowed
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -323,7 +387,12 @@ pub struct LaunchStep {
 }
 
 impl LaunchStep {
-    fn validate_partial(&self, launch_name: &str, allowed: &[&str]) -> anyhow::Result<()> {
+    fn validate(
+        &self,
+        launch_name: &str,
+        allowed: &[&str],
+        policy: TemplatePolicy,
+    ) -> anyhow::Result<()> {
         validate_name("launch step", &self.name)?;
         if self.phase != LaunchStepPhase::PostReady {
             anyhow::bail!(
@@ -332,31 +401,21 @@ impl LaunchStep {
             );
         }
         validate_command("launch.steps.command", &self.command)?;
-        validate_partial_launch_command_templates("launch.steps.command", &self.command, allowed)?;
+        validate_command_templates_with_policy(
+            "launch.steps.command",
+            &self.command,
+            allowed,
+            policy,
+        )?;
         if let Some(cwd) = &self.cwd {
-            validate_partial_launch_template("launch.steps.cwd", cwd, allowed)?;
+            validate_template_with_policy("launch.steps.cwd", cwd, allowed, policy)?;
         }
-        validate_partial_launch_env_map("launch.steps.env", &self.env, allowed)?;
-        if let Some(timeout) = &self.timeout {
-            parse_duration(timeout)?;
-        }
-        Ok(())
-    }
-
-    fn validate(&self, launch_name: &str, allowed: &[&str]) -> anyhow::Result<()> {
-        validate_name("launch step", &self.name)?;
-        if self.phase != LaunchStepPhase::PostReady {
-            anyhow::bail!(
-                "launch {launch_name:?} step {:?} only supports phase = \"post_ready\"",
-                self.name
-            );
-        }
-        validate_command("launch.steps.command", &self.command)?;
-        validate_command_templates("launch.steps.command", &self.command, allowed)?;
-        if let Some(cwd) = &self.cwd {
-            validate_template("launch.steps.cwd", cwd, allowed)?;
-        }
-        validate_env_keyed_template_map("launch.steps.env", &self.env, allowed)?;
+        validate_env_keyed_template_map_with_policy(
+            "launch.steps.env",
+            &self.env,
+            allowed,
+            policy,
+        )?;
         if let Some(timeout) = &self.timeout {
             parse_duration(timeout)?;
         }
