@@ -1,4 +1,5 @@
 use tempfile::TempDir;
+use toml::Value;
 
 pub(crate) fn launch_config_for_test() -> &'static str {
     r#"
@@ -34,33 +35,111 @@ command = ["git", "clone", "--branch", "main", "--single-branch", "{var.repo}", 
 }
 
 pub(crate) fn gateway_sample_for_test(dir: &TempDir, workspace: &std::path::Path) -> String {
-    let sample = include_str!("../../aw-gateway.sample.toml").to_string();
-    let sample = replace_required(
-        sample,
-        "directory = \"{state}/logs/gateway\"",
-        &format!("directory = \"{}\"", dir.path().join("logs").display()),
+    let mut sample = GatewaySampleFixture::parse();
+    sample.set_string(
+        &["logging", "directory"],
+        dir.path().join("logs").display().to_string(),
     );
-    replace_required(
-        sample,
-        "path = \"workspace\"",
-        &format!("path = \"{}\"", workspace.display()),
-    )
+    sample.set_string(
+        &["target_defaults", "workspace", "path"],
+        workspace.display().to_string(),
+    );
+    sample.finish()
 }
 
 pub(crate) fn gateway_sample_with_transfer_denied(
     dir: &TempDir,
     workspace: &std::path::Path,
 ) -> String {
-    let sample = gateway_sample_for_test(dir, workspace);
-    let sample = replace_required(sample, "sftp = \"allow\"", "sftp = \"deny\"");
-    replace_required(sample, "legacy_scp = \"allow\"", "legacy_scp = \"deny\"")
+    let mut sample = GatewaySampleFixture::parse_from(gateway_sample_for_test(dir, workspace));
+    sample.set_string(
+        &["target_defaults", "container_ssh", "transfer", "sftp"],
+        "deny",
+    );
+    sample.set_string(
+        &["target_defaults", "container_ssh", "transfer", "legacy_scp"],
+        "deny",
+    );
+    sample.finish()
 }
 
-fn replace_required(input: String, needle: &str, replacement: &str) -> String {
-    let output = input.replace(needle, replacement);
-    assert_ne!(
-        output, input,
-        "expected aw-gateway sample fixture to contain {needle:?}"
-    );
-    output
+struct GatewaySampleFixture {
+    root: Value,
+}
+
+impl GatewaySampleFixture {
+    fn parse() -> Self {
+        Self::parse_from(include_str!("../../aw-gateway.sample.toml"))
+    }
+
+    fn parse_from(input: impl AsRef<str>) -> Self {
+        Self {
+            root: toml::from_str(input.as_ref())
+                .expect("canonical gateway sample fixture should parse as TOML"),
+        }
+    }
+
+    fn set_string(&mut self, path: &[&str], value: impl Into<String>) {
+        let Some((field, parents)) = path.split_last() else {
+            panic!("test fixture mutation path must not be empty");
+        };
+        let table = parents.iter().fold(&mut self.root, |current, key| {
+            current
+                .as_table_mut()
+                .and_then(|table| table.get_mut(*key))
+                .unwrap_or_else(|| {
+                    panic!("gateway sample fixture missing TOML table path {path:?}")
+                })
+        });
+        let slot = table
+            .as_table_mut()
+            .and_then(|table| table.get_mut(*field))
+            .unwrap_or_else(|| panic!("gateway sample fixture missing TOML field path {path:?}"));
+        assert!(
+            slot.is_str(),
+            "gateway sample fixture TOML path {path:?} should contain a string"
+        );
+        *slot = Value::String(value.into());
+    }
+
+    fn finish(self) -> String {
+        toml::to_string_pretty(&self.root)
+            .expect("mutated gateway sample fixture should serialize as TOML")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_sample_fixture_mutates_named_paths() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("workspace");
+
+        let text = gateway_sample_for_test(&dir, &workspace);
+        let parsed: Value = toml::from_str(&text).unwrap();
+
+        assert_eq!(
+            parsed["logging"]["directory"].as_str(),
+            Some(dir.path().join("logs").to_str().unwrap())
+        );
+        assert_eq!(
+            parsed["target_defaults"]["workspace"]["path"].as_str(),
+            Some(workspace.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn transfer_denied_fixture_mutates_policy_fields() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join("workspace");
+
+        let text = gateway_sample_with_transfer_denied(&dir, &workspace);
+        let parsed: Value = toml::from_str(&text).unwrap();
+
+        let transfer = &parsed["target_defaults"]["container_ssh"]["transfer"];
+        assert_eq!(transfer["sftp"].as_str(), Some("deny"));
+        assert_eq!(transfer["legacy_scp"].as_str(), Some("deny"));
+    }
 }
