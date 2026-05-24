@@ -9,6 +9,7 @@ mod http;
 mod include;
 mod launch;
 mod resolver;
+mod steps;
 mod target;
 mod validation;
 
@@ -25,6 +26,7 @@ use resolver::{
     TemplateChainResolver, launch_template_dependencies, overlay_launch_template,
     overlay_target_template, target_template_dependencies,
 };
+use steps::PayloadInheritancePolicy;
 pub use target::{
     ContainerBootstrapConfig, ContainerMountConfig, ContainerMountMode, ContainerSshConfig,
     ContainerSshTransferConfig, ControlSocketsConfig, IdleCleanupAction, IdleCleanupConfig,
@@ -509,12 +511,10 @@ impl RawLifecycleStep {
         &self,
         inherited: Option<&LifecycleStep>,
     ) -> anyhow::Result<LifecycleStep> {
-        let inherit_payload =
-            self.timeout.is_some() && self.command.is_none() && self.required.is_none();
+        let policy = PayloadInheritancePolicy::TimeoutOnlyReplacement;
+        let inherit_payload = policy.lifecycle_inherits_payload(self);
         let command = self.command.clone().or_else(|| {
-            inherit_payload
-                .then(|| inherited.map(|step| step.command.clone()))
-                .flatten()
+            policy.inherit_optional(inherit_payload, inherited, |step| step.command.clone())
         });
         Ok(LifecycleStep {
             phase: self.phase,
@@ -522,9 +522,7 @@ impl RawLifecycleStep {
             required: self
                 .required
                 .or_else(|| {
-                    inherit_payload
-                        .then(|| inherited.map(|step| step.required))
-                        .flatten()
+                    policy.inherit_optional(inherit_payload, inherited, |step| step.required)
                 })
                 .unwrap_or(true),
             command: command.ok_or_else(|| {
@@ -610,23 +608,17 @@ impl RawHostStep {
     }
 
     pub(super) fn to_effective(&self, inherited: Option<&HostStep>) -> anyhow::Result<HostStep> {
-        let inherit_payload = self.timeout.is_some()
-            && self.command.is_none()
-            && self.required.is_none()
-            && self.health_check.is_none();
+        let policy = PayloadInheritancePolicy::TimeoutOnlyReplacement;
+        let inherit_payload = policy.host_inherits_payload(self);
         let command = self.command.clone().or_else(|| {
-            inherit_payload
-                .then(|| inherited.map(|step| step.command.clone()))
-                .flatten()
+            policy.inherit_optional(inherit_payload, inherited, |step| step.command.clone())
         });
         Ok(HostStep {
             name: self.name.clone(),
             required: self
                 .required
                 .or_else(|| {
-                    inherit_payload
-                        .then(|| inherited.map(|step| step.required))
-                        .flatten()
+                    policy.inherit_optional(inherit_payload, inherited, |step| step.required)
                 })
                 .unwrap_or(true),
             command: command.ok_or_else(|| {
@@ -636,9 +628,9 @@ impl RawHostStep {
                 )
             })?,
             health_check: self.health_check.clone().or_else(|| {
-                inherit_payload
-                    .then(|| inherited.and_then(|step| step.health_check.clone()))
-                    .flatten()
+                policy.inherit_optional(inherit_payload, inherited, |step| {
+                    step.health_check.clone()
+                })?
             }),
             timeout: self.timeout.clone(),
         })
@@ -704,6 +696,8 @@ impl RawContainerBootstrapStep {
     }
 
     pub(super) fn to_effective(&self) -> anyhow::Result<ContainerBootstrapStep> {
+        let inheritance_policy = PayloadInheritancePolicy::NoInheritedPayload;
+        debug_assert!(!inheritance_policy.allows_inherited_payload());
         Ok(ContainerBootstrapStep {
             name: self.name.clone(),
             required: self.required.unwrap_or(true),
@@ -2077,6 +2071,59 @@ command = ["acl-proxy", "--config", "/etc/acl-proxy/internal-acl-proxy.toml"]
     }
 
     #[test]
+    fn container_agent_services_replace_in_place_and_append_without_order_controls() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+use = ["policy"]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[[target_defaults.container_agent.services]]
+name = "first"
+command = ["/bin/first"]
+
+[[target_defaults.container_agent.services]]
+name = "replace-me"
+command = ["/bin/old"]
+
+[[target_templates.policy.container_agent.services]]
+name = "replace-me"
+command = ["/bin/template"]
+
+[[target_templates.policy.container_agent.services]]
+name = "template-new"
+command = ["/bin/template-new"]
+
+[[targets.default.container_agent.services]]
+name = "concrete-new"
+command = ["/bin/concrete-new"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let target = cfg.effective_target("default").unwrap();
+        let services: Vec<_> = target
+            .container_agent
+            .services
+            .iter()
+            .map(|service| (service.name.as_str(), service.command[0].as_str()))
+            .collect();
+        assert_eq!(
+            services,
+            [
+                ("first", "/bin/first"),
+                ("replace-me", "/bin/template"),
+                ("template-new", "/bin/template-new"),
+                ("concrete-new", "/bin/concrete-new")
+            ]
+        );
+    }
+
+    #[test]
     fn target_container_ssh_transfer_replaces_global_policy() {
         let cfg: GatewayConfig = toml::from_str(
             r#"
@@ -2241,6 +2288,169 @@ enabled = false
     }
 
     #[test]
+    fn host_steps_insert_before_and_after_inherited_steps() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[[target_defaults.host_steps]]
+name = "first"
+command = ["/bin/first"]
+
+[[target_defaults.host_steps]]
+name = "last"
+command = ["/bin/last"]
+
+[[targets.default.host_steps]]
+name = "after-first"
+after = "first"
+command = ["/bin/after-first"]
+
+[[targets.default.host_steps]]
+name = "before-last"
+before = "last"
+command = ["/bin/before-last"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let target = cfg.effective_target("default").unwrap();
+        let steps: Vec<_> = target
+            .host_steps
+            .iter()
+            .map(|step| (step.name.as_str(), step.command[0].as_str()))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("first", "/bin/first"),
+                ("after-first", "/bin/after-first"),
+                ("before-last", "/bin/before-last"),
+                ("last", "/bin/last")
+            ]
+        );
+    }
+
+    #[test]
+    fn container_bootstrap_steps_insert_before_and_after_inherited_steps() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[[target_defaults.container_bootstrap_steps]]
+name = "first"
+command = ["/bin/first"]
+
+[[target_defaults.container_bootstrap_steps]]
+name = "last"
+command = ["/bin/last"]
+
+[[targets.default.container_bootstrap_steps]]
+name = "after-first"
+after = "first"
+command = ["/bin/after-first"]
+
+[[targets.default.container_bootstrap_steps]]
+name = "before-last"
+before = "last"
+command = ["/bin/before-last"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let target = cfg.effective_target("default").unwrap();
+        let steps: Vec<_> = target
+            .container_bootstrap_steps
+            .iter()
+            .map(|step| (step.name.as_str(), step.command[0].as_str()))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("first", "/bin/first"),
+                ("after-first", "/bin/after-first"),
+                ("before-last", "/bin/before-last"),
+                ("last", "/bin/last")
+            ]
+        );
+    }
+
+    #[test]
+    fn lifecycle_step_before_after_references_are_phase_scoped() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[[target_defaults.lifecycle_steps]]
+phase = "pre_start"
+name = "anchor"
+command = ["/bin/pre-anchor"]
+
+[[target_defaults.lifecycle_steps]]
+phase = "post_stop"
+name = "anchor"
+command = ["/bin/post-anchor"]
+
+[[targets.default.lifecycle_steps]]
+phase = "pre_start"
+name = "after-anchor"
+after = "anchor"
+command = ["/bin/pre-after"]
+
+[[targets.default.lifecycle_steps]]
+phase = "post_stop"
+name = "before-anchor"
+before = "anchor"
+command = ["/bin/post-before"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let target = cfg.effective_target("default").unwrap();
+        let pre_start: Vec<_> = target
+            .lifecycle_steps
+            .iter()
+            .filter(|step| step.phase == LifecyclePhase::PreStart)
+            .map(|step| (step.name.as_str(), step.command[0].as_str()))
+            .collect();
+        let post_stop: Vec<_> = target
+            .lifecycle_steps
+            .iter()
+            .filter(|step| step.phase == LifecyclePhase::PostStop)
+            .map(|step| (step.name.as_str(), step.command[0].as_str()))
+            .collect();
+        assert_eq!(
+            pre_start,
+            [
+                ("anchor", "/bin/pre-anchor"),
+                ("after-anchor", "/bin/pre-after")
+            ]
+        );
+        assert_eq!(
+            post_stop,
+            [
+                ("before-anchor", "/bin/post-before"),
+                ("anchor", "/bin/post-anchor")
+            ]
+        );
+    }
+
+    #[test]
     fn target_step_timeout_only_overrides_keep_inherited_payload() {
         let cfg: GatewayConfig = toml::from_str(
             r#"
@@ -2281,6 +2491,40 @@ timeout = "30s"
         let host = &target.host_steps;
         assert_eq!(host[0].command, ["/bin/firewall"]);
         assert_eq!(host[0].timeout.as_deref(), Some("30s"));
+    }
+
+    #[test]
+    fn container_bootstrap_step_replacement_does_not_inherit_payload() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[[target_defaults.container_bootstrap_steps]]
+name = "bootstrap"
+required = false
+user = "worker"
+command = ["/bin/old"]
+timeout = "10s"
+
+[[targets.default.container_bootstrap_steps]]
+name = "bootstrap"
+command = ["/bin/new"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let target = cfg.effective_target("default").unwrap();
+        let step = &target.container_bootstrap_steps[0];
+        assert_eq!(step.name, "bootstrap");
+        assert!(step.required);
+        assert_eq!(step.user, "root");
+        assert_eq!(step.command, ["/bin/new"]);
+        assert_eq!(step.timeout, None);
     }
 
     #[test]
@@ -3338,6 +3582,78 @@ command = ["launch-prep", "{var.repo}"]
         assert!(launch.vars.contains_key("mode"));
         assert_eq!(launch.steps.len(), 1);
         assert_eq!(launch.steps[0].command, ["launch-prep", "{var.repo}"]);
+    }
+
+    #[test]
+    fn launch_step_replacement_preserves_position_and_append_order_across_chain() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launch_defaults]
+target = "default"
+command = ["default-command"]
+
+[[launch_defaults.steps]]
+phase = "post_ready"
+location = "container"
+name = "first"
+command = ["default-first"]
+
+[[launch_defaults.steps]]
+phase = "post_ready"
+location = "container"
+name = "replace-me"
+command = ["default-replace"]
+
+[launch_templates.runtime]
+
+[[launch_templates.runtime.steps]]
+phase = "post_ready"
+location = "container"
+name = "replace-me"
+command = ["template-replace"]
+
+[[launch_templates.runtime.steps]]
+phase = "post_ready"
+location = "container"
+name = "template-new"
+command = ["template-new"]
+
+[launches.review]
+use = ["runtime"]
+command = ["review"]
+
+[[launches.review.steps]]
+phase = "post_ready"
+location = "container"
+name = "concrete-new"
+command = ["concrete-new"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let launch = cfg.effective_launch("review").unwrap();
+        let steps: Vec<_> = launch
+            .steps
+            .iter()
+            .map(|step| (step.name.as_str(), step.command[0].as_str()))
+            .collect();
+        assert_eq!(
+            steps,
+            [
+                ("first", "default-first"),
+                ("replace-me", "template-replace"),
+                ("template-new", "template-new"),
+                ("concrete-new", "concrete-new")
+            ]
+        );
     }
 
     #[test]
