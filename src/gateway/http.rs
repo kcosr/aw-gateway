@@ -1062,14 +1062,21 @@ command = ["step-command", "{{var.repo}}", "{{var.count}}", "{{var.ratio}}"]
         assert!(object.contains("invalid launch variable"), "{object}");
     }
 
-    #[test]
-    fn execution_response_projects_wait_detach_and_invalid_utf8() {
+    #[tokio::test]
+    async fn execution_response_projects_wait_detach_and_invalid_utf8() {
         let response =
             execution_response(ExecutionOutcome::captured(7, Some(b"out".to_vec()), None));
         assert_eq!(response.status(), StatusCode::OK);
 
         let response = execution_response(ExecutionOutcome::detached("abc123".into()));
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let object = body.as_object().unwrap();
+        assert_eq!(object.len(), 4);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["mode"], "detach");
+        assert_eq!(body["status"], "accepted");
+        assert_eq!(body["operation_id"], "abc123");
 
         let response = execution_response(ExecutionOutcome::captured(0, Some(vec![0xff]), None));
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
