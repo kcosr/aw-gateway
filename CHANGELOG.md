@@ -10,6 +10,9 @@
 
 ### Changed
 
+- Refactored target step overlay internals to make patch semantics explicit
+  while preserving existing config behavior
+  ([#36](https://github.com/kcosr/aw-gateway/pull/36)).
 - Refactored the private container-agent control protocol to typed internal
   models. Malformed agent status responses now report the agent as unavailable
   instead of present-but-not-ready
