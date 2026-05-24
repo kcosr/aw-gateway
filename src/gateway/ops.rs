@@ -9,7 +9,7 @@ use crate::cli::{
     ClientConfigArgs, LaunchShowArgs, LaunchesArgs, RunArgs, SetDefaultArgs, StatusArg, StopArgs,
     TargetArg, TargetsArgs,
 };
-use crate::config::{GatewayConfig, LaunchConfig, LocalSshMode};
+use crate::config::{self, GatewayConfig, LaunchConfig, LocalSshMode};
 use crate::paths::{self, UserContext};
 use crate::runtime::ContainerRuntime;
 use crate::ssh_dispatch::{GatewayAction, RunAction, StatusAction};
@@ -365,7 +365,7 @@ impl ExecutionOutcome {
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(super) struct SuppliedLaunchVars {
-    values: std::collections::BTreeMap<String, SuppliedLaunchVarValue>,
+    values: std::collections::BTreeMap<String, CanonicalLaunchVarValue>,
 }
 
 impl SuppliedLaunchVars {
@@ -379,7 +379,7 @@ impl SuppliedLaunchVars {
             };
             vars.insert(
                 key.to_string(),
-                SuppliedLaunchVarValue::String(value.to_string()),
+                CanonicalLaunchVarValue::String(value.to_string()),
             )?;
         }
         Ok(vars)
@@ -388,7 +388,7 @@ impl SuppliedLaunchVars {
     pub(super) fn insert(
         &mut self,
         key: String,
-        value: SuppliedLaunchVarValue,
+        value: CanonicalLaunchVarValue,
     ) -> OperationResult<()> {
         if self.values.insert(key.clone(), value).is_some() {
             return Err(OperationError::invalid_launch_variable(format!(
@@ -398,7 +398,7 @@ impl SuppliedLaunchVars {
         Ok(())
     }
 
-    pub(super) fn get(&self, key: &str) -> Option<&SuppliedLaunchVarValue> {
+    pub(super) fn get(&self, key: &str) -> Option<&CanonicalLaunchVarValue> {
         self.values.get(key)
     }
 
@@ -408,12 +408,128 @@ impl SuppliedLaunchVars {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub(super) enum SuppliedLaunchVarValue {
+pub(super) enum CanonicalLaunchVarValue {
     String(String),
     Boolean(bool),
-    Integer(i64),
-    Float(f64),
+    Number(String),
+}
+
+impl CanonicalLaunchVarValue {
+    pub(super) fn from_config_default(value: &config::LaunchVarValue) -> Self {
+        match value {
+            config::LaunchVarValue::String(value) => Self::String(value.clone()),
+            config::LaunchVarValue::Boolean(value) => Self::Boolean(*value),
+            config::LaunchVarValue::Integer(_) | config::LaunchVarValue::Float(_) => {
+                Self::Number(value.rendered())
+            }
+        }
+    }
+
+    pub(super) fn from_json_string(value: String) -> Self {
+        Self::String(value)
+    }
+
+    pub(super) fn from_json_bool(value: bool) -> Self {
+        Self::Boolean(value)
+    }
+
+    pub(super) fn from_json_number(
+        key: &str,
+        integer: Option<i64>,
+        float: Option<f64>,
+    ) -> Result<Self, String> {
+        if let Some(value) = integer {
+            Ok(Self::Number(value.to_string()))
+        } else {
+            let value = float
+                .ok_or_else(|| format!("invalid launch variable {key:?}: number must be finite"))?;
+            if !value.is_finite() {
+                return Err(format!(
+                    "invalid launch variable {key:?}: number must be finite"
+                ));
+            }
+            Ok(Self::Number(canonical_number_string(value)))
+        }
+    }
+
+    pub(super) fn coerce_for_config(
+        &self,
+        name: &str,
+        var: &config::LaunchVarConfig,
+    ) -> OperationResult<Self> {
+        match var.var_type {
+            config::LaunchVarType::String => match self {
+                Self::String(value) => Ok(Self::String(value.clone())),
+                _ => Err(OperationError::invalid_launch_variable(format!(
+                    "invalid string launch variable {name:?}; expected string"
+                ))),
+            },
+            config::LaunchVarType::Enum => {
+                let Self::String(value) = self else {
+                    return Err(OperationError::invalid_launch_variable(format!(
+                        "invalid enum launch variable {name:?}; expected string"
+                    )));
+                };
+                let values = var.values.as_deref().unwrap_or(&[]);
+                if values.iter().any(|allowed| allowed == value) {
+                    Ok(Self::String(value.clone()))
+                } else {
+                    Err(OperationError::invalid_launch_variable(format!(
+                        "invalid enum launch variable {name:?}; expected one of {}",
+                        values.join(", ")
+                    )))
+                }
+            }
+            config::LaunchVarType::Boolean => match self {
+                Self::Boolean(value) => Ok(Self::Boolean(*value)),
+                Self::String(value) if value == "true" || value == "false" => {
+                    Ok(Self::Boolean(value == "true"))
+                }
+                _ => Err(OperationError::invalid_launch_variable(format!(
+                    "invalid boolean launch variable {name:?}; expected true or false"
+                ))),
+            },
+            config::LaunchVarType::Number => match self {
+                Self::Number(value) => Ok(Self::Number(value.clone())),
+                Self::String(value) => {
+                    let parsed = value.parse::<f64>().map_err(|_| {
+                        OperationError::invalid_launch_variable(format!(
+                            "invalid number launch variable {name:?}"
+                        ))
+                    })?;
+                    if !parsed.is_finite() {
+                        return Err(OperationError::invalid_launch_variable(format!(
+                            "invalid number launch variable {name:?}; expected finite number"
+                        )));
+                    }
+                    Ok(Self::Number(canonical_cli_number(value, parsed)))
+                }
+                Self::Boolean(_) => Err(OperationError::invalid_launch_variable(format!(
+                    "invalid number launch variable {name:?}"
+                ))),
+            },
+        }
+    }
+
+    pub(super) fn rendered(&self) -> String {
+        match self {
+            Self::String(value) | Self::Number(value) => value.clone(),
+            Self::Boolean(value) => value.to_string(),
+        }
+    }
+}
+
+fn canonical_cli_number(raw: &str, parsed: f64) -> String {
+    if raw.parse::<i64>().is_ok() {
+        raw.trim_start_matches('+').to_string()
+    } else {
+        canonical_number_string(parsed)
+    }
+}
+
+fn canonical_number_string(value: f64) -> String {
+    let text = value.to_string();
+    text.strip_suffix(".0").unwrap_or(&text).to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -788,9 +904,176 @@ async fn operation_status_all(config_path: Option<PathBuf>) -> anyhow::Result<Ve
 mod tests {
     use super::*;
     use crate::cli::{LaunchShowArgs, LaunchesArgs, RunArgs, StatusArg, TargetsArgs};
+    use crate::config::{LaunchVarConfig, LaunchVarType, LaunchVarValue};
     use crate::ssh_dispatch::{
         ClientBundleAction, ClientConfigAction, KeyAction, KeySourceAction, TargetSessionAction,
     };
+
+    fn launch_var_config(var_type: LaunchVarType, values: Option<Vec<&str>>) -> LaunchVarConfig {
+        LaunchVarConfig {
+            var_type,
+            required: false,
+            default: None,
+            values: values.map(|values| values.into_iter().map(str::to_string).collect()),
+            description: None,
+        }
+    }
+
+    fn assert_coerced_rendered(
+        name: &str,
+        var: LaunchVarConfig,
+        value: CanonicalLaunchVarValue,
+        expected: &str,
+    ) {
+        let rendered = value.coerce_for_config(name, &var).unwrap().rendered();
+        assert_eq!(rendered, expected);
+    }
+
+    fn assert_coercion_error(
+        name: &str,
+        var: LaunchVarConfig,
+        value: CanonicalLaunchVarValue,
+        expected: &str,
+    ) {
+        let err = value.coerce_for_config(name, &var).unwrap_err();
+        assert!(
+            err.to_string().contains(expected),
+            "expected {expected:?} in {err}"
+        );
+    }
+
+    #[test]
+    fn canonical_launch_var_values_coerce_and_render_for_config_types() {
+        assert_coerced_rendered(
+            "repo",
+            launch_var_config(LaunchVarType::String, None),
+            CanonicalLaunchVarValue::String("https://example.test/repo.git".into()),
+            "https://example.test/repo.git",
+        );
+        assert_coerced_rendered(
+            "mode",
+            launch_var_config(LaunchVarType::Enum, Some(vec!["fast", "safe"])),
+            CanonicalLaunchVarValue::String("safe".into()),
+            "safe",
+        );
+        assert_coerced_rendered(
+            "debug",
+            launch_var_config(LaunchVarType::Boolean, None),
+            CanonicalLaunchVarValue::String("true".into()),
+            "true",
+        );
+        assert_coerced_rendered(
+            "debug",
+            launch_var_config(LaunchVarType::Boolean, None),
+            CanonicalLaunchVarValue::String("false".into()),
+            "false",
+        );
+        assert_coerced_rendered(
+            "debug",
+            launch_var_config(LaunchVarType::Boolean, None),
+            CanonicalLaunchVarValue::Boolean(true),
+            "true",
+        );
+        assert_coerced_rendered(
+            "count",
+            launch_var_config(LaunchVarType::Number, None),
+            CanonicalLaunchVarValue::String("2.0".into()),
+            "2",
+        );
+        assert_coerced_rendered(
+            "count",
+            launch_var_config(LaunchVarType::Number, None),
+            CanonicalLaunchVarValue::String("+2".into()),
+            "2",
+        );
+        assert_coerced_rendered(
+            "count",
+            launch_var_config(LaunchVarType::Number, None),
+            CanonicalLaunchVarValue::String("001".into()),
+            "001",
+        );
+        assert_coerced_rendered(
+            "count",
+            launch_var_config(LaunchVarType::Number, None),
+            CanonicalLaunchVarValue::Number("3".into()),
+            "3",
+        );
+        assert_coerced_rendered(
+            "ratio",
+            launch_var_config(LaunchVarType::Number, None),
+            CanonicalLaunchVarValue::Number("1.5".into()),
+            "1.5",
+        );
+        assert_coerced_rendered(
+            "limit",
+            launch_var_config(LaunchVarType::Number, None),
+            CanonicalLaunchVarValue::from_config_default(&LaunchVarValue::Float(2.0)),
+            "2",
+        );
+
+        assert_coercion_error(
+            "count",
+            launch_var_config(LaunchVarType::Number, None),
+            CanonicalLaunchVarValue::String("abc".into()),
+            "invalid number launch variable \"count\"",
+        );
+        assert_coercion_error(
+            "count",
+            launch_var_config(LaunchVarType::Number, None),
+            CanonicalLaunchVarValue::String("NaN".into()),
+            "invalid number launch variable \"count\"; expected finite number",
+        );
+        assert_coercion_error(
+            "debug",
+            launch_var_config(LaunchVarType::Boolean, None),
+            CanonicalLaunchVarValue::String("yes".into()),
+            "invalid boolean launch variable \"debug\"; expected true or false",
+        );
+        assert_coercion_error(
+            "repo",
+            launch_var_config(LaunchVarType::String, None),
+            CanonicalLaunchVarValue::Boolean(true),
+            "invalid string launch variable \"repo\"; expected string",
+        );
+        assert_coercion_error(
+            "mode",
+            launch_var_config(LaunchVarType::Enum, Some(vec!["fast", "safe"])),
+            CanonicalLaunchVarValue::Boolean(true),
+            "invalid enum launch variable \"mode\"; expected string",
+        );
+        assert_coercion_error(
+            "count",
+            launch_var_config(LaunchVarType::Number, None),
+            CanonicalLaunchVarValue::Boolean(true),
+            "invalid number launch variable \"count\"",
+        );
+    }
+
+    #[test]
+    fn canonical_launch_var_json_constructors_preserve_http_scalar_rules() {
+        assert_eq!(
+            CanonicalLaunchVarValue::from_json_string("repo".into()),
+            CanonicalLaunchVarValue::String("repo".into())
+        );
+        assert_eq!(
+            CanonicalLaunchVarValue::from_json_bool(true),
+            CanonicalLaunchVarValue::Boolean(true)
+        );
+        assert_eq!(
+            CanonicalLaunchVarValue::from_json_number("count", Some(3), Some(3.0)).unwrap(),
+            CanonicalLaunchVarValue::Number("3".into())
+        );
+        assert_eq!(
+            CanonicalLaunchVarValue::from_json_number("ratio", None, Some(1.5)).unwrap(),
+            CanonicalLaunchVarValue::Number("1.5".into())
+        );
+
+        let err = CanonicalLaunchVarValue::from_json_number("count", None, None).unwrap_err();
+        assert_eq!(
+            err,
+            "invalid launch variable \"count\": number must be finite"
+        );
+    }
 
     #[test]
     fn operation_error_display_preserves_messages_and_source() {
