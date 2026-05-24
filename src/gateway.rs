@@ -1768,9 +1768,9 @@ impl RuntimeIdentity {
         session_id: Option<String>,
         user: UserContext,
         target: &TargetConfig,
+        container_name: String,
         container_runtime: &ContainerRuntime,
     ) -> anyhow::Result<Self> {
-        let container_name = target.container_name(session_id.as_deref())?;
         let default_container_user = target.container_user.clone().unwrap_or_else(|| {
             if container_runtime.kind() == ContainerRuntimeType::Podman {
                 user.user.clone()
@@ -1790,36 +1790,36 @@ impl RuntimeIdentity {
         identity_vars.insert("uid".into(), user.uid.to_string());
         identity_vars.insert("gid".into(), user.gid.to_string());
         identity_vars.insert("home".into(), user.home.display().to_string());
-        let identity = target.identity.as_ref();
-        let bootstrap_user = identity
-            .and_then(|identity| identity.bootstrap_user.as_deref())
+        let identity_cfg = target.identity.as_ref();
+        let bootstrap_user = identity_cfg
+            .and_then(|cfg| cfg.bootstrap_user.as_deref())
             .map(|value| template::render(value, &identity_vars))
             .transpose()?
             .unwrap_or_else(|| "root".into());
-        let container_user = identity
-            .and_then(|identity| identity.session_user.as_deref())
+        let container_user = identity_cfg
+            .and_then(|cfg| cfg.session_user.as_deref())
             .map(|value| template::render(value, &identity_vars))
             .transpose()?
             .unwrap_or(default_container_user);
         validate_name("target identity session_user", &container_user)?;
-        let session_uid = identity
-            .and_then(|identity| identity.session_uid.as_deref())
+        let session_uid = identity_cfg
+            .and_then(|cfg| cfg.session_uid.as_deref())
             .map(|value| template::render(value, &identity_vars))
             .transpose()?
             .map(|value| value.parse::<u32>())
             .transpose()
             .context("parse target identity session_uid")?
             .unwrap_or(user.uid);
-        let session_gid = identity
-            .and_then(|identity| identity.session_gid.as_deref())
+        let session_gid = identity_cfg
+            .and_then(|cfg| cfg.session_gid.as_deref())
             .map(|value| template::render(value, &identity_vars))
             .transpose()?
             .map(|value| value.parse::<u32>())
             .transpose()
             .context("parse target identity session_gid")?
             .unwrap_or(user.gid);
-        let container_home = identity
-            .and_then(|identity| identity.session_home.as_deref())
+        let container_home = identity_cfg
+            .and_then(|cfg| cfg.session_home.as_deref())
             .map(|value| template::render(value, &identity_vars).map(PathBuf::from))
             .transpose()?
             .unwrap_or(default_container_home);
@@ -1830,8 +1830,8 @@ impl RuntimeIdentity {
             "target identity session_home",
             &container_home.display().to_string(),
         )?;
-        let session_shell = identity
-            .and_then(|identity| identity.session_shell.as_deref())
+        let session_shell = identity_cfg
+            .and_then(|cfg| cfg.session_shell.as_deref())
             .map(|value| template::render(value, &identity_vars))
             .transpose()?
             .unwrap_or_else(|| "/bin/bash".into());
@@ -1850,35 +1850,23 @@ impl RuntimeIdentity {
             container_name,
         })
     }
-
-    fn runtime_id(&self, mode: TargetMode) -> String {
-        match mode {
-            TargetMode::Fixed => self.target_name.clone(),
-            TargetMode::Ephemeral => self
-                .session_id
-                .clone()
-                .expect("ephemeral target has a session id"),
-        }
-    }
 }
 
 impl RuntimePaths {
-    fn resolve(target: &TargetConfig, identity: &RuntimeIdentity) -> anyhow::Result<Self> {
-        let workspace = resolve_target_workspace(
-            target,
-            &identity.target_name,
-            &identity.user,
-            identity.session_id.as_deref(),
-        )?;
+    fn resolve(
+        target: &TargetConfig,
+        identity: &RuntimeIdentity,
+        workspace: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let session_id = identity.session_id.as_deref();
+        let session_id = || session_id.expect("ephemeral target has a session id");
         let (state_kind, state_id) = match target.mode {
             TargetMode::Fixed => ("containers", identity.container_name.as_str()),
-            TargetMode::Ephemeral => (
-                "sessions",
-                identity
-                    .session_id
-                    .as_deref()
-                    .expect("ephemeral target has a session id"),
-            ),
+            TargetMode::Ephemeral => ("sessions", session_id()),
+        };
+        let runtime_id = match target.mode {
+            TargetMode::Fixed => identity.target_name.as_str(),
+            TargetMode::Ephemeral => session_id(),
         };
         let container_state_dir = workspace
             .join(&target.workspace.state_dir)
@@ -1889,14 +1877,13 @@ impl RuntimePaths {
             &target.workspace.state_dir,
             [state_kind, state_id],
         );
-        let runtime_id = identity.runtime_id(target.mode);
         let control_sockets = render_control_socket_paths(
             &target.control_sockets,
             target,
             &identity.target_name,
             &identity.container_name,
             identity.session_id.as_deref(),
-            &runtime_id,
+            runtime_id,
             &identity.user,
         )?;
         Ok(Self {
@@ -1951,6 +1938,9 @@ impl Runtime {
                 None => anyhow::bail!("ephemeral target {target_name:?} requires --session-id"),
             },
         };
+        let container_name = target_cfg.container_name(session_id.as_deref())?;
+        let workspace =
+            resolve_target_workspace(&target_cfg, &target_name, &user, session_id.as_deref())?;
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, &user.user, &user.home)?;
         let identity = RuntimeIdentity::resolve(
@@ -1959,9 +1949,10 @@ impl Runtime {
             session_id,
             user,
             &target_cfg,
+            container_name,
             &container_runtime,
         )?;
-        let paths = RuntimePaths::resolve(&target_cfg, &identity)?;
+        let paths = RuntimePaths::resolve(&target_cfg, &identity, workspace)?;
         let runtime = Runtime {
             cfg,
             target: target_cfg,
