@@ -556,33 +556,213 @@ async fn run_container_command_with_runtime(
     command: Vec<String>,
     options: OperationExecutionOptions,
 ) -> anyhow::Result<ExecutionOutcome> {
-    let session_kind = "run-command";
-    if options.mode == OperationMode::Detach {
-        return detach_run_container_command(runtime, session_kind, cwd, command).await;
-    }
-    let mut session = runtime.begin_operation_session(session_kind, false)?;
-    let result = async {
-        let _ready = runtime.ensure_ready().await?;
-        runtime
-            .hold_operation_agent_session(&mut session, session_kind)
-            .await?;
-        let cwd = cwd
-            .as_deref()
-            .map(|cwd| paths::expand_home(&runtime.container_home, cwd));
-        exec_final_container_command_with_options(
-            &runtime,
-            command,
-            cwd,
-            runtime.session_env()?,
-            options,
-        )
+    OperationRunner::run_command(runtime, options, cwd, command)
+        .run()
         .await
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OperationSessionSpec {
+    RunCommand,
+    Launch,
+}
+
+impl OperationSessionSpec {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::RunCommand => "run-command",
+            Self::Launch => "launch",
+        }
+    }
+
+    fn uses_launch_marker(self) -> bool {
+        matches!(self, Self::Launch)
+    }
+
+    fn warn_detached_failure(self, operation_id: &str, err: &anyhow::Error) {
+        match self {
+            Self::RunCommand => {
+                tracing::warn!(
+                    operation_id = %operation_id,
+                    error = %err,
+                    "detached run operation failed"
+                );
+            }
+            Self::Launch => {
+                tracing::warn!(
+                    operation_id = %operation_id,
+                    error = %err,
+                    "detached launch operation failed"
+                );
+            }
+        }
+    }
+}
+
+struct OperationRunner {
+    runtime: Runtime,
+    options: OperationExecutionOptions,
+    session_spec: OperationSessionSpec,
+    body: OperationBody,
+}
+
+impl OperationRunner {
+    fn run_command(
+        runtime: Runtime,
+        options: OperationExecutionOptions,
+        cwd: Option<String>,
+        command: Vec<String>,
+    ) -> Self {
+        Self {
+            runtime,
+            options,
+            session_spec: OperationSessionSpec::RunCommand,
+            body: OperationBody::Run { cwd, command },
+        }
+    }
+
+    fn launch(
+        runtime: Runtime,
+        options: OperationExecutionOptions,
+        launch: LaunchConfig,
+        resolved_vars: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            runtime,
+            options,
+            session_spec: OperationSessionSpec::Launch,
+            body: OperationBody::Launch {
+                launch,
+                resolved_vars,
+            },
+        }
+    }
+
+    async fn run(self) -> anyhow::Result<ExecutionOutcome> {
+        if self.options.mode == OperationMode::Detach {
+            return self.spawn_detached().await;
+        }
+        let Self {
+            runtime,
+            options,
+            session_spec,
+            body,
+        } = self;
+        let session = runtime
+            .begin_operation_session(session_spec.kind(), session_spec.uses_launch_marker())?;
+        run_operation_session(runtime, session_spec, session, body, options).await
+    }
+
+    async fn spawn_detached(self) -> anyhow::Result<ExecutionOutcome> {
+        let operation_id = generate_session_id_value()?;
+        let Self {
+            runtime,
+            session_spec,
+            body,
+            ..
+        } = self;
+        let session = runtime
+            .begin_operation_session(session_spec.kind(), session_spec.uses_launch_marker())?;
+        let background_id = operation_id.clone();
+        tokio::spawn(async move {
+            let result = run_operation_session(
+                runtime,
+                session_spec,
+                session,
+                body,
+                detach_discard_options(),
+            )
+            .await;
+            if let Err(err) = result {
+                session_spec.warn_detached_failure(&background_id, &err);
+            }
+        });
+        Ok(ExecutionOutcome::detached(operation_id))
+    }
+}
+
+async fn run_operation_session(
+    runtime: Runtime,
+    session_spec: OperationSessionSpec,
+    mut session: OperationSessionGuard,
+    body: OperationBody,
+    options: OperationExecutionOptions,
+) -> anyhow::Result<ExecutionOutcome> {
+    let result = async {
+        let ready = runtime.ensure_ready().await?;
+        runtime
+            .hold_operation_agent_session(&mut session, session_spec.kind())
+            .await?;
+        body.execute(&runtime, ready, options).await
     }
     .await;
     let outcome = SessionOutcome::from_execution_result(&result);
     runtime
         .finish_operation_session(session, result, outcome)
         .await
+}
+
+enum OperationBody {
+    Run {
+        cwd: Option<String>,
+        command: Vec<String>,
+    },
+    Launch {
+        launch: LaunchConfig,
+        resolved_vars: BTreeMap<String, String>,
+    },
+}
+
+impl OperationBody {
+    async fn execute(
+        self,
+        runtime: &Runtime,
+        ready: ReadyStatus,
+        options: OperationExecutionOptions,
+    ) -> anyhow::Result<ExecutionOutcome> {
+        match self {
+            Self::Run { cwd, command } => {
+                let cwd = cwd
+                    .as_deref()
+                    .map(|cwd| paths::expand_home(&runtime.container_home, cwd));
+                exec_final_container_command_with_options(
+                    runtime,
+                    command,
+                    cwd,
+                    runtime.session_env()?,
+                    options,
+                )
+                .await
+            }
+            Self::Launch {
+                launch,
+                resolved_vars,
+            } => {
+                let container_pid = ready.container_pid.to_string();
+                let vars = launch_template_vars(runtime, &resolved_vars, Some(&container_pid));
+                let launch_env = render_template_map(&launch.env, &vars)?;
+                run_launch_steps(runtime, &launch, &vars, &launch_env).await?;
+                let env = launch_final_env(&runtime.session_env()?, &launch_env);
+                let cwd = render_launch_cwd(
+                    launch.cwd.as_deref(),
+                    &vars,
+                    runtime.container_home.as_path(),
+                )?;
+                let command = template::render_argv(&launch.command, &vars)?;
+                exec_final_container_command_with_options(runtime, command, cwd, env, options).await
+            }
+        }
+    }
+}
+
+fn detach_discard_options() -> OperationExecutionOptions {
+    OperationExecutionOptions {
+        mode: OperationMode::Detach,
+        output: OutputSelection {
+            stdout: false,
+            stderr: false,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -634,56 +814,6 @@ async fn exec_final_container_command_with_options(
             runtime.container_runtime.exec_discard(&exec_spec).await?,
         )),
     }
-}
-
-async fn detach_run_container_command(
-    runtime: Runtime,
-    session_kind: &'static str,
-    cwd: Option<String>,
-    command: Vec<String>,
-) -> anyhow::Result<ExecutionOutcome> {
-    let operation_id = generate_session_id_value()?;
-    let session = runtime.begin_operation_session(session_kind, false)?;
-    let background_id = operation_id.clone();
-    tokio::spawn(async move {
-        let mut session = session;
-        let result = async {
-            let _ready = runtime.ensure_ready().await?;
-            runtime
-                .hold_operation_agent_session(&mut session, session_kind)
-                .await?;
-            let cwd = cwd
-                .as_deref()
-                .map(|cwd| paths::expand_home(&runtime.container_home, cwd));
-            exec_final_container_command_with_options(
-                &runtime,
-                command,
-                cwd,
-                runtime.session_env()?,
-                OperationExecutionOptions {
-                    mode: OperationMode::Detach,
-                    output: OutputSelection {
-                        stdout: false,
-                        stderr: false,
-                    },
-                },
-            )
-            .await
-        }
-        .await;
-        let session_outcome = SessionOutcome::from_execution_result(&result);
-        let result = runtime
-            .finish_operation_session(session, result, session_outcome)
-            .await;
-        if let Err(err) = result {
-            tracing::warn!(
-                operation_id = %background_id,
-                error = %err,
-                "detached run operation failed"
-            );
-        }
-    });
-    Ok(ExecutionOutcome::detached(operation_id))
 }
 
 async fn stop(config_path: Option<PathBuf>, args: StopArgs) -> anyhow::Result<()> {
@@ -1020,93 +1150,9 @@ async fn launch_execute_with_config(
     let target = launch.target.clone();
     let runtime =
         Runtime::from_config(cfg, Some(&target), session_id, true, Some(name.to_string())).await?;
-    let session_kind = "launch";
-    if options.mode == OperationMode::Detach {
-        return detach_launch_execute_with_runtime(runtime, launch, resolved_vars, session_kind)
-            .await;
-    }
-    let mut session = runtime.begin_operation_session(session_kind, true)?;
-    let result = async {
-        let ready = runtime.ensure_ready().await?;
-        runtime
-            .hold_operation_agent_session(&mut session, session_kind)
-            .await?;
-        let container_pid = ready.container_pid.to_string();
-        let vars = launch_template_vars(&runtime, &resolved_vars, Some(&container_pid));
-        let launch_env = render_template_map(&launch.env, &vars)?;
-        run_launch_steps(&runtime, &launch, &vars, &launch_env).await?;
-        let env = launch_final_env(&runtime.session_env()?, &launch_env);
-        let cwd = render_launch_cwd(
-            launch.cwd.as_deref(),
-            &vars,
-            runtime.container_home.as_path(),
-        )?;
-        let command = template::render_argv(&launch.command, &vars)?;
-        exec_final_container_command_with_options(&runtime, command, cwd, env, options).await
-    }
-    .await;
-    let outcome = SessionOutcome::from_execution_result(&result);
-    runtime
-        .finish_operation_session(session, result, outcome)
+    OperationRunner::launch(runtime, options, launch, resolved_vars)
+        .run()
         .await
-}
-
-async fn detach_launch_execute_with_runtime(
-    runtime: Runtime,
-    launch: LaunchConfig,
-    resolved_vars: BTreeMap<String, String>,
-    session_kind: &'static str,
-) -> anyhow::Result<ExecutionOutcome> {
-    let operation_id = generate_session_id_value()?;
-    let session = runtime.begin_operation_session(session_kind, true)?;
-    let background_id = operation_id.clone();
-    tokio::spawn(async move {
-        let mut session = session;
-        let result = async {
-            let ready = runtime.ensure_ready().await?;
-            runtime
-                .hold_operation_agent_session(&mut session, session_kind)
-                .await?;
-            let container_pid = ready.container_pid.to_string();
-            let vars = launch_template_vars(&runtime, &resolved_vars, Some(&container_pid));
-            let launch_env = render_template_map(&launch.env, &vars)?;
-            run_launch_steps(&runtime, &launch, &vars, &launch_env).await?;
-            let env = launch_final_env(&runtime.session_env()?, &launch_env);
-            let cwd = render_launch_cwd(
-                launch.cwd.as_deref(),
-                &vars,
-                runtime.container_home.as_path(),
-            )?;
-            let command = template::render_argv(&launch.command, &vars)?;
-            exec_final_container_command_with_options(
-                &runtime,
-                command,
-                cwd,
-                env,
-                OperationExecutionOptions {
-                    mode: OperationMode::Detach,
-                    output: OutputSelection {
-                        stdout: false,
-                        stderr: false,
-                    },
-                },
-            )
-            .await
-        }
-        .await;
-        let session_outcome = SessionOutcome::from_execution_result(&result);
-        let result = runtime
-            .finish_operation_session(session, result, session_outcome)
-            .await;
-        if let Err(err) = result {
-            tracing::warn!(
-                operation_id = %background_id,
-                error = %err,
-                "detached launch operation failed"
-            );
-        }
-    });
-    Ok(ExecutionOutcome::detached(operation_id))
 }
 
 fn launch_summaries(cfg: &GatewayConfig) -> anyhow::Result<Vec<LaunchSummary>> {
@@ -3620,6 +3666,30 @@ exit 0
         )
     }
 
+    fn fake_background_runtime_script(log: &Path) -> String {
+        let user = UserContext::current().unwrap();
+        format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  exec)
+    echo started > "{log}"
+    sleep 0.2
+    echo done >> "{log}"
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+            log = log.display()
+        )
+    }
+
     fn session_marker_count(dir: &Path) -> usize {
         std::fs::read_dir(dir)
             .map(|entries| {
@@ -3631,6 +3701,19 @@ exit 0
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    async fn wait_for_background_marker_clear(log: &Path, marker_dir: &Path, panic_message: &str) {
+        for _ in 0..20 {
+            let done = std::fs::read_to_string(log)
+                .map(|value| value.contains("done"))
+                .unwrap_or(false);
+            if done && session_marker_count(marker_dir) == 0 {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{panic_message}");
     }
 
     fn test_control_socket_paths(base: &Path) -> ControlSocketPaths {
@@ -3709,6 +3792,34 @@ exit 0
             container_runtime,
             user,
         }
+    }
+
+    fn launch_test_config(
+        dir: &tempfile::TempDir,
+        fake_runtime: &Path,
+        launch_name: &str,
+        command: Vec<String>,
+    ) -> GatewayConfig {
+        let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+        cfg.runtime.program = Some(fake_runtime.display().to_string());
+        disable_default_container_agent(&mut cfg);
+        cfg.target_defaults.host_steps.clear();
+        cfg.target_defaults.workspace = Some(crate::config::WorkspaceConfigInput {
+            path: Some(dir.path().join("workspace").display().to_string()),
+            state_dir: Some(".aw-gateway".into()),
+            cleanup: None,
+        });
+        cfg.targets.get_mut("default").unwrap().stop_when_idle = Some(false);
+        cfg.launches.insert(
+            launch_name.into(),
+            crate::config::LaunchConfigInput {
+                target: Some("default".into()),
+                command: Some(command),
+                ..Default::default()
+            },
+        );
+        cfg.validate().unwrap();
+        cfg
     }
 
     fn configure_workspace_cleanup_runtime(
@@ -4470,6 +4581,20 @@ exit 0
         );
     }
 
+    #[test]
+    fn detached_runner_uses_detach_mode_without_selected_output() {
+        assert_eq!(
+            detach_discard_options(),
+            OperationExecutionOptions {
+                mode: OperationMode::Detach,
+                output: OutputSelection {
+                    stdout: false,
+                    stderr: false,
+                },
+            }
+        );
+    }
+
     #[tokio::test]
     async fn run_operation_core_returns_nonzero_exit_without_exiting_process() {
         let dir = tempfile::tempdir().unwrap();
@@ -4497,30 +4622,7 @@ exit 0
         let dir = tempfile::tempdir().unwrap();
         let fake_runtime = dir.path().join("runtime");
         let log = dir.path().join("runtime.log");
-        let user = UserContext::current().unwrap();
-        write_fake_runtime(
-            &fake_runtime,
-            &format!(
-                r#"#!/bin/sh
-case "$1" in
-  inspect)
-    cat <<'JSON'
-[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
-JSON
-    ;;
-  exec)
-    echo started > "{log}"
-    sleep 0.2
-    echo done >> "{log}"
-    ;;
-esac
-exit 0
-"#,
-                user = user.user,
-                uid = user.uid,
-                log = log.display()
-            ),
-        );
+        write_fake_runtime(&fake_runtime, &fake_background_runtime_script(&log));
         let runtime = test_runtime(&dir, fake_runtime, |cfg| {
             cfg.target_defaults.host_steps.clear();
             cfg.targets.get_mut("default").unwrap().stop_when_idle = Some(false);
@@ -4539,16 +4641,12 @@ exit 0
         assert!(matches!(outcome, ExecutionOutcome::Detached { .. }));
         assert_eq!(session_marker_count(&marker_dir), 1);
 
-        for _ in 0..20 {
-            let done = std::fs::read_to_string(&log)
-                .map(|value| value.contains("done"))
-                .unwrap_or(false);
-            if done && session_marker_count(&marker_dir) == 0 {
-                return;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-        panic!("detached background operation did not finish and clear marker");
+        wait_for_background_marker_clear(
+            &log,
+            &marker_dir,
+            "detached background operation did not finish and clear marker",
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -4556,25 +4654,12 @@ exit 0
         let dir = tempfile::tempdir().unwrap();
         let fake_runtime = dir.path().join("runtime");
         write_fake_runtime(&fake_runtime, &fake_running_runtime_script(42));
-        let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
-        cfg.runtime.program = Some(fake_runtime.display().to_string());
-        disable_default_container_agent(&mut cfg);
-        cfg.target_defaults.host_steps.clear();
-        cfg.target_defaults.workspace = Some(crate::config::WorkspaceConfigInput {
-            path: Some(dir.path().join("workspace").display().to_string()),
-            state_dir: Some(".aw-gateway".into()),
-            cleanup: None,
-        });
-        cfg.targets.get_mut("default").unwrap().stop_when_idle = Some(false);
-        cfg.launches.insert(
-            "returns-nonzero".into(),
-            crate::config::LaunchConfigInput {
-                target: Some("default".into()),
-                command: Some(vec!["/bin/command-that-returns-42".into()]),
-                ..Default::default()
-            },
+        let cfg = launch_test_config(
+            &dir,
+            &fake_runtime,
+            "returns-nonzero",
+            vec!["/bin/command-that-returns-42".into()],
         );
-        cfg.validate().unwrap();
 
         let outcome = launch_execute_with_config(
             cfg,
@@ -4587,6 +4672,54 @@ exit 0
         .unwrap();
 
         assert_eq!(outcome, ExecutionOutcome::new(42));
+    }
+
+    #[tokio::test]
+    async fn detached_launch_keeps_launch_marker_until_background_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_runtime = dir.path().join("runtime");
+        let log = dir.path().join("runtime.log");
+        write_fake_runtime(&fake_runtime, &fake_background_runtime_script(&log));
+        let cfg = launch_test_config(
+            &dir,
+            &fake_runtime,
+            "detached-launch",
+            vec!["/bin/background-launch".into()],
+        );
+        let marker_runtime = Runtime::from_config(
+            cfg.clone(),
+            Some("default"),
+            None,
+            true,
+            Some("detached-launch".into()),
+        )
+        .await
+        .unwrap();
+        let marker_dir = marker_runtime.session_marker_dir();
+
+        let outcome = launch_execute_with_config(
+            cfg,
+            "detached-launch",
+            None,
+            SuppliedLaunchVars::default(),
+            OperationExecutionOptions::DETACH,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, ExecutionOutcome::Detached { .. }));
+        assert_eq!(session_marker_count(&marker_dir), 1);
+        let sessions = marker_runtime.active_session_markers().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].kind, "launch");
+        assert_eq!(sessions[0].launch.as_deref(), Some("detached-launch"));
+
+        wait_for_background_marker_clear(
+            &log,
+            &marker_dir,
+            "detached launch background operation did not finish and clear marker",
+        )
+        .await;
     }
 
     #[tokio::test]
