@@ -83,6 +83,102 @@ pub(super) enum GatewayOperationResult {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct SshGatewayOperation {
+    pub(super) operation: GatewayOperation,
+    pub(super) render: SshRenderOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct SshRenderOptions {
+    pub(super) json: bool,
+}
+
+impl SshGatewayOperation {
+    pub(super) fn from_action(action: &GatewayAction) -> OperationResult<Option<Self>> {
+        Ok(match action {
+            GatewayAction::Up(target) => Some(Self {
+                operation: GatewayOperation::Up {
+                    target: target.clone(),
+                    session_id: None,
+                },
+                render: SshRenderOptions::default(),
+            }),
+            GatewayAction::Run(action) => Some(Self {
+                operation: GatewayOperation::from_run_action(action),
+                render: SshRenderOptions::default(),
+            }),
+            GatewayAction::Launches { json } => Some(Self {
+                operation: GatewayOperation::Launches,
+                render: SshRenderOptions { json: *json },
+            }),
+            GatewayAction::LaunchShow { name, json } => Some(Self {
+                operation: GatewayOperation::LaunchShow { name: name.clone() },
+                render: SshRenderOptions { json: *json },
+            }),
+            GatewayAction::LaunchRun {
+                name,
+                session_id,
+                vars,
+            } => {
+                let vars = SuppliedLaunchVars::from_cli_pairs(vars.clone())?;
+                Some(Self {
+                    operation: GatewayOperation::launch_run(name.clone(), session_id.clone(), vars),
+                    render: SshRenderOptions::default(),
+                })
+            }
+            GatewayAction::Status(action) => Some(Self {
+                operation: GatewayOperation::from_status_action(action),
+                render: SshRenderOptions::default(),
+            }),
+            GatewayAction::Targets { json } => Some(Self {
+                operation: GatewayOperation::Targets,
+                render: SshRenderOptions { json: *json },
+            }),
+            GatewayAction::Stop(target) => Some(Self {
+                operation: GatewayOperation::Stop {
+                    target: target.clone(),
+                    session_id: None,
+                },
+                render: SshRenderOptions::default(),
+            }),
+            GatewayAction::Remove(target) => Some(Self {
+                operation: GatewayOperation::Remove {
+                    target: target.clone(),
+                },
+                render: SshRenderOptions::default(),
+            }),
+            GatewayAction::SetDefault(target_or_image) => Some(Self {
+                operation: GatewayOperation::SetDefault {
+                    target_or_image: target_or_image.clone(),
+                },
+                render: SshRenderOptions::default(),
+            }),
+            GatewayAction::ShowDefault => Some(Self {
+                operation: GatewayOperation::ShowDefault,
+                render: SshRenderOptions::default(),
+            }),
+            GatewayAction::ResetDefault => Some(Self {
+                operation: GatewayOperation::ResetDefault,
+                render: SshRenderOptions::default(),
+            }),
+            GatewayAction::ClientConfig(action) => Some(Self {
+                operation: GatewayOperation::ClientConfig {
+                    target: action.target.clone(),
+                    identity_file: action.identity_file.clone().map(PathBuf::from),
+                },
+                render: SshRenderOptions::default(),
+            }),
+            GatewayAction::Connect(_)
+            | GatewayAction::AddKey(_)
+            | GatewayAction::AddHostKey(_)
+            | GatewayAction::AddContainerKey(_)
+            | GatewayAction::ClientBundle(_)
+            | GatewayAction::Help => None,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum OperationError {
     InvalidRequest { message: String },
@@ -414,64 +510,22 @@ impl GatewayOperation {
         }
     }
 
-    pub(super) fn from_ssh_action(action: GatewayAction) -> OperationResult<Option<Self>> {
-        Ok(match action {
-            GatewayAction::Up(target) => Some(Self::Up {
-                target,
-                session_id: None,
-            }),
-            GatewayAction::Run(action) => Some(Self::from_run_action(action)),
-            GatewayAction::Launches { .. } => Some(Self::Launches),
-            GatewayAction::LaunchShow { name, .. } => Some(Self::LaunchShow { name }),
-            GatewayAction::LaunchRun {
-                name,
-                session_id,
-                vars,
-            } => {
-                let vars = SuppliedLaunchVars::from_cli_pairs(vars)?;
-                Some(Self::launch_run(name, session_id, vars))
-            }
-            GatewayAction::Status(action) => Some(Self::from_status_action(action)),
-            GatewayAction::Targets { .. } => Some(Self::Targets),
-            GatewayAction::Stop(target) => Some(Self::Stop {
-                target,
-                session_id: None,
-            }),
-            GatewayAction::Remove(target) => Some(Self::Remove { target }),
-            GatewayAction::SetDefault(target_or_image) => {
-                Some(Self::SetDefault { target_or_image })
-            }
-            GatewayAction::ShowDefault => Some(Self::ShowDefault),
-            GatewayAction::ResetDefault => Some(Self::ResetDefault),
-            GatewayAction::ClientConfig(action) => Some(Self::ClientConfig {
-                target: action.target,
-                identity_file: action.identity_file.map(PathBuf::from),
-            }),
-            GatewayAction::Connect(_)
-            | GatewayAction::AddKey(_)
-            | GatewayAction::AddHostKey(_)
-            | GatewayAction::AddContainerKey(_)
-            | GatewayAction::ClientBundle(_)
-            | GatewayAction::Help => None,
-        })
-    }
-
-    fn from_run_action(action: RunAction) -> Self {
+    fn from_run_action(action: &RunAction) -> Self {
         Self::Run {
-            target: action.target,
-            session_id: action.session_id,
-            cwd: action.cwd,
-            command: action.command,
+            target: action.target.clone(),
+            session_id: action.session_id.clone(),
+            cwd: action.cwd.clone(),
+            command: action.command.clone(),
             options: OperationExecutionOptions::STREAM,
         }
     }
 
-    fn from_status_action(action: StatusAction) -> Self {
+    fn from_status_action(action: &StatusAction) -> Self {
         if action.all {
             Self::StatusAll
         } else {
             Self::Status {
-                target: action.target,
+                target: action.target.clone(),
                 session_id: None,
             }
         }
@@ -734,6 +788,9 @@ async fn operation_status_all(config_path: Option<PathBuf>) -> anyhow::Result<Ve
 mod tests {
     use super::*;
     use crate::cli::{LaunchShowArgs, LaunchesArgs, RunArgs, StatusArg, TargetsArgs};
+    use crate::ssh_dispatch::{
+        ClientBundleAction, ClientConfigAction, KeyAction, KeySourceAction, TargetSessionAction,
+    };
 
     #[test]
     fn operation_error_display_preserves_messages_and_source() {
@@ -927,90 +984,230 @@ command = ["true"]
         );
     }
 
-    #[test]
-    fn constructs_requests_from_ssh_actions_without_transport_flags() {
+    fn assert_ssh_operation_request(
+        action: GatewayAction,
+        operation: GatewayOperation,
+        render: SshRenderOptions,
+    ) {
         assert_eq!(
-            GatewayOperation::from_ssh_action(GatewayAction::Run(RunAction {
+            SshGatewayOperation::from_action(&action).unwrap(),
+            Some(SshGatewayOperation { operation, render })
+        );
+    }
+
+    #[test]
+    fn constructs_operation_requests_from_ssh_actions() {
+        assert_ssh_operation_request(
+            GatewayAction::Up(Some("dev".into())),
+            GatewayOperation::Up {
+                target: Some("dev".into()),
+                session_id: None,
+            },
+            SshRenderOptions::default(),
+        );
+        assert_ssh_operation_request(
+            GatewayAction::Run(RunAction {
                 target: Some("dev".into()),
                 session_id: Some("abc123".into()),
                 cwd: Some("/work".into()),
                 command: vec!["cargo".into(), "test".into()],
-            }))
+            }),
+            GatewayOperation::from_run_args(RunArgs {
+                target: Some("dev".into()),
+                session_id: Some("abc123".into()),
+                cwd: Some("/work".into()),
+                command: vec!["cargo".into(), "test".into()],
+            })
             .unwrap(),
-            Some(
-                GatewayOperation::from_run_args(RunArgs {
-                    target: Some("dev".into()),
-                    session_id: Some("abc123".into()),
-                    cwd: Some("/work".into()),
-                    command: vec!["cargo".into(), "test".into()],
-                })
-                .unwrap()
-            )
+            SshRenderOptions::default(),
         );
-        assert_eq!(
-            GatewayOperation::from_ssh_action(GatewayAction::LaunchRun {
+        assert_ssh_operation_request(
+            GatewayAction::LaunchRun {
                 name: "repo-shell".into(),
                 session_id: Some("abc123".into()),
                 vars: vec!["repo=https://example.test/repo.git".into()],
-            })
-            .unwrap(),
-            Some(GatewayOperation::launch_run(
+            },
+            GatewayOperation::launch_run(
                 "repo-shell".into(),
                 Some("abc123".into()),
                 SuppliedLaunchVars::from_cli_pairs(vec![
-                    "repo=https://example.test/repo.git".into()
+                    "repo=https://example.test/repo.git".into(),
                 ])
                 .unwrap(),
-            ))
+            ),
+            SshRenderOptions::default(),
         );
-        assert_eq!(
-            GatewayOperation::from_ssh_action(GatewayAction::Launches { json: true }).unwrap(),
-            Some(GatewayOperation::from_launches_args(LaunchesArgs {
-                json: false
-            }))
-        );
-        assert_eq!(
-            GatewayOperation::from_ssh_action(GatewayAction::Targets { json: true }).unwrap(),
-            Some(GatewayOperation::from_targets_args(TargetsArgs {
-                json: false
-            }))
-        );
-        assert_eq!(
-            GatewayOperation::from_ssh_action(GatewayAction::LaunchShow {
-                name: "repo-shell".into(),
-                json: true,
-            })
-            .unwrap(),
-            Some(GatewayOperation::from_launch_show_args(LaunchShowArgs {
-                name: "repo-shell".into(),
-                json: false,
-            }))
-        );
-        assert_eq!(
-            GatewayOperation::from_ssh_action(GatewayAction::Status(StatusAction {
+        assert_ssh_operation_request(
+            GatewayAction::Status(StatusAction {
                 target: Some("dev".into()),
                 all: false,
-            }))
-            .unwrap(),
-            Some(GatewayOperation::from_status_args(StatusArg {
+            }),
+            GatewayOperation::from_status_args(StatusArg {
                 target: Some("dev".into()),
                 all: false,
                 json: false,
                 session_id: None,
-            }))
+            }),
+            SshRenderOptions::default(),
         );
-        assert_eq!(
-            GatewayOperation::from_ssh_action(GatewayAction::Status(StatusAction {
+        assert_ssh_operation_request(
+            GatewayAction::Status(StatusAction {
                 target: None,
                 all: true,
-            }))
-            .unwrap(),
-            Some(GatewayOperation::from_status_args(StatusArg {
+            }),
+            GatewayOperation::from_status_args(StatusArg {
                 target: None,
                 all: true,
                 json: false,
                 session_id: None,
-            }))
+            }),
+            SshRenderOptions::default(),
         );
+        assert_ssh_operation_request(
+            GatewayAction::Stop(Some("dev".into())),
+            GatewayOperation::Stop {
+                target: Some("dev".into()),
+                session_id: None,
+            },
+            SshRenderOptions::default(),
+        );
+        assert_ssh_operation_request(
+            GatewayAction::Remove(Some("dev".into())),
+            GatewayOperation::Remove {
+                target: Some("dev".into()),
+            },
+            SshRenderOptions::default(),
+        );
+        assert_ssh_operation_request(
+            GatewayAction::SetDefault("fedora-dev".into()),
+            GatewayOperation::SetDefault {
+                target_or_image: "fedora-dev".into(),
+            },
+            SshRenderOptions::default(),
+        );
+        assert_ssh_operation_request(
+            GatewayAction::ShowDefault,
+            GatewayOperation::ShowDefault,
+            SshRenderOptions::default(),
+        );
+        assert_ssh_operation_request(
+            GatewayAction::ResetDefault,
+            GatewayOperation::ResetDefault,
+            SshRenderOptions::default(),
+        );
+        assert_ssh_operation_request(
+            GatewayAction::ClientConfig(ClientConfigAction {
+                target: Some("dev".into()),
+                identity_file: Some("/tmp/id".into()),
+            }),
+            GatewayOperation::ClientConfig {
+                target: Some("dev".into()),
+                identity_file: Some(PathBuf::from("/tmp/id")),
+            },
+            SshRenderOptions::default(),
+        );
+    }
+
+    #[test]
+    fn preserves_ssh_render_options_for_metadata_actions() {
+        for json in [false, true] {
+            assert_ssh_operation_request(
+                GatewayAction::Launches { json },
+                GatewayOperation::from_launches_args(LaunchesArgs { json: false }),
+                SshRenderOptions { json },
+            );
+            assert_ssh_operation_request(
+                GatewayAction::Targets { json },
+                GatewayOperation::from_targets_args(TargetsArgs { json: false }),
+                SshRenderOptions { json },
+            );
+            assert_ssh_operation_request(
+                GatewayAction::LaunchShow {
+                    name: "repo-shell".into(),
+                    json,
+                },
+                GatewayOperation::from_launch_show_args(LaunchShowArgs {
+                    name: "repo-shell".into(),
+                    json: false,
+                }),
+                SshRenderOptions { json },
+            );
+        }
+    }
+
+    #[test]
+    fn status_ssh_requests_ignore_transport_json_and_render_as_status_operations() {
+        assert_ssh_operation_request(
+            GatewayAction::Status(StatusAction {
+                target: Some("dev".into()),
+                all: false,
+            }),
+            GatewayOperation::Status {
+                target: Some("dev".into()),
+                session_id: None,
+            },
+            SshRenderOptions::default(),
+        );
+        assert_ssh_operation_request(
+            GatewayAction::Status(StatusAction {
+                target: None,
+                all: true,
+            }),
+            GatewayOperation::StatusAll,
+            SshRenderOptions::default(),
+        );
+    }
+
+    #[test]
+    fn non_operation_ssh_actions_are_deferred() {
+        for action in [
+            GatewayAction::Connect(TargetSessionAction {
+                target: Some("dev".into()),
+                session_id: Some("abc123".into()),
+            }),
+            GatewayAction::AddKey(KeyAction {
+                target: Some("dev".into()),
+                public_key: Some("-".into()),
+            }),
+            GatewayAction::AddHostKey(KeySourceAction {
+                public_key: Some("-".into()),
+            }),
+            GatewayAction::AddContainerKey(KeyAction {
+                target: Some("dev".into()),
+                public_key: Some("-".into()),
+            }),
+            GatewayAction::ClientBundle(ClientBundleAction {
+                target: Some("dev".into()),
+                identity_file: Some("/tmp/id".into()),
+                rotate_key: true,
+            }),
+            GatewayAction::Help,
+        ] {
+            assert_eq!(SshGatewayOperation::from_action(&action).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn ssh_launch_var_conversion_errors_remain_typed() {
+        let err = SshGatewayOperation::from_action(&GatewayAction::LaunchRun {
+            name: "repo-shell".into(),
+            session_id: None,
+            vars: vec!["repo=a".into(), "repo=b".into()],
+        })
+        .unwrap_err();
+        assert!(matches!(err, OperationError::InvalidLaunchVariable { .. }));
+        assert_eq!(err.to_string(), "duplicate launch variable \"repo\"");
+    }
+
+    #[test]
+    fn launch_var_conversion_uses_existing_cli_pair_validation() {
+        let err = SshGatewayOperation::from_action(&GatewayAction::LaunchRun {
+            name: "repo-shell".into(),
+            session_id: None,
+            vars: vec!["repo".into()],
+        })
+        .unwrap_err();
+        assert!(matches!(err, OperationError::InvalidLaunchVariable { .. }));
+        assert_eq!(err.to_string(), "--var must be key=value");
     }
 }

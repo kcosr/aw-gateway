@@ -77,8 +77,8 @@ use model::{
 use ops::{
     ExecutionOutcome, GatewayOperation, GatewayOperationResult, OperationError,
     OperationExecutionOptions, OperationMode, OperationResult, OutputSelection, RemoveResult,
-    StopResult, SuppliedLaunchVarValue, SuppliedLaunchVars, execute_gateway_operation,
-    lookup_launch, operation_up_with_runtime,
+    SshGatewayOperation, SshRenderOptions, StopResult, SuppliedLaunchVarValue, SuppliedLaunchVars,
+    execute_gateway_operation, lookup_launch, operation_up_with_runtime,
 };
 use session::{generate_session_id_value, validate_session_id};
 
@@ -233,11 +233,11 @@ async fn run_gateway_action(
     config_path: Option<PathBuf>,
     action: GatewayAction,
 ) -> anyhow::Result<()> {
-    if let Some(render) = SshOperationRender::from_action(&action) {
-        let operation = GatewayOperation::from_ssh_action(action)?
-            .expect("ssh operation render must match operation conversion");
+    if let Some(request) = SshGatewayOperation::from_action(&action)? {
+        let operation = request.operation;
+        let render_operation = operation.clone();
         let result = execute_gateway_operation(config_path, operation).await?;
-        return render_operation_result(result, render);
+        return render_operation_result(&render_operation, result, request.render);
     }
     match action {
         GatewayAction::Connect(action) => {
@@ -306,93 +306,55 @@ async fn run_gateway_action(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum SshOperationRender {
-    Up,
-    Run,
-    Launches { json: bool },
-    LaunchShow { json: bool },
-    Launch,
-    Status,
-    Targets { json: bool },
-    Stop,
-    Remove,
-    DefaultSelection,
-    ClientConfig,
-}
-
-impl SshOperationRender {
-    fn from_action(action: &GatewayAction) -> Option<Self> {
-        match action {
-            GatewayAction::Up(_) => Some(Self::Up),
-            GatewayAction::Run(_) => Some(Self::Run),
-            GatewayAction::Launches { json } => Some(Self::Launches { json: *json }),
-            GatewayAction::LaunchShow { json, .. } => Some(Self::LaunchShow { json: *json }),
-            GatewayAction::LaunchRun { .. } => Some(Self::Launch),
-            GatewayAction::Status(_) => Some(Self::Status),
-            GatewayAction::Targets { json } => Some(Self::Targets { json: *json }),
-            GatewayAction::Stop(_) => Some(Self::Stop),
-            GatewayAction::Remove(_) => Some(Self::Remove),
-            GatewayAction::SetDefault(_)
-            | GatewayAction::ShowDefault
-            | GatewayAction::ResetDefault => Some(Self::DefaultSelection),
-            GatewayAction::ClientConfig(_) => Some(Self::ClientConfig),
-            GatewayAction::Connect(_)
-            | GatewayAction::AddKey(_)
-            | GatewayAction::AddHostKey(_)
-            | GatewayAction::AddContainerKey(_)
-            | GatewayAction::ClientBundle(_)
-            | GatewayAction::Help => None,
-        }
-    }
-}
-
 fn render_operation_result(
+    operation: &GatewayOperation,
     result: GatewayOperationResult,
-    render: SshOperationRender,
+    render: SshRenderOptions,
 ) -> anyhow::Result<()> {
-    match (result, render) {
-        (GatewayOperationResult::Up(ready), SshOperationRender::Up) => render_up_result(ready),
-        (GatewayOperationResult::Run(outcome), SshOperationRender::Run)
-        | (GatewayOperationResult::Launch(outcome), SshOperationRender::Launch) => {
+    match (operation, result) {
+        (GatewayOperation::Up { .. }, GatewayOperationResult::Up(ready)) => render_up_result(ready),
+        (GatewayOperation::Run { .. }, GatewayOperationResult::Run(outcome))
+        | (GatewayOperation::Launch { .. }, GatewayOperationResult::Launch(outcome)) => {
             exit_with_execution_outcome(outcome)
         }
-        (GatewayOperationResult::Launches(entries), SshOperationRender::Launches { json }) => {
-            render_launches(entries, json)
+        (GatewayOperation::Launches, GatewayOperationResult::Launches(entries)) => {
+            render_launches(entries, render.json)
         }
-        (GatewayOperationResult::LaunchShow(detail), SshOperationRender::LaunchShow { json }) => {
-            render_launch_detail(detail, json)
+        (GatewayOperation::LaunchShow { .. }, GatewayOperationResult::LaunchShow(detail)) => {
+            render_launch_detail(detail, render.json)
         }
-        (GatewayOperationResult::Status(status), SshOperationRender::Status) => {
+        (GatewayOperation::Status { .. }, GatewayOperationResult::Status(status)) => {
             render_status_result(status, true)
         }
-        (GatewayOperationResult::StatusAll(entries), SshOperationRender::Status) => {
+        (GatewayOperation::StatusAll, GatewayOperationResult::StatusAll(entries)) => {
             render_status_all(entries, true)
         }
-        (GatewayOperationResult::Targets(entries), SshOperationRender::Targets { json }) => {
-            render_targets(entries, json)
+        (GatewayOperation::Targets, GatewayOperationResult::Targets(entries)) => {
+            render_targets(entries, render.json)
         }
-        (GatewayOperationResult::Stop(result), SshOperationRender::Stop) => {
+        (GatewayOperation::Stop { .. }, GatewayOperationResult::Stop(result)) => {
             render_stop_result(&result);
             Ok(())
         }
-        (GatewayOperationResult::Remove(result), SshOperationRender::Remove) => {
+        (GatewayOperation::Remove { .. }, GatewayOperationResult::Remove(result)) => {
             render_remove_result(&result);
             Ok(())
         }
         (
+            GatewayOperation::SetDefault { .. }
+            | GatewayOperation::ShowDefault
+            | GatewayOperation::ResetDefault,
             GatewayOperationResult::DefaultSelection(selection),
-            SshOperationRender::DefaultSelection,
         ) => {
             render_default_selection(&selection);
             Ok(())
         }
         (
+            GatewayOperation::ClientConfig { .. },
             GatewayOperationResult::ClientConfig {
                 rendered,
                 written_path,
             },
-            SshOperationRender::ClientConfig,
         ) => {
             let _written_path = written_path;
             println!("{rendered}");
@@ -5181,7 +5143,7 @@ mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
 
     #[tokio::test]
     async fn operation_boundary_classifies_launch_variable_errors() {
-        let duplicate = GatewayOperation::from_ssh_action(GatewayAction::LaunchRun {
+        let duplicate = SshGatewayOperation::from_action(&GatewayAction::LaunchRun {
             name: "agent".into(),
             session_id: None,
             vars: vec!["repo=a".into(), "repo=b".into()],
