@@ -1748,13 +1748,12 @@ impl Runtime {
             },
         };
         let container_name = target_cfg.container_name(session_id.as_deref())?;
-        let effective_container_ssh = cfg.effective_container_ssh(&target_cfg)?;
-        let effective_lifecycle_steps = cfg.effective_lifecycle_steps(&target_cfg)?;
-        let effective_host_steps = cfg.effective_host_steps(&target_cfg)?;
-        let effective_container_bootstrap = cfg.effective_container_bootstrap(&target_cfg)?;
-        let effective_container_bootstrap_steps =
-            cfg.effective_container_bootstrap_steps(&target_cfg)?;
-        let effective_container_agent = cfg.effective_container_agent(&target_cfg)?;
+        let effective_container_ssh = target_cfg.container_ssh.clone();
+        let effective_lifecycle_steps = target_cfg.lifecycle_steps.clone();
+        let effective_host_steps = target_cfg.host_steps.clone();
+        let effective_container_bootstrap = target_cfg.container_bootstrap.clone();
+        let effective_container_bootstrap_steps = target_cfg.container_bootstrap_steps.clone();
+        let effective_container_agent = target_cfg.container_agent.clone();
         let workspace =
             resolve_target_workspace(&target_cfg, &target_name, &user, session_id.as_deref())?;
         let container_runtime =
@@ -1848,9 +1847,8 @@ impl Runtime {
                 .clone()
                 .expect("ephemeral target has a session id"),
         };
-        let effective_control_sockets = cfg.effective_control_sockets(&target_cfg)?;
         let control_sockets = render_control_socket_paths(
-            &effective_control_sockets,
+            &target_cfg.control_sockets,
             &target_cfg,
             &target_name,
             &container_name,
@@ -3698,14 +3696,12 @@ exit 0
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, &user.user, &user.home).unwrap();
         Runtime {
-            effective_container_ssh: cfg.effective_container_ssh(&target).unwrap(),
-            effective_lifecycle_steps: cfg.effective_lifecycle_steps(&target).unwrap(),
-            effective_host_steps: cfg.effective_host_steps(&target).unwrap(),
-            effective_container_bootstrap: cfg.effective_container_bootstrap(&target).unwrap(),
-            effective_container_bootstrap_steps: cfg
-                .effective_container_bootstrap_steps(&target)
-                .unwrap(),
-            effective_container_agent: cfg.effective_container_agent(&target).unwrap(),
+            effective_container_ssh: target.container_ssh.clone(),
+            effective_lifecycle_steps: target.lifecycle_steps.clone(),
+            effective_host_steps: target.host_steps.clone(),
+            effective_container_bootstrap: target.container_bootstrap.clone(),
+            effective_container_bootstrap_steps: target.container_bootstrap_steps.clone(),
+            effective_container_agent: target.container_agent.clone(),
             cfg,
             target_name: "default".into(),
             target,
@@ -5449,14 +5445,12 @@ name = "{{image_slug}}"
             home: PathBuf::from("/home/alice"),
         };
         let runtime = Runtime {
-            effective_container_ssh: cfg.effective_container_ssh(&target).unwrap(),
-            effective_lifecycle_steps: cfg.effective_lifecycle_steps(&target).unwrap(),
-            effective_host_steps: cfg.effective_host_steps(&target).unwrap(),
-            effective_container_bootstrap: cfg.effective_container_bootstrap(&target).unwrap(),
-            effective_container_bootstrap_steps: cfg
-                .effective_container_bootstrap_steps(&target)
-                .unwrap(),
-            effective_container_agent: cfg.effective_container_agent(&target).unwrap(),
+            effective_container_ssh: target.container_ssh.clone(),
+            effective_lifecycle_steps: target.lifecycle_steps.clone(),
+            effective_host_steps: target.host_steps.clone(),
+            effective_container_bootstrap: target.container_bootstrap.clone(),
+            effective_container_bootstrap_steps: target.container_bootstrap_steps.clone(),
+            effective_container_agent: target.container_agent.clone(),
             cfg,
             target_name: "default".into(),
             target,
@@ -5715,14 +5709,12 @@ name = "{{image_slug}}"
             .join("workspace/.aw-gateway/containers/ubuntu-dev");
         std::fs::create_dir_all(&container_state_dir).unwrap();
         let runtime = Runtime {
-            effective_container_ssh: cfg.effective_container_ssh(&target).unwrap(),
-            effective_lifecycle_steps: cfg.effective_lifecycle_steps(&target).unwrap(),
-            effective_host_steps: cfg.effective_host_steps(&target).unwrap(),
-            effective_container_bootstrap: cfg.effective_container_bootstrap(&target).unwrap(),
-            effective_container_bootstrap_steps: cfg
-                .effective_container_bootstrap_steps(&target)
-                .unwrap(),
-            effective_container_agent: cfg.effective_container_agent(&target).unwrap(),
+            effective_container_ssh: target.container_ssh.clone(),
+            effective_lifecycle_steps: target.lifecycle_steps.clone(),
+            effective_host_steps: target.host_steps.clone(),
+            effective_container_bootstrap: target.container_bootstrap.clone(),
+            effective_container_bootstrap_steps: target.container_bootstrap_steps.clone(),
+            effective_container_agent: target.container_agent.clone(),
             cfg,
             target_name: "default".into(),
             target,
@@ -5796,14 +5788,12 @@ name = "{{image_slug}}"
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
         let runtime = Runtime {
-            effective_container_ssh: cfg.effective_container_ssh(&target).unwrap(),
-            effective_lifecycle_steps: cfg.effective_lifecycle_steps(&target).unwrap(),
-            effective_host_steps: cfg.effective_host_steps(&target).unwrap(),
-            effective_container_bootstrap: cfg.effective_container_bootstrap(&target).unwrap(),
-            effective_container_bootstrap_steps: cfg
-                .effective_container_bootstrap_steps(&target)
-                .unwrap(),
-            effective_container_agent: cfg.effective_container_agent(&target).unwrap(),
+            effective_container_ssh: target.container_ssh.clone(),
+            effective_lifecycle_steps: target.lifecycle_steps.clone(),
+            effective_host_steps: target.host_steps.clone(),
+            effective_container_bootstrap: target.container_bootstrap.clone(),
+            effective_container_bootstrap_steps: target.container_bootstrap_steps.clone(),
+            effective_container_agent: target.container_agent.clone(),
             cfg,
             target_name: "default".into(),
             target,
@@ -5849,14 +5839,12 @@ name = "{{image_slug}}"
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
         let runtime = Runtime {
-            effective_container_ssh: cfg.effective_container_ssh(&target).unwrap(),
-            effective_lifecycle_steps: cfg.effective_lifecycle_steps(&target).unwrap(),
-            effective_host_steps: cfg.effective_host_steps(&target).unwrap(),
-            effective_container_bootstrap: cfg.effective_container_bootstrap(&target).unwrap(),
-            effective_container_bootstrap_steps: cfg
-                .effective_container_bootstrap_steps(&target)
-                .unwrap(),
-            effective_container_agent: cfg.effective_container_agent(&target).unwrap(),
+            effective_container_ssh: target.container_ssh.clone(),
+            effective_lifecycle_steps: target.lifecycle_steps.clone(),
+            effective_host_steps: target.host_steps.clone(),
+            effective_container_bootstrap: target.container_bootstrap.clone(),
+            effective_container_bootstrap_steps: target.container_bootstrap_steps.clone(),
+            effective_container_agent: target.container_agent.clone(),
             cfg,
             target_name: "default".into(),
             target,
@@ -5919,14 +5907,12 @@ name = "{{image_slug}}"
             .join("workspace/.aw-gateway/containers/ubuntu-dev");
         std::fs::create_dir_all(&container_state_dir).unwrap();
         let runtime = Runtime {
-            effective_container_ssh: cfg.effective_container_ssh(&target).unwrap(),
-            effective_lifecycle_steps: cfg.effective_lifecycle_steps(&target).unwrap(),
-            effective_host_steps: cfg.effective_host_steps(&target).unwrap(),
-            effective_container_bootstrap: cfg.effective_container_bootstrap(&target).unwrap(),
-            effective_container_bootstrap_steps: cfg
-                .effective_container_bootstrap_steps(&target)
-                .unwrap(),
-            effective_container_agent: cfg.effective_container_agent(&target).unwrap(),
+            effective_container_ssh: target.container_ssh.clone(),
+            effective_lifecycle_steps: target.lifecycle_steps.clone(),
+            effective_host_steps: target.host_steps.clone(),
+            effective_container_bootstrap: target.container_bootstrap.clone(),
+            effective_container_bootstrap_steps: target.container_bootstrap_steps.clone(),
+            effective_container_agent: target.container_agent.clone(),
             cfg,
             target_name: "default".into(),
             target,
@@ -6035,14 +6021,12 @@ name = "{{image_slug}}"
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
         let runtime = Runtime {
-            effective_container_ssh: cfg.effective_container_ssh(&target).unwrap(),
-            effective_lifecycle_steps: cfg.effective_lifecycle_steps(&target).unwrap(),
-            effective_host_steps: cfg.effective_host_steps(&target).unwrap(),
-            effective_container_bootstrap: cfg.effective_container_bootstrap(&target).unwrap(),
-            effective_container_bootstrap_steps: cfg
-                .effective_container_bootstrap_steps(&target)
-                .unwrap(),
-            effective_container_agent: cfg.effective_container_agent(&target).unwrap(),
+            effective_container_ssh: target.container_ssh.clone(),
+            effective_lifecycle_steps: target.lifecycle_steps.clone(),
+            effective_host_steps: target.host_steps.clone(),
+            effective_container_bootstrap: target.container_bootstrap.clone(),
+            effective_container_bootstrap_steps: target.container_bootstrap_steps.clone(),
+            effective_container_agent: target.container_agent.clone(),
             cfg,
             target_name: "default".into(),
             target,
@@ -6122,14 +6106,12 @@ name = "{{image_slug}}"
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
         let runtime = Runtime {
-            effective_container_ssh: cfg.effective_container_ssh(&target).unwrap(),
-            effective_lifecycle_steps: cfg.effective_lifecycle_steps(&target).unwrap(),
-            effective_host_steps: cfg.effective_host_steps(&target).unwrap(),
-            effective_container_bootstrap: cfg.effective_container_bootstrap(&target).unwrap(),
-            effective_container_bootstrap_steps: cfg
-                .effective_container_bootstrap_steps(&target)
-                .unwrap(),
-            effective_container_agent: cfg.effective_container_agent(&target).unwrap(),
+            effective_container_ssh: target.container_ssh.clone(),
+            effective_lifecycle_steps: target.lifecycle_steps.clone(),
+            effective_host_steps: target.host_steps.clone(),
+            effective_container_bootstrap: target.container_bootstrap.clone(),
+            effective_container_bootstrap_steps: target.container_bootstrap_steps.clone(),
+            effective_container_agent: target.container_agent.clone(),
             cfg,
             target_name: "default".into(),
             target,
