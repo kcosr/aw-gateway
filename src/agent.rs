@@ -1,4 +1,9 @@
 use crate::VERSION;
+use crate::agent_control::{
+    AgentStatus, AuthRequirement, BridgeStatus, ControlEnvelope, ControlFailure, ControlRequest,
+    ControlRequestId, ControlSuccess, DecodedControlEnvelope, IdleCleanupStatus, IdleStateName,
+    ProcessMatch, ReapResult, ServiceStatus, SessionHoldResult, ShutdownResult,
+};
 use crate::cli::{AgentArgs, AgentCommand, ConfigCommand};
 use crate::config::{
     ContainerAgentFile, ControlSocketConfig, EnvValue, HealthCheck, IdleCleanupAction,
@@ -212,32 +217,6 @@ struct IdleRuntimeState {
     preserve_reason: Option<String>,
     matched_processes: Vec<ProcessMatch>,
     last_reap_result: Option<ReapResult>,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum IdleStateName {
-    #[default]
-    IdlePending,
-    Attached,
-    Preserved,
-    ShutdownContainer,
-    ReapUnpreservedProcesses,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ProcessMatch {
-    pid: u32,
-    comm: String,
-    #[serde(skip)]
-    start_time: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ReapResult {
-    dry_run: bool,
-    would_terminate: Vec<ProcessMatch>,
-    preserved: Vec<ProcessMatch>,
 }
 
 #[derive(Debug)]
@@ -1251,74 +1230,78 @@ async fn handle_control_connection(
 ) -> anyhow::Result<()> {
     validate_control_peer(&stream, state.socket_owner.map(|owner| owner.uid))?;
     let mut reader = BufReader::new(stream);
-    let line = match tokio::time::timeout(CONTROL_READ_TIMEOUT, read_control_request(&mut reader))
-        .await
-    {
-        Ok(Ok(line)) => line,
-        Ok(Err(err)) if err.to_string().contains("exceeds") => {
-            let response = serde_json::json!({"id": serde_json::Value::Null, "ok": false, "error": {"code": "request_too_large", "message": "control request is too large"}});
-            write_control_response(reader.into_inner(), response).await?;
-            return Ok(());
-        }
-        Ok(Err(err)) => return Err(err),
-        Err(_) => anyhow::bail!("timed out reading control request"),
-    };
+    let line =
+        match tokio::time::timeout(CONTROL_READ_TIMEOUT, read_control_request(&mut reader)).await {
+            Ok(Ok(line)) => line,
+            Ok(Err(err)) if err.to_string().contains("exceeds") => {
+                let response = ControlFailure::new(
+                    serde_json::Value::Null,
+                    "request_too_large",
+                    "control request is too large",
+                );
+                write_control_response(reader.into_inner(), response).await?;
+                return Ok(());
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(_) => anyhow::bail!("timed out reading control request"),
+        };
     let Some(line) = line else {
         anyhow::bail!("empty control request");
     };
     let request: serde_json::Value = match serde_json::from_slice(&line) {
         Ok(request) => request,
         Err(err) => {
-            let response = serde_json::json!({"id": serde_json::Value::Null, "ok": false, "error": {"code": "parse_error", "message": err.to_string()}});
+            let response =
+                ControlFailure::new(serde_json::Value::Null, "parse_error", err.to_string());
             write_control_response(reader.into_inner(), response).await?;
             return Ok(());
         }
     };
-    let id = request
-        .get("id")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let method = request
-        .get("method")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let (response, exit_after_response) = match method {
-        "status" => (
-            serde_json::json!({"id": id, "ok": true, "result": status_payload(&state).await}),
-            false,
-        ),
-        "session_hold" => {
-            if let Some(response) = unauthorized_if_needed(&state, &request, &id) {
-                write_control_response(reader.into_inner(), response).await?;
-                return Ok(());
-            }
+    let envelope = match ControlEnvelope::decode(&request) {
+        DecodedControlEnvelope::Request(envelope) => envelope,
+        DecodedControlEnvelope::UnknownMethod(id) => {
+            let response = ControlFailure::new(id, "unknown_method", "unknown control method");
+            write_control_response(reader.into_inner(), response).await?;
+            return Ok(());
+        }
+    };
+    let ControlEnvelope { id, request } = envelope;
+    if let Some(response) = unauthorized_if_needed(&state, &request, &id) {
+        write_control_response(reader.into_inner(), response).await?;
+        return Ok(());
+    }
+    match request {
+        ControlRequest::Status => {
+            let response = ControlSuccess::new(id, status_payload(&state).await);
+            write_control_response(reader.into_inner(), response).await?;
+        }
+        ControlRequest::SessionHold(_) => {
             let mut stream = reader.into_inner();
             write_control_response_ref(
                 &mut stream,
-                serde_json::json!({"id": id, "ok": true, "result": {"held": true}}),
+                ControlSuccess::new(id, SessionHoldResult { held: true }),
             )
             .await?;
             hold_control_session(state, stream).await;
             return Ok(());
         }
-        "shutdown" => {
-            if let Some(response) = unauthorized_if_needed(&state, &request, &id) {
-                write_control_response(reader.into_inner(), response).await?;
-                return Ok(());
-            }
+        ControlRequest::Shutdown(_) => {
             state.shutting_down.store(true, Ordering::SeqCst);
             state.accepting_bridge.store(false, Ordering::SeqCst);
             stop_services(&state).await;
-            (
-                serde_json::json!({"id": id, "ok": true, "result": {"shutting_down": true}}),
-                true,
-            )
+            let response = ControlSuccess::new(
+                id,
+                ShutdownResult {
+                    shutting_down: true,
+                },
+            );
+            write_control_response(reader.into_inner(), response).await?;
+            tokio::spawn(async {
+                sleep(Duration::from_millis(10)).await;
+                std::process::exit(0);
+            });
         }
-        "reap_now" => {
-            if let Some(response) = unauthorized_if_needed(&state, &request, &id) {
-                write_control_response(reader.into_inner(), response).await?;
-                return Ok(());
-            }
+        ControlRequest::ReapNow(_) => {
             let result = state
                 .idle_cleanup
                 .as_ref()
@@ -1329,23 +1312,10 @@ async fn handle_control_connection(
                     preserved: Vec::new(),
                 });
             state.idle_state.lock().await.last_reap_result = Some(result.clone());
-            (
-                serde_json::json!({"id": id, "ok": true, "result": result}),
-                false,
-            )
+            let response = ControlSuccess::new(id, result);
+            write_control_response(reader.into_inner(), response).await?;
         }
-        _ => (
-            serde_json::json!({"id": id, "ok": false, "error": {"code": "unknown_method", "message": "unknown control method"}}),
-            false,
-        ),
     };
-    write_control_response(reader.into_inner(), response).await?;
-    if exit_after_response {
-        tokio::spawn(async {
-            sleep(Duration::from_millis(10)).await;
-            std::process::exit(0);
-        });
-    }
     Ok(())
 }
 
@@ -1452,37 +1422,33 @@ fn unix_peer_credentials(_stream: &UnixStream) -> anyhow::Result<PeerCredentials
 
 fn unauthorized_if_needed(
     state: &AgentState,
-    request: &serde_json::Value,
-    id: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let expected = state.control_token.as_deref()?;
-    let actual = request
-        .get("params")
-        .and_then(|params| params.get("token"))
-        .and_then(serde_json::Value::as_str);
-    if actual == Some(expected) {
+    request: &ControlRequest,
+    id: &ControlRequestId,
+) -> Option<ControlFailure> {
+    if request.auth_requirement() == AuthRequirement::None {
         return None;
     }
-    Some(serde_json::json!({
-        "id": id,
-        "ok": false,
-        "error": {
-            "code": "unauthorized",
-            "message": "control token is required"
-        }
-    }))
+    let expected = state.control_token.as_deref()?;
+    if request.token() == Some(expected) {
+        return None;
+    }
+    Some(ControlFailure::new(
+        id.clone(),
+        "unauthorized",
+        "control token is required",
+    ))
 }
 
-async fn write_control_response(
+async fn write_control_response<T: Serialize>(
     mut stream: UnixStream,
-    response: serde_json::Value,
+    response: T,
 ) -> anyhow::Result<()> {
     write_control_response_ref(&mut stream, response).await
 }
 
-async fn write_control_response_ref(
+async fn write_control_response_ref<T: Serialize>(
     stream: &mut UnixStream,
-    response: serde_json::Value,
+    response: T,
 ) -> anyhow::Result<()> {
     stream
         .write_all(serde_json::to_string(&response)?.as_bytes())
@@ -1659,47 +1625,6 @@ fn idle_action_name(action: IdleCleanupAction) -> &'static str {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct AgentStatus {
-    ready: bool,
-    version: String,
-    services: Vec<ServiceStatus>,
-    ssh_bridge: BridgeStatus,
-    idle_cleanup: Option<IdleCleanupStatus>,
-    shutting_down: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct IdleCleanupStatus {
-    owner: String,
-    action: String,
-    state: IdleStateName,
-    idle_for_ms: Option<u128>,
-    preserve: bool,
-    preserve_reason: Option<String>,
-    matched_processes: Vec<ProcessMatch>,
-    last_reap_result: Option<ReapResult>,
-}
-
-#[derive(Debug, Serialize)]
-struct ServiceStatus {
-    name: String,
-    required: bool,
-    state: String,
-    pid: Option<u32>,
-    healthy: bool,
-    restart_count: usize,
-    last_error: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct BridgeStatus {
-    enabled: bool,
-    ready: bool,
-    active_streams: usize,
-    active_sessions: usize,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1777,6 +1702,38 @@ mod tests {
         assert!(should_restart(RestartPolicy::Always, true));
         assert!(should_restart(RestartPolicy::OnFailure, false));
         assert!(!should_restart(RestartPolicy::OnFailure, true));
+    }
+
+    #[test]
+    fn control_auth_helper_only_requires_configured_token_for_mutating_methods() {
+        let no_token_state = AgentState::new(PathBuf::from("/tmp"), None, false, None, None);
+        let token_state = AgentState::new(
+            PathBuf::from("/tmp"),
+            None,
+            false,
+            Some("secret".into()),
+            None,
+        );
+        let id = serde_json::Value::String("request".into());
+        let status = ControlRequest::Status;
+        let wrong_hold = ControlRequest::SessionHold(crate::agent_control::SessionHoldParams {
+            token: Some("wrong".into()),
+            kind: Some("run".into()),
+        });
+        let correct_hold = ControlRequest::SessionHold(crate::agent_control::SessionHoldParams {
+            token: Some("secret".into()),
+            kind: Some("run".into()),
+        });
+
+        assert!(unauthorized_if_needed(&no_token_state, &wrong_hold, &id).is_none());
+        assert!(unauthorized_if_needed(&token_state, &status, &id).is_none());
+        assert!(unauthorized_if_needed(&token_state, &correct_hold, &id).is_none());
+
+        let failure = unauthorized_if_needed(&token_state, &wrong_hold, &id).unwrap();
+        assert_eq!(failure.id, id);
+        assert!(!failure.ok);
+        assert_eq!(failure.error.code, "unauthorized");
+        assert_eq!(failure.error.message, "control token is required");
     }
 
     #[test]

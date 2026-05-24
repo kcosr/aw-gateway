@@ -1381,8 +1381,8 @@ command = ["launch-command"]
         assert_eq!(body["error"]["code"], "invalid_launch_var");
     }
 
-    #[test]
-    fn status_shape_can_be_wrapped_in_data_envelope() {
+    #[tokio::test]
+    async fn status_shape_can_be_wrapped_in_data_envelope() {
         let status = GatewayStatus {
             target: "default".into(),
             session_id: None,
@@ -1394,12 +1394,42 @@ command = ["launch-command"]
             container_pid: Some(123),
             active_sessions: 0,
             sessions: Vec::new(),
-            agent_ready: false,
+            agent_ready: true,
             ssh_socket: PathBuf::from("/tmp/ssh.sock"),
             status: "ready".into(),
-            agent: None,
+            agent: Some(Box::new(crate::agent_control::AgentStatus {
+                ready: true,
+                version: "0.2.0".into(),
+                services: Vec::new(),
+                ssh_bridge: crate::agent_control::BridgeStatus {
+                    enabled: true,
+                    ready: true,
+                    active_streams: 0,
+                    active_sessions: 0,
+                },
+                idle_cleanup: Some(crate::agent_control::IdleCleanupStatus {
+                    owner: "agent".into(),
+                    action: "exit_container".into(),
+                    state: crate::agent_control::IdleStateName::IdlePending,
+                    idle_for_ms: None,
+                    preserve: false,
+                    preserve_reason: None,
+                    matched_processes: Vec::new(),
+                    last_reap_result: None,
+                }),
+                shutting_down: false,
+            })),
         };
         let response = success_data(status);
-        assert_eq!(response.status(), StatusCode::OK);
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["data"]["agent"]["ready"], true);
+        assert_eq!(body["data"]["agent"]["ssh_bridge"]["enabled"], true);
+        assert_eq!(body["data"]["agent"]["ssh_bridge"]["ready"], true);
+        assert_eq!(
+            body["data"]["agent"]["idle_cleanup"]["state"],
+            "idle_pending"
+        );
     }
 }

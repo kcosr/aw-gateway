@@ -179,6 +179,10 @@ poll_interval = "30s"
 
     wait_for_path(&control_socket);
 
+    let response = control_request(&control_socket, br#"{"id":"status","method":"status"}"#);
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["result"]["ready"], true);
+
     let response = control_request(
         &control_socket,
         br#"{"id":"1","method":"reap_now","params":{"dry_run":true}}"#,
@@ -195,10 +199,65 @@ poll_interval = "30s"
 
     let response = control_request(
         &control_socket,
+        br#"{"id":"wrong","method":"reap_now","params":{"dry_run":true,"token":"wrong"}}"#,
+    );
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "unauthorized");
+
+    let response = control_request(
+        &control_socket,
         br#"{"id":"2","method":"reap_now","params":{"dry_run":true,"token":"secret"}}"#,
     );
     assert_eq!(response["ok"], true);
     assert_eq!(response["result"]["dry_run"], true);
+
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
+#[test]
+fn container_agent_returns_unknown_method_when_method_is_missing_or_non_string() {
+    let dir = tempdir().unwrap();
+    let control_socket = dir.path().join("agent.sock");
+    let state_dir = dir.path().join("state");
+    let config = dir.path().join("container-agent.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+
+[container_agent]
+control_socket = "{}"
+"#,
+            control_socket.display()
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::cargo_bin("aw-container-agent")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .env("AW_CONTAINER_STATE_DIR", &state_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    wait_for_path(&control_socket);
+
+    let response = control_request(&control_socket, br#"{"id":"missing"}"#);
+    assert_eq!(response["id"], "missing");
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "unknown_method");
+    assert_eq!(response["error"]["message"], "unknown control method");
+
+    let response = control_request(&control_socket, br#"{"id":"non-string","method":123}"#);
+    assert_eq!(response["id"], "non-string");
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "unknown_method");
+    assert_eq!(response["error"]["message"], "unknown control method");
 
     child.kill().unwrap();
     let _ = child.wait();
