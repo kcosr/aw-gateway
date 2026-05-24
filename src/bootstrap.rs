@@ -1,11 +1,10 @@
 use crate::cli::BootstrapArgs;
 use crate::config::{ContainerBootstrapFile, RenderedContainerBootstrapStep, parse_duration};
+use crate::fileutil::{self, AtomicWritePolicy, DurabilityPolicy, FileModePolicy};
 use anyhow::Context;
 use std::ffi::CStr;
 use std::ffi::CString;
-use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
@@ -140,36 +139,17 @@ fn ensure_dir_owned_if_created(path: &Path, uid: u32, gid: u32) -> anyhow::Resul
 }
 
 fn atomic_write_preserve_mode(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
-    let metadata = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    let mode = metadata.permissions().mode();
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid file name {}", path.display()))?;
-    let tmp = parent.join(format!(".{file_name}.aw-tmp-{}", std::process::id()));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .with_context(|| format!("open {}", tmp.display()))?;
-        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))?;
-        if let Ok(parent_file) = std::fs::File::open(parent) {
-            let _ = parent_file.sync_all();
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
+    fileutil::atomic_write_file(
+        path,
+        contents,
+        AtomicWritePolicy::new(
+            FileModePolicy::PreserveExisting,
+            DurabilityPolicy {
+                fsync_file: true,
+                fsync_parent_dir: true,
+            },
+        ),
+    )
 }
 
 fn chown(path: &Path, uid: u32, gid: u32) -> anyhow::Result<()> {
@@ -306,6 +286,7 @@ fn exec_agent(cfg: &ContainerBootstrapFile) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn ensure_group_allows_gid_collision_with_different_name() {

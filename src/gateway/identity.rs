@@ -1,6 +1,8 @@
 use super::Runtime;
-use super::fileutil::{
-    atomic_write_file, random_hex_token, remove_if_exists, set_mode, write_private_file,
+use super::token::random_hex_token;
+use crate::fileutil::{
+    AtomicWritePolicy, DurabilityPolicy, FileModePolicy, atomic_write_file, remove_if_exists,
+    set_mode, write_private_file,
 };
 use crate::paths;
 use anyhow::Context;
@@ -234,7 +236,17 @@ pub(super) fn ensure_authorized_key(path: &Path, public_key: &str) -> anyhow::Re
     if !present {
         keys.push(public_key);
     }
-    atomic_write_file(path, format!("{}\n", keys.join("\n")).as_bytes(), 0o644)?;
+    atomic_write_file(
+        path,
+        format!("{}\n", keys.join("\n")).as_bytes(),
+        AtomicWritePolicy::new(
+            FileModePolicy::Fixed(0o644),
+            DurabilityPolicy {
+                fsync_file: false,
+                fsync_parent_dir: false,
+            },
+        ),
+    )?;
     Ok(!present)
 }
 
