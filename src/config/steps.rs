@@ -55,9 +55,9 @@ pub(super) enum TargetStepPatchState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TargetStepPatchPosition<K> {
     Append,
-    Before(K),
-    After(K),
-    ReplaceExisting,
+    Before { reference: K, name: String },
+    After { reference: K, name: String },
+    ConflictingBeforeAfter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,9 +87,16 @@ impl<K: MergeKey> TargetStepPatch<K> {
     {
         let key = key(raw);
         let position = match (raw.before(), raw.after()) {
-            (Some(before), None) => TargetStepPatchPosition::Before(key.reference_key(before)),
-            (None, Some(after)) => TargetStepPatchPosition::After(key.reference_key(after)),
-            _ => TargetStepPatchPosition::Append,
+            (Some(before), None) => TargetStepPatchPosition::Before {
+                reference: key.reference_key(before),
+                name: before.to_owned(),
+            },
+            (None, Some(after)) => TargetStepPatchPosition::After {
+                reference: key.reference_key(after),
+                name: after.to_owned(),
+            },
+            (Some(_), Some(_)) => TargetStepPatchPosition::ConflictingBeforeAfter,
+            (None, None) => TargetStepPatchPosition::Append,
         };
         Self {
             key,
@@ -102,13 +109,46 @@ impl<K: MergeKey> TargetStepPatch<K> {
             payload: TargetStepPatchPayload::new(raw.has_payload()),
         }
     }
+}
 
-    fn mark_replace_existing(&mut self) {
-        self.position = TargetStepPatchPosition::ReplaceExisting;
+#[derive(Debug, Clone, Copy)]
+pub(super) enum PayloadInheritancePolicy {
+    TimeoutOnlyReplacement,
+    NoInheritedPayload,
+}
+
+impl PayloadInheritancePolicy {
+    pub(super) fn allows_inherited_payload(self) -> bool {
+        matches!(self, Self::TimeoutOnlyReplacement)
     }
 
-    fn replaces_existing(&self) -> bool {
-        matches!(self.position, TargetStepPatchPosition::ReplaceExisting)
+    pub(super) fn lifecycle_inherits_payload(self, step: &RawLifecycleStep) -> bool {
+        self.allows_inherited_payload()
+            && step.timeout.is_some()
+            && step.command.is_none()
+            && step.required.is_none()
+    }
+
+    pub(super) fn host_inherits_payload(self, step: &RawHostStep) -> bool {
+        self.allows_inherited_payload()
+            && step.timeout.is_some()
+            && step.command.is_none()
+            && step.required.is_none()
+            && step.health_check.is_none()
+    }
+
+    pub(super) fn inherit_optional<T, U, F>(
+        self,
+        should_inherit: bool,
+        inherited: Option<&T>,
+        field: F,
+    ) -> Option<U>
+    where
+        F: FnOnce(&T) -> U,
+    {
+        self.allows_inherited_payload()
+            .then(|| should_inherit.then(|| inherited.map(field)).flatten())
+            .flatten()
     }
 }
 
@@ -238,7 +278,7 @@ where
     }
 
     for entry in raw {
-        let mut patch = TargetStepPatch::from_raw(entry, &raw_key);
+        let patch = TargetStepPatch::from_raw(entry, &raw_key);
         let existing_index = effective_keys
             .iter()
             .position(|candidate| candidate == &patch.key);
@@ -249,8 +289,6 @@ where
                     patch.key.label()
                 );
             }
-            patch.mark_replace_existing();
-            debug_assert!(patch.replaces_existing());
             match patch.state {
                 TargetStepPatchState::Enabled => {
                     result[index] = convert(entry, Some(&result[index]))?;
@@ -272,17 +310,17 @@ where
         }
 
         let insert_at = match &patch.position {
-            TargetStepPatchPosition::Before(reference) => effective_keys
+            TargetStepPatchPosition::Before { reference, name } => effective_keys
                 .iter()
                 .position(|candidate| candidate == reference)
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "{list_name} {} references missing before = {:?}",
                         patch.key.label(),
-                        entry.before().unwrap_or_default()
+                        name
                     )
                 })?,
-            TargetStepPatchPosition::After(reference) => effective_keys
+            TargetStepPatchPosition::After { reference, name } => effective_keys
                 .iter()
                 .position(|candidate| candidate == reference)
                 .map(|index| index + 1)
@@ -290,11 +328,13 @@ where
                     anyhow::anyhow!(
                         "{list_name} {} references missing after = {:?}",
                         patch.key.label(),
-                        entry.after().unwrap_or_default()
+                        name
                     )
                 })?,
             TargetStepPatchPosition::Append => result.len(),
-            TargetStepPatchPosition::ReplaceExisting => unreachable!("new patches cannot replace"),
+            TargetStepPatchPosition::ConflictingBeforeAfter => unreachable!(
+                "raw target step validation rejects patches with both before and after"
+            ),
         };
         result.insert(insert_at, convert(entry, None)?);
         effective_keys.insert(insert_at, patch.key);

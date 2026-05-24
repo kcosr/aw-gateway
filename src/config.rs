@@ -26,6 +26,7 @@ use resolver::{
     TemplateChainResolver, launch_template_dependencies, overlay_launch_template,
     overlay_target_template, target_template_dependencies,
 };
+use steps::PayloadInheritancePolicy;
 pub use target::{
     ContainerBootstrapConfig, ContainerMountConfig, ContainerMountMode, ContainerSshConfig,
     ContainerSshTransferConfig, ControlSocketsConfig, IdleCleanupAction, IdleCleanupConfig,
@@ -474,33 +475,6 @@ impl Default for ClientConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(super) enum PayloadInheritancePolicy {
-    TimeoutOnlyReplacement,
-    NoInheritedPayload,
-}
-
-impl PayloadInheritancePolicy {
-    fn allows_inherited_payload(self) -> bool {
-        matches!(self, Self::TimeoutOnlyReplacement)
-    }
-
-    fn lifecycle_inherits_payload(self, step: &RawLifecycleStep) -> bool {
-        self.allows_inherited_payload()
-            && step.timeout.is_some()
-            && step.command.is_none()
-            && step.required.is_none()
-    }
-
-    fn host_inherits_payload(self, step: &RawHostStep) -> bool {
-        self.allows_inherited_payload()
-            && step.timeout.is_some()
-            && step.command.is_none()
-            && step.required.is_none()
-            && step.health_check.is_none()
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawLifecycleStep {
@@ -537,12 +511,10 @@ impl RawLifecycleStep {
         &self,
         inherited: Option<&LifecycleStep>,
     ) -> anyhow::Result<LifecycleStep> {
-        let inherit_payload =
-            PayloadInheritancePolicy::TimeoutOnlyReplacement.lifecycle_inherits_payload(self);
+        let policy = PayloadInheritancePolicy::TimeoutOnlyReplacement;
+        let inherit_payload = policy.lifecycle_inherits_payload(self);
         let command = self.command.clone().or_else(|| {
-            inherit_payload
-                .then(|| inherited.map(|step| step.command.clone()))
-                .flatten()
+            policy.inherit_optional(inherit_payload, inherited, |step| step.command.clone())
         });
         Ok(LifecycleStep {
             phase: self.phase,
@@ -550,9 +522,7 @@ impl RawLifecycleStep {
             required: self
                 .required
                 .or_else(|| {
-                    inherit_payload
-                        .then(|| inherited.map(|step| step.required))
-                        .flatten()
+                    policy.inherit_optional(inherit_payload, inherited, |step| step.required)
                 })
                 .unwrap_or(true),
             command: command.ok_or_else(|| {
@@ -638,21 +608,17 @@ impl RawHostStep {
     }
 
     pub(super) fn to_effective(&self, inherited: Option<&HostStep>) -> anyhow::Result<HostStep> {
-        let inherit_payload =
-            PayloadInheritancePolicy::TimeoutOnlyReplacement.host_inherits_payload(self);
+        let policy = PayloadInheritancePolicy::TimeoutOnlyReplacement;
+        let inherit_payload = policy.host_inherits_payload(self);
         let command = self.command.clone().or_else(|| {
-            inherit_payload
-                .then(|| inherited.map(|step| step.command.clone()))
-                .flatten()
+            policy.inherit_optional(inherit_payload, inherited, |step| step.command.clone())
         });
         Ok(HostStep {
             name: self.name.clone(),
             required: self
                 .required
                 .or_else(|| {
-                    inherit_payload
-                        .then(|| inherited.map(|step| step.required))
-                        .flatten()
+                    policy.inherit_optional(inherit_payload, inherited, |step| step.required)
                 })
                 .unwrap_or(true),
             command: command.ok_or_else(|| {
@@ -662,9 +628,9 @@ impl RawHostStep {
                 )
             })?,
             health_check: self.health_check.clone().or_else(|| {
-                inherit_payload
-                    .then(|| inherited.and_then(|step| step.health_check.clone()))
-                    .flatten()
+                policy.inherit_optional(inherit_payload, inherited, |step| {
+                    step.health_check.clone()
+                })?
             }),
             timeout: self.timeout.clone(),
         })
