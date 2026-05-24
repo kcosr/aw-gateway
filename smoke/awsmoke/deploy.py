@@ -177,7 +177,7 @@ def render_gateway_config(
         text = set_toml_string(text, "program", host.docker_program, section="runtime")
         text = append_control_socket_override(text, host)
     else:
-        text = text.replace("/opt/aw-gateway", root)
+        text = replace_mount_sources(text, "/opt/aw-gateway", root)
     if ephemeral_target:
         text = text.replace('mode = "fixed"', 'mode = "ephemeral"', 1)
         text = text.replace('name = "{image_slug}"', 'ephemeral_name = "{image_slug}-{session_id}"', 1)
@@ -228,6 +228,15 @@ Match User {user}
     output = output_dir / f"99-aw-gateway-smoke-{user}.conf"
     output.write_text(text)
     return output
+
+
+def replace_mount_sources(text: str, old_root: str, new_root: str) -> str:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith('source = "') and old_root in stripped:
+            lines[index] = line.replace(old_root, new_root, 1)
+    return "\n".join(lines) + "\n"
 
 
 def replace_toml_string(text: str, key: str, value: str, *, section: str) -> str:

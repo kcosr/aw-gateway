@@ -147,7 +147,10 @@ No Mac files are installed under `/opt`.
 `rocky10` uses rootless Podman from a user-owned install. Rootless Podman on
 SELinux could not relabel root-owned `/opt/aw-gateway` bind mounts, so the
 smoke layout uses `/home/kevin/aw-gateway` for the operator and
-`/home/awsmoke/aw-gateway` for the restricted user.
+`/home/awsmoke/aw-gateway` for the restricted user. Runtime helper sources
+come from that host install, but their in-container mount targets remain under
+`/opt/aw-gateway` so helper mountpoints do not land inside the workspace
+mounted at the session home.
 
 `macos-colima` uses Colima profile `aw-gateway` and Docker socket:
 
@@ -181,5 +184,8 @@ The current suite covers:
 - Linux restricted `ForceCommand` help, target listing, and `run`.
 - HTTP API bearer auth, metadata, lifecycle, command execution, launch
   execution, validation errors, and action allow-listing over SSH tunnels.
+- Short-timer cleanup behavior for gateway-owned idle stop, Linux agent-owned
+  idle stop, preserve-process handling, process reaping, and ephemeral
+  workspace cleanup.
 
 Additional coverage notes are tracked in [SCENARIOS.md](SCENARIOS.md).

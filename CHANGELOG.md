@@ -2,7 +2,17 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Added live smoke coverage for short-timer idle cleanup, preserve-process,
+  reaping, and ephemeral workspace cleanup behavior
+  ([#17](https://github.com/kcosr/aw-gateway/pull/17)).
+
+### Fixed
+
+- Fixed rootless Podman session workspace cleanup for workspaces containing
+  subuid-owned files by removing them through `podman unshare`
+  ([#17](https://github.com/kcosr/aw-gateway/pull/17)).
 
 ## [0.2.0] - 2026-05-23
 
