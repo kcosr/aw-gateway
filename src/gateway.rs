@@ -1,6 +1,6 @@
 use crate::agent_control::{
-    AgentStatus, ControlEnvelope, ControlFailure, ControlResponse, ControlSuccess,
-    SessionHoldParams, SessionHoldResult, ShutdownParams, ShutdownResult,
+    AgentStatus, ControlEnvelope, ControlFailure, ControlSuccess, SessionHoldParams,
+    SessionHoldResult, ShutdownParams, ShutdownResult,
 };
 use crate::cli::{
     AddContainerKeyArgs, AddHostKeyArgs, AddKeyArgs, ClientBundleArgs, ClientConfigArgs,
@@ -2558,15 +2558,18 @@ impl Runtime {
     fn parse_agent_control_success<T: DeserializeOwned>(
         line: &str,
     ) -> anyhow::Result<ControlSuccess<T>> {
-        match serde_json::from_str::<ControlResponse<T>>(line)? {
-            ControlResponse::Success(response) if response.ok => Ok(response),
-            ControlResponse::Success(response) => {
-                anyhow::bail!(
-                    "agent control request returned ok=false without error: {:?}",
-                    response.id
-                )
+        let value: serde_json::Value = serde_json::from_str(line)?;
+        match value.get("ok").and_then(serde_json::Value::as_bool) {
+            Some(true) => Ok(serde_json::from_value::<ControlSuccess<T>>(value)?),
+            Some(false) if value.get("error").is_some() => {
+                let failure = serde_json::from_value::<ControlFailure>(value)?;
+                Err(Self::agent_control_failure(failure))
             }
-            ControlResponse::Failure(failure) => Err(Self::agent_control_failure(failure)),
+            Some(false) => {
+                let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                anyhow::bail!("agent control request returned ok=false without error: {id:?}")
+            }
+            None => Ok(serde_json::from_value::<ControlSuccess<T>>(value)?),
         }
     }
 
@@ -6411,6 +6414,15 @@ name = "{{image_slug}}"
         .to_string();
         assert!(err.contains("agent control request returned ok=false without error"));
         assert!(err.contains("hold"));
+    }
+
+    #[test]
+    fn typed_agent_status_parses_remote_smoke_response_shape() {
+        let response = Runtime::parse_agent_control_success::<AgentStatus>(
+            r#"{"id":"status","ok":true,"result":{"ready":true,"version":"0.2.0","services":[{"name":"container-sshd","required":true,"state":"running","pid":13,"healthy":true,"restart_count":0,"last_error":null}],"ssh_bridge":{"enabled":true,"ready":true,"active_streams":0,"active_sessions":0},"idle_cleanup":{"owner":"agent","action":"exit_container","state":"idle_pending","idle_for_ms":11947,"preserve":false,"preserve_reason":null,"matched_processes":[],"last_reap_result":null},"shutting_down":false}}"#,
+        )
+        .unwrap();
+        assert!(response.result.ready);
     }
 
     #[tokio::test]
