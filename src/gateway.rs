@@ -549,7 +549,7 @@ impl OperationSessionSpec {
         matches!(self, Self::Launch)
     }
 
-    fn warn_detached_failure(self, operation_id: &str, err: &anyhow::Error) {
+    fn warn_fire_and_forget_failure(self, operation_id: &str, err: &anyhow::Error) {
         match self {
             Self::RunCommand => {
                 tracing::warn!(
@@ -628,6 +628,9 @@ impl OperationRunner {
     }
 
     async fn spawn_detached(self) -> anyhow::Result<ExecutionOutcome> {
+        // Detach is explicitly fire-and-forget. This id is emitted in the
+        // response and logs so operators can correlate failures, not look up
+        // operation status later.
         let operation_id = generate_session_id_value()?;
         let Self {
             runtime,
@@ -648,7 +651,7 @@ impl OperationRunner {
             )
             .await;
             if let Err(err) = result {
-                session_spec.warn_detached_failure(&background_id, &err);
+                session_spec.warn_fire_and_forget_failure(&background_id, &err);
             }
         });
         Ok(ExecutionOutcome::detached(operation_id))

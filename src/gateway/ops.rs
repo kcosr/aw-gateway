@@ -276,6 +276,8 @@ pub(super) fn lookup_launch(cfg: &GatewayConfig, name: &str) -> OperationResult<
 pub(super) enum OperationMode {
     Wait,
     Stream,
+    // Fire-and-forget execution. The returned operation_id is a log
+    // correlation handle only; there is no queryable operation registry.
     Detach,
 }
 
@@ -329,6 +331,8 @@ pub(super) enum ExecutionOutcome {
         stdout: Option<Vec<u8>>,
         stderr: Option<Vec<u8>>,
     },
+    // The operation_id is intentionally not a registry key. Detached
+    // background failures are logged and cannot be queried through the API.
     Detached {
         operation_id: String,
     },
