@@ -10,6 +10,8 @@
 
 ### Changed
 
+- Moved target lifecycle, host, and container-bootstrap step models and patch
+  helpers into `src/config/steps.rs` while preserving existing config behavior.
 - Refactored target step overlay internals to make patch semantics explicit
   while preserving existing config behavior
   ([#36](https://github.com/kcosr/aw-gateway/pull/36)).

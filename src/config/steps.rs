@@ -55,7 +55,7 @@ impl RawLifecycleStep {
             command: command.ok_or_else(|| {
                 anyhow::anyhow!(
                     "lifecycle_steps {}/{} command must be provided when enabled",
-                    lifecycle_phase_name(self.phase),
+                    self.phase.name(),
                     self.name
                 )
             })?,
@@ -100,6 +100,17 @@ pub enum LifecyclePhase {
     PostStartHost,
     PreStop,
     PostStop,
+}
+
+impl LifecyclePhase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::PreStart => "pre_start",
+            Self::PostStartHost => "post_start_host",
+            Self::PreStop => "pre_stop",
+            Self::PostStop => "post_stop",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -334,7 +345,7 @@ impl MergeKey for LifecycleStepKey {
 
     fn label(&self) -> String {
         match self.phase {
-            Some(phase) => format!("{}/{}", lifecycle_phase_name(phase), self.name),
+            Some(phase) => format!("{}/{}", phase.name(), self.name),
             None => self.name.clone(),
         }
     }
@@ -406,24 +417,24 @@ impl<K: MergeKey> TargetStepPatch<K> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) enum PayloadInheritancePolicy {
+enum PayloadInheritancePolicy {
     TimeoutOnlyReplacement,
     NoInheritedPayload,
 }
 
 impl PayloadInheritancePolicy {
-    pub(super) fn allows_inherited_payload(self) -> bool {
+    fn allows_inherited_payload(self) -> bool {
         matches!(self, Self::TimeoutOnlyReplacement)
     }
 
-    pub(super) fn lifecycle_inherits_payload(self, step: &RawLifecycleStep) -> bool {
+    fn lifecycle_inherits_payload(self, step: &RawLifecycleStep) -> bool {
         self.allows_inherited_payload()
             && step.timeout.is_some()
             && step.command.is_none()
             && step.required.is_none()
     }
 
-    pub(super) fn host_inherits_payload(self, step: &RawHostStep) -> bool {
+    fn host_inherits_payload(self, step: &RawHostStep) -> bool {
         self.allows_inherited_payload()
             && step.timeout.is_some()
             && step.command.is_none()
@@ -431,7 +442,7 @@ impl PayloadInheritancePolicy {
             && step.health_check.is_none()
     }
 
-    pub(super) fn inherit_optional<T, U, F>(
+    fn inherit_optional<T, U, F>(
         self,
         should_inherit: bool,
         inherited: Option<&T>,
