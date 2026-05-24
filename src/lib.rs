@@ -1,5 +1,6 @@
 mod action;
 pub mod agent;
+mod agent_control;
 pub mod bootstrap;
 pub mod cli;
 pub mod config;

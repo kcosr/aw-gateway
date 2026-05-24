@@ -1,3 +1,7 @@
+use crate::agent_control::{
+    AgentStatus, ControlEnvelope, ControlFailure, ControlResponse, ControlSuccess,
+    SessionHoldParams, SessionHoldResult, ShutdownParams, ShutdownResult,
+};
 use crate::cli::{
     AddContainerKeyArgs, AddHostKeyArgs, AddKeyArgs, ClientBundleArgs, ClientConfigArgs,
     ConfigCommand, ConnectArgs, GatewayArgs, GatewayCommand, LaunchCommand, LaunchesArgs, RunArgs,
@@ -25,6 +29,7 @@ use crate::ssh_filter::{
 };
 use crate::template::{self, Vars};
 use anyhow::Context;
+use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Component, Path, PathBuf};
@@ -2074,11 +2079,7 @@ impl Runtime {
         };
         let sessions = self.active_session_markers()?;
         let launch = status_launch(self.identity.session_id.as_deref(), &sessions);
-        let agent_ready = agent
-            .as_ref()
-            .and_then(|value| value.get("ready"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let agent_ready = agent.as_ref().is_some_and(|status| status.ready);
         Ok(GatewayStatus {
             target: self.identity.target_name.clone(),
             session_id: self.identity.session_id.clone(),
@@ -2101,7 +2102,7 @@ impl Runtime {
                 agent_ready,
             )
             .into(),
-            agent,
+            agent: agent.map(Box::new),
         })
     }
 
@@ -2544,10 +2545,7 @@ impl Runtime {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Ok(status) = self.agent_status().await
-                && status
-                    .get("ready")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
+                && status.ready
             {
                 return Ok(());
             }
@@ -2575,39 +2573,45 @@ impl Runtime {
         }
     }
 
-    async fn agent_status(&self) -> anyhow::Result<serde_json::Value> {
+    async fn agent_status(&self) -> anyhow::Result<AgentStatus> {
         let response = self
-            .agent_request(serde_json::json!({"id":"status","method":"status"}))
+            .agent_request::<AgentStatus>(&ControlEnvelope::status(serde_json::json!("status")))
             .await?;
-        if !response
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-        {
-            anyhow::bail!("agent status failed: {response}");
-        }
-        Ok(response
-            .get("result")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null))
+        Ok(response.result)
     }
 
     async fn agent_shutdown(&self) -> anyhow::Result<()> {
         let token = self.control_token()?;
-        let _ = self
-            .agent_request(serde_json::json!({
-                "id": "shutdown",
-                "method": "shutdown",
-                "params": {
-                    "reason": "gateway-stop",
-                    "token": token,
+        let _response = self
+            .agent_request::<ShutdownResult>(&ControlEnvelope::shutdown(
+                serde_json::json!("shutdown"),
+                ShutdownParams {
+                    token: Some(token),
+                    reason: Some("gateway-stop".into()),
                 },
-            }))
+            ))
             .await?;
         Ok(())
     }
 
-    async fn agent_request(&self, request: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    async fn agent_request<T: DeserializeOwned>(
+        &self,
+        request: &ControlEnvelope,
+    ) -> anyhow::Result<ControlSuccess<T>> {
+        let (response, _reader) = self
+            .send_typed_agent_request(
+                request,
+                "timed out waiting for container agent control response",
+            )
+            .await?;
+        Ok(response)
+    }
+
+    async fn send_typed_agent_request<T: DeserializeOwned>(
+        &self,
+        request: &ControlEnvelope,
+        timeout_message: &'static str,
+    ) -> anyhow::Result<(ControlSuccess<T>, BufReader<UnixStream>)> {
         tokio::time::timeout(Duration::from_secs(5), async {
             self.validate_agent_socket().await?;
             let mut stream = UnixStream::connect(self.agent_socket()).await?;
@@ -2617,46 +2621,58 @@ impl Runtime {
             let mut reader = BufReader::new(stream);
             let mut line = String::new();
             reader.read_line(&mut line).await?;
-            Ok(serde_json::from_str(&line)?)
+            let response = Self::parse_agent_control_success(&line)?;
+            Ok((response, reader))
         })
         .await
-        .context("timed out waiting for container agent control response")?
+        .context(timeout_message)?
+    }
+
+    fn parse_agent_control_success<T: DeserializeOwned>(
+        line: &str,
+    ) -> anyhow::Result<ControlSuccess<T>> {
+        match serde_json::from_str::<ControlResponse<T>>(line)? {
+            ControlResponse::Success(response) if response.ok => Ok(response),
+            ControlResponse::Success(response) => {
+                anyhow::bail!(
+                    "agent control request returned ok=false without error: {:?}",
+                    response.id
+                )
+            }
+            ControlResponse::Failure(failure) => Err(Self::agent_control_failure(failure)),
+        }
+    }
+
+    fn agent_control_failure(failure: ControlFailure) -> anyhow::Error {
+        anyhow::anyhow!(
+            "agent control request failed: {}: {}",
+            failure.error.code,
+            failure.error.message
+        )
     }
 
     async fn agent_session_hold(&self, kind: &str) -> anyhow::Result<Option<AgentSessionHold>> {
         if !self.uses_agent_idle_cleanup() {
             return Ok(None);
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
-            self.validate_agent_socket().await?;
-            let mut stream = UnixStream::connect(self.agent_socket()).await?;
-            let token = self.control_token()?;
-            let request = serde_json::json!({
-                "id": "session_hold",
-                "method": "session_hold",
-                "params": {
-                    "token": token,
-                    "kind": kind,
-                },
-            });
-            let mut payload = serde_json::to_vec(&request)?;
-            payload.push(b'\n');
-            stream.write_all(&payload).await?;
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            reader.read_line(&mut line).await?;
-            let response: serde_json::Value = serde_json::from_str(&line)?;
-            if !response
-                .get("ok")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-            {
-                anyhow::bail!("agent session hold failed: {response}");
-            }
-            Ok(Some(AgentSessionHold { _reader: reader }))
-        })
-        .await
-        .context("timed out opening container agent session hold")?
+        let token = self.control_token()?;
+        let request = ControlEnvelope::session_hold(
+            serde_json::json!("session_hold"),
+            SessionHoldParams {
+                token: Some(token),
+                kind: Some(kind.to_string()),
+            },
+        );
+        let (response, reader) = self
+            .send_typed_agent_request::<SessionHoldResult>(
+                &request,
+                "timed out opening container agent session hold",
+            )
+            .await?;
+        if !response.result.held {
+            anyhow::bail!("agent session hold response did not confirm hold");
+        }
+        Ok(Some(AgentSessionHold { _reader: reader }))
     }
 
     fn uses_agent_idle_cleanup(&self) -> bool {
@@ -3752,6 +3768,7 @@ struct OperationSessionGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     fn write_fake_runtime(path: &Path, script: &str) {
         std::fs::write(path, script).unwrap();
@@ -3795,6 +3812,42 @@ exit 0
             user = user.user,
             uid = user.uid,
         )
+    }
+
+    fn agent_status_response(ready: bool) -> String {
+        format!(
+            r#"{{"id":"status","ok":true,"result":{{"ready":{ready},"version":"0.2.0","services":[],"ssh_bridge":{{"enabled":true,"ready":{ready},"active_streams":0,"active_sessions":0}},"idle_cleanup":null,"shutting_down":false}}}}
+"#
+        )
+    }
+
+    fn bind_fake_agent_control(socket: &Path, response: String) -> tokio::task::JoinHandle<()> {
+        if let Some(parent) = socket.parent() {
+            paths::ensure_private_dir(parent).unwrap();
+        }
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).await.is_ok() {
+                        let mut stream = reader.into_inner();
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                });
+            }
+        })
     }
 
     fn fake_background_runtime_script(log: &Path) -> String {
@@ -6322,6 +6375,88 @@ name = "{{image_slug}}"
             "container-running-agent-not-ready"
         );
         assert_eq!(gateway_status_name(true, true, true, true), "ready");
+    }
+
+    #[test]
+    fn typed_agent_control_failure_response_is_reported() {
+        let err = Runtime::parse_agent_control_success::<SessionHoldResult>(
+            r#"{"id":"hold","ok":false,"error":{"code":"unauthorized","message":"control token is required"}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("agent control request failed: unauthorized"));
+        assert!(err.contains("control token is required"));
+    }
+
+    #[test]
+    fn typed_agent_control_ok_false_without_error_is_reported() {
+        let err = Runtime::parse_agent_control_success::<SessionHoldResult>(
+            r#"{"id":"hold","ok":false,"result":{"held":true}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("agent control request returned ok=false without error"));
+        assert!(err.contains("hold"));
+    }
+
+    #[tokio::test]
+    async fn typed_agent_status_ready_drives_wait_and_runtime_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_runtime = dir.path().join("runtime");
+        write_fake_runtime(&fake_runtime, &fake_running_runtime_script(0));
+        let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+            cfg.target_defaults.container_agent = Some(crate::config::ContainerAgentConfigInput {
+                enabled: Some(true),
+                services: Vec::new(),
+                ssh_bridge: None,
+                control_socket: None,
+                idle_cleanup: None,
+            });
+        });
+        let agent_server = bind_fake_agent_control(
+            &runtime.paths.control_sockets.host_agent_socket,
+            agent_status_response(true),
+        );
+
+        runtime.wait_agent_ready().await.unwrap();
+        let status = runtime.status().await.unwrap();
+
+        assert!(status.agent_ready);
+        assert_eq!(status.status, "ready");
+        assert!(status.agent.as_ref().unwrap().ready);
+        assert!(status.agent.as_ref().unwrap().ssh_bridge.ready);
+
+        agent_server.abort();
+    }
+
+    #[tokio::test]
+    async fn malformed_typed_agent_status_is_agent_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_runtime = dir.path().join("runtime");
+        write_fake_runtime(&fake_runtime, &fake_running_runtime_script(0));
+        let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+            cfg.target_defaults.container_agent = Some(crate::config::ContainerAgentConfigInput {
+                enabled: Some(true),
+                services: Vec::new(),
+                ssh_bridge: None,
+                control_socket: None,
+                idle_cleanup: None,
+            });
+        });
+        let agent_server = bind_fake_agent_control(
+            &runtime.paths.control_sockets.host_agent_socket,
+            r#"{"id":"status","ok":true,"result":{"ready":"yes"}}
+"#
+            .to_string(),
+        );
+
+        let status = runtime.status().await.unwrap();
+
+        assert!(!status.agent_ready);
+        assert!(status.agent.is_none());
+        assert_eq!(status.status, "container-running-agent-unavailable");
+
+        agent_server.abort();
     }
 
     #[test]

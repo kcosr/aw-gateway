@@ -1,3 +1,4 @@
+use crate::agent_control::AgentStatus;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -63,7 +64,7 @@ pub(super) struct GatewayStatus {
     pub(super) agent_ready: bool,
     pub(super) ssh_socket: PathBuf,
     pub(super) status: String,
-    pub(super) agent: Option<serde_json::Value>,
+    pub(super) agent: Option<Box<AgentStatus>>,
 }
 
 #[derive(Debug, Serialize)]

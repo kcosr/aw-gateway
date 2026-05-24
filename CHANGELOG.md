@@ -8,6 +8,12 @@
   reaping, and ephemeral workspace cleanup behavior
   ([#17](https://github.com/kcosr/aw-gateway/pull/17)).
 
+### Changed
+
+- Refactored the private container-agent control protocol to typed internal
+  models. Malformed agent status responses now report the agent as unavailable
+  instead of present-but-not-ready.
+
 ### Fixed
 
 - Fixed rootless Podman session workspace cleanup for workspaces containing
