@@ -1,8 +1,302 @@
-use super::{
-    LifecyclePhase, RawContainerBootstrapStep, RawHostStep, RawLifecycleStep,
-    validation::lifecycle_phase_name,
-};
+use super::{HealthCheck, validation::*};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawLifecycleStep {
+    pub phase: LifecyclePhase,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub required: Option<bool>,
+    pub command: Option<Vec<String>>,
+    pub timeout: Option<String>,
+}
+
+impl RawLifecycleStep {
+    pub(super) fn to_effective_without_inherited(&self) -> anyhow::Result<LifecycleStep> {
+        self.to_effective(None)
+    }
+
+    pub(super) fn from_effective(step: LifecycleStep) -> Self {
+        Self {
+            phase: step.phase,
+            name: step.name,
+            enabled: true,
+            before: None,
+            after: None,
+            required: Some(step.required),
+            command: Some(step.command),
+            timeout: step.timeout,
+        }
+    }
+
+    pub(super) fn to_effective(
+        &self,
+        inherited: Option<&LifecycleStep>,
+    ) -> anyhow::Result<LifecycleStep> {
+        let policy = PayloadInheritancePolicy::TimeoutOnlyReplacement;
+        let inherit_payload = policy.lifecycle_inherits_payload(self);
+        let command = self.command.clone().or_else(|| {
+            policy.inherit_optional(inherit_payload, inherited, |step| step.command.clone())
+        });
+        Ok(LifecycleStep {
+            phase: self.phase,
+            name: self.name.clone(),
+            required: self
+                .required
+                .or_else(|| {
+                    policy.inherit_optional(inherit_payload, inherited, |step| step.required)
+                })
+                .unwrap_or(true),
+            command: command.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "lifecycle_steps {}/{} command must be provided when enabled",
+                    lifecycle_phase_name(self.phase),
+                    self.name
+                )
+            })?,
+            timeout: self.timeout.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleStep {
+    pub phase: LifecyclePhase,
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub required: bool,
+    pub command: Vec<String>,
+    pub timeout: Option<String>,
+}
+
+impl LifecycleStep {
+    pub fn validate(&self, field: &str) -> anyhow::Result<()> {
+        validate_name(field, &self.name)?;
+        validate_command(field, &self.command)?;
+        let vars = match self.phase {
+            LifecyclePhase::PreStart => GATEWAY_TEMPLATE_VARS_NO_PID,
+            LifecyclePhase::PostStartHost | LifecyclePhase::PreStop | LifecyclePhase::PostStop => {
+                GATEWAY_TEMPLATE_VARS
+            }
+        };
+        validate_command_templates(field, &self.command, vars)?;
+        if let Some(timeout) = &self.timeout {
+            parse_duration(timeout)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecyclePhase {
+    PreStart,
+    PostStartHost,
+    PreStop,
+    PostStop,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawHostStep {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub required: Option<bool>,
+    pub command: Option<Vec<String>>,
+    pub health_check: Option<HealthCheck>,
+    pub timeout: Option<String>,
+}
+
+impl RawHostStep {
+    pub(super) fn to_effective_without_inherited(&self) -> anyhow::Result<HostStep> {
+        self.to_effective(None)
+    }
+
+    pub(super) fn from_effective(step: HostStep) -> Self {
+        Self {
+            name: step.name,
+            enabled: true,
+            before: None,
+            after: None,
+            required: Some(step.required),
+            command: Some(step.command),
+            health_check: step.health_check,
+            timeout: step.timeout,
+        }
+    }
+
+    pub(super) fn to_effective(&self, inherited: Option<&HostStep>) -> anyhow::Result<HostStep> {
+        let policy = PayloadInheritancePolicy::TimeoutOnlyReplacement;
+        let inherit_payload = policy.host_inherits_payload(self);
+        let command = self.command.clone().or_else(|| {
+            policy.inherit_optional(inherit_payload, inherited, |step| step.command.clone())
+        });
+        Ok(HostStep {
+            name: self.name.clone(),
+            required: self
+                .required
+                .or_else(|| {
+                    policy.inherit_optional(inherit_payload, inherited, |step| step.required)
+                })
+                .unwrap_or(true),
+            command: command.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "host_steps {} command must be provided when enabled",
+                    self.name
+                )
+            })?,
+            health_check: self.health_check.clone().or_else(|| {
+                policy.inherit_optional(inherit_payload, inherited, |step| {
+                    step.health_check.clone()
+                })?
+            }),
+            timeout: self.timeout.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostStep {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub required: bool,
+    pub command: Vec<String>,
+    pub health_check: Option<HealthCheck>,
+    pub timeout: Option<String>,
+}
+
+impl HostStep {
+    pub fn validate(&self, field: &str) -> anyhow::Result<()> {
+        validate_name(field, &self.name)?;
+        validate_command(field, &self.command)?;
+        validate_command_templates(field, &self.command, GATEWAY_TEMPLATE_VARS)?;
+        if let Some(timeout) = &self.timeout {
+            parse_duration(timeout)?;
+        }
+        if let Some(health_check) = &self.health_check {
+            if matches!(health_check, HealthCheck::Process) {
+                anyhow::bail!("host_step health_check does not support process checks");
+            }
+            health_check.validate()?;
+            health_check.validate_templates(GATEWAY_TEMPLATE_VARS)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawContainerBootstrapStep {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub required: Option<bool>,
+    pub user: Option<String>,
+    pub command: Option<Vec<String>>,
+    pub timeout: Option<String>,
+}
+
+impl RawContainerBootstrapStep {
+    pub(super) fn from_effective(step: ContainerBootstrapStep) -> Self {
+        Self {
+            name: step.name,
+            enabled: true,
+            before: None,
+            after: None,
+            required: Some(step.required),
+            user: Some(step.user),
+            command: Some(step.command),
+            timeout: step.timeout,
+        }
+    }
+
+    pub(super) fn to_effective(&self) -> anyhow::Result<ContainerBootstrapStep> {
+        let inheritance_policy = PayloadInheritancePolicy::NoInheritedPayload;
+        debug_assert!(!inheritance_policy.allows_inherited_payload());
+        Ok(ContainerBootstrapStep {
+            name: self.name.clone(),
+            required: self.required.unwrap_or(true),
+            user: self.user.clone().unwrap_or_else(default_root),
+            command: self.command.clone().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "container_bootstrap_steps {} command must be provided when enabled",
+                    self.name
+                )
+            })?,
+            timeout: self.timeout.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerBootstrapStep {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub required: bool,
+    #[serde(default = "default_root")]
+    pub user: String,
+    pub command: Vec<String>,
+    pub timeout: Option<String>,
+}
+
+impl ContainerBootstrapStep {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_name("container_bootstrap.steps.name", &self.name)?;
+        if self.user.trim().is_empty() {
+            anyhow::bail!("container_bootstrap.steps.user must not be empty");
+        }
+        validate_template(
+            "container_bootstrap.steps.user",
+            &self.user,
+            GATEWAY_TEMPLATE_VARS_NO_PID,
+        )?;
+        validate_command("container_bootstrap.steps.command", &self.command)?;
+        validate_command_templates(
+            "container_bootstrap.steps.command",
+            &self.command,
+            GATEWAY_TEMPLATE_VARS_NO_PID,
+        )?;
+        if let Some(timeout) = &self.timeout {
+            parse_duration(timeout)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenderedContainerBootstrapStep {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub required: bool,
+    #[serde(default = "default_root")]
+    pub user: String,
+    pub command: Vec<String>,
+    pub timeout: Option<String>,
+}
+
+impl RenderedContainerBootstrapStep {
+    pub(super) fn validate(&self) -> anyhow::Result<()> {
+        validate_name("bootstrap step", &self.name)?;
+        if self.user.trim().is_empty() {
+            anyhow::bail!("bootstrap step user must not be empty");
+        }
+        validate_command("bootstrap step command", &self.command)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct StepKey {

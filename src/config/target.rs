@@ -1,11 +1,9 @@
 use super::steps::{
-    LifecycleStepKey, StepKey, merge_target_step_patches, validate_raw_target_steps,
+    ContainerBootstrapStep, HostStep, LifecycleStep, LifecycleStepKey, RawContainerBootstrapStep,
+    RawHostStep, RawLifecycleStep, StepKey, merge_target_step_patches, validate_raw_target_steps,
 };
 use super::validation::*;
-use super::{
-    ContainerAgentConfig, ContainerAgentConfigInput, ContainerBootstrapStep, HostStep,
-    LifecycleStep, RawContainerBootstrapStep, RawHostStep, RawLifecycleStep,
-};
+use super::{ContainerAgentConfig, ContainerAgentConfigInput};
 use crate::template;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
