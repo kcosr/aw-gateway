@@ -20,7 +20,7 @@ use crate::fileutil::{AtomicWritePolicy, atomic_write_toml, write_private_file};
 use crate::paths::{self, UserContext};
 use crate::runtime::{
     self, ContainerExecSpec, ContainerInspect, ContainerMountSpec, ContainerRunSpec,
-    ContainerRuntime, ManagedContainer,
+    ContainerRuntime,
 };
 use crate::ssh_dispatch::{self, Dispatch, GatewayAction};
 use crate::ssh_filter::{
@@ -41,7 +41,6 @@ pub const DEFAULT_GATEWAY_CONFIG: &str = include_str!("../aw-gateway.sample.toml
 const MAX_SSH_ORIGINAL_COMMAND_BYTES: usize = 64 * 1024;
 const DEFAULT_HOST_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_SESSION_SHELL_ENV: &str = "/usr/bin/bash";
-const UNKNOWN_STATUS_LABEL: &str = "unknown";
 
 #[cfg(target_os = "linux")]
 const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
@@ -72,25 +71,34 @@ mod identity;
 mod listener;
 mod model;
 mod ops;
+mod render;
 mod session;
+mod status_view;
 mod token;
 
 use client::{read_default_selection, resolve_target_selection};
 use health::{run_argv_with_options, run_argv_with_timeout, run_health_check};
 use model::{
-    AllStatusEntry, GatewayStatus, LaunchDetail, LaunchStepDetail, LaunchSummary,
-    LaunchVarMetadata, ReadyStatus, TargetEntry, TcpEndpoint, gateway_status_name,
+    GatewayStatus, LaunchDetail, LaunchStepDetail, LaunchSummary, LaunchVarMetadata, ReadyStatus,
+    TargetEntry, TcpEndpoint, gateway_status_name,
 };
 use ops::{
     CanonicalLaunchVarValue, ExecutionOutcome, GatewayOperation, GatewayOperationResult,
     OperationError, OperationExecutionOptions, OperationMode, OperationResult, OutputSelection,
-    RemoveResult, SshGatewayOperation, SshRenderOptions, StopResult, SuppliedLaunchVars,
-    execute_gateway_operation, lookup_launch, operation_up_with_runtime,
+    SshGatewayOperation, SshRenderOptions, SuppliedLaunchVars, execute_gateway_operation,
+    lookup_launch, operation_up_with_runtime,
+};
+use render::{
+    render_default_selection, render_launch_detail, render_launches, render_remove_result,
+    render_status_all, render_status_result, render_stop_result, render_targets, render_up_result,
 };
 use session::{generate_session_id_value, validate_session_id};
+use status_view::{status_all_entries, status_launch};
 
 #[cfg(test)]
 use crate::config::HealthCheck;
+#[cfg(test)]
+use crate::runtime::ManagedContainer;
 #[cfg(test)]
 use client::{configured_default_display, normalize_image_selection};
 #[cfg(test)]
@@ -99,7 +107,11 @@ use identity::{
     validate_public_key_content,
 };
 #[cfg(test)]
-use model::{LocalListenerStatus, SessionMarker};
+use model::{AllStatusEntry, LocalListenerStatus, SessionMarker};
+#[cfg(test)]
+use ops::{RemoveResult, StopResult};
+#[cfg(test)]
+use render::{remove_result_text, stop_result_text};
 #[cfg(test)]
 use session::{
     local_listener_is_active, parse_process_start_time, process_start_time,
@@ -499,11 +511,6 @@ async fn up(config_path: Option<PathBuf>, status: UpArgs) -> anyhow::Result<()> 
     render_up_result(ready)
 }
 
-fn render_up_result(ready: ReadyStatus) -> anyhow::Result<()> {
-    println!("{}", serde_json::to_string_pretty(&ready)?);
-    Ok(())
-}
-
 async fn run_container_command(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()> {
     let operation = GatewayOperation::from_run_args(args)?;
     let result = execute_gateway_operation(config_path, operation).await?;
@@ -813,30 +820,6 @@ async fn remove(config_path: Option<PathBuf>, args: TargetArg) -> anyhow::Result
     Ok(())
 }
 
-fn render_stop_result(result: &StopResult) {
-    if result.stopped {
-        println!("{}", stop_result_text(result));
-    } else {
-        println!("not running");
-    }
-}
-
-fn stop_result_text(result: &StopResult) -> String {
-    format!("stopped {}", result.container)
-}
-
-fn render_remove_result(result: &RemoveResult) {
-    if result.removed {
-        println!("{}", remove_result_text(result));
-    } else {
-        println!("not found");
-    }
-}
-
-fn remove_result_text(result: &RemoveResult) -> String {
-    format!("removed {}", result.container)
-}
-
 async fn set_default(config_path: Option<PathBuf>, args: SetDefaultArgs) -> anyhow::Result<()> {
     let operation = GatewayOperation::from_set_default_args(args)?;
     let result = execute_gateway_operation(config_path, operation).await?;
@@ -854,10 +837,6 @@ async fn show_default(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     };
     render_default_selection(&selection);
     Ok(())
-}
-
-fn render_default_selection(selection: &str) {
-    println!("{selection}");
 }
 
 async fn client_config(config_path: Option<PathBuf>, args: ClientConfigArgs) -> anyhow::Result<()> {
@@ -899,48 +878,6 @@ async fn status(config_path: Option<PathBuf>, status: StatusArg) -> anyhow::Resu
     render_status_result(result, json)
 }
 
-fn render_status_result(result: GatewayStatus, json: bool) -> anyhow::Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
-        println!(
-            "{}: {} ({})",
-            result.target,
-            result.status,
-            result.container.unwrap_or_else(|| "not-created".into())
-        );
-        if let Some(launch) = &result.launch {
-            println!("launch: {launch}");
-        }
-    }
-    Ok(())
-}
-
-fn render_status_all(summaries: Vec<AllStatusEntry>, json: bool) -> anyhow::Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(&summaries)?);
-    } else if summaries.is_empty() {
-        println!("No aw-gateway-managed containers found for this user.");
-    } else {
-        println!(
-            "{:<15} {:<11} {:<16} {:<11} {:<22} STATUS",
-            "TARGET", "SESSION", "LAUNCH", "MODE", "CONTAINER"
-        );
-        for entry in summaries {
-            println!(
-                "{:<15} {:<11} {:<16} {:<11} {:<22} {}",
-                entry.target,
-                entry.session_id.as_deref().unwrap_or("-"),
-                entry.launch.as_deref().unwrap_or("-"),
-                entry.mode,
-                entry.container,
-                entry.status
-            );
-        }
-    }
-    Ok(())
-}
-
 async fn targets(config_path: Option<PathBuf>, args: TargetsArgs) -> anyhow::Result<()> {
     let json = args.json;
     let operation = GatewayOperation::from_targets_args(args);
@@ -951,22 +888,6 @@ async fn targets(config_path: Option<PathBuf>, args: TargetsArgs) -> anyhow::Res
     render_targets(entries, json)
 }
 
-fn render_targets(entries: Vec<TargetEntry>, json: bool) -> anyhow::Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(&entries)?);
-    } else {
-        println!("{:<24} {:<24} {:<10} CONTAINER", "TARGET", "IMAGE", "MODE");
-        for entry in entries {
-            let default_marker = if entry.default { " *" } else { "" };
-            println!(
-                "{:<24} {:<24} {:<10} {}{}",
-                entry.target, entry.image, entry.mode, entry.container, default_marker
-            );
-        }
-    }
-    Ok(())
-}
-
 async fn launches(config_path: Option<PathBuf>, args: LaunchesArgs) -> anyhow::Result<()> {
     let json = args.json;
     let operation = GatewayOperation::from_launches_args(args);
@@ -975,35 +896,6 @@ async fn launches(config_path: Option<PathBuf>, args: LaunchesArgs) -> anyhow::R
         unreachable!("launches operation returned a different result");
     };
     render_launches(entries, json)
-}
-
-fn render_launches(entries: Vec<LaunchSummary>, json: bool) -> anyhow::Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(&entries)?);
-    } else if entries.is_empty() {
-        println!("No launches configured.");
-    } else {
-        println!(
-            "{:<24} {:<24} {:<25} DESCRIPTION",
-            "LAUNCH", "TARGET", "REQUIRED VARS"
-        );
-        for entry in entries {
-            let required = entry
-                .vars
-                .iter()
-                .filter_map(|(name, var)| var.required.then_some(name.as_str()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            println!(
-                "{:<24} {:<24} {:<25} {}",
-                entry.name,
-                entry.target,
-                required,
-                entry.description.unwrap_or_default()
-            );
-        }
-    }
-    Ok(())
 }
 
 async fn launch(config_path: Option<PathBuf>, command: LaunchCommand) -> anyhow::Result<()> {
@@ -1086,15 +978,6 @@ async fn launch_show(
         unreachable!("launch-show operation returned a different result");
     };
     render_launch_detail(detail, json)
-}
-
-fn render_launch_detail(detail: LaunchDetail, json: bool) -> anyhow::Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(&detail)?);
-    } else {
-        print_launch_detail(&detail);
-    }
-    Ok(())
 }
 
 async fn launch_execute(
@@ -1193,91 +1076,6 @@ fn launch_step_detail(step: &LaunchStep) -> LaunchStepDetail {
         env: step.env.clone(),
         command: step.command.clone(),
     }
-}
-
-fn print_launch_detail(detail: &LaunchDetail) {
-    println!("Launch: {}", detail.name);
-    println!("Target: {}", detail.target);
-    if let Some(description) = &detail.description {
-        println!("Description: {description}");
-    }
-    if !detail.vars.is_empty() {
-        println!("\nVariables:");
-        for (name, var) in &detail.vars {
-            println!(
-                "  {name} ({}){}",
-                launch_var_text(var),
-                launch_var_description(var)
-            );
-        }
-    }
-    if !detail.steps.is_empty() {
-        println!("\nSteps:");
-        for (index, step) in detail.steps.iter().enumerate() {
-            let required = if step.required {
-                "required"
-            } else {
-                "optional"
-            };
-            let timeout = step
-                .timeout
-                .as_deref()
-                .map(|value| format!(", timeout: {value}"))
-                .unwrap_or_default();
-            println!(
-                "  {}. {} [{}/{}, {}{}]",
-                index + 1,
-                step.name,
-                step.phase,
-                step.location,
-                required,
-                timeout
-            );
-            if let Some(cwd) = &step.cwd {
-                println!("     cwd: {cwd}");
-            }
-            if !step.env.is_empty() {
-                println!("     env: {}", env_summary(&step.env));
-            }
-            println!("     argv: {}", step.command.join(" "));
-        }
-    }
-    println!("\nCommand:");
-    if let Some(cwd) = &detail.cwd {
-        println!("  cwd: {cwd}");
-    }
-    if !detail.env.is_empty() {
-        println!("  env: {}", env_summary(&detail.env));
-    }
-    println!("  argv: {}", detail.command.join(" "));
-}
-
-fn launch_var_text(var: &LaunchVarMetadata) -> String {
-    let mut parts = Vec::new();
-    match (var.var_type, &var.values) {
-        ("enum", Some(values)) => parts.push(format!("enum: {}", values.join(", "))),
-        (var_type, _) => parts.push(var_type.to_string()),
-    }
-    if var.required {
-        parts.push("required".into());
-    } else if let Some(default) = &var.default {
-        parts.push(format!("default: {}", default.rendered()));
-    }
-    parts.join(", ")
-}
-
-fn launch_var_description(var: &LaunchVarMetadata) -> String {
-    var.description
-        .as_deref()
-        .map(|description| format!(" - {description}"))
-        .unwrap_or_default()
-}
-
-fn env_summary(env: &BTreeMap<String, String>) -> String {
-    env.iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn launch_var_type_name(var_type: LaunchVarType) -> &'static str {
@@ -1457,104 +1255,6 @@ fn unix_socket_path_bytes(path: &Path) -> usize {
 #[cfg(not(unix))]
 fn unix_socket_path_bytes(path: &Path) -> usize {
     path.as_os_str().to_string_lossy().len()
-}
-
-fn status_launch(session_id: Option<&str>, sessions: &[model::SessionStatus]) -> Option<String> {
-    match session_id {
-        Some(session_id) => sessions
-            .iter()
-            .find(|session| session.id == session_id)
-            .and_then(|session| session.launch.clone()),
-        None => sessions.iter().find_map(|session| session.launch.clone()),
-    }
-}
-
-fn status_all_entries(
-    cfg: &GatewayConfig,
-    containers: Vec<ManagedContainer>,
-) -> Vec<AllStatusEntry> {
-    containers
-        .into_iter()
-        .map(|container| status_all_entry(cfg, container))
-        .collect()
-}
-
-fn status_all_entry(cfg: &GatewayConfig, container: ManagedContainer) -> AllStatusEntry {
-    let target = container
-        .labels
-        .get("io.aw-gateway.target")
-        .cloned()
-        .unwrap_or_else(|| UNKNOWN_STATUS_LABEL.into());
-    let session_id = container.labels.get("io.aw-gateway.session_id").cloned();
-    let mode = container
-        .labels
-        .get("io.aw-gateway.mode")
-        .cloned()
-        .unwrap_or_else(|| {
-            infer_status_all_mode(cfg, &target, &container.name, session_id.as_deref())
-        });
-    // Launch labels are only persisted on ephemeral session containers. Fixed
-    // targets can be reused across launches, so their live provenance comes
-    // from per-session markers in `status <target>`.
-    let launch = (mode == "ephemeral")
-        .then(|| container.labels.get("io.aw-gateway.launch").cloned())
-        .flatten();
-    let user = container
-        .labels
-        .get("io.aw-gateway.user")
-        .cloned()
-        .unwrap_or_default();
-    let uid = container
-        .labels
-        .get("io.aw-gateway.uid")
-        .cloned()
-        .unwrap_or_default();
-    let image = container
-        .labels
-        .get("io.aw-gateway.image")
-        .cloned()
-        .unwrap_or(container.image);
-    let container_name = container
-        .labels
-        .get("io.aw-gateway.container_id")
-        .cloned()
-        .unwrap_or(container.name);
-    let status = if container.running {
-        "running"
-    } else {
-        "stopped"
-    }
-    .to_string();
-    AllStatusEntry {
-        target,
-        session_id,
-        launch,
-        mode,
-        user,
-        uid,
-        image,
-        container: container_name,
-        status,
-    }
-}
-
-fn infer_status_all_mode(
-    cfg: &GatewayConfig,
-    target: &str,
-    container_name: &str,
-    session_id: Option<&str>,
-) -> String {
-    let Ok(target_cfg) = cfg.effective_target(target) else {
-        return UNKNOWN_STATUS_LABEL.into();
-    };
-    match target_cfg.mode {
-        TargetMode::Fixed => match target_cfg.container_name(None) {
-            Ok(expected) if expected == container_name => "fixed".into(),
-            _ => UNKNOWN_STATUS_LABEL.into(),
-        },
-        TargetMode::Ephemeral if session_id.is_some() => "ephemeral".into(),
-        TargetMode::Ephemeral => UNKNOWN_STATUS_LABEL.into(),
-    }
 }
 
 fn target_entries(cfg: &GatewayConfig) -> anyhow::Result<Vec<TargetEntry>> {
@@ -4618,8 +4318,8 @@ exit 1
             )],
         );
 
-        assert_eq!(entries[0].target, UNKNOWN_STATUS_LABEL);
-        assert_eq!(entries[0].mode, UNKNOWN_STATUS_LABEL);
+        assert_eq!(entries[0].target, "unknown");
+        assert_eq!(entries[0].mode, "unknown");
         assert_eq!(entries[0].status, "stopped");
     }
 
