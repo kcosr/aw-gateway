@@ -65,7 +65,7 @@ fn ensure_group_at(path: &Path, name: &str, gid: u32) -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
-            if fields[2] == gid.to_string() {
+            if group_gid_collision_policy_allows_existing_gid(fields[2], gid) {
                 return Ok(());
             }
         }
@@ -77,6 +77,13 @@ fn ensure_group_at(path: &Path, name: &str, gid: u32) -> anyhow::Result<()> {
     updated.push_str(&format!("{name}:x:{gid}:\n"));
     atomic_write_preserve_mode(path, updated.as_bytes()).context("write /etc/group")?;
     Ok(())
+}
+
+fn group_gid_collision_policy_allows_existing_gid(existing_gid: &str, requested_gid: u32) -> bool {
+    // A session gid may already exist under a different group name in base
+    // images. Reusing that gid preserves host identity mapping without adding
+    // an alias group.
+    existing_gid.parse::<u32>().ok() == Some(requested_gid)
 }
 
 fn ensure_passwd_entry(

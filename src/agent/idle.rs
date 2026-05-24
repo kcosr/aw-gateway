@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::time::{Duration, Instant, sleep};
 
-use super::lifecycle::shutdown_agent;
+use super::lifecycle::{exit_pid1_agent_process_success, shutdown_agent};
 use super::process::{
     ProcInfo, current_uid, read_process_table, signal_matching_processes, signal_number,
     signal_processes,
@@ -37,7 +37,7 @@ pub(super) async fn run_idle_cleanup(state: Arc<AgentState>) {
             IdleTransition::None => {}
             IdleTransition::ShutdownContainer => {
                 shutdown_agent(state.clone()).await;
-                std::process::exit(0);
+                exit_pid1_agent_process_success();
             }
             IdleTransition::ReapProcesses => {
                 let managed = managed_service_pids(&state).await;

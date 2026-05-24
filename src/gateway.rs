@@ -40,6 +40,8 @@ use tokio::time::{Duration, Instant, sleep};
 pub const DEFAULT_GATEWAY_CONFIG: &str = include_str!("../aw-gateway.sample.toml");
 const MAX_SSH_ORIGINAL_COMMAND_BYTES: usize = 64 * 1024;
 const DEFAULT_HOST_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_SESSION_SHELL_ENV: &str = "/usr/bin/bash";
+const UNKNOWN_STATUS_LABEL: &str = "unknown";
 
 #[cfg(target_os = "linux")]
 const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
@@ -1479,7 +1481,7 @@ fn status_all_entry(cfg: &GatewayConfig, container: ManagedContainer) -> AllStat
         .labels
         .get("io.aw-gateway.target")
         .cloned()
-        .unwrap_or_else(|| "unknown".into());
+        .unwrap_or_else(|| UNKNOWN_STATUS_LABEL.into());
     let session_id = container.labels.get("io.aw-gateway.session_id").cloned();
     let mode = container
         .labels
@@ -1540,15 +1542,15 @@ fn infer_status_all_mode(
     session_id: Option<&str>,
 ) -> String {
     let Ok(target_cfg) = cfg.effective_target(target) else {
-        return "unknown".into();
+        return UNKNOWN_STATUS_LABEL.into();
     };
     match target_cfg.mode {
         TargetMode::Fixed => match target_cfg.container_name(None) {
             Ok(expected) if expected == container_name => "fixed".into(),
-            _ => "unknown".into(),
+            _ => UNKNOWN_STATUS_LABEL.into(),
         },
         TargetMode::Ephemeral if session_id.is_some() => "ephemeral".into(),
-        TargetMode::Ephemeral => "unknown".into(),
+        TargetMode::Ephemeral => UNKNOWN_STATUS_LABEL.into(),
     }
 }
 
@@ -3046,7 +3048,7 @@ impl Runtime {
 
     fn session_env(&self) -> anyhow::Result<BTreeMap<String, String>> {
         let mut env = BTreeMap::from([
-            ("SHELL".into(), "/usr/bin/bash".to_string()),
+            ("SHELL".into(), DEFAULT_SESSION_SHELL_ENV.to_string()),
             (
                 "PATH".into(),
                 "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
@@ -4580,6 +4582,25 @@ exit 1
         assert_eq!(entries[0].session_id, None);
         assert_eq!(entries[0].launch, None);
         assert_eq!(entries[0].status, "running");
+    }
+
+    #[test]
+    fn status_all_entry_uses_unknown_policy_for_missing_labels() {
+        let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+
+        let entries = status_all_entries(
+            &cfg,
+            vec![managed_container(
+                "aw-unlabeled",
+                "runtime/old",
+                false,
+                BTreeMap::new(),
+            )],
+        );
+
+        assert_eq!(entries[0].target, UNKNOWN_STATUS_LABEL);
+        assert_eq!(entries[0].mode, UNKNOWN_STATUS_LABEL);
+        assert_eq!(entries[0].status, "stopped");
     }
 
     #[test]
@@ -6511,6 +6532,10 @@ name = "{{image_slug}}"
         assert!(!spec.env.contains_key("SESSION_ONLY"));
 
         let exec_env = runtime.session_env().unwrap();
+        assert_eq!(
+            exec_env.get("SHELL").map(String::as_str),
+            Some(DEFAULT_SESSION_SHELL_ENV)
+        );
         assert_eq!(exec_env.get("SESSION_ONLY"), Some(&"session".to_string()));
 
         std::fs::create_dir_all(&runtime.paths.container_state_dir).unwrap();
