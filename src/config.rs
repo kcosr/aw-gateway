@@ -189,7 +189,7 @@ impl GatewayConfig {
         name: &str,
         target: &TargetConfigInput,
     ) -> anyhow::Result<TargetConfig> {
-        let effective_input = self.overlay_target_templates(
+        let effective_input = self.target_template_resolver().overlay_templates(
             TargetConfigInput::builtin_defaults().overlay(&self.target_defaults)?,
             &format!("target {name:?}"),
             &target.use_templates,
@@ -241,7 +241,7 @@ impl GatewayConfig {
         launch: &LaunchConfigInput,
         targets: &BTreeMap<String, TargetConfig>,
     ) -> anyhow::Result<LaunchConfig> {
-        let effective_input = self.overlay_launch_templates(
+        let effective_input = self.launch_template_resolver().overlay_templates(
             self.launch_defaults.clone(),
             &format!("launch {name:?}"),
             &launch.use_templates,
@@ -252,154 +252,130 @@ impl GatewayConfig {
     }
 
     fn validate_target_template_references(&self) -> anyhow::Result<()> {
-        for name in self.target_templates.keys() {
-            self.check_target_template_references(name, &mut Vec::new())?;
-        }
-        Ok(())
+        self.target_template_resolver().validate_references()
     }
 
     fn validate_launch_template_references(&self) -> anyhow::Result<()> {
-        for name in self.launch_templates.keys() {
-            self.check_launch_template_references(name, &mut Vec::new())?;
+        self.launch_template_resolver().validate_references()
+    }
+
+    fn target_template_resolver(&self) -> TemplateChainResolver<'_, TargetConfigInput> {
+        TemplateChainResolver {
+            kind: "target",
+            templates: &self.target_templates,
+            dependencies: target_template_dependencies,
+            overlay: overlay_target_template,
+        }
+    }
+
+    fn launch_template_resolver(&self) -> TemplateChainResolver<'_, LaunchConfigInput> {
+        TemplateChainResolver {
+            kind: "launch",
+            templates: &self.launch_templates,
+            dependencies: launch_template_dependencies,
+            overlay: overlay_launch_template,
+        }
+    }
+}
+
+struct TemplateChainResolver<'a, Input> {
+    kind: &'static str,
+    templates: &'a BTreeMap<String, Input>,
+    dependencies: fn(&Input) -> &[String],
+    overlay: fn(Input, &Input) -> anyhow::Result<Input>,
+}
+
+impl<Input> TemplateChainResolver<'_, Input> {
+    fn validate_references(&self) -> anyhow::Result<()> {
+        for name in self.templates.keys() {
+            self.check_template_references(name, &mut Vec::new())?;
         }
         Ok(())
     }
 
-    fn overlay_target_templates(
+    fn overlay_templates(
         &self,
-        mut base: TargetConfigInput,
+        mut base: Input,
         owner: &str,
         templates: &[String],
-    ) -> anyhow::Result<TargetConfigInput> {
+    ) -> anyhow::Result<Input> {
         for template in templates {
             base = self
-                .apply_target_template(base, template, &mut Vec::new())
-                .with_context(|| format!("{owner} uses target template {template:?}"))?;
+                .apply_template(base, template, &mut Vec::new())
+                .with_context(|| format!("{owner} uses {} template {template:?}", self.kind))?;
         }
         Ok(base)
     }
 
-    fn check_target_template_references(
-        &self,
-        name: &str,
-        stack: &mut Vec<String>,
-    ) -> anyhow::Result<()> {
-        if let Some(start) = stack.iter().position(|entry| entry == name) {
-            let mut cycle = stack[start..].to_vec();
-            cycle.push(name.to_string());
-            anyhow::bail!("target template cycle: {}", cycle.join(" -> "));
-        }
-        let template = self
-            .target_templates
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown target template {name:?}"))?;
+    fn check_template_references(&self, name: &str, stack: &mut Vec<String>) -> anyhow::Result<()> {
+        let template = self.template_or_cycle_error(name, stack)?;
 
         stack.push(name.to_string());
-        for dependency in &template.use_templates {
-            self.check_target_template_references(dependency, stack)
-                .with_context(|| {
-                    format!("target template {name:?} uses target template {dependency:?}")
-                })?;
+        for dependency in (self.dependencies)(template) {
+            self.check_template_references(dependency, stack)
+                .with_context(|| self.dependency_context(name, dependency))?;
         }
         stack.pop();
         Ok(())
     }
 
-    fn apply_target_template(
+    fn apply_template(
         &self,
-        mut base: TargetConfigInput,
+        mut base: Input,
         name: &str,
         stack: &mut Vec<String>,
-    ) -> anyhow::Result<TargetConfigInput> {
+    ) -> anyhow::Result<Input> {
+        let template = self.template_or_cycle_error(name, stack)?;
+
+        stack.push(name.to_string());
+        for dependency in (self.dependencies)(template) {
+            base = self
+                .apply_template(base, dependency, stack)
+                .with_context(|| self.dependency_context(name, dependency))?;
+        }
+        stack.pop();
+        (self.overlay)(base, template)
+    }
+
+    fn template_or_cycle_error(&self, name: &str, stack: &[String]) -> anyhow::Result<&Input> {
         if let Some(start) = stack.iter().position(|entry| entry == name) {
             let mut cycle = stack[start..].to_vec();
             cycle.push(name.to_string());
-            anyhow::bail!("target template cycle: {}", cycle.join(" -> "));
+            anyhow::bail!("{} template cycle: {}", self.kind, cycle.join(" -> "));
         }
-        let template = self
-            .target_templates
+        self.templates
             .get(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown target template {name:?}"))?;
-
-        stack.push(name.to_string());
-        for dependency in &template.use_templates {
-            base = self
-                .apply_target_template(base, dependency, stack)
-                .with_context(|| {
-                    format!("target template {name:?} uses target template {dependency:?}")
-                })?;
-        }
-        stack.pop();
-        base.overlay(template)
+            .ok_or_else(|| anyhow::anyhow!("unknown {} template {name:?}", self.kind))
     }
 
-    fn overlay_launch_templates(
-        &self,
-        mut base: LaunchConfigInput,
-        owner: &str,
-        templates: &[String],
-    ) -> anyhow::Result<LaunchConfigInput> {
-        for template in templates {
-            base = self
-                .apply_launch_template(base, template, &mut Vec::new())
-                .with_context(|| format!("{owner} uses launch template {template:?}"))?;
-        }
-        Ok(base)
+    fn dependency_context(&self, name: &str, dependency: &str) -> String {
+        format!(
+            "{} template {name:?} uses {} template {dependency:?}",
+            self.kind, self.kind
+        )
     }
+}
 
-    fn check_launch_template_references(
-        &self,
-        name: &str,
-        stack: &mut Vec<String>,
-    ) -> anyhow::Result<()> {
-        if let Some(start) = stack.iter().position(|entry| entry == name) {
-            let mut cycle = stack[start..].to_vec();
-            cycle.push(name.to_string());
-            anyhow::bail!("launch template cycle: {}", cycle.join(" -> "));
-        }
-        let template = self
-            .launch_templates
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown launch template {name:?}"))?;
+fn target_template_dependencies(template: &TargetConfigInput) -> &[String] {
+    &template.use_templates
+}
 
-        stack.push(name.to_string());
-        for dependency in &template.use_templates {
-            self.check_launch_template_references(dependency, stack)
-                .with_context(|| {
-                    format!("launch template {name:?} uses launch template {dependency:?}")
-                })?;
-        }
-        stack.pop();
-        Ok(())
-    }
+fn launch_template_dependencies(template: &LaunchConfigInput) -> &[String] {
+    &template.use_templates
+}
 
-    fn apply_launch_template(
-        &self,
-        mut base: LaunchConfigInput,
-        name: &str,
-        stack: &mut Vec<String>,
-    ) -> anyhow::Result<LaunchConfigInput> {
-        if let Some(start) = stack.iter().position(|entry| entry == name) {
-            let mut cycle = stack[start..].to_vec();
-            cycle.push(name.to_string());
-            anyhow::bail!("launch template cycle: {}", cycle.join(" -> "));
-        }
-        let template = self
-            .launch_templates
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown launch template {name:?}"))?;
+fn overlay_target_template(
+    base: TargetConfigInput,
+    template: &TargetConfigInput,
+) -> anyhow::Result<TargetConfigInput> {
+    base.overlay(template)
+}
 
-        stack.push(name.to_string());
-        for dependency in &template.use_templates {
-            base = self
-                .apply_launch_template(base, dependency, stack)
-                .with_context(|| {
-                    format!("launch template {name:?} uses launch template {dependency:?}")
-                })?;
-        }
-        stack.pop();
-        base.overlay(template)
-    }
+fn overlay_launch_template(
+    base: LaunchConfigInput,
+    template: &LaunchConfigInput,
+) -> anyhow::Result<LaunchConfigInput> {
+    base.overlay(template)
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -6146,6 +6122,81 @@ use = ["runtime"]
     }
 
     #[test]
+    fn target_chain_overlays_defaults_nested_templates_and_concrete_target() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[target_defaults]
+image = "ubuntu/default"
+mode = "fixed"
+name = "default-name"
+
+[target_defaults.container_env]
+KEEP = "default"
+OVERRIDE = "default"
+
+[[target_defaults.container_mounts]]
+source = "/tmp/default"
+target = "/mnt/default"
+mode = "ro"
+
+[target_templates.base]
+container_user = "base-user"
+
+[target_templates.base.container_env]
+BASE = "true"
+OVERRIDE = "base"
+
+[target_templates.runtime]
+use = ["base"]
+image = "ubuntu/runtime"
+
+[target_templates.runtime.container_env]
+RUNTIME = "true"
+OVERRIDE = "runtime"
+
+[target_templates.policy]
+name = "policy-name"
+
+[target_templates.policy.container_env]
+POLICY = "true"
+OVERRIDE = "policy"
+
+[[target_templates.policy.container_mounts]]
+source = "/tmp/policy"
+target = "/mnt/policy"
+mode = "rw"
+
+[targets.default]
+use = ["runtime", "policy"]
+image = "ubuntu/final"
+name = "final-name"
+
+[targets.default.container_env]
+TARGET = "true"
+OVERRIDE = "target"
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let target = cfg.effective_target("default").unwrap();
+        assert_eq!(target.image, "ubuntu/final");
+        assert_eq!(target.name.as_deref(), Some("final-name"));
+        assert_eq!(target.container_user.as_deref(), Some("base-user"));
+        assert_eq!(target.container_env["KEEP"], "default");
+        assert_eq!(target.container_env["BASE"], "true");
+        assert_eq!(target.container_env["RUNTIME"], "true");
+        assert_eq!(target.container_env["POLICY"], "true");
+        assert_eq!(target.container_env["TARGET"], "true");
+        assert_eq!(target.container_env["OVERRIDE"], "target");
+        assert_eq!(target.container_mounts.len(), 2);
+        assert_eq!(target.container_mounts[0].target, "/mnt/default");
+        assert_eq!(target.container_mounts[1].target, "/mnt/policy");
+    }
+
+    #[test]
     fn target_template_cycles_and_unknown_names_are_rejected() {
         let cfg: GatewayConfig = toml::from_str(
             r#"
@@ -6182,6 +6233,38 @@ name = "{image_slug}"
         let err = format!("{:#}", cfg.validate().unwrap_err());
         assert!(
             err.contains("target \"default\" uses target template \"missing\""),
+            "{err}"
+        );
+        assert!(err.contains("unknown target template \"missing\""), "{err}");
+
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[target_templates.outer]
+use = ["missing"]
+
+[targets.default]
+use = ["outer"]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(
+            err.contains("target template \"outer\" uses target template \"missing\""),
+            "{err}"
+        );
+        assert!(err.contains("unknown target template \"missing\""), "{err}");
+        let err = format!("{:#}", cfg.effective_target("default").unwrap_err());
+        assert!(
+            err.contains("target \"default\" uses target template \"outer\""),
+            "{err}"
+        );
+        assert!(
+            err.contains("target template \"outer\" uses target template \"missing\""),
             "{err}"
         );
         assert!(err.contains("unknown target template \"missing\""), "{err}");
@@ -6600,6 +6683,82 @@ use = ["command"]
     }
 
     #[test]
+    fn launch_chain_overlays_defaults_nested_templates_and_concrete_launch() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launch_defaults]
+target = "default"
+description = "Default description"
+cwd = "{container_home}/default"
+env = { KEEP = "default", OVERRIDE = "default" }
+command = ["default-command"]
+
+[launch_defaults.vars]
+repo = { type = "string", required = true }
+
+[[launch_defaults.steps]]
+phase = "post_ready"
+location = "container"
+name = "prep"
+command = ["default-prep"]
+
+[launch_templates.base]
+cwd = "{container_home}/base"
+env = { BASE = "true", OVERRIDE = "base" }
+
+[launch_templates.runtime]
+use = ["base"]
+command = ["runtime-command", "{var.repo}"]
+env = { RUNTIME = "true", OVERRIDE = "runtime" }
+
+[launch_templates.policy]
+description = "Policy description"
+env = { POLICY = "true", OVERRIDE = "policy" }
+
+[launch_templates.policy.vars]
+mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
+
+[launches.review]
+use = ["runtime", "policy"]
+description = "Review description"
+command = ["review", "{var.repo}", "{var.mode}"]
+env = { LAUNCH = "true", OVERRIDE = "launch" }
+
+[[launches.review.steps]]
+phase = "post_ready"
+location = "container"
+name = "prep"
+command = ["launch-prep", "{var.repo}"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let launch = cfg.effective_launch("review").unwrap();
+        assert_eq!(launch.target, "default");
+        assert_eq!(launch.description.as_deref(), Some("Review description"));
+        assert_eq!(launch.cwd.as_deref(), Some("{container_home}/base"));
+        assert_eq!(launch.command, ["review", "{var.repo}", "{var.mode}"]);
+        assert_eq!(launch.env["KEEP"], "default");
+        assert_eq!(launch.env["BASE"], "true");
+        assert_eq!(launch.env["RUNTIME"], "true");
+        assert_eq!(launch.env["POLICY"], "true");
+        assert_eq!(launch.env["LAUNCH"], "true");
+        assert_eq!(launch.env["OVERRIDE"], "launch");
+        assert!(launch.vars.contains_key("repo"));
+        assert!(launch.vars.contains_key("mode"));
+        assert_eq!(launch.steps.len(), 1);
+        assert_eq!(launch.steps[0].command, ["launch-prep", "{var.repo}"]);
+    }
+
+    #[test]
     fn launch_template_cycles_and_unknown_names_are_rejected() {
         let cfg: GatewayConfig = toml::from_str(
             r#"
@@ -6644,6 +6803,42 @@ command = ["true"]
         let err = format!("{:#}", cfg.validate().unwrap_err());
         assert!(
             err.contains("launch \"agent\" uses launch template \"missing\""),
+            "{err}"
+        );
+        assert!(err.contains("unknown launch template \"missing\""), "{err}");
+
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launch_templates.outer]
+use = ["missing"]
+
+[launches.agent]
+use = ["outer"]
+target = "default"
+command = ["true"]
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(
+            err.contains("launch template \"outer\" uses launch template \"missing\""),
+            "{err}"
+        );
+        assert!(err.contains("unknown launch template \"missing\""), "{err}");
+        let err = format!("{:#}", cfg.effective_launch("agent").unwrap_err());
+        assert!(
+            err.contains("launch \"agent\" uses launch template \"outer\""),
+            "{err}"
+        );
+        assert!(
+            err.contains("launch template \"outer\" uses launch template \"missing\""),
             "{err}"
         );
         assert!(err.contains("unknown launch template \"missing\""), "{err}");
