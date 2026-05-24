@@ -1,5 +1,6 @@
 use crate::config::{ContainerAgentFile, GatewayConfig, LoggingConfig, WorkspaceConfig};
 use crate::paths::{self, UserContext};
+use crate::rotating_log::RotationState;
 use crate::template::{self, Vars};
 use anyhow::Context;
 use std::fs::{File, OpenOptions};
@@ -209,12 +210,8 @@ impl Write for SizeRotatingWriter {
 }
 
 struct SizeRotatingFile {
-    directory: PathBuf,
-    file_name: String,
-    max_bytes: u64,
-    max_files: usize,
+    rotation: RotationState,
     file: File,
-    bytes_written: u64,
 }
 
 impl SizeRotatingFile {
@@ -231,32 +228,23 @@ impl SizeRotatingFile {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let bytes_written = file.metadata()?.len();
         Ok(Self {
-            directory,
-            file_name,
-            max_bytes: max_bytes.max(1),
-            max_files,
+            rotation: RotationState::new(path, max_bytes, max_files, bytes_written),
             file,
-            bytes_written,
         })
     }
 
     fn path_for_generation(&self, generation: usize) -> PathBuf {
-        if generation == 0 {
-            self.directory.join(&self.file_name)
-        } else {
-            self.directory
-                .join(format!("{}.{}", self.file_name, generation))
-        }
+        self.rotation.path_for_generation(generation)
     }
 
     fn rotate_if_needed(&mut self, incoming: usize) -> io::Result<()> {
-        if self.max_files == 0 || self.bytes_written + incoming as u64 <= self.max_bytes {
+        if !self.rotation.should_rotate(incoming) {
             return Ok(());
         }
         self.file.flush()?;
-        for generation in (1..=self.max_files).rev() {
+        for generation in (1..=self.rotation.max_files()).rev() {
             let path = self.path_for_generation(generation);
-            if generation == self.max_files {
+            if generation == self.rotation.max_files() {
                 let _ = std::fs::remove_file(path);
             } else {
                 let next = self.path_for_generation(generation + 1);
@@ -275,7 +263,7 @@ impl SizeRotatingFile {
             .truncate(true)
             .write(true)
             .open(current)?;
-        self.bytes_written = 0;
+        self.rotation.reset_after_rotation();
         Ok(())
     }
 }
@@ -284,7 +272,7 @@ impl Write for SizeRotatingFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.rotate_if_needed(buf.len())?;
         let written = self.file.write(buf)?;
-        self.bytes_written += written as u64;
+        self.rotation.record_write(written);
         Ok(written)
     }
 
