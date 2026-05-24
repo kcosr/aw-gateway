@@ -3,6 +3,7 @@ pub mod agent;
 pub mod bootstrap;
 pub mod cli;
 pub mod config;
+mod fileutil;
 pub mod gateway;
 pub mod logging;
 pub mod paths;

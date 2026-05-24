@@ -12,6 +12,7 @@ use crate::config::{
     RenderedContainerBootstrapStep, TargetConfig, TargetMode, WorkspaceCleanup, validate_name,
     validate_passwd_scalar,
 };
+use crate::fileutil::{AtomicWritePolicy, atomic_write_toml, write_private_file};
 use crate::paths::{self, UserContext};
 use crate::runtime::{
     self, ContainerExecSpec, ContainerInspect, ContainerMountSpec, ContainerRunSpec,
@@ -58,7 +59,6 @@ const UNIX_SOCKET_PATH_MAX_BYTES: usize = 103;
 const UNIX_SOCKET_PATH_MAX_BYTES: usize = 103;
 
 mod client;
-mod fileutil;
 mod health;
 mod http;
 mod identity;
@@ -66,9 +66,9 @@ mod listener;
 mod model;
 mod ops;
 mod session;
+mod token;
 
 use client::{read_default_selection, resolve_target_selection};
-use fileutil::{atomic_write_file, write_private_file};
 use health::{render_command, run_argv_with_options, run_argv_with_timeout, run_health_check};
 use model::{
     AllStatusEntry, GatewayStatus, LaunchDetail, LaunchStepDetail, LaunchSummary,
@@ -2622,8 +2622,7 @@ impl Runtime {
             container_agent,
         };
         let path = self.container_agent_config_host();
-        let raw = toml::to_string_pretty(&cfg)?;
-        write_private_file(&path, raw.as_bytes(), 0o600)
+        atomic_write_toml(&path, &cfg, AtomicWritePolicy::fixed_no_fsync(0o600))
             .with_context(|| format!("write {}", path.display()))?;
         Ok(path)
     }
@@ -2670,8 +2669,7 @@ impl Runtime {
             legacy_scp: self.target.container_ssh.transfer.legacy_scp,
         };
         let path = self.ssh_command_filter_policy_host();
-        let raw = toml::to_string_pretty(&cfg)?;
-        atomic_write_file(&path, raw.as_bytes(), 0o600)
+        atomic_write_toml(&path, &cfg, AtomicWritePolicy::fixed_no_fsync(0o600))
             .with_context(|| format!("write {}", path.display()))?;
         Ok(path)
     }
@@ -2715,8 +2713,7 @@ impl Runtime {
             steps,
         };
         let path = self.container_bootstrap_config_host();
-        let raw = toml::to_string_pretty(&cfg)?;
-        write_private_file(&path, raw.as_bytes(), 0o600)
+        atomic_write_toml(&path, &cfg, AtomicWritePolicy::fixed_no_fsync(0o600))
             .with_context(|| format!("write {}", path.display()))?;
         Ok(path)
     }
@@ -3590,6 +3587,17 @@ mod tests {
             std::fs::set_permissions(path, permissions).unwrap();
         }
     }
+
+    #[cfg(unix)]
+    fn assert_file_mode(path: &Path, expected: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, expected, "unexpected mode for {}", path.display());
+    }
+
+    #[cfg(not(unix))]
+    fn assert_file_mode(_path: &Path, _expected: u32) {}
 
     fn fake_running_runtime_script(exit_code: i32) -> String {
         let user = UserContext::current().unwrap();
@@ -5757,6 +5765,7 @@ name = "{{image_slug}}"
         };
 
         let agent_path = runtime.write_container_agent_config().unwrap();
+        assert_file_mode(&agent_path, 0o600);
         let agent_config = std::fs::read_to_string(agent_path).unwrap();
         assert!(agent_config.contains("/etc/acl-proxy/internal-acl-proxy.toml"));
         assert!(!agent_config.contains("/etc/acl-proxy/acl-proxy.toml"));
@@ -5836,6 +5845,12 @@ name = "{{image_slug}}"
 
         let exec_env = runtime.session_env().unwrap();
         assert_eq!(exec_env.get("SESSION_ONLY"), Some(&"session".to_string()));
+
+        std::fs::create_dir_all(&runtime.container_state_dir).unwrap();
+        let env_path = runtime.write_sshd_session_env_config().unwrap();
+        assert_file_mode(&env_path, 0o600);
+        let env_config = std::fs::read_to_string(env_path).unwrap();
+        assert!(env_config.contains("SESSION_ONLY=session"));
     }
 
     #[test]
@@ -5937,11 +5952,13 @@ name = "{{image_slug}}"
         };
 
         let policy_path = runtime.write_ssh_command_filter_policy().unwrap();
+        assert_file_mode(&policy_path, 0o600);
         let policy = std::fs::read_to_string(policy_path).unwrap();
         assert!(policy.contains("sftp = \"deny\""));
         assert!(policy.contains("legacy_scp = \"deny\""));
 
         let agent_path = runtime.write_container_agent_config().unwrap();
+        assert_file_mode(&agent_path, 0o600);
         let agent_config = std::fs::read_to_string(agent_path).unwrap();
         assert!(agent_config.contains("AW_SSHD_POLICY_CONFIG"));
         assert!(
@@ -6070,6 +6087,7 @@ name = "{{image_slug}}"
 
         std::fs::create_dir_all(&runtime.container_state_dir).unwrap();
         let bootstrap_path = runtime.write_container_bootstrap_config().unwrap();
+        assert_file_mode(&bootstrap_path, 0o600);
         let bootstrap_config = std::fs::read_to_string(bootstrap_path).unwrap();
         assert!(bootstrap_config.contains("agent_program = \"/opt/aw-gateway/bin/target-agent\""));
         assert!(bootstrap_config.contains("name = \"target-bootstrap\""));

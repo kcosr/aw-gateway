@@ -1,4 +1,3 @@
-use anyhow::Context;
 use serde::Serialize;
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
@@ -92,12 +91,6 @@ pub fn expand_home(home: &Path, input: &str) -> PathBuf {
 }
 
 pub fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("chmod 0700 {}", path.display()))?;
-    }
-    Ok(())
+    // Keep `paths` as the public boundary while the shared implementation stays crate-private.
+    crate::fileutil::ensure_private_dir(path)
 }

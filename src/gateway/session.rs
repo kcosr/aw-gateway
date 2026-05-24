@@ -1,7 +1,8 @@
 use super::Runtime;
-use super::fileutil::{random_hex_token, write_private_file};
 use super::model::{LocalListenerStatus, SessionMarker, SessionStatus};
+use super::token::random_hex_token;
 use crate::config::LocalSshConfig;
+use crate::fileutil::write_private_file;
 use crate::paths;
 use anyhow::Context;
 use std::os::fd::AsRawFd;
