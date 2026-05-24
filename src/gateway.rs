@@ -12,9 +12,7 @@ use crate::config::{
     RenderedContainerBootstrapStep, TargetConfig, TargetMode, WorkspaceCleanup, validate_name,
     validate_passwd_scalar,
 };
-use crate::fileutil::{
-    AtomicWritePolicy, DurabilityPolicy, FileModePolicy, atomic_write_toml, write_private_file,
-};
+use crate::fileutil::{AtomicWritePolicy, atomic_write_toml, write_private_file};
 use crate::paths::{self, UserContext};
 use crate::runtime::{
     self, ContainerExecSpec, ContainerInspect, ContainerMountSpec, ContainerRunSpec,
@@ -2624,7 +2622,7 @@ impl Runtime {
             container_agent,
         };
         let path = self.container_agent_config_host();
-        atomic_write_toml(&path, &cfg, Self::fixed_no_fsync_policy(0o600))
+        atomic_write_toml(&path, &cfg, AtomicWritePolicy::fixed_no_fsync(0o600))
             .with_context(|| format!("write {}", path.display()))?;
         Ok(path)
     }
@@ -2671,7 +2669,7 @@ impl Runtime {
             legacy_scp: self.target.container_ssh.transfer.legacy_scp,
         };
         let path = self.ssh_command_filter_policy_host();
-        atomic_write_toml(&path, &cfg, Self::fixed_no_fsync_policy(0o600))
+        atomic_write_toml(&path, &cfg, AtomicWritePolicy::fixed_no_fsync(0o600))
             .with_context(|| format!("write {}", path.display()))?;
         Ok(path)
     }
@@ -2715,7 +2713,7 @@ impl Runtime {
             steps,
         };
         let path = self.container_bootstrap_config_host();
-        atomic_write_toml(&path, &cfg, Self::fixed_no_fsync_policy(0o600))
+        atomic_write_toml(&path, &cfg, AtomicWritePolicy::fixed_no_fsync(0o600))
             .with_context(|| format!("write {}", path.display()))?;
         Ok(path)
     }
@@ -2785,16 +2783,6 @@ impl Runtime {
         write_private_file(&path, raw.as_bytes(), 0o600)
             .with_context(|| format!("write {}", path.display()))?;
         Ok(path)
-    }
-
-    fn fixed_no_fsync_policy(mode: u32) -> AtomicWritePolicy {
-        AtomicWritePolicy::new(
-            FileModePolicy::Fixed(mode),
-            DurabilityPolicy {
-                fsync_file: false,
-                fsync_parent_dir: false,
-            },
-        )
     }
 
     fn prepare_control_socket_dir(&self) -> anyhow::Result<()> {

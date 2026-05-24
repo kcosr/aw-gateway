@@ -91,5 +91,6 @@ pub fn expand_home(home: &Path, input: &str) -> PathBuf {
 }
 
 pub fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
+    // Keep `paths` as the public boundary while the shared implementation stays crate-private.
     crate::fileutil::ensure_private_dir(path)
 }

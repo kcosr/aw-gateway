@@ -1,6 +1,6 @@
 use crate::cli::BootstrapArgs;
 use crate::config::{ContainerBootstrapFile, RenderedContainerBootstrapStep, parse_duration};
-use crate::fileutil::{self, AtomicWritePolicy, DurabilityPolicy, FileModePolicy};
+use crate::fileutil::{self, AtomicWritePolicy};
 use anyhow::Context;
 use std::ffi::CStr;
 use std::ffi::CString;
@@ -142,13 +142,7 @@ fn atomic_write_preserve_mode(path: &Path, contents: &[u8]) -> anyhow::Result<()
     fileutil::atomic_write_file(
         path,
         contents,
-        AtomicWritePolicy::new(
-            FileModePolicy::PreserveExisting,
-            DurabilityPolicy {
-                fsync_file: true,
-                fsync_parent_dir: true,
-            },
-        ),
+        AtomicWritePolicy::preserve_existing_with_full_durability(),
     )
 }
 

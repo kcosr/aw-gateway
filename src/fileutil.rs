@@ -6,13 +6,27 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FileModePolicy {
     Fixed(u32),
+    /// Preserve the full existing Unix mode, including setuid/setgid/sticky bits.
     PreserveExisting,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DurabilityPolicy {
+    /// Sync the temporary file before rename.
     pub(crate) fsync_file: bool,
+    /// Best-effort parent directory sync after rename.
     pub(crate) fsync_parent_dir: bool,
+}
+
+impl DurabilityPolicy {
+    pub(crate) const NONE: Self = Self {
+        fsync_file: false,
+        fsync_parent_dir: false,
+    };
+    pub(crate) const FILE_AND_PARENT: Self = Self {
+        fsync_file: true,
+        fsync_parent_dir: true,
+    };
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -24,6 +38,17 @@ pub(crate) struct AtomicWritePolicy {
 impl AtomicWritePolicy {
     pub(crate) const fn new(mode: FileModePolicy, durability: DurabilityPolicy) -> Self {
         Self { mode, durability }
+    }
+
+    pub(crate) const fn fixed_no_fsync(mode: u32) -> Self {
+        Self::new(FileModePolicy::Fixed(mode), DurabilityPolicy::NONE)
+    }
+
+    pub(crate) const fn preserve_existing_with_full_durability() -> Self {
+        Self::new(
+            FileModePolicy::PreserveExisting,
+            DurabilityPolicy::FILE_AND_PARENT,
+        )
     }
 }
 
@@ -95,9 +120,9 @@ pub(crate) fn atomic_write_file(
         let mut file = options
             .open(&temp)
             .with_context(|| format!("open {}", temp.display()))?;
-        set_mode(&temp, mode)?;
         file.write_all(contents)
             .with_context(|| format!("write {}", temp.display()))?;
+        set_mode(&temp, mode)?;
         if policy.durability.fsync_file {
             file.sync_all()
                 .with_context(|| format!("fsync {}", temp.display()))?;
@@ -208,6 +233,17 @@ mod tests {
     }
 
     #[test]
+    fn remove_if_exists_handles_present_and_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale");
+        std::fs::write(&path, "stale").unwrap();
+
+        remove_if_exists(&path).unwrap();
+        assert!(!path.exists());
+        remove_if_exists(&path).unwrap();
+    }
+
+    #[test]
     fn atomic_write_fixed_mode_replaces_file_and_cleans_temp() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -215,11 +251,34 @@ mod tests {
         #[cfg(unix)]
         set_file_mode(&path, 0o644);
 
-        atomic_write_file(&path, b"new", fixed_no_fsync(0o600)).unwrap();
+        atomic_write_file(&path, b"new", AtomicWritePolicy::fixed_no_fsync(0o600)).unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
         #[cfg(unix)]
         assert_eq!(file_mode(&path), 0o600);
+        let temp_count = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".config.toml.")
+            })
+            .count();
+        assert_eq!(temp_count, 0);
+    }
+
+    #[test]
+    fn atomic_write_removes_temp_file_on_rename_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+
+        let err =
+            atomic_write_file(&path, b"new", AtomicWritePolicy::fixed_no_fsync(0o600)).unwrap_err();
+
+        assert!(err.to_string().contains("rename"));
         let temp_count = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(Result::ok)
@@ -244,13 +303,7 @@ mod tests {
         atomic_write_file(
             &path,
             b"root:x:0:0\nawuser:x:2450:2450\n",
-            AtomicWritePolicy::new(
-                FileModePolicy::PreserveExisting,
-                DurabilityPolicy {
-                    fsync_file: true,
-                    fsync_parent_dir: true,
-                },
-            ),
+            AtomicWritePolicy::preserve_existing_with_full_durability(),
         )
         .unwrap();
 
@@ -267,13 +320,7 @@ mod tests {
         let err = atomic_write_file(
             &path,
             b"contents",
-            AtomicWritePolicy::new(
-                FileModePolicy::PreserveExisting,
-                DurabilityPolicy {
-                    fsync_file: false,
-                    fsync_parent_dir: false,
-                },
-            ),
+            AtomicWritePolicy::new(FileModePolicy::PreserveExisting, DurabilityPolicy::NONE),
         )
         .unwrap_err();
 
@@ -296,22 +343,11 @@ mod tests {
             name: "default".into(),
         };
 
-        atomic_write_toml(&path, &fixture, fixed_no_fsync(0o600)).unwrap();
+        atomic_write_toml(&path, &fixture, AtomicWritePolicy::fixed_no_fsync(0o600)).unwrap();
 
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("enabled = true"));
-        assert!(raw.contains("name = \"default\""));
+        assert_eq!(raw, toml::to_string_pretty(&fixture).unwrap());
         #[cfg(unix)]
         assert_eq!(file_mode(&path), 0o600);
-    }
-
-    fn fixed_no_fsync(mode: u32) -> AtomicWritePolicy {
-        AtomicWritePolicy::new(
-            FileModePolicy::Fixed(mode),
-            DurabilityPolicy {
-                fsync_file: false,
-                fsync_parent_dir: false,
-            },
-        )
     }
 }
