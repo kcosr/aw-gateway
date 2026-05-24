@@ -75,9 +75,10 @@ use model::{
     LaunchVarMetadata, ReadyStatus, TargetEntry, TcpEndpoint, gateway_status_name,
 };
 use ops::{
-    ExecutionOutcome, GatewayOperation, GatewayOperationResult, OperationExecutionOptions,
-    OperationMode, OutputSelection, RemoveResult, StopResult, SuppliedLaunchVarValue,
-    SuppliedLaunchVars, execute_gateway_operation, operation_up_with_runtime,
+    ExecutionOutcome, GatewayOperation, GatewayOperationResult, OperationError,
+    OperationExecutionOptions, OperationMode, OperationResult, OutputSelection, RemoveResult,
+    StopResult, SuppliedLaunchVarValue, SuppliedLaunchVars, execute_gateway_operation,
+    operation_up_with_runtime,
 };
 use session::{generate_session_id_value, validate_session_id};
 
@@ -1148,8 +1149,10 @@ async fn launch_execute_with_config(
     session_id: Option<String>,
     supplied: SuppliedLaunchVars,
     options: OperationExecutionOptions,
-) -> anyhow::Result<ExecutionOutcome> {
-    let launch = cfg.effective_launch(name)?;
+) -> OperationResult<ExecutionOutcome> {
+    let launch = cfg
+        .effective_launch(name)
+        .map_err(|err| OperationError::unknown_launch(err.to_string()))?;
     let resolved_vars = resolve_launch_vars(name, &launch, &supplied)?;
     let target = launch.target.clone();
     let runtime =
@@ -1157,6 +1160,7 @@ async fn launch_execute_with_config(
     OperationRunner::launch(runtime, options, launch, resolved_vars)
         .run()
         .await
+        .map_err(OperationError::operation_failed)
 }
 
 fn launch_summaries(cfg: &GatewayConfig) -> anyhow::Result<Vec<LaunchSummary>> {
@@ -1319,11 +1323,13 @@ fn resolve_launch_vars(
     launch_name: &str,
     launch: &LaunchConfig,
     supplied: &SuppliedLaunchVars,
-) -> anyhow::Result<BTreeMap<String, String>> {
+) -> OperationResult<BTreeMap<String, String>> {
     let mut resolved = BTreeMap::new();
     for key in supplied.keys() {
         if !launch.vars.contains_key(key) {
-            anyhow::bail!("unknown launch variable {key:?}");
+            return Err(OperationError::invalid_launch_variable(format!(
+                "unknown launch variable {key:?}"
+            )));
         }
     }
     for (name, var) in &launch.vars {
@@ -1332,7 +1338,9 @@ fn resolve_launch_vars(
         } else if let Some(default) = var.default_rendered() {
             resolved.insert(name.clone(), default);
         } else if var.required {
-            anyhow::bail!("missing required launch variable {name:?}");
+            return Err(OperationError::invalid_launch_variable(format!(
+                "missing required launch variable {name:?}"
+            )));
         }
     }
     tracing::debug!(
@@ -1347,24 +1355,28 @@ fn validate_launch_var_value(
     name: &str,
     var: &LaunchVarConfig,
     value: &SuppliedLaunchVarValue,
-) -> anyhow::Result<String> {
+) -> OperationResult<String> {
     match var.var_type {
         LaunchVarType::String => match value {
             SuppliedLaunchVarValue::String(value) => Ok(value.to_string()),
-            _ => anyhow::bail!("invalid string launch variable {name:?}; expected string"),
+            _ => Err(OperationError::invalid_launch_variable(format!(
+                "invalid string launch variable {name:?}; expected string"
+            ))),
         },
         LaunchVarType::Enum => {
             let SuppliedLaunchVarValue::String(value) = value else {
-                anyhow::bail!("invalid enum launch variable {name:?}; expected string");
+                return Err(OperationError::invalid_launch_variable(format!(
+                    "invalid enum launch variable {name:?}; expected string"
+                )));
             };
             let values = var.values.as_deref().unwrap_or(&[]);
             if values.iter().any(|allowed| allowed == value) {
                 Ok(value.to_string())
             } else {
-                anyhow::bail!(
+                Err(OperationError::invalid_launch_variable(format!(
                     "invalid enum launch variable {name:?}; expected one of {}",
                     values.join(", ")
-                );
+                )))
             }
         }
         LaunchVarType::Boolean => match value {
@@ -1372,32 +1384,36 @@ fn validate_launch_var_value(
             SuppliedLaunchVarValue::String(value) if value == "true" || value == "false" => {
                 Ok(value.to_string())
             }
-            _ => anyhow::bail!("invalid boolean launch variable {name:?}; expected true or false"),
+            _ => Err(OperationError::invalid_launch_variable(format!(
+                "invalid boolean launch variable {name:?}; expected true or false"
+            ))),
         },
         LaunchVarType::Number => match value {
             SuppliedLaunchVarValue::Integer(value) => Ok(value.to_string()),
             SuppliedLaunchVarValue::Float(value) => {
                 if !value.is_finite() {
-                    anyhow::bail!(
+                    return Err(OperationError::invalid_launch_variable(format!(
                         "invalid number launch variable {name:?}; expected finite number"
-                    );
+                    )));
                 }
                 Ok(canonical_cli_number(&value.to_string(), *value))
             }
             SuppliedLaunchVarValue::String(value) => {
-                let parsed = value
-                    .parse::<f64>()
-                    .with_context(|| format!("invalid number launch variable {name:?}"))?;
+                let parsed = value.parse::<f64>().map_err(|_| {
+                    OperationError::invalid_launch_variable(format!(
+                        "invalid number launch variable {name:?}"
+                    ))
+                })?;
                 if !parsed.is_finite() {
-                    anyhow::bail!(
+                    return Err(OperationError::invalid_launch_variable(format!(
                         "invalid number launch variable {name:?}; expected finite number"
-                    );
+                    )));
                 }
                 Ok(canonical_cli_number(value, parsed))
             }
-            SuppliedLaunchVarValue::Boolean(_) => {
-                anyhow::bail!("invalid number launch variable {name:?}")
-            }
+            SuppliedLaunchVarValue::Boolean(_) => Err(OperationError::invalid_launch_variable(
+                format!("invalid number launch variable {name:?}"),
+            )),
         },
     }
 }
@@ -1901,7 +1917,7 @@ impl Runtime {
         target: Option<&str>,
         session_id: Option<String>,
         generate_session_id: bool,
-    ) -> anyhow::Result<Runtime> {
+    ) -> OperationResult<Runtime> {
         let cfg = load_config(config_path)?;
         Self::from_config(cfg, target, session_id, generate_session_id, None).await
     }
@@ -1912,7 +1928,7 @@ impl Runtime {
         session_id: Option<String>,
         generate_session_id: bool,
         launch_name: Option<String>,
-    ) -> anyhow::Result<Runtime> {
+    ) -> OperationResult<Runtime> {
         let user = UserContext::current()?;
         let target_name = match target {
             Some(target) => resolve_target_selection(&cfg, Some(target))?,
@@ -1925,17 +1941,24 @@ impl Runtime {
         let session_id = match target_cfg.mode {
             TargetMode::Fixed => {
                 if session_id.is_some() {
-                    anyhow::bail!("--session-id is only valid for ephemeral targets");
+                    return Err(OperationError::invalid_session(
+                        "--session-id is only valid for ephemeral targets",
+                    ));
                 }
                 None
             }
             TargetMode::Ephemeral => match session_id {
                 Some(value) => {
-                    validate_session_id(&value)?;
+                    validate_session_id(&value)
+                        .map_err(|err| OperationError::invalid_session(err.to_string()))?;
                     Some(value)
                 }
                 None if generate_session_id => Some(generate_session_id_value()?),
-                None => anyhow::bail!("ephemeral target {target_name:?} requires --session-id"),
+                None => {
+                    return Err(OperationError::invalid_session(format!(
+                        "ephemeral target {target_name:?} requires --session-id"
+                    )));
+                }
             },
         };
         let container_name = target_cfg.container_name(session_id.as_deref())?;
@@ -4017,6 +4040,56 @@ exit 0
         cfg
     }
 
+    fn launch_var_boundary_config() -> GatewayConfig {
+        toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.agent]
+target = "default"
+command = ["true", "{var.repo}", "{var.count}", "{var.debug}", "{var.mode}"]
+
+[launches.agent.vars]
+repo = { type = "string", required = true }
+count = { type = "number", default = 1 }
+debug = { type = "boolean", default = false }
+mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
+"#,
+        )
+        .unwrap()
+    }
+
+    fn write_gateway_config(dir: &tempfile::TempDir, body: &str) -> PathBuf {
+        let config = dir.path().join("gateway.toml");
+        std::fs::write(&config, body).unwrap();
+        config
+    }
+
+    fn assert_invalid_launch_variable(err: OperationError, expected: &str) {
+        let OperationError::InvalidLaunchVariable { message } = err else {
+            panic!("expected invalid launch variable error, got {err:?}");
+        };
+        assert!(
+            message.contains(expected),
+            "expected {expected:?} in {message:?}"
+        );
+    }
+
+    fn assert_invalid_session(err: OperationError, expected: &str) {
+        let OperationError::InvalidSession { message } = err else {
+            panic!("expected invalid session error, got {err:?}");
+        };
+        assert!(
+            message.contains(expected),
+            "expected {expected:?} in {message:?}"
+        );
+    }
+
     fn configure_workspace_cleanup_runtime(
         runtime: &mut Runtime,
         cleanup: WorkspaceCleanup,
@@ -5106,6 +5179,169 @@ mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
         let vars = resolve_launch_vars("agent", &launch, &typed).unwrap();
         assert_eq!(vars["count"], "3");
         assert_eq!(vars["debug"], "true");
+    }
+
+    #[tokio::test]
+    async fn operation_boundary_classifies_launch_variable_errors() {
+        let duplicate = GatewayOperation::from_ssh_action(GatewayAction::LaunchRun {
+            name: "agent".into(),
+            session_id: None,
+            vars: vec!["repo=a".into(), "repo=b".into()],
+        })
+        .unwrap_err();
+        assert_invalid_launch_variable(duplicate, "duplicate launch variable");
+
+        let cfg = launch_var_boundary_config();
+
+        let unknown = SuppliedLaunchVars::from_cli_pairs(vec![
+            "repo=https://example.test/repo.git".into(),
+            "extra=value".into(),
+        ])
+        .unwrap();
+        let err = launch_execute_with_config(
+            cfg.clone(),
+            "agent",
+            None,
+            unknown,
+            OperationExecutionOptions::STREAM,
+        )
+        .await
+        .unwrap_err();
+        assert_invalid_launch_variable(err, "unknown launch variable");
+
+        let err = launch_execute_with_config(
+            cfg.clone(),
+            "agent",
+            None,
+            SuppliedLaunchVars::default(),
+            OperationExecutionOptions::STREAM,
+        )
+        .await
+        .unwrap_err();
+        assert_invalid_launch_variable(err, "missing required launch variable");
+
+        let invalid_enum = SuppliedLaunchVars::from_cli_pairs(vec![
+            "repo=https://example.test/repo.git".into(),
+            "mode=slow".into(),
+        ])
+        .unwrap();
+        let err = launch_execute_with_config(
+            cfg.clone(),
+            "agent",
+            None,
+            invalid_enum,
+            OperationExecutionOptions::STREAM,
+        )
+        .await
+        .unwrap_err();
+        assert_invalid_launch_variable(err, "invalid enum launch variable");
+
+        let invalid_number = SuppliedLaunchVars::from_cli_pairs(vec![
+            "repo=https://example.test/repo.git".into(),
+            "count=abc".into(),
+        ])
+        .unwrap();
+        let err = launch_execute_with_config(
+            cfg.clone(),
+            "agent",
+            None,
+            invalid_number,
+            OperationExecutionOptions::STREAM,
+        )
+        .await
+        .unwrap_err();
+        assert_invalid_launch_variable(err, "invalid number launch variable");
+
+        let mut invalid_type = SuppliedLaunchVars::default();
+        invalid_type
+            .insert("repo".into(), SuppliedLaunchVarValue::Boolean(true))
+            .unwrap();
+        let err = launch_execute_with_config(
+            cfg,
+            "agent",
+            None,
+            invalid_type,
+            OperationExecutionOptions::STREAM,
+        )
+        .await
+        .unwrap_err();
+        assert_invalid_launch_variable(err, "invalid string launch variable");
+    }
+
+    #[tokio::test]
+    async fn operation_boundary_classifies_unknown_launch_and_session_errors() {
+        let cfg = launch_var_boundary_config();
+        let err = launch_execute_with_config(
+            cfg,
+            "missing",
+            None,
+            SuppliedLaunchVars::default(),
+            OperationExecutionOptions::STREAM,
+        )
+        .await
+        .unwrap_err();
+        let OperationError::UnknownLaunch { message } = err else {
+            panic!("expected unknown launch error, got {err:?}");
+        };
+        assert_eq!(message, "unknown launch \"missing\"");
+
+        let dir = tempfile::tempdir().unwrap();
+        let fixed_config = write_gateway_config(
+            &dir,
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        );
+        let err = execute_gateway_operation(
+            Some(fixed_config),
+            GatewayOperation::Status {
+                target: Some("default".into()),
+                session_id: Some("abc123def456".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_invalid_session(err, "--session-id is only valid for ephemeral targets");
+
+        let dir = tempfile::tempdir().unwrap();
+        let ephemeral_config = write_gateway_config(
+            &dir,
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "ephemeral"
+ephemeral_name = "{image_slug}-{session_id}"
+stop_when_idle = true
+"#,
+        );
+        let err = execute_gateway_operation(
+            Some(ephemeral_config.clone()),
+            GatewayOperation::Status {
+                target: Some("default".into()),
+                session_id: Some("..".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_invalid_session(err, "invalid session id");
+
+        let err = execute_gateway_operation(
+            Some(ephemeral_config),
+            GatewayOperation::Status {
+                target: Some("default".into()),
+                session_id: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_invalid_session(err, "requires --session-id");
     }
 
     #[test]
