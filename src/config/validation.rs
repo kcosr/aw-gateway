@@ -1,4 +1,4 @@
-use super::{LaunchStep, LifecyclePhase, ServiceConfig};
+use super::{LaunchStep, ServiceConfig};
 use crate::{action, template};
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet};
@@ -209,15 +209,6 @@ pub(super) fn merge_launch_steps(
         }
     }
     Ok(inherited)
-}
-
-pub(super) fn lifecycle_phase_name(phase: LifecyclePhase) -> &'static str {
-    match phase {
-        LifecyclePhase::PreStart => "pre_start",
-        LifecyclePhase::PostStartHost => "post_start_host",
-        LifecyclePhase::PreStop => "pre_stop",
-        LifecyclePhase::PostStop => "post_stop",
-    }
 }
 
 pub(super) fn validate_template(field: &str, value: &str, allowed: &[&str]) -> anyhow::Result<()> {
