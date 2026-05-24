@@ -52,6 +52,10 @@ pub fn render(input: &str, vars: &Vars) -> anyhow::Result<String> {
     Ok(out)
 }
 
+pub(crate) fn render_argv(command: &[String], vars: &Vars) -> anyhow::Result<Vec<String>> {
+    command.iter().map(|arg| render(arg, vars)).collect()
+}
+
 pub fn image_slug(image: &str) -> String {
     image
         .trim_start_matches("localhost/")
@@ -74,6 +78,26 @@ mod tests {
         let mut vars = Vars::new();
         vars.insert("image_slug".into(), "ubuntu-dev".into());
         assert_eq!(render("{image_slug}/x", &vars).unwrap(), "ubuntu-dev/x");
+    }
+
+    #[test]
+    fn renders_argv_elements_independently() {
+        let vars = BTreeMap::from([("workspace".to_string(), "/work tree".to_string())]);
+        let command = vec![
+            "printf".to_string(),
+            "{workspace}".to_string(),
+            "literal arg".to_string(),
+        ];
+
+        assert_eq!(
+            render_argv(&command, &vars).unwrap(),
+            vec![
+                "printf".to_string(),
+                "/work tree".to_string(),
+                "literal arg".to_string()
+            ]
+        );
+        assert!(render_argv(&["{missing}".to_string()], &vars).is_err());
     }
 
     #[test]

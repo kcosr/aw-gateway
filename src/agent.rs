@@ -5,7 +5,10 @@ use crate::config::{
     IdleCleanupConfig, IdleCleanupOwner, LoggingConfig, RestartPolicy, ServiceConfig,
     parse_duration,
 };
+use crate::fileutil;
+use crate::health_probe::{JsonFieldCheck, check_json_fields, http_get};
 use crate::paths;
+use crate::rotating_log::RotationState;
 use crate::template::{self, Vars};
 use anyhow::Context;
 use serde::Serialize;
@@ -63,7 +66,7 @@ async fn run_agent(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let state_dir = std::env::var_os("AW_CONTAINER_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(paths::DEFAULT_AGENT_STATE_DIR));
-    ensure_private_dir(&state_dir).await?;
+    fileutil::ensure_private_dir(&state_dir)?;
     let bridge_enabled = cfg
         .container_agent
         .ssh_bridge
@@ -547,7 +550,7 @@ async fn start_service(service: &ManagedService) -> anyhow::Result<()> {
         .await?,
     ));
     let vars = service.vars();
-    let command_argv = render_command(&service.config.command, &vars)?;
+    let command_argv = template::render_argv(&service.config.command, &vars)?;
     let mut command = Command::new(&command_argv[0]);
     command.args(&command_argv[1..]);
     command.env_clear();
@@ -642,11 +645,8 @@ async fn copy_service_output<R>(
 }
 
 struct RotatingServiceLog {
-    path: PathBuf,
-    max_bytes: u64,
-    max_files: usize,
+    rotation: RotationState,
     file: tokio::fs::File,
-    bytes_written: u64,
 }
 
 impl RotatingServiceLog {
@@ -659,57 +659,47 @@ impl RotatingServiceLog {
             .with_context(|| format!("open {}", path.display()))?;
         let bytes_written = file.metadata().await?.len();
         Ok(Self {
-            path,
-            max_bytes: max_bytes.max(1),
-            max_files,
+            rotation: RotationState::new(path, max_bytes, max_files, bytes_written),
             file,
-            bytes_written,
         })
     }
 
     async fn write_all(&mut self, buffer: &[u8]) -> anyhow::Result<()> {
         self.rotate_if_needed(buffer.len()).await?;
         self.file.write_all(buffer).await?;
-        self.bytes_written += buffer.len() as u64;
+        self.rotation.record_write(buffer.len());
         Ok(())
     }
 
     async fn rotate_if_needed(&mut self, incoming: usize) -> anyhow::Result<()> {
-        if self.max_files == 0 || self.bytes_written + incoming as u64 <= self.max_bytes {
+        if !self.rotation.should_rotate(incoming) {
             return Ok(());
         }
         self.file.flush().await?;
-        for generation in (1..=self.max_files).rev() {
-            let path = self.path_for_generation(generation);
-            if generation == self.max_files {
+        for generation in (1..=self.rotation.max_files()).rev() {
+            let path = self.rotation.path_for_generation(generation);
+            if generation == self.rotation.max_files() {
                 let _ = tokio::fs::remove_file(path).await;
             } else {
-                let next = self.path_for_generation(generation + 1);
+                let next = self.rotation.path_for_generation(generation + 1);
                 if tokio::fs::try_exists(&path).await? {
                     tokio::fs::rename(path, next).await?;
                 }
             }
         }
-        if tokio::fs::try_exists(&self.path).await? {
-            tokio::fs::rename(&self.path, self.path_for_generation(1)).await?;
+        let active = self.rotation.active_path().to_path_buf();
+        if tokio::fs::try_exists(&active).await? {
+            tokio::fs::rename(&active, self.rotation.path_for_generation(1)).await?;
         }
         self.file = tokio::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
-            .open(&self.path)
+            .open(self.rotation.active_path())
             .await
-            .with_context(|| format!("open {}", self.path.display()))?;
-        self.bytes_written = 0;
+            .with_context(|| format!("open {}", self.rotation.active_path().display()))?;
+        self.rotation.reset_after_rotation();
         Ok(())
-    }
-
-    fn path_for_generation(&self, generation: usize) -> PathBuf {
-        if generation == 0 {
-            self.path.clone()
-        } else {
-            PathBuf::from(format!("{}.{}", self.path.display(), generation))
-        }
     }
 }
 
@@ -737,57 +727,25 @@ fn resolve_env(value: &EnvValue, vars: &Vars) -> anyhow::Result<Option<String>> 
     value.resolve(vars)
 }
 
-fn render_command(command: &[String], vars: &Vars) -> anyhow::Result<Vec<String>> {
-    command
-        .iter()
-        .map(|arg| template::render(arg, vars))
-        .collect()
-}
-
 async fn http_health(
     url: &str,
     expect_status: u16,
     expect_json: &BTreeMap<String, String>,
 ) -> anyhow::Result<bool> {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return Ok(false);
-    };
-    let (host_port, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let (host, port) = match host_port.split_once(':') {
-        Some((host, port)) => (host, port.parse::<u16>()?),
-        None => (host_port, 80),
-    };
-    let mut stream = TcpStream::connect((host, port)).await?;
-    let request = format!("GET /{path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    let response = String::from_utf8_lossy(&buf);
-    let status_ok = response.starts_with(&format!("HTTP/1.1 {expect_status} "))
-        || response.starts_with(&format!("HTTP/1.0 {expect_status} "));
-    if !status_ok {
+    let response = http_get(url).await?;
+    if !response.status_matches(expect_status) {
         return Ok(false);
     }
     if expect_json.is_empty() {
         return Ok(true);
     }
-    let Some((_, body)) = response.split_once("\r\n\r\n") else {
+    let Some(body) = response.body() else {
         return Ok(false);
     };
-    json_fields_match(body, expect_json)
-}
-
-fn json_fields_match(body: &str, expected: &BTreeMap<String, String>) -> anyhow::Result<bool> {
-    let value: serde_json::Value = serde_json::from_str(body)?;
-    for (key, expected_value) in expected {
-        let Some(actual) = value.get(key).and_then(serde_json::Value::as_str) else {
-            return Ok(false);
-        };
-        if actual != expected_value {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(matches!(
+        check_json_fields(body, expect_json)?,
+        JsonFieldCheck::Match
+    ))
 }
 
 async fn run_bridge(
@@ -802,7 +760,7 @@ async fn run_bridge(
     );
     let socket = PathBuf::from(template::render(&socket_template, &vars)?);
     if let Some(parent) = socket.parent() {
-        ensure_private_dir(parent).await?;
+        fileutil::ensure_private_dir(parent)?;
         apply_path_owner(parent, state.socket_owner)?;
     }
     unlink_socket_if_present(&socket).await?;
@@ -1224,7 +1182,7 @@ async fn unlink_socket_if_present(path: &Path) -> anyhow::Result<()> {
 
 async fn run_control_socket(state: Arc<AgentState>, path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        ensure_private_dir(parent).await?;
+        fileutil::ensure_private_dir(parent)?;
         apply_path_owner(parent, state.socket_owner)?;
     }
     unlink_socket_if_present(path).await?;
@@ -1285,20 +1243,6 @@ async fn shutdown_agent(state: Arc<AgentState>) {
     state.shutting_down.store(true, Ordering::SeqCst);
     state.accepting_bridge.store(false, Ordering::SeqCst);
     stop_services(&state).await;
-}
-
-async fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
-    tokio::fs::create_dir_all(path)
-        .await
-        .with_context(|| format!("create {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .await
-            .with_context(|| format!("chmod 0700 {}", path.display()))?;
-    }
-    Ok(())
 }
 
 async fn handle_control_connection(
@@ -1976,9 +1920,18 @@ mod tests {
     #[test]
     fn json_health_expectation_matches_top_level_fields() {
         let expected = BTreeMap::from([("status".to_string(), "ready".to_string())]);
-        assert!(json_fields_match(r#"{"status":"ready"}"#, &expected).unwrap());
-        assert!(!json_fields_match(r#"{"status":"starting"}"#, &expected).unwrap());
-        assert!(!json_fields_match(r#"{"state":"ready"}"#, &expected).unwrap());
+        assert!(matches!(
+            check_json_fields(r#"{"status":"ready"}"#, &expected).unwrap(),
+            JsonFieldCheck::Match
+        ));
+        assert!(matches!(
+            check_json_fields(r#"{"status":"starting"}"#, &expected).unwrap(),
+            JsonFieldCheck::Mismatch { .. }
+        ));
+        assert!(matches!(
+            check_json_fields(r#"{"state":"ready"}"#, &expected).unwrap(),
+            JsonFieldCheck::Missing { .. }
+        ));
     }
 
     #[test]
@@ -1993,7 +1946,7 @@ mod tests {
         ];
 
         assert_eq!(
-            render_command(&command, &vars).unwrap(),
+            template::render_argv(&command, &vars).unwrap(),
             vec![
                 "/bin/echo".to_string(),
                 "/tmp/agent-state/ready".to_string()
@@ -2034,7 +1987,7 @@ mod tests {
     async fn ensure_private_dir_sets_private_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state");
-        ensure_private_dir(&path).await.unwrap();
+        fileutil::ensure_private_dir(&path).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

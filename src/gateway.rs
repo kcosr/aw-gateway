@@ -69,7 +69,7 @@ mod session;
 mod token;
 
 use client::{read_default_selection, resolve_target_selection};
-use health::{render_command, run_argv_with_options, run_argv_with_timeout, run_health_check};
+use health::{run_argv_with_options, run_argv_with_timeout, run_health_check};
 use model::{
     AllStatusEntry, GatewayStatus, LaunchDetail, LaunchStepDetail, LaunchSummary,
     LaunchVarMetadata, ReadyStatus, TargetEntry, TcpEndpoint, gateway_status_name,
@@ -1041,7 +1041,7 @@ async fn launch_execute_with_config(
             &vars,
             runtime.container_home.as_path(),
         )?;
-        let command = render_command(&launch.command, &vars)?;
+        let command = template::render_argv(&launch.command, &vars)?;
         exec_final_container_command_with_options(&runtime, command, cwd, env, options).await
     }
     .await;
@@ -1077,7 +1077,7 @@ async fn detach_launch_execute_with_runtime(
                 &vars,
                 runtime.container_home.as_path(),
             )?;
-            let command = render_command(&launch.command, &vars)?;
+            let command = template::render_argv(&launch.command, &vars)?;
             exec_final_container_command_with_options(
                 &runtime,
                 command,
@@ -1390,7 +1390,7 @@ async fn run_host_launch_step(
     vars: &Vars,
     runtime: &Runtime,
 ) -> anyhow::Result<()> {
-    let command = render_command(&step.command, vars)?;
+    let command = template::render_argv(&step.command, vars)?;
     let cwd = step.cwd.as_deref();
     let cwd = render_launch_cwd(cwd, vars, runtime.user.home.as_path())?;
     let env = render_template_map(&step.env, vars)?;
@@ -1414,7 +1414,7 @@ async fn run_container_launch_step(
         cwd,
         env,
         container_name: runtime.container_name.clone(),
-        command: render_command(&step.command, vars)?,
+        command: template::render_argv(&step.command, vars)?,
     };
     let timeout = host_hook_timeout(step.timeout.as_deref())?;
     let code = runtime
@@ -2373,7 +2373,7 @@ impl Runtime {
         container_pid: Option<&str>,
     ) -> anyhow::Result<()> {
         let vars = self.vars(container_pid);
-        let command = render_command(&step.command, &vars)?;
+        let command = template::render_argv(&step.command, &vars)?;
         let timeout = host_hook_timeout(step.timeout.as_deref())?;
         match run_argv_with_timeout(&command, timeout).await {
             Ok(()) => Ok(()),
@@ -2388,7 +2388,7 @@ impl Runtime {
     async fn run_host_steps(&self, container_pid: &str) -> anyhow::Result<()> {
         for step in &self.target.host_steps {
             let vars = self.vars(Some(container_pid));
-            let command = render_command(&step.command, &vars)?;
+            let command = template::render_argv(&step.command, &vars)?;
             let timeout = host_hook_timeout(step.timeout.as_deref())?;
             let command_result = run_argv_with_timeout(&command, timeout).await;
             if let Err(err) = command_result {
