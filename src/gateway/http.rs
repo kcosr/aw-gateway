@@ -1,28 +1,31 @@
 use super::ops::{
-    CanonicalLaunchVarValue, ExecutionOutcome, GatewayOperation, GatewayOperationResult,
-    OperationError, OperationExecutionOptions, OperationMode, OutputSelection, SuppliedLaunchVars,
-    execute_gateway_operation,
+    CanonicalLaunchVarValue, GatewayOperation, GatewayOperationResult, OperationExecutionOptions,
+    OperationMode, OutputSelection, SuppliedLaunchVars, execute_gateway_operation,
 };
-use crate::config::{GatewayConfig, HttpAuthType};
-use crate::paths::{self, UserContext};
+use crate::config::GatewayConfig;
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
 use serde::de::{self, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::json;
+use serde::{Deserialize, Deserializer};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const MAX_BEARER_TOKEN_BYTES: usize = 4096;
+mod auth;
+mod response;
+
+use auth::{authorize, authorize_action};
+use response::{
+    ErrorCode, HttpError, execution_response, metadata_result_response, operation_error_response,
+};
 
 #[derive(Clone)]
-struct AppState {
+pub(super) struct AppState {
     config_path: Option<PathBuf>,
     config: Arc<GatewayConfig>,
 }
@@ -233,221 +236,6 @@ async fn handle_execution(
     }
 }
 
-async fn authorize_action(
-    state: &AppState,
-    headers: &HeaderMap,
-    action: &'static str,
-) -> Result<(), ActionAuthorizationError> {
-    authorize(state, headers).await?;
-    if !state
-        .config
-        .http
-        .enabled_actions
-        .iter()
-        .any(|enabled| enabled == action)
-    {
-        return Err(
-            OperationError::disabled_action(format!("http action {action:?} is disabled")).into(),
-        );
-    }
-    Ok(())
-}
-
-#[derive(Debug)]
-enum ActionAuthorizationError {
-    Http(HttpError),
-    Operation(OperationError),
-}
-
-impl IntoResponse for ActionAuthorizationError {
-    fn into_response(self) -> Response {
-        match self {
-            Self::Http(err) => err.into_response(),
-            Self::Operation(err) => operation_error_response(err),
-        }
-    }
-}
-
-impl From<HttpError> for ActionAuthorizationError {
-    fn from(err: HttpError) -> Self {
-        Self::Http(err)
-    }
-}
-
-impl From<OperationError> for ActionAuthorizationError {
-    fn from(err: OperationError) -> Self {
-        Self::Operation(err)
-    }
-}
-
-async fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), HttpError> {
-    match state.config.http.auth.auth_type {
-        HttpAuthType::None => Ok(()),
-        HttpAuthType::Bearer => authorize_bearer(state, headers).await,
-    }
-}
-
-async fn authorize_bearer(state: &AppState, headers: &HeaderMap) -> Result<(), HttpError> {
-    let supplied = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| HttpError::unauthorized("unauthorized"))?;
-    let expected = read_bearer_token(state).await?;
-    if !constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
-        return Err(HttpError::unauthorized("unauthorized"));
-    }
-    Ok(())
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() > MAX_BEARER_TOKEN_BYTES || right.len() > MAX_BEARER_TOKEN_BYTES {
-        return false;
-    }
-    let mut diff = left.len() ^ right.len();
-    for index in 0..MAX_BEARER_TOKEN_BYTES {
-        let left_byte = left.get(index).copied().unwrap_or_default();
-        let right_byte = right.get(index).copied().unwrap_or_default();
-        diff |= usize::from(left_byte ^ right_byte);
-    }
-    diff == 0
-}
-
-async fn read_bearer_token(state: &AppState) -> Result<String, HttpError> {
-    let token_file = state
-        .config
-        .http
-        .auth
-        .token_file
-        .as_deref()
-        .ok_or_else(|| HttpError::unauthorized("unauthorized"))?;
-    let user = UserContext::current().map_err(|_| HttpError::unauthorized("unauthorized"))?;
-    let path = paths::expand_home(&user.home, token_file);
-    let metadata = tokio::fs::metadata(&path).await.map_err(|err| {
-        tracing::warn!(path = %path.display(), error = %err, "failed to stat http bearer token file");
-        HttpError::unauthorized("unauthorized")
-    })?;
-    validate_bearer_token_file(&path, &metadata)?;
-    let token = tokio::fs::read_to_string(&path).await.map_err(|err| {
-        tracing::warn!(path = %path.display(), error = %err, "failed to read http bearer token file");
-        HttpError::unauthorized("unauthorized")
-    })?;
-    let token = token.trim().to_string();
-    if token.is_empty() || token.len() > MAX_BEARER_TOKEN_BYTES {
-        return Err(HttpError::unauthorized("unauthorized"));
-    }
-    Ok(token)
-}
-
-#[cfg(unix)]
-fn validate_bearer_token_file(
-    path: &std::path::Path,
-    metadata: &std::fs::Metadata,
-) -> Result<(), HttpError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    if metadata.permissions().mode() & 0o077 != 0 {
-        tracing::warn!(
-            path = %path.display(),
-            "http bearer token file must not be group- or world-readable"
-        );
-        return Err(HttpError::unauthorized("unauthorized"));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn validate_bearer_token_file(
-    _path: &std::path::Path,
-    _metadata: &std::fs::Metadata,
-) -> Result<(), HttpError> {
-    Ok(())
-}
-
-fn metadata_result_response(result: GatewayOperationResult) -> Response {
-    match result {
-        GatewayOperationResult::Targets(value) => success_data(value),
-        GatewayOperationResult::Status(value) => success_data(value),
-        GatewayOperationResult::StatusAll(value) => success_data(value),
-        GatewayOperationResult::Up(value) => success_data(value),
-        GatewayOperationResult::Launches(value) => success_data(value),
-        GatewayOperationResult::LaunchShow(value) => success_data(value),
-        _ => HttpError::operation_failed("operation returned an unexpected result").into_response(),
-    }
-}
-
-fn success_data<T: Serialize>(data: T) -> Response {
-    (StatusCode::OK, Json(json!({ "ok": true, "data": data }))).into_response()
-}
-
-fn execution_response(outcome: ExecutionOutcome) -> Response {
-    match outcome {
-        ExecutionOutcome::Captured {
-            exit_code,
-            stdout,
-            stderr,
-        } => match wait_payload(exit_code, stdout, stderr) {
-            Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-            Err(err) => err.into_response(),
-        },
-        ExecutionOutcome::Detached { operation_id } => (
-            StatusCode::ACCEPTED,
-            Json(json!({
-                "ok": true,
-                "mode": "detach",
-                "status": "accepted",
-                "operation_id": operation_id,
-            })),
-        )
-            .into_response(),
-        ExecutionOutcome::Streamed { .. } => {
-            HttpError::operation_failed("http operations must use wait or detach mode")
-                .into_response()
-        }
-    }
-}
-
-fn wait_payload(
-    exit_code: i32,
-    stdout: Option<Vec<u8>>,
-    stderr: Option<Vec<u8>>,
-) -> Result<serde_json::Value, HttpError> {
-    let mut payload = serde_json::Map::new();
-    payload.insert("ok".into(), json!(true));
-    payload.insert("mode".into(), json!("wait"));
-    payload.insert("exit_code".into(), json!(exit_code));
-    if let Some(stdout) = stdout {
-        let stdout = String::from_utf8(stdout)
-            .map_err(|_| HttpError::operation_failed("captured stdout is not valid UTF-8"))?;
-        payload.insert("stdout".into(), json!(stdout));
-    }
-    if let Some(stderr) = stderr {
-        let stderr = String::from_utf8(stderr)
-            .map_err(|_| HttpError::operation_failed("captured stderr is not valid UTF-8"))?;
-        payload.insert("stderr".into(), json!(stderr));
-    }
-    Ok(serde_json::Value::Object(payload))
-}
-
-fn operation_error_response(err: OperationError) -> Response {
-    let message = err.to_string();
-    match err {
-        OperationError::InvalidRequest { .. } | OperationError::InvalidSession { .. } => {
-            HttpError::invalid_request(message)
-        }
-        OperationError::DisabledAction { .. } => HttpError::disabled_action(message),
-        OperationError::UnknownLaunch { .. } => HttpError::not_found(message),
-        OperationError::InvalidLaunchVariable { .. } => HttpError::new(
-            StatusCode::BAD_REQUEST,
-            ErrorCode::InvalidLaunchVar,
-            message,
-        ),
-        OperationError::OperationFailed { .. } => HttpError::operation_failed(message),
-    }
-    .into_response()
-}
-
 fn parse_body<T: for<'de> Deserialize<'de>>(
     body: &[u8],
     semantic_code: ErrorCode,
@@ -624,107 +412,19 @@ impl<'de> Visitor<'de> for LaunchVarsVisitor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ErrorCode {
-    Unauthorized,
-    DisabledAction,
-    NotFound,
-    InvalidRequest,
-    InvalidMode,
-    InvalidOutput,
-    InvalidLaunchVar,
-    OperationFailed,
-}
-
-impl ErrorCode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Unauthorized => "unauthorized",
-            Self::DisabledAction => "disabled_action",
-            Self::NotFound => "not_found",
-            Self::InvalidRequest => "invalid_request",
-            Self::InvalidMode => "invalid_mode",
-            Self::InvalidOutput => "invalid_output",
-            Self::InvalidLaunchVar => "invalid_launch_var",
-            Self::OperationFailed => "operation_failed",
-        }
-    }
-}
-
-#[derive(Debug)]
-struct HttpError {
-    status: StatusCode,
-    code: ErrorCode,
-    message: String,
-}
-
-impl HttpError {
-    fn new(status: StatusCode, code: ErrorCode, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            code,
-            message: message.into(),
-        }
-    }
-
-    fn unauthorized(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized, message)
-    }
-
-    fn disabled_action(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::FORBIDDEN, ErrorCode::DisabledAction, message)
-    }
-
-    fn not_found(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::NOT_FOUND, ErrorCode::NotFound, message)
-    }
-
-    fn invalid_request(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, message)
-    }
-
-    fn invalid_mode(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, ErrorCode::InvalidMode, message)
-    }
-
-    fn invalid_output(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::BAD_REQUEST, ErrorCode::InvalidOutput, message)
-    }
-
-    fn operation_failed(message: impl Into<String>) -> Self {
-        Self::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ErrorCode::OperationFailed,
-            message,
-        )
-    }
-}
-
-impl IntoResponse for HttpError {
-    fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({
-                "ok": false,
-                "error": {
-                    "code": self.code.as_str(),
-                    "message": self.message,
-                },
-            })),
-        )
-            .into_response()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::model::GatewayStatus;
+    use super::super::ops::{ExecutionOutcome, OperationError};
+    use super::auth::ActionAuthorizationError;
+    use super::response::success_data;
     use super::*;
-    use crate::config::{HttpAuthConfig, HttpConfig};
+    use crate::config::{HttpAuthConfig, HttpAuthType, HttpConfig};
+    use crate::paths::UserContext;
     use axum::body::Body;
     use axum::body::to_bytes;
-    use axum::http::Request;
     use axum::http::header::AUTHORIZATION;
+    use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
     fn write_fake_runtime(path: &std::path::Path, script: &str) {
