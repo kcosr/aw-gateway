@@ -419,8 +419,9 @@ impl CanonicalLaunchVarValue {
         match value {
             config::LaunchVarValue::String(value) => Self::String(value.clone()),
             config::LaunchVarValue::Boolean(value) => Self::Boolean(*value),
-            config::LaunchVarValue::Integer(_) | config::LaunchVarValue::Float(_) => {
-                Self::Number(value.rendered())
+            config::LaunchVarValue::Integer(value) => Self::Number(value.to_string()),
+            config::LaunchVarValue::Float(value) => {
+                Self::Number(config::canonical_number_string(*value))
             }
         }
     }
@@ -448,7 +449,7 @@ impl CanonicalLaunchVarValue {
                     "invalid launch variable {key:?}: number must be finite"
                 ));
             }
-            Ok(Self::Number(canonical_number_string(value)))
+            Ok(Self::Number(config::canonical_number_string(value)))
         }
     }
 
@@ -523,13 +524,8 @@ fn canonical_cli_number(raw: &str, parsed: f64) -> String {
     if raw.parse::<i64>().is_ok() {
         raw.trim_start_matches('+').to_string()
     } else {
-        canonical_number_string(parsed)
+        config::canonical_number_string(parsed)
     }
-}
-
-fn canonical_number_string(value: f64) -> String {
-    let text = value.to_string();
-    text.strip_suffix(".0").unwrap_or(&text).to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -943,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_launch_var_values_coerce_and_render_for_config_types() {
+    fn canonical_launch_var_values_coerce_render_and_convert_defaults_for_config_types() {
         assert_coerced_rendered(
             "repo",
             launch_var_config(LaunchVarType::String, None),
@@ -1024,6 +1020,18 @@ mod tests {
             "invalid number launch variable \"count\"; expected finite number",
         );
         assert_coercion_error(
+            "count",
+            launch_var_config(LaunchVarType::Number, None),
+            CanonicalLaunchVarValue::String("inf".into()),
+            "invalid number launch variable \"count\"; expected finite number",
+        );
+        assert_coercion_error(
+            "count",
+            launch_var_config(LaunchVarType::Number, None),
+            CanonicalLaunchVarValue::String("-inf".into()),
+            "invalid number launch variable \"count\"; expected finite number",
+        );
+        assert_coercion_error(
             "debug",
             launch_var_config(LaunchVarType::Boolean, None),
             CanonicalLaunchVarValue::String("yes".into()),
@@ -1069,6 +1077,12 @@ mod tests {
         );
 
         let err = CanonicalLaunchVarValue::from_json_number("count", None, None).unwrap_err();
+        assert_eq!(
+            err,
+            "invalid launch variable \"count\": number must be finite"
+        );
+        let err = CanonicalLaunchVarValue::from_json_number("count", None, Some(f64::INFINITY))
+            .unwrap_err();
         assert_eq!(
             err,
             "invalid launch variable \"count\": number must be finite"

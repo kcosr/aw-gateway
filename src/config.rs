@@ -790,10 +790,6 @@ impl LaunchVarConfig {
         }
         Ok(())
     }
-
-    pub fn default_rendered(&self) -> Option<String> {
-        self.default.as_ref().map(LaunchVarValue::rendered)
-    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -4194,7 +4190,7 @@ fn collect_var_references_from_command(
     Ok(())
 }
 
-fn canonical_number_string(value: f64) -> String {
+pub(crate) fn canonical_number_string(value: f64) -> String {
     let text = value.to_string();
     text.strip_suffix(".0").unwrap_or(&text).to_string()
 }

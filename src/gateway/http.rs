@@ -807,14 +807,15 @@ command = ["launch-command"]
 [launches.typed]
 target = "default"
 cwd = "/repo-{{var.repo}}-{{var.count}}"
-env = {{ REPO = "{{var.repo}}", DEBUG = "{{var.debug}}", COUNT = "{{var.count}}", MODE = "{{var.mode}}" }}
-command = ["launch-command", "{{var.repo}}", "{{var.mode}}", "{{var.debug}}", "{{var.count}}"]
+env = {{ REPO = "{{var.repo}}", DEBUG = "{{var.debug}}", COUNT = "{{var.count}}", MODE = "{{var.mode}}", RATIO = "{{var.ratio}}" }}
+command = ["launch-command", "{{var.repo}}", "{{var.mode}}", "{{var.debug}}", "{{var.count}}", "{{var.ratio}}"]
 
 [launches.typed.vars]
 repo = {{ type = "string", required = true }}
 mode = {{ type = "enum", values = ["fast", "safe"], default = "fast" }}
 debug = {{ type = "boolean", default = false }}
 count = {{ type = "number", default = 1 }}
+ratio = {{ type = "number", default = 1 }}
 
 [[launches.typed.steps]]
 phase = "post_ready"
@@ -822,9 +823,9 @@ location = "container"
 name = "prepare"
 required = false
 cwd = "/step-{{var.mode}}-{{var.count}}"
-env = {{ STEP_REPO = "{{var.repo}}", STEP_DEBUG = "{{var.debug}}" }}
-command = ["step-command", "{{var.repo}}", "{{var.count}}"]
-	"#,
+env = {{ STEP_REPO = "{{var.repo}}", STEP_DEBUG = "{{var.debug}}", STEP_RATIO = "{{var.ratio}}" }}
+command = ["step-command", "{{var.repo}}", "{{var.count}}", "{{var.ratio}}"]
+            "#,
                 program = fake_runtime.display(),
                 workspace = dir.path().join("workspace").display()
             ),
@@ -1294,7 +1295,7 @@ command = ["step-command", "{{var.repo}}", "{{var.count}}"]
         let (status, body) = post_json(
             app.clone(),
             "/api/v1/launches/typed/run",
-            r#"{"vars":{"repo":"alpha","mode":"safe","debug":true,"count":3},"mode":"wait"}"#,
+            r#"{"vars":{"repo":"alpha","mode":"safe","debug":true,"count":3,"ratio":1.5},"mode":"wait"}"#,
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1304,14 +1305,16 @@ command = ["step-command", "{{var.repo}}", "{{var.count}}"]
         assert!(log.contains("--workdir /step-safe-3"), "{log}");
         assert!(log.contains("--env STEP_DEBUG=true"), "{log}");
         assert!(log.contains("--env STEP_REPO=alpha"), "{log}");
-        assert!(log.contains("ubuntu-dev step-command alpha 3"), "{log}");
+        assert!(log.contains("--env STEP_RATIO=1.5"), "{log}");
+        assert!(log.contains("ubuntu-dev step-command alpha 3 1.5"), "{log}");
         assert!(log.contains("--workdir /repo-alpha-3"), "{log}");
         assert!(log.contains("--env COUNT=3"), "{log}");
         assert!(log.contains("--env DEBUG=true"), "{log}");
         assert!(log.contains("--env MODE=safe"), "{log}");
+        assert!(log.contains("--env RATIO=1.5"), "{log}");
         assert!(log.contains("--env REPO=alpha"), "{log}");
         assert!(
-            log.contains("ubuntu-dev launch-command alpha safe true 3"),
+            log.contains("ubuntu-dev launch-command alpha safe true 3 1.5"),
             "{log}"
         );
 
