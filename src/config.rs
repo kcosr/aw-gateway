@@ -4948,6 +4948,47 @@ type = "string"
     }
 
     #[test]
+    fn launch_partial_allows_later_var_bindings_but_effective_rejects_unbound_vars() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launch_defaults]
+target = "default"
+command = ["echo", "{var.future}"]
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.bad]
+target = "default"
+command = ["echo", "{var.future}"]
+"#,
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(
+            err.contains("unknown interpolation variable {var.future}"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn launch_schema_rejects_bad_vars_and_templates() {
         for (config, expected) in [
             (

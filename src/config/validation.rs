@@ -458,7 +458,7 @@ pub(super) fn lifecycle_phase_name(phase: LifecyclePhase) -> &'static str {
 }
 
 pub(super) fn validate_template(field: &str, value: &str, allowed: &[&str]) -> anyhow::Result<()> {
-    template::validate_keys(value, allowed).with_context(|| format!("validate {field}"))
+    validate_template_with_policy(field, value, allowed, TemplatePolicy::STRICT)
 }
 
 pub(super) fn validate_command_templates(
@@ -472,16 +472,34 @@ pub(super) fn validate_command_templates(
     Ok(())
 }
 
-pub(super) fn validate_partial_launch_template(
+#[derive(Debug, Clone, Copy)]
+pub(super) struct TemplatePolicy {
+    allow_unbound_var_prefix: bool,
+}
+
+impl TemplatePolicy {
+    pub(super) const STRICT: Self = Self {
+        allow_unbound_var_prefix: false,
+    };
+
+    pub(super) const ALLOW_UNBOUND_VAR_PREFIX: Self = Self {
+        allow_unbound_var_prefix: true,
+    };
+}
+
+pub(super) fn validate_template_with_policy(
     field: &str,
     value: &str,
     allowed: &[&str],
+    policy: TemplatePolicy,
 ) -> anyhow::Result<()> {
     for key in template::referenced_keys(value).with_context(|| format!("validate {field}"))? {
         if allowed.contains(&key) {
             continue;
         }
-        if let Some(var_name) = key.strip_prefix("var.") {
+        if policy.allow_unbound_var_prefix
+            && let Some(var_name) = key.strip_prefix("var.")
+        {
             validate_name("launch var", var_name).with_context(|| format!("validate {field}"))?;
             continue;
         }
@@ -493,13 +511,14 @@ pub(super) fn validate_partial_launch_template(
     Ok(())
 }
 
-pub(super) fn validate_partial_launch_command_templates(
+pub(super) fn validate_command_templates_with_policy(
     field: &str,
     command: &[String],
     allowed: &[&str],
+    policy: TemplatePolicy,
 ) -> anyhow::Result<()> {
     for arg in command {
-        validate_partial_launch_template(field, arg, allowed)?;
+        validate_template_with_policy(field, arg, allowed, policy)?;
     }
     Ok(())
 }
@@ -558,26 +577,15 @@ pub(super) fn validate_env_map(field: &str, env: &BTreeMap<String, String>) -> a
     Ok(())
 }
 
-pub(super) fn validate_env_keyed_template_map(
+pub(super) fn validate_env_keyed_template_map_with_policy(
     field: &str,
     env: &BTreeMap<String, String>,
     allowed: &[&str],
+    policy: TemplatePolicy,
 ) -> anyhow::Result<()> {
     for (key, value) in env {
         validate_env_key(key)?;
-        validate_template(&format!("{field}.{key}"), value, allowed)?;
-    }
-    Ok(())
-}
-
-pub(super) fn validate_partial_launch_env_map(
-    field: &str,
-    env: &BTreeMap<String, String>,
-    allowed: &[&str],
-) -> anyhow::Result<()> {
-    for (key, value) in env {
-        validate_env_key(key)?;
-        validate_partial_launch_template(&format!("{field}.{key}"), value, allowed)?;
+        validate_template_with_policy(&format!("{field}.{key}"), value, allowed, policy)?;
     }
     Ok(())
 }
