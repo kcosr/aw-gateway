@@ -627,6 +627,10 @@ impl OperationRunner {
         launch: LaunchConfig,
         resolved_vars: BTreeMap<String, String>,
     ) -> Self {
+        debug_assert!(
+            runtime.launch_name.is_some(),
+            "launch operations require a launch name on the runtime"
+        );
         Self {
             runtime,
             options,
@@ -659,7 +663,7 @@ impl OperationRunner {
             runtime,
             session_spec,
             body,
-            ..
+            options: _,
         } = self;
         let session = runtime
             .begin_operation_session(session_spec.kind(), session_spec.uses_launch_marker())?;
@@ -4592,6 +4596,59 @@ exit 0
                     stderr: false,
                 },
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_run_operation_core_returns_selected_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_runtime = dir.path().join("runtime");
+        let user = UserContext::current().unwrap();
+        write_fake_runtime(
+            &fake_runtime,
+            &format!(
+                r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  exec)
+    echo "captured stdout"
+    echo "captured stderr" >&2
+    exit 23
+    ;;
+esac
+exit 0
+"#,
+                user = user.user,
+                uid = user.uid,
+            ),
+        );
+        let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+            cfg.target_defaults.host_steps.clear();
+            cfg.targets.get_mut("default").unwrap().stop_when_idle = Some(false);
+        });
+
+        let outcome = run_container_command_with_runtime(
+            runtime,
+            None,
+            vec!["/bin/capture".into()],
+            OperationExecutionOptions {
+                mode: OperationMode::Wait,
+                output: OutputSelection {
+                    stdout: true,
+                    stderr: false,
+                },
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            ExecutionOutcome::captured(23, Some(b"captured stdout\n".to_vec()), None)
         );
     }
 
