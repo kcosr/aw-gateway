@@ -11,7 +11,7 @@ use tokio::process::Command;
 
 impl Runtime {
     pub(super) fn workspace_state_dir(&self) -> PathBuf {
-        self.workspace.join(&self.target.workspace.state_dir)
+        self.paths.workspace.join(&self.target.workspace.state_dir)
     }
 
     pub(super) fn ssh_dir(&self) -> PathBuf {
@@ -31,7 +31,10 @@ impl Runtime {
     }
 
     pub(super) fn client_private_key_name(&self) -> String {
-        format!("aw-{}-{}_inner_ed25519", self.user.user, self.target_name)
+        format!(
+            "aw-{}-{}_inner_ed25519",
+            self.identity.user.user, self.identity.target_name
+        )
     }
 
     pub(super) async fn ensure_inner_keypair(&self, rotate: bool) -> anyhow::Result<InnerKeypair> {
@@ -45,12 +48,17 @@ impl Runtime {
         }
         if private_key.exists() {
             validate_private_key_permissions(&private_key)?;
-            validate_private_key(&private_key, &self.target_name).await?;
+            validate_private_key(&private_key, &self.identity.target_name).await?;
             if !public_key.exists() {
                 write_public_key_from_private(&private_key, &public_key).await?;
             }
         } else {
-            generate_inner_keypair(&private_key, &self.user.user, &self.target_name).await?;
+            generate_inner_keypair(
+                &private_key,
+                &self.identity.user.user,
+                &self.identity.target_name,
+            )
+            .await?;
         }
         set_mode(&private_key, 0o600)?;
         set_mode(&public_key, 0o644)?;
@@ -76,7 +84,10 @@ impl Runtime {
         keypair: &InnerKeypair,
         config: &str,
     ) -> anyhow::Result<PathBuf> {
-        let bundle_dir = self.ssh_dir().join("bundle").join(&self.target_name);
+        let bundle_dir = self
+            .ssh_dir()
+            .join("bundle")
+            .join(&self.identity.target_name);
         paths::ensure_private_dir(&bundle_dir)?;
         let private_name = self.client_private_key_name();
         let private_out = bundle_dir.join(&private_name);
@@ -102,12 +113,12 @@ impl Runtime {
         if let Ok(value) = std::env::var("AW_IDENTITY_TOKEN") {
             return validate_identity_token_content(&value, Path::new("AW_IDENTITY_TOKEN"));
         }
-        let path = self.user.config_dir().join("identity-token");
+        let path = self.identity.user.config_dir().join("identity-token");
         ensure_identity_token_file(&path)
     }
 
     pub(super) fn control_token_path(&self) -> PathBuf {
-        self.container_state_dir.join("control.token")
+        self.paths.container_state_dir.join("control.token")
     }
 
     pub(super) fn ensure_control_token(&self) -> anyhow::Result<String> {

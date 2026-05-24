@@ -628,7 +628,7 @@ impl OperationRunner {
         resolved_vars: BTreeMap<String, String>,
     ) -> Self {
         debug_assert!(
-            runtime.launch_name.is_some(),
+            runtime.identity.launch_name.is_some(),
             "launch operations require a launch name on the runtime"
         );
         Self {
@@ -728,7 +728,7 @@ impl OperationBody {
             Self::Run { cwd, command } => {
                 let cwd = cwd
                     .as_deref()
-                    .map(|cwd| paths::expand_home(&runtime.container_home, cwd));
+                    .map(|cwd| paths::expand_home(&runtime.identity.container_home, cwd));
                 exec_final_container_command_with_options(
                     runtime,
                     command,
@@ -750,7 +750,7 @@ impl OperationBody {
                 let cwd = render_launch_cwd(
                     launch.cwd.as_deref(),
                     &vars,
-                    runtime.container_home.as_path(),
+                    runtime.identity.container_home.as_path(),
                 )?;
                 let command = template::render_argv(&launch.command, &vars)?;
                 exec_final_container_command_with_options(runtime, command, cwd, env, options).await
@@ -799,7 +799,7 @@ async fn exec_final_container_command_with_options(
         user: runtime.exec_identity(),
         cwd,
         env,
-        container_name: runtime.container_name.clone(),
+        container_name: runtime.identity.container_name.clone(),
         command,
     };
     match options.mode {
@@ -1442,7 +1442,7 @@ async fn run_host_launch_step(
 ) -> anyhow::Result<()> {
     let command = template::render_argv(&step.command, vars)?;
     let cwd = step.cwd.as_deref();
-    let cwd = render_launch_cwd(cwd, vars, runtime.user.home.as_path())?;
+    let cwd = render_launch_cwd(cwd, vars, runtime.identity.user.home.as_path())?;
     let env = render_template_map(&step.env, vars)?;
     let timeout = host_hook_timeout(step.timeout.as_deref())?;
     run_argv_with_options(&command, timeout, cwd.as_deref(), &env).await
@@ -1456,14 +1456,18 @@ async fn run_container_launch_step(
     runtime: &Runtime,
 ) -> anyhow::Result<()> {
     let env = launch_container_step_env(session_env, launch_env, &step.env, vars)?;
-    let cwd = render_launch_cwd(step.cwd.as_deref(), vars, runtime.container_home.as_path())?;
+    let cwd = render_launch_cwd(
+        step.cwd.as_deref(),
+        vars,
+        runtime.identity.container_home.as_path(),
+    )?;
     let exec_spec = ContainerExecSpec {
         stdin_tty: false,
         stdout_tty: false,
         user: runtime.exec_identity(),
         cwd,
         env,
-        container_name: runtime.container_name.clone(),
+        container_name: runtime.identity.container_name.clone(),
         command: template::render_argv(&step.command, vars)?,
     };
     let timeout = host_hook_timeout(step.timeout.as_deref())?;
@@ -1677,8 +1681,15 @@ fn target_container_display(target: &TargetConfig) -> anyhow::Result<String> {
 #[derive(Debug)]
 struct Runtime {
     cfg: GatewayConfig,
-    target_name: String,
     target: TargetConfig,
+    identity: RuntimeIdentity,
+    paths: RuntimePaths,
+    container_runtime: ContainerRuntime,
+}
+
+#[derive(Debug)]
+struct RuntimeIdentity {
+    target_name: String,
     launch_name: Option<String>,
     session_id: Option<String>,
     user: UserContext,
@@ -1688,12 +1699,15 @@ struct Runtime {
     session_shell: String,
     container_user: String,
     container_home: PathBuf,
+    container_name: String,
+}
+
+#[derive(Debug)]
+struct RuntimePaths {
     workspace: PathBuf,
     container_state_dir: PathBuf,
     container_state_dir_in_container: PathBuf,
     control_sockets: ControlSocketPaths,
-    container_name: String,
-    container_runtime: ContainerRuntime,
 }
 
 #[derive(Debug, Clone)]
@@ -1747,62 +1761,24 @@ impl SessionOutcome {
     }
 }
 
-impl Runtime {
-    async fn load(
-        config_path: Option<PathBuf>,
-        target: Option<&str>,
-        session_id: Option<String>,
-        generate_session_id: bool,
-    ) -> anyhow::Result<Runtime> {
-        let cfg = load_config(config_path)?;
-        Self::from_config(cfg, target, session_id, generate_session_id, None).await
-    }
-
-    async fn from_config(
-        cfg: GatewayConfig,
-        target: Option<&str>,
-        session_id: Option<String>,
-        generate_session_id: bool,
+impl RuntimeIdentity {
+    fn resolve(
+        target_name: String,
         launch_name: Option<String>,
-    ) -> anyhow::Result<Runtime> {
-        let user = UserContext::current()?;
-        let target_name = match target {
-            Some(target) => resolve_target_selection(&cfg, Some(target))?,
-            None => match read_default_selection(&user).transpose()? {
-                Some(selection) => resolve_target_selection(&cfg, Some(&selection))?,
-                None => cfg.default_target.clone(),
-            },
-        };
-        let target_cfg = cfg.effective_target(&target_name)?;
-        let session_id = match target_cfg.mode {
-            TargetMode::Fixed => {
-                if session_id.is_some() {
-                    anyhow::bail!("--session-id is only valid for ephemeral targets");
-                }
-                None
-            }
-            TargetMode::Ephemeral => match session_id {
-                Some(value) => {
-                    validate_session_id(&value)?;
-                    Some(value)
-                }
-                None if generate_session_id => Some(generate_session_id_value()?),
-                None => anyhow::bail!("ephemeral target {target_name:?} requires --session-id"),
-            },
-        };
-        let container_name = target_cfg.container_name(session_id.as_deref())?;
-        let workspace =
-            resolve_target_workspace(&target_cfg, &target_name, &user, session_id.as_deref())?;
-        let container_runtime =
-            ContainerRuntime::from_config(&cfg.runtime, &user.user, &user.home)?;
-        let default_container_user = target_cfg.container_user.clone().unwrap_or_else(|| {
+        session_id: Option<String>,
+        user: UserContext,
+        target: &TargetConfig,
+        container_runtime: &ContainerRuntime,
+    ) -> anyhow::Result<Self> {
+        let container_name = target.container_name(session_id.as_deref())?;
+        let default_container_user = target.container_user.clone().unwrap_or_else(|| {
             if container_runtime.kind() == ContainerRuntimeType::Podman {
                 user.user.clone()
             } else {
                 "root".into()
             }
         });
-        let default_container_home = target_cfg.container_home.clone().unwrap_or_else(|| {
+        let default_container_home = target.container_home.clone().unwrap_or_else(|| {
             if container_runtime.kind() == ContainerRuntimeType::Podman {
                 user.home.clone()
             } else {
@@ -1814,7 +1790,7 @@ impl Runtime {
         identity_vars.insert("uid".into(), user.uid.to_string());
         identity_vars.insert("gid".into(), user.gid.to_string());
         identity_vars.insert("home".into(), user.home.display().to_string());
-        let identity = target_cfg.identity.as_ref();
+        let identity = target.identity.as_ref();
         let bootstrap_user = identity
             .and_then(|identity| identity.bootstrap_user.as_deref())
             .map(|value| template::render(value, &identity_vars))
@@ -1860,43 +1836,8 @@ impl Runtime {
             .transpose()?
             .unwrap_or_else(|| "/bin/bash".into());
         validate_passwd_scalar("target identity session_shell", &session_shell)?;
-        let (state_kind, state_id) = match target_cfg.mode {
-            TargetMode::Fixed => ("containers", container_name.as_str()),
-            TargetMode::Ephemeral => (
-                "sessions",
-                session_id
-                    .as_deref()
-                    .expect("ephemeral target has a session id"),
-            ),
-        };
-        let container_state_dir = workspace
-            .join(&target_cfg.workspace.state_dir)
-            .join(state_kind)
-            .join(state_id);
-        let container_state_dir_in_container = resolve_container_path(
-            &container_home,
-            &target_cfg.workspace.state_dir,
-            [state_kind, state_id],
-        );
-        let runtime_id = match target_cfg.mode {
-            TargetMode::Fixed => target_name.clone(),
-            TargetMode::Ephemeral => session_id
-                .clone()
-                .expect("ephemeral target has a session id"),
-        };
-        let control_sockets = render_control_socket_paths(
-            &target_cfg.control_sockets,
-            &target_cfg,
-            &target_name,
-            &container_name,
-            session_id.as_deref(),
-            &runtime_id,
-            &user,
-        )?;
-        let runtime = Runtime {
-            cfg,
+        Ok(Self {
             target_name,
-            target: target_cfg,
             launch_name,
             session_id,
             user,
@@ -1906,11 +1847,126 @@ impl Runtime {
             session_shell,
             container_user,
             container_home,
+            container_name,
+        })
+    }
+
+    fn runtime_id(&self, mode: TargetMode) -> String {
+        match mode {
+            TargetMode::Fixed => self.target_name.clone(),
+            TargetMode::Ephemeral => self
+                .session_id
+                .clone()
+                .expect("ephemeral target has a session id"),
+        }
+    }
+}
+
+impl RuntimePaths {
+    fn resolve(target: &TargetConfig, identity: &RuntimeIdentity) -> anyhow::Result<Self> {
+        let workspace = resolve_target_workspace(
+            target,
+            &identity.target_name,
+            &identity.user,
+            identity.session_id.as_deref(),
+        )?;
+        let (state_kind, state_id) = match target.mode {
+            TargetMode::Fixed => ("containers", identity.container_name.as_str()),
+            TargetMode::Ephemeral => (
+                "sessions",
+                identity
+                    .session_id
+                    .as_deref()
+                    .expect("ephemeral target has a session id"),
+            ),
+        };
+        let container_state_dir = workspace
+            .join(&target.workspace.state_dir)
+            .join(state_kind)
+            .join(state_id);
+        let container_state_dir_in_container = resolve_container_path(
+            &identity.container_home,
+            &target.workspace.state_dir,
+            [state_kind, state_id],
+        );
+        let runtime_id = identity.runtime_id(target.mode);
+        let control_sockets = render_control_socket_paths(
+            &target.control_sockets,
+            target,
+            &identity.target_name,
+            &identity.container_name,
+            identity.session_id.as_deref(),
+            &runtime_id,
+            &identity.user,
+        )?;
+        Ok(Self {
             workspace,
             container_state_dir,
             container_state_dir_in_container,
             control_sockets,
-            container_name,
+        })
+    }
+}
+
+impl Runtime {
+    async fn load(
+        config_path: Option<PathBuf>,
+        target: Option<&str>,
+        session_id: Option<String>,
+        generate_session_id: bool,
+    ) -> anyhow::Result<Runtime> {
+        let cfg = load_config(config_path)?;
+        Self::from_config(cfg, target, session_id, generate_session_id, None).await
+    }
+
+    async fn from_config(
+        cfg: GatewayConfig,
+        target: Option<&str>,
+        session_id: Option<String>,
+        generate_session_id: bool,
+        launch_name: Option<String>,
+    ) -> anyhow::Result<Runtime> {
+        let user = UserContext::current()?;
+        let target_name = match target {
+            Some(target) => resolve_target_selection(&cfg, Some(target))?,
+            None => match read_default_selection(&user).transpose()? {
+                Some(selection) => resolve_target_selection(&cfg, Some(&selection))?,
+                None => cfg.default_target.clone(),
+            },
+        };
+        let target_cfg = cfg.effective_target(&target_name)?;
+        let session_id = match target_cfg.mode {
+            TargetMode::Fixed => {
+                if session_id.is_some() {
+                    anyhow::bail!("--session-id is only valid for ephemeral targets");
+                }
+                None
+            }
+            TargetMode::Ephemeral => match session_id {
+                Some(value) => {
+                    validate_session_id(&value)?;
+                    Some(value)
+                }
+                None if generate_session_id => Some(generate_session_id_value()?),
+                None => anyhow::bail!("ephemeral target {target_name:?} requires --session-id"),
+            },
+        };
+        let container_runtime =
+            ContainerRuntime::from_config(&cfg.runtime, &user.user, &user.home)?;
+        let identity = RuntimeIdentity::resolve(
+            target_name,
+            launch_name,
+            session_id,
+            user,
+            &target_cfg,
+            &container_runtime,
+        )?;
+        let paths = RuntimePaths::resolve(&target_cfg, &identity)?;
+        let runtime = Runtime {
+            cfg,
+            target: target_cfg,
+            identity,
+            paths,
             container_runtime,
         };
         runtime.validate_workspace_cleanup_path().await?;
@@ -1923,7 +1979,7 @@ impl Runtime {
         let mut started_container = false;
         let mut attempted_container_start = false;
         let result = async {
-            paths::ensure_private_dir(&self.container_state_dir)?;
+            paths::ensure_private_dir(&self.paths.container_state_dir)?;
             self.prepare_control_socket_dir()?;
             self.write_sshd_session_env_config()?;
             self.write_ssh_command_filter_policy()?;
@@ -1937,7 +1993,10 @@ impl Runtime {
                     self.write_container_bootstrap_config()?;
                 }
             }
-            let mut inspect = self.container_runtime.inspect(&self.container_name).await?;
+            let mut inspect = self
+                .container_runtime
+                .inspect(&self.identity.container_name)
+                .await?;
             match readiness_plan(inspect.as_ref()) {
                 ContainerReadinessPlan::ReuseRunning => {
                     let existing = inspect
@@ -1954,9 +2013,14 @@ impl Runtime {
                         .await?;
                     self.remove_stale_control_socket_files()?;
                     attempted_container_start = true;
-                    self.container_runtime.start(&self.container_name).await?;
+                    self.container_runtime
+                        .start(&self.identity.container_name)
+                        .await?;
                     started_container = true;
-                    inspect = self.container_runtime.inspect(&self.container_name).await?;
+                    inspect = self
+                        .container_runtime
+                        .inspect(&self.identity.container_name)
+                        .await?;
                 }
                 ContainerReadinessPlan::CreateMissing => {
                     self.run_lifecycle_phase(LifecyclePhase::PreStart, None)
@@ -1965,7 +2029,10 @@ impl Runtime {
                     attempted_container_start = true;
                     self.start_container().await?;
                     started_container = true;
-                    inspect = self.container_runtime.inspect(&self.container_name).await?;
+                    inspect = self
+                        .container_runtime
+                        .inspect(&self.identity.container_name)
+                        .await?;
                 }
             }
             let inspect =
@@ -2006,12 +2073,12 @@ impl Runtime {
             }
         };
         Ok(ReadyStatus {
-            target: self.target_name.clone(),
-            session_id: self.session_id.clone(),
+            target: self.identity.target_name.clone(),
+            session_id: self.identity.session_id.clone(),
             mode: format!("{:?}", self.target.mode).to_lowercase(),
-            user: self.user.user.clone(),
+            user: self.identity.user.user.clone(),
             image: self.target.image.clone(),
-            container: self.container_name.clone(),
+            container: self.identity.container_name.clone(),
             container_pid: inspect.state.pid,
             ssh_socket: self.ssh_socket(),
             ssh_tcp: self.published_ssh_endpoint().await?,
@@ -2022,27 +2089,32 @@ impl Runtime {
     }
 
     async fn status(&self) -> anyhow::Result<GatewayStatus> {
-        let inspect = self.container_runtime.inspect(&self.container_name).await?;
+        let inspect = self
+            .container_runtime
+            .inspect(&self.identity.container_name)
+            .await?;
         let agent = if self.agent_control_enabled() {
             self.agent_status().await.ok()
         } else {
             None
         };
         let sessions = self.active_session_markers()?;
-        let launch = status_launch(self.session_id.as_deref(), &sessions);
+        let launch = status_launch(self.identity.session_id.as_deref(), &sessions);
         let agent_ready = agent
             .as_ref()
             .and_then(|value| value.get("ready"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
         Ok(GatewayStatus {
-            target: self.target_name.clone(),
-            session_id: self.session_id.clone(),
+            target: self.identity.target_name.clone(),
+            session_id: self.identity.session_id.clone(),
             launch,
             mode: format!("{:?}", self.target.mode).to_lowercase(),
-            user: self.user.user.clone(),
+            user: self.identity.user.user.clone(),
             image: self.target.image.clone(),
-            container: inspect.as_ref().map(|_| self.container_name.clone()),
+            container: inspect
+                .as_ref()
+                .map(|_| self.identity.container_name.clone()),
             container_pid: inspect.as_ref().map(|value| value.state.pid),
             active_sessions: sessions.len(),
             sessions,
@@ -2083,7 +2155,7 @@ impl Runtime {
         }
         if self.has_preserve_process(cleanup).await? {
             tracing::info!(
-                container = self.container_name,
+                container = self.identity.container_name,
                 "gateway-owned cleanup preserving container because preserve process is running"
             );
             return Ok(());
@@ -2159,16 +2231,16 @@ impl Runtime {
             Ok(sessions) if sessions.is_empty() => {}
             Ok(_) => {
                 tracing::warn!(
-                    target = %self.target_name,
-                    workspace = %self.workspace.display(),
+                    target = %self.identity.target_name,
+                    workspace = %self.paths.workspace.display(),
                     "workspace cleanup skipped because active sessions remain"
                 );
                 return;
             }
             Err(err) => {
                 tracing::warn!(
-                    target = %self.target_name,
-                    workspace = %self.workspace.display(),
+                    target = %self.identity.target_name,
+                    workspace = %self.paths.workspace.display(),
                     error = %err,
                     "workspace cleanup skipped because active sessions could not be checked"
                 );
@@ -2177,8 +2249,8 @@ impl Runtime {
         }
         if let Err(err) = self.remove_session_workspace().await {
             tracing::warn!(
-                target = %self.target_name,
-                workspace = %self.workspace.display(),
+                target = %self.identity.target_name,
+                workspace = %self.paths.workspace.display(),
                 error = %err,
                 "workspace cleanup failed"
             );
@@ -2194,7 +2266,11 @@ impl Runtime {
     }
 
     async fn stop_managed_container(&self) -> anyhow::Result<()> {
-        let Some(inspect) = self.container_runtime.inspect(&self.container_name).await? else {
+        let Some(inspect) = self
+            .container_runtime
+            .inspect(&self.identity.container_name)
+            .await?
+        else {
             return Ok(());
         };
         self.stop_inspected_container(&inspect).await
@@ -2209,16 +2285,25 @@ impl Runtime {
             let _ = self.agent_shutdown().await;
             if let Some(current) = self.wait_for_container_exit().await? {
                 self.validate_labels(&current)?;
-                self.container_runtime.stop(&self.container_name).await?;
+                self.container_runtime
+                    .stop(&self.identity.container_name)
+                    .await?;
             }
         } else {
-            self.container_runtime.stop(&self.container_name).await?;
+            self.container_runtime
+                .stop(&self.identity.container_name)
+                .await?;
         }
         if self.target.remove_on_stop
-            && let Some(current) = self.container_runtime.inspect(&self.container_name).await?
+            && let Some(current) = self
+                .container_runtime
+                .inspect(&self.identity.container_name)
+                .await?
         {
             self.validate_labels(&current)?;
-            self.container_runtime.rm(&self.container_name).await?;
+            self.container_runtime
+                .rm(&self.identity.container_name)
+                .await?;
         }
         self.run_lifecycle_phase(LifecyclePhase::PostStop, Some(&container_pid))
             .await?;
@@ -2230,7 +2315,11 @@ impl Runtime {
         let timeout = self.shutdown_wait_timeout();
         let deadline = Instant::now() + timeout;
         loop {
-            let Some(inspect) = self.container_runtime.inspect(&self.container_name).await? else {
+            let Some(inspect) = self
+                .container_runtime
+                .inspect(&self.identity.container_name)
+                .await?
+            else {
                 return Ok(None);
             };
             self.validate_labels(&inspect)?;
@@ -2260,7 +2349,10 @@ impl Runtime {
         for process in &cleanup.preserve_processes {
             let code = self
                 .container_runtime
-                .exec_quiet(&self.container_name, ["pgrep", "-x", process.as_str()])
+                .exec_quiet(
+                    &self.identity.container_name,
+                    ["pgrep", "-x", process.as_str()],
+                )
                 .await?;
             if code == 0 {
                 return Ok(true);
@@ -2278,11 +2370,11 @@ impl Runtime {
                 format!("{:?}", self.target.mode).to_lowercase(),
             ),
         ]);
-        if let Some(session_id) = &self.session_id {
+        if let Some(session_id) = &self.identity.session_id {
             labels.insert("io.aw-gateway.session_id".into(), session_id.clone());
         }
         if self.target.mode == TargetMode::Ephemeral
-            && let Some(launch_name) = &self.launch_name
+            && let Some(launch_name) = &self.identity.launch_name
         {
             labels.insert("io.aw-gateway.launch".into(), launch_name.clone());
         }
@@ -2292,12 +2384,18 @@ impl Runtime {
     fn validation_labels(&self) -> BTreeMap<String, String> {
         BTreeMap::from([
             ("io.aw-gateway.gateway".into(), "true".into()),
-            ("io.aw-gateway.user".into(), self.user.user.clone()),
-            ("io.aw-gateway.uid".into(), self.user.uid.to_string()),
-            ("io.aw-gateway.target".into(), self.target_name.clone()),
+            ("io.aw-gateway.user".into(), self.identity.user.user.clone()),
+            (
+                "io.aw-gateway.uid".into(),
+                self.identity.user.uid.to_string(),
+            ),
+            (
+                "io.aw-gateway.target".into(),
+                self.identity.target_name.clone(),
+            ),
             (
                 "io.aw-gateway.container_id".into(),
-                self.container_name.clone(),
+                self.identity.container_name.clone(),
             ),
         ])
     }
@@ -2339,8 +2437,14 @@ impl Runtime {
             );
         }
         if self.agent_enabled() {
-            env.insert("AW_AUTHENTICATED_UID".into(), self.user.uid.to_string());
-            env.insert("AW_AUTHENTICATED_GID".into(), self.user.gid.to_string());
+            env.insert(
+                "AW_AUTHENTICATED_UID".into(),
+                self.identity.user.uid.to_string(),
+            );
+            env.insert(
+                "AW_AUTHENTICATED_GID".into(),
+                self.identity.user.gid.to_string(),
+            );
         }
         env.extend(self.render_env_map(&self.target.container_env)?);
         let command = if self.agent_enabled() {
@@ -2370,21 +2474,21 @@ impl Runtime {
             vec!["sleep".into(), "infinity".into()]
         };
         Ok(ContainerRunSpec {
-            name: self.container_name.clone(),
-            hostname: self.container_name.clone(),
+            name: self.identity.container_name.clone(),
+            hostname: self.identity.container_name.clone(),
             image: self.target.image.clone(),
-            workspace: self.workspace.clone(),
-            container_home: self.container_home.clone(),
+            workspace: self.paths.workspace.clone(),
+            container_home: self.identity.container_home.clone(),
             container_user: if self.target.container_bootstrap.enabled {
                 self.bootstrap_identity()
             } else {
-                self.container_user.clone()
+                self.identity.container_user.clone()
             },
             passwd_entry: self
                 .container_runtime
                 .is_podman()
                 .then(|| self.passwd_entry()),
-            state_dir_in_container: self.container_state_dir_in_container.clone(),
+            state_dir_in_container: self.paths.container_state_dir_in_container.clone(),
             mounts: self.container_mounts()?,
             env,
             labels: self.labels(),
@@ -2591,29 +2695,36 @@ impl Runtime {
 
     fn vars(&self, container_pid: Option<&str>) -> Vars {
         let mut vars = Vars::new();
-        vars.insert("user".into(), self.user.user.clone());
-        vars.insert("uid".into(), self.session_uid.to_string());
-        vars.insert("gid".into(), self.session_gid.to_string());
-        vars.insert("home".into(), self.user.home.display().to_string());
-        vars.insert("container_user".into(), self.container_user.clone());
+        vars.insert("user".into(), self.identity.user.user.clone());
+        vars.insert("uid".into(), self.identity.session_uid.to_string());
+        vars.insert("gid".into(), self.identity.session_gid.to_string());
+        vars.insert("home".into(), self.identity.user.home.display().to_string());
+        vars.insert(
+            "container_user".into(),
+            self.identity.container_user.clone(),
+        );
         vars.insert(
             "container_home".into(),
-            self.container_home.display().to_string(),
+            self.identity.container_home.display().to_string(),
         );
-        vars.insert("workspace".into(), self.workspace.display().to_string());
+        vars.insert(
+            "workspace".into(),
+            self.paths.workspace.display().to_string(),
+        );
         vars.insert(
             "state".into(),
-            self.workspace
+            self.paths
+                .workspace
                 .join(&self.target.workspace.state_dir)
                 .display()
                 .to_string(),
         );
         vars.insert(
             "state_dir".into(),
-            self.user.state_dir().display().to_string(),
+            self.identity.user.state_dir().display().to_string(),
         );
-        vars.insert("target".into(), self.target_name.clone());
-        if let Some(session_id) = &self.session_id {
+        vars.insert("target".into(), self.identity.target_name.clone());
+        if let Some(session_id) = &self.identity.session_id {
             vars.insert("session_id".into(), session_id.clone());
         }
         vars.insert("image".into(), self.target.image.clone());
@@ -2621,14 +2732,20 @@ impl Runtime {
             "image_slug".into(),
             template::image_slug(&self.target.image),
         );
-        vars.insert("container_name".into(), self.container_name.clone());
+        vars.insert(
+            "container_name".into(),
+            self.identity.container_name.clone(),
+        );
         vars.insert(
             "container_state_dir".into(),
-            self.container_state_dir.display().to_string(),
+            self.paths.container_state_dir.display().to_string(),
         );
         vars.insert(
             "container_state_dir_in_container".into(),
-            self.container_state_dir_in_container.display().to_string(),
+            self.paths
+                .container_state_dir_in_container
+                .display()
+                .to_string(),
         );
         if let Some(container_pid) = container_pid {
             vars.insert("container_pid".into(), container_pid.to_string());
@@ -2640,7 +2757,8 @@ impl Runtime {
         let mut container_agent = self.target.container_agent.clone();
         if self.agent_control_enabled() {
             container_agent.control_socket = Some(ControlSocketConfig::Path(
-                self.control_sockets
+                self.paths
+                    .control_sockets
                     .container_agent_socket
                     .display()
                     .to_string(),
@@ -2651,7 +2769,8 @@ impl Runtime {
             && bridge.enabled
         {
             bridge.socket = Some(
-                self.control_sockets
+                self.paths
+                    .control_sockets
                     .container_ssh_socket
                     .display()
                     .to_string(),
@@ -2753,12 +2872,16 @@ impl Runtime {
                 .to_string(),
             skip_identity_prepare: self.container_runtime.is_podman(),
             identity: BootstrapIdentity {
-                session_user: self.container_user.clone(),
-                session_uid: self.session_uid,
-                session_gid: self.session_gid,
-                session_home: self.container_home.display().to_string(),
-                session_shell: self.session_shell.clone(),
-                state_dir: self.container_state_dir_in_container.display().to_string(),
+                session_user: self.identity.container_user.clone(),
+                session_uid: self.identity.session_uid,
+                session_gid: self.identity.session_gid,
+                session_home: self.identity.container_home.display().to_string(),
+                session_shell: self.identity.session_shell.clone(),
+                state_dir: self
+                    .paths
+                    .container_state_dir_in_container
+                    .display()
+                    .to_string(),
             },
             steps,
         };
@@ -2769,38 +2892,46 @@ impl Runtime {
     }
 
     fn container_agent_config_host(&self) -> PathBuf {
-        self.container_state_dir.join("container-agent.toml")
+        self.paths.container_state_dir.join("container-agent.toml")
     }
 
     fn container_agent_config_in_container(&self) -> PathBuf {
-        self.container_state_dir_in_container
+        self.paths
+            .container_state_dir_in_container
             .join("container-agent.toml")
     }
 
     fn container_bootstrap_config_host(&self) -> PathBuf {
-        self.container_state_dir.join("container-bootstrap.toml")
+        self.paths
+            .container_state_dir
+            .join("container-bootstrap.toml")
     }
 
     fn container_bootstrap_config_in_container(&self) -> PathBuf {
-        self.container_state_dir_in_container
+        self.paths
+            .container_state_dir_in_container
             .join("container-bootstrap.toml")
     }
 
     fn sshd_session_env_config_host(&self) -> PathBuf {
-        self.container_state_dir.join("sshd-session-env.conf")
+        self.paths.container_state_dir.join("sshd-session-env.conf")
     }
 
     fn sshd_session_env_config_in_container(&self) -> PathBuf {
-        self.container_state_dir_in_container
+        self.paths
+            .container_state_dir_in_container
             .join("sshd-session-env.conf")
     }
 
     fn ssh_command_filter_policy_host(&self) -> PathBuf {
-        self.container_state_dir.join("ssh-command-filter.toml")
+        self.paths
+            .container_state_dir
+            .join("ssh-command-filter.toml")
     }
 
     fn ssh_command_filter_policy_in_container(&self) -> PathBuf {
-        self.container_state_dir_in_container
+        self.paths
+            .container_state_dir_in_container
             .join("ssh-command-filter.toml")
     }
 
@@ -2836,8 +2967,8 @@ impl Runtime {
     }
 
     fn prepare_control_socket_dir(&self) -> anyhow::Result<()> {
-        if self.control_sockets.default_host_dir {
-            let run_user_dir = PathBuf::from(format!("/run/user/{}", self.user.uid));
+        if self.paths.control_sockets.default_host_dir {
+            let run_user_dir = PathBuf::from(format!("/run/user/{}", self.identity.user.uid));
             let metadata = std::fs::metadata(&run_user_dir).with_context(|| {
                 format!(
                     "{} is required by the default control_sockets.host_dir; configure control_sockets.host_dir to a writable short absolute path if this host does not provide per-user runtime directories",
@@ -2867,14 +2998,14 @@ impl Runtime {
                 }
             }
         }
-        ensure_control_socket_dir(&self.control_sockets.host_dir)?;
+        ensure_control_socket_dir(&self.paths.control_sockets.host_dir)?;
         Ok(())
     }
 
     fn remove_stale_control_socket_files(&self) -> anyhow::Result<()> {
         for socket in [
-            &self.control_sockets.host_agent_socket,
-            &self.control_sockets.host_ssh_socket,
+            &self.paths.control_sockets.host_agent_socket,
+            &self.paths.control_sockets.host_ssh_socket,
         ] {
             match std::fs::symlink_metadata(socket) {
                 Ok(metadata) if metadata.is_dir() => {
@@ -2901,12 +3032,12 @@ impl Runtime {
     fn passwd_entry(&self) -> String {
         format!(
             "{}:x:{}:{}:{}:{}:{}",
-            self.container_user,
-            self.session_uid,
-            self.session_gid,
-            self.container_user,
-            self.container_home.display(),
-            self.session_shell,
+            self.identity.container_user,
+            self.identity.session_uid,
+            self.identity.session_gid,
+            self.identity.container_user,
+            self.identity.container_home.display(),
+            self.identity.session_shell,
         )
     }
 
@@ -2930,8 +3061,8 @@ impl Runtime {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         mounts.push(ContainerMountSpec {
-            source: self.control_sockets.host_dir.clone(),
-            target: self.control_sockets.container_dir.clone(),
+            source: self.paths.control_sockets.host_dir.clone(),
+            target: self.paths.control_sockets.container_dir.clone(),
             readonly: false,
         });
         Ok(mounts)
@@ -2976,9 +3107,12 @@ impl Runtime {
 
     fn exec_identity(&self) -> String {
         if self.container_runtime.is_podman() {
-            format!("{}:{}", self.session_uid, self.session_gid)
+            format!(
+                "{}:{}",
+                self.identity.session_uid, self.identity.session_gid
+            )
         } else {
-            self.container_user.clone()
+            self.identity.container_user.clone()
         }
     }
 
@@ -2986,7 +3120,7 @@ impl Runtime {
         if self.container_runtime.is_podman() {
             "0:0".into()
         } else {
-            self.bootstrap_user.clone()
+            self.identity.bootstrap_user.clone()
         }
     }
 
@@ -3003,18 +3137,20 @@ impl Runtime {
     }
 
     fn agent_socket(&self) -> PathBuf {
-        self.control_sockets.host_agent_socket.clone()
+        self.paths.control_sockets.host_agent_socket.clone()
     }
 
     fn ssh_socket(&self) -> PathBuf {
-        self.control_sockets.host_ssh_socket.clone()
+        self.paths.control_sockets.host_ssh_socket.clone()
     }
 
     fn container_agent_socket(&self) -> anyhow::Result<Option<PathBuf>> {
         if !self.agent_control_enabled() {
             return Ok(None);
         }
-        Ok(Some(self.control_sockets.container_agent_socket.clone()))
+        Ok(Some(
+            self.paths.control_sockets.container_agent_socket.clone(),
+        ))
     }
 
     fn container_ssh_socket(&self) -> anyhow::Result<Option<PathBuf>> {
@@ -3027,7 +3163,9 @@ impl Runtime {
         else {
             return Ok(None);
         };
-        Ok(Some(self.control_sockets.container_ssh_socket.clone()))
+        Ok(Some(
+            self.paths.control_sockets.container_ssh_socket.clone(),
+        ))
     }
 
     fn effective_unix_socket_paths(&self) -> anyhow::Result<Vec<(&'static str, PathBuf)>> {
@@ -3054,7 +3192,7 @@ impl Runtime {
                 anyhow::bail!(
                     "{label} is too long for a Unix domain socket ({bytes} bytes, limit {UNIX_SOCKET_PATH_MAX_BYTES}): {}. Configure control_sockets.host_dir or control_sockets.container_dir to a shorter absolute path. For fixed targets, runtime_id is the target id {:?}; for ephemeral targets, runtime_id is the session id.",
                     path.display(),
-                    self.target_name
+                    self.identity.target_name
                 );
             }
         }
@@ -3110,7 +3248,7 @@ impl Runtime {
             };
             anyhow::bail!(
                 "target {:?} does not configure an SSH endpoint (container_agent.enabled = {}, local_ssh.backend = {backend:?}, container_agent.ssh_bridge = {bridge}); set container_agent.ssh_bridge.enabled = true for socket backend or use local_ssh.backend = \"published_port\" with an image-managed SSH server",
-                self.target_name,
+                self.identity.target_name,
                 self.agent_enabled()
             )
         }
@@ -3132,7 +3270,7 @@ impl Runtime {
         }
         Ok(self
             .container_runtime
-            .published_port(&self.container_name, 22)
+            .published_port(&self.identity.container_name, 22)
             .await?
             .map(|port| TcpEndpoint {
                 host: "127.0.0.1".into(),
@@ -3141,7 +3279,11 @@ impl Runtime {
     }
 
     async fn validate_agent_socket(&self) -> anyhow::Result<()> {
-        runtime::socket_is_safe_for(&self.agent_socket(), self.user.uid, self.user.gid)
+        runtime::socket_is_safe_for(
+            &self.agent_socket(),
+            self.identity.user.uid,
+            self.identity.user.gid,
+        )
     }
 
     async fn validate_ssh_socket(&self) -> anyhow::Result<()> {
@@ -3149,7 +3291,7 @@ impl Runtime {
     }
 
     async fn validate_socket_path(&self, socket: &Path) -> anyhow::Result<()> {
-        runtime::socket_is_safe_for(socket, self.user.uid, self.user.gid)?;
+        runtime::socket_is_safe_for(socket, self.identity.user.uid, self.identity.user.gid)?;
         let _ = UnixStream::connect(socket)
             .await
             .with_context(|| format!("test-connect {}", socket.display()))?;
@@ -3157,28 +3299,39 @@ impl Runtime {
     }
 
     async fn cleanup_failed_start(&self) {
-        match self.container_runtime.inspect(&self.container_name).await {
+        match self
+            .container_runtime
+            .inspect(&self.identity.container_name)
+            .await
+        {
             Ok(Some(inspect)) => {
                 if let Err(err) = self.validate_labels(&inspect) {
                     tracing::warn!(
-                        container = self.container_name,
+                        container = self.identity.container_name,
                         error = %err,
                         "not cleaning failed start because labels did not match"
                     );
                     return;
                 }
-                if let Err(err) = self.container_runtime.stop(&self.container_name).await {
+                if let Err(err) = self
+                    .container_runtime
+                    .stop(&self.identity.container_name)
+                    .await
+                {
                     tracing::warn!(
-                        container = self.container_name,
+                        container = self.identity.container_name,
                         error = %err,
                         "failed to stop container after startup failure"
                     );
                 }
                 if self.target.remove_on_stop
-                    && let Err(err) = self.container_runtime.rm(&self.container_name).await
+                    && let Err(err) = self
+                        .container_runtime
+                        .rm(&self.identity.container_name)
+                        .await
                 {
                     tracing::warn!(
-                        container = self.container_name,
+                        container = self.identity.container_name,
                         error = %err,
                         "failed to remove container after startup failure"
                     );
@@ -3187,7 +3340,7 @@ impl Runtime {
             Ok(None) => {}
             Err(err) => {
                 tracing::warn!(
-                    container = self.container_name,
+                    container = self.identity.container_name,
                     error = %err,
                     "failed to inspect container after startup failure"
                 );
@@ -3196,17 +3349,17 @@ impl Runtime {
     }
 
     fn cleanup_control_socket_dir(&self) {
-        match std::fs::symlink_metadata(&self.control_sockets.host_dir) {
+        match std::fs::symlink_metadata(&self.paths.control_sockets.host_dir) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 tracing::warn!(
-                    path = %self.control_sockets.host_dir.display(),
+                    path = %self.paths.control_sockets.host_dir.display(),
                     "not removing symlink control socket runtime directory"
                 );
                 return;
             }
             Ok(metadata) if !metadata.is_dir() => {
                 tracing::warn!(
-                    path = %self.control_sockets.host_dir.display(),
+                    path = %self.paths.control_sockets.host_dir.display(),
                     "not removing non-directory control socket runtime path"
                 );
                 return;
@@ -3215,7 +3368,7 @@ impl Runtime {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
             Err(err) => {
                 tracing::warn!(
-                    path = %self.control_sockets.host_dir.display(),
+                    path = %self.paths.control_sockets.host_dir.display(),
                     error = %err,
                     "failed to inspect control socket runtime directory before cleanup"
                 );
@@ -3224,8 +3377,8 @@ impl Runtime {
         }
 
         for socket in [
-            &self.control_sockets.host_agent_socket,
-            &self.control_sockets.host_ssh_socket,
+            &self.paths.control_sockets.host_agent_socket,
+            &self.paths.control_sockets.host_ssh_socket,
         ] {
             match std::fs::remove_file(socket) {
                 Ok(()) => {}
@@ -3240,12 +3393,12 @@ impl Runtime {
             }
         }
 
-        match std::fs::remove_dir(&self.control_sockets.host_dir) {
+        match std::fs::remove_dir(&self.paths.control_sockets.host_dir) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
                 tracing::warn!(
-                    path = %self.control_sockets.host_dir.display(),
+                    path = %self.paths.control_sockets.host_dir.display(),
                     error = %err,
                     "failed to remove control socket runtime directory"
                 );
@@ -3257,21 +3410,21 @@ impl Runtime {
         if self.target.workspace.cleanup == WorkspaceCleanup::Never {
             return Ok(());
         }
-        let session_id = self
-            .session_id
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("workspace_cleanup requires an ephemeral session id"))?;
+        let session_id =
+            self.identity.session_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("workspace_cleanup requires an ephemeral session id")
+            })?;
         validate_workspace_cleanup_path(
-            &self.workspace,
-            &self.user.home,
+            &self.paths.workspace,
+            &self.identity.user.home,
             session_id,
             Some(self.target.workspace.path.as_str()),
         )?;
-        match tokio::fs::symlink_metadata(&self.workspace).await {
+        match tokio::fs::symlink_metadata(&self.paths.workspace).await {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 anyhow::bail!(
                     "workspace_cleanup path {} must not be a symlink",
-                    self.workspace.display()
+                    self.paths.workspace.display()
                 );
             }
             Ok(_) => {}
@@ -3280,7 +3433,7 @@ impl Runtime {
                 return Err(err).with_context(|| {
                     format!(
                         "inspect workspace cleanup path {}",
-                        self.workspace.display()
+                        self.paths.workspace.display()
                     )
                 });
             }
@@ -3290,14 +3443,14 @@ impl Runtime {
 
     async fn remove_session_workspace(&self) -> anyhow::Result<()> {
         self.validate_workspace_cleanup_path().await?;
-        let metadata = match tokio::fs::symlink_metadata(&self.workspace).await {
+        let metadata = match tokio::fs::symlink_metadata(&self.paths.workspace).await {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => {
                 return Err(err).with_context(|| {
                     format!(
                         "inspect workspace cleanup path {}",
-                        self.workspace.display()
+                        self.paths.workspace.display()
                     )
                 });
             }
@@ -3305,17 +3458,17 @@ impl Runtime {
         if metadata.file_type().is_symlink() {
             anyhow::bail!(
                 "workspace cleanup path {} must not be a symlink",
-                self.workspace.display()
+                self.paths.workspace.display()
             );
         }
         if !metadata.is_dir() {
             anyhow::bail!(
                 "workspace cleanup path {} exists but is not a directory",
-                self.workspace.display()
+                self.paths.workspace.display()
             );
         }
         self.container_runtime
-            .remove_host_dir_all(&self.workspace)
+            .remove_host_dir_all(&self.paths.workspace)
             .await
     }
 }
@@ -3734,6 +3887,65 @@ exit 0
         }
     }
 
+    fn test_runtime_from_parts(
+        cfg: GatewayConfig,
+        target: TargetConfig,
+        container_runtime: ContainerRuntime,
+        user: UserContext,
+        container_state_dir: PathBuf,
+        dir: &tempfile::TempDir,
+        launch_name: Option<String>,
+    ) -> Runtime {
+        let container_state_dir_in_container = user.home.join(".aw-gateway/containers/ubuntu-dev");
+        Runtime {
+            cfg,
+            target,
+            identity: RuntimeIdentity {
+                target_name: "default".into(),
+                launch_name,
+                session_id: None,
+                bootstrap_user: "root".into(),
+                session_uid: user.uid,
+                session_gid: user.gid,
+                session_shell: "/bin/bash".into(),
+                container_user: user.user.clone(),
+                container_home: user.home.clone(),
+                container_name: "ubuntu-dev".into(),
+                user,
+            },
+            paths: RuntimePaths {
+                workspace: dir.path().join("workspace"),
+                container_state_dir,
+                container_state_dir_in_container,
+                control_sockets: test_control_socket_paths(dir.path()),
+            },
+            container_runtime,
+        }
+    }
+
+    fn test_alice_runtime(
+        cfg: GatewayConfig,
+        target: TargetConfig,
+        container_runtime: ContainerRuntime,
+        dir: &tempfile::TempDir,
+        container_state_dir: PathBuf,
+    ) -> Runtime {
+        test_runtime_from_parts(
+            cfg,
+            target,
+            container_runtime,
+            UserContext {
+                uid: 2450,
+                gid: 2450,
+                user: "alice".into(),
+                home: PathBuf::from("/home/alice"),
+            },
+            container_state_dir,
+            dir,
+            None,
+        )
+    }
+
     fn disable_default_container_agent(cfg: &mut GatewayConfig) {
         cfg.target_defaults.container_agent = Some(crate::config::ContainerAgentConfigInput {
             enabled: Some(false),
@@ -3774,28 +3986,16 @@ exit 0
         let user = UserContext::current().unwrap();
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, &user.user, &user.home).unwrap();
-        Runtime {
+        test_runtime_from_parts(
             cfg,
-            target_name: "default".into(),
             target,
-            launch_name: Some("agent-pack-codex".into()),
-            session_id: None,
-            bootstrap_user: "root".into(),
-            session_uid: user.uid,
-            session_gid: user.gid,
-            session_shell: "/bin/bash".into(),
-            container_user: user.user.clone(),
-            container_home: user.home.clone(),
-            workspace: dir.path().join("workspace"),
-            container_state_dir: dir
-                .path()
-                .join("workspace/.aw-gateway/containers/ubuntu-dev"),
-            container_state_dir_in_container: user.home.join(".aw-gateway/containers/ubuntu-dev"),
-            control_sockets: test_control_socket_paths(dir.path()),
-            container_name: "ubuntu-dev".into(),
             container_runtime,
-            user,
-        }
+            user.clone(),
+            dir.path()
+                .join("workspace/.aw-gateway/containers/ubuntu-dev"),
+            dir,
+            Some("agent-pack-codex".into()),
+        )
     }
 
     fn launch_test_config(
@@ -3839,14 +4039,15 @@ exit 0
         runtime.target.workspace.path =
             "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}".into();
         runtime.target.workspace.cleanup = cleanup;
-        runtime.session_id = Some(session_id.into());
-        runtime.workspace = workspace;
-        runtime.container_state_dir = runtime
+        runtime.identity.session_id = Some(session_id.into());
+        runtime.paths.workspace = workspace;
+        runtime.paths.container_state_dir = runtime
+            .paths
             .workspace
             .join(&runtime.target.workspace.state_dir)
             .join("sessions")
             .join(session_id);
-        runtime.user.home = home;
+        runtime.identity.user.home = home;
     }
 
     #[test]
@@ -4239,7 +4440,7 @@ exit 1
             session_id,
         );
         runtime.target.idle_cleanup = None;
-        runtime.container_state_dir = dir.path().join("state");
+        runtime.paths.container_state_dir = dir.path().join("state");
         let session = runtime.create_session_marker("test").unwrap();
 
         let code = runtime
@@ -4434,7 +4635,7 @@ exit 1
         assert!(!runtime.labels().contains_key("io.aw-gateway.launch"));
 
         runtime.target.mode = TargetMode::Ephemeral;
-        runtime.session_id = Some("1a2b3c4d5e6f".into());
+        runtime.identity.session_id = Some("1a2b3c4d5e6f".into());
 
         assert_eq!(
             runtime
@@ -4816,7 +5017,7 @@ exit 0
                 ..Default::default()
             });
         });
-        std::fs::create_dir_all(&runtime.container_state_dir).unwrap();
+        std::fs::create_dir_all(&runtime.paths.container_state_dir).unwrap();
         let session = runtime.create_launch_session_marker("launch").unwrap();
 
         runtime.apply_gateway_idle_cleanup().await.unwrap();
@@ -5004,13 +5205,13 @@ mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
             cfg.target_defaults.host_steps.clear();
         });
         runtime.prepare_control_socket_dir().unwrap();
-        std::fs::write(&runtime.control_sockets.host_agent_socket, "").unwrap();
-        std::fs::write(&runtime.control_sockets.host_ssh_socket, "").unwrap();
+        std::fs::write(&runtime.paths.control_sockets.host_agent_socket, "").unwrap();
+        std::fs::write(&runtime.paths.control_sockets.host_ssh_socket, "").unwrap();
 
         runtime.ensure_ready().await.unwrap();
 
-        assert!(runtime.control_sockets.host_agent_socket.exists());
-        assert!(runtime.control_sockets.host_ssh_socket.exists());
+        assert!(runtime.paths.control_sockets.host_agent_socket.exists());
+        assert!(runtime.paths.control_sockets.host_ssh_socket.exists());
     }
 
     #[tokio::test]
@@ -5059,14 +5260,14 @@ exit 0
             cfg.target_defaults.host_steps.clear();
         });
         runtime.prepare_control_socket_dir().unwrap();
-        std::fs::write(&runtime.control_sockets.host_agent_socket, "").unwrap();
-        std::fs::write(&runtime.control_sockets.host_ssh_socket, "").unwrap();
+        std::fs::write(&runtime.paths.control_sockets.host_agent_socket, "").unwrap();
+        std::fs::write(&runtime.paths.control_sockets.host_ssh_socket, "").unwrap();
 
         runtime.ensure_ready().await.unwrap();
 
         assert_eq!(std::fs::read_to_string(log).unwrap(), "clean\n");
-        assert!(!runtime.control_sockets.host_agent_socket.exists());
-        assert!(!runtime.control_sockets.host_ssh_socket.exists());
+        assert!(!runtime.paths.control_sockets.host_agent_socket.exists());
+        assert!(!runtime.paths.control_sockets.host_ssh_socket.exists());
     }
 
     #[tokio::test]
@@ -5114,14 +5315,14 @@ exit 0
             cfg.target_defaults.host_steps.clear();
         });
         runtime.prepare_control_socket_dir().unwrap();
-        std::fs::write(&runtime.control_sockets.host_agent_socket, "").unwrap();
-        std::fs::write(&runtime.control_sockets.host_ssh_socket, "").unwrap();
+        std::fs::write(&runtime.paths.control_sockets.host_agent_socket, "").unwrap();
+        std::fs::write(&runtime.paths.control_sockets.host_ssh_socket, "").unwrap();
 
         runtime.ensure_ready().await.unwrap();
 
         assert_eq!(std::fs::read_to_string(log).unwrap(), "clean\n");
-        assert!(!runtime.control_sockets.host_agent_socket.exists());
-        assert!(!runtime.control_sockets.host_ssh_socket.exists());
+        assert!(!runtime.paths.control_sockets.host_agent_socket.exists());
+        assert!(!runtime.paths.control_sockets.host_ssh_socket.exists());
     }
 
     #[tokio::test]
@@ -5270,33 +5471,34 @@ stop_when_idle = true
         .await
         .unwrap();
 
-        assert_eq!(runtime.session_id.as_deref(), Some("abc123def456"));
-        assert_eq!(runtime.container_name, "ubuntu-dev-abc123def456");
+        assert_eq!(runtime.identity.session_id.as_deref(), Some("abc123def456"));
+        assert_eq!(runtime.identity.container_name, "ubuntu-dev-abc123def456");
         assert!(
             runtime
+                .paths
                 .container_state_dir
                 .ends_with(".aw-gateway/sessions/abc123def456")
         );
         assert_eq!(
-            runtime.control_sockets.host_agent_socket,
+            runtime.paths.control_sockets.host_agent_socket,
             PathBuf::from(format!(
                 "/run/user/{}/aw-gateway/abc123def456/agent.sock",
-                runtime.user.uid
+                runtime.identity.user.uid
             ))
         );
         assert_eq!(
-            runtime.control_sockets.host_ssh_socket,
+            runtime.paths.control_sockets.host_ssh_socket,
             PathBuf::from(format!(
                 "/run/user/{}/aw-gateway/abc123def456/ssh.sock",
-                runtime.user.uid
+                runtime.identity.user.uid
             ))
         );
         assert_eq!(
-            runtime.control_sockets.container_agent_socket,
+            runtime.paths.control_sockets.container_agent_socket,
             PathBuf::from("/run/aw-gateway/agent.sock")
         );
         assert_eq!(
-            runtime.control_sockets.container_ssh_socket,
+            runtime.paths.control_sockets.container_ssh_socket,
             PathBuf::from("/run/aw-gateway/ssh.sock")
         );
     }
@@ -5334,27 +5536,27 @@ name = "{{image_slug}}"
             .await
             .unwrap();
 
-        assert_eq!(runtime.session_id, None);
+        assert_eq!(runtime.identity.session_id, None);
         assert_eq!(
-            runtime.control_sockets.host_agent_socket,
+            runtime.paths.control_sockets.host_agent_socket,
             PathBuf::from(format!(
                 "/run/user/{}/aw-gateway/dev-shell/agent.sock",
-                runtime.user.uid
+                runtime.identity.user.uid
             ))
         );
         assert_eq!(
-            runtime.control_sockets.host_ssh_socket,
+            runtime.paths.control_sockets.host_ssh_socket,
             PathBuf::from(format!(
                 "/run/user/{}/aw-gateway/dev-shell/ssh.sock",
-                runtime.user.uid
+                runtime.identity.user.uid
             ))
         );
         assert_eq!(
-            runtime.control_sockets.container_agent_socket,
+            runtime.paths.control_sockets.container_agent_socket,
             PathBuf::from("/run/aw-gateway/agent.sock")
         );
         assert_eq!(
-            runtime.control_sockets.container_ssh_socket,
+            runtime.paths.control_sockets.container_ssh_socket,
             PathBuf::from("/run/aw-gateway/ssh.sock")
         );
     }
@@ -5409,11 +5611,11 @@ container_dir = "/tmp/aw-gateway"
             .await
             .unwrap();
         assert_eq!(
-            global.control_sockets.host_agent_socket,
+            global.paths.control_sockets.host_agent_socket,
             dir.path().join("global/global/agent.sock")
         );
         assert_eq!(
-            global.control_sockets.container_ssh_socket,
+            global.paths.control_sockets.container_ssh_socket,
             PathBuf::from("/run/global-aw/ssh.sock")
         );
 
@@ -5421,11 +5623,11 @@ container_dir = "/tmp/aw-gateway"
             .await
             .unwrap();
         assert_eq!(
-            targeted.control_sockets.host_agent_socket,
+            targeted.paths.control_sockets.host_agent_socket,
             dir.path().join("target/targeted/agent.sock")
         );
         assert_eq!(
-            targeted.control_sockets.container_ssh_socket,
+            targeted.paths.control_sockets.container_ssh_socket,
             PathBuf::from("/tmp/aw-gateway/ssh.sock")
         );
     }
@@ -5662,36 +5864,10 @@ name = "{{image_slug}}"
         let target = cfg.effective_target("default").unwrap();
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
-        let user = UserContext {
-            uid: 2450,
-            gid: 2450,
-            user: "alice".into(),
-            home: PathBuf::from("/home/alice"),
-        };
-        let runtime = Runtime {
-            cfg,
-            target_name: "default".into(),
-            target,
-            launch_name: None,
-            session_id: None,
-            user,
-            bootstrap_user: "root".into(),
-            session_uid: 2450,
-            session_gid: 2450,
-            session_shell: "/bin/bash".into(),
-            container_user: "alice".into(),
-            container_home: PathBuf::from("/home/alice"),
-            workspace: dir.path().join("workspace"),
-            container_state_dir: dir
-                .path()
-                .join("workspace/.aw-gateway/containers/ubuntu-dev"),
-            container_state_dir_in_container: PathBuf::from(
-                "/home/alice/.aw-gateway/containers/ubuntu-dev",
-            ),
-            control_sockets: test_control_socket_paths(dir.path()),
-            container_name: "ubuntu-dev".into(),
-            container_runtime,
-        };
+        let container_state_dir = dir
+            .path()
+            .join("workspace/.aw-gateway/containers/ubuntu-dev");
+        let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
 
         let old_labels = runtime.validation_labels();
         assert!(!old_labels.contains_key("io.aw-gateway.mode"));
@@ -5720,7 +5896,10 @@ name = "{{image_slug}}"
         assert!(args.contains(&"--init".to_string()));
         assert!(args.contains(&"--passwd-entry".to_string()));
         assert!(args.contains(&"alice:x:2450:2450:alice:/home/alice:/bin/bash".to_string()));
-        assert!(args.contains(&format!("{}:/home/alice:Z", runtime.workspace.display())));
+        assert!(args.contains(&format!(
+            "{}:/home/alice:Z",
+            runtime.paths.workspace.display()
+        )));
         assert!(args.contains(&"AW_IDENTITY_TOKEN=identity-token".to_string()));
         assert!(args.contains(&"AW_CONTAINER_CONTROL_TOKEN=control-token".to_string()));
         assert!(args.contains(&"AW_AUTHENTICATED_UID=2450".to_string()));
@@ -5751,24 +5930,24 @@ name = "{{image_slug}}"
             enable_default_ssh_bridge(cfg);
         });
 
-        std::fs::create_dir_all(&runtime.control_sockets.host_dir).unwrap();
+        std::fs::create_dir_all(&runtime.paths.control_sockets.host_dir).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(
-                &runtime.control_sockets.host_dir,
+                &runtime.paths.control_sockets.host_dir,
                 std::fs::Permissions::from_mode(0o700),
             )
             .unwrap();
         }
-        std::fs::write(&runtime.control_sockets.host_agent_socket, "").unwrap();
-        std::fs::write(&runtime.control_sockets.host_ssh_socket, "").unwrap();
+        std::fs::write(&runtime.paths.control_sockets.host_agent_socket, "").unwrap();
+        std::fs::write(&runtime.paths.control_sockets.host_ssh_socket, "").unwrap();
 
         runtime.prepare_control_socket_dir().unwrap();
 
-        assert!(runtime.control_sockets.host_dir.is_dir());
-        assert!(runtime.control_sockets.host_agent_socket.exists());
-        assert!(runtime.control_sockets.host_ssh_socket.exists());
+        assert!(runtime.paths.control_sockets.host_dir.is_dir());
+        assert!(runtime.paths.control_sockets.host_agent_socket.exists());
+        assert!(runtime.paths.control_sockets.host_ssh_socket.exists());
     }
 
     #[test]
@@ -5778,14 +5957,14 @@ name = "{{image_slug}}"
             enable_default_ssh_bridge(cfg);
         });
 
-        std::fs::create_dir_all(&runtime.control_sockets.host_dir).unwrap();
-        std::fs::write(&runtime.control_sockets.host_agent_socket, "").unwrap();
-        std::fs::write(&runtime.control_sockets.host_ssh_socket, "").unwrap();
+        std::fs::create_dir_all(&runtime.paths.control_sockets.host_dir).unwrap();
+        std::fs::write(&runtime.paths.control_sockets.host_agent_socket, "").unwrap();
+        std::fs::write(&runtime.paths.control_sockets.host_ssh_socket, "").unwrap();
 
         runtime.remove_stale_control_socket_files().unwrap();
 
-        assert!(!runtime.control_sockets.host_agent_socket.exists());
-        assert!(!runtime.control_sockets.host_ssh_socket.exists());
+        assert!(!runtime.paths.control_sockets.host_agent_socket.exists());
+        assert!(!runtime.paths.control_sockets.host_ssh_socket.exists());
     }
 
     #[cfg(unix)]
@@ -5797,7 +5976,7 @@ name = "{{image_slug}}"
         let runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
         let target = dir.path().join("real-runtime-dir");
         std::fs::create_dir_all(&target).unwrap();
-        symlink(&target, &runtime.control_sockets.host_dir).unwrap();
+        symlink(&target, &runtime.paths.control_sockets.host_dir).unwrap();
         let err = runtime
             .prepare_control_socket_dir()
             .unwrap_err()
@@ -5807,9 +5986,9 @@ name = "{{image_slug}}"
 
         let dir = tempfile::tempdir().unwrap();
         let runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
-        std::fs::create_dir_all(&runtime.control_sockets.host_dir).unwrap();
+        std::fs::create_dir_all(&runtime.paths.control_sockets.host_dir).unwrap();
         std::fs::set_permissions(
-            &runtime.control_sockets.host_dir,
+            &runtime.paths.control_sockets.host_dir,
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
@@ -5819,7 +5998,7 @@ name = "{{image_slug}}"
             .unwrap_err()
             .to_string();
         assert!(err.contains("exists with permissions 755"), "{err}");
-        let mode = std::fs::symlink_metadata(&runtime.control_sockets.host_dir)
+        let mode = std::fs::symlink_metadata(&runtime.paths.control_sockets.host_dir)
             .unwrap()
             .permissions()
             .mode()
@@ -5834,19 +6013,20 @@ name = "{{image_slug}}"
             enable_default_ssh_bridge(cfg);
         });
         let parent = runtime
+            .paths
             .control_sockets
             .host_dir
             .parent()
             .unwrap()
             .to_path_buf();
-        std::fs::create_dir_all(&runtime.control_sockets.host_dir).unwrap();
+        std::fs::create_dir_all(&runtime.paths.control_sockets.host_dir).unwrap();
         std::fs::write(parent.join("parent-marker"), "").unwrap();
-        std::fs::write(&runtime.control_sockets.host_agent_socket, "").unwrap();
-        std::fs::write(&runtime.control_sockets.host_ssh_socket, "").unwrap();
+        std::fs::write(&runtime.paths.control_sockets.host_agent_socket, "").unwrap();
+        std::fs::write(&runtime.paths.control_sockets.host_ssh_socket, "").unwrap();
 
         runtime.cleanup_control_socket_dir();
 
-        assert!(!runtime.control_sockets.host_dir.exists());
+        assert!(!runtime.paths.control_sockets.host_dir.exists());
         assert!(parent.join("parent-marker").exists());
         assert!(parent.is_dir());
     }
@@ -5861,12 +6041,12 @@ name = "{{image_slug}}"
         let target = dir.path().join("real-runtime-dir");
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(target.join("marker"), "").unwrap();
-        symlink(&target, &runtime.control_sockets.host_dir).unwrap();
+        symlink(&target, &runtime.paths.control_sockets.host_dir).unwrap();
 
         runtime.cleanup_control_socket_dir();
 
         assert!(target.join("marker").exists());
-        assert!(runtime.control_sockets.host_dir.exists());
+        assert!(runtime.paths.control_sockets.host_dir.exists());
     }
 
     #[test]
@@ -5926,33 +6106,7 @@ name = "{{image_slug}}"
             .path()
             .join("workspace/.aw-gateway/containers/ubuntu-dev");
         std::fs::create_dir_all(&container_state_dir).unwrap();
-        let runtime = Runtime {
-            cfg,
-            target_name: "default".into(),
-            target,
-            launch_name: None,
-            session_id: None,
-            user: UserContext {
-                uid: 2450,
-                gid: 2450,
-                user: "alice".into(),
-                home: PathBuf::from("/home/alice"),
-            },
-            bootstrap_user: "root".into(),
-            session_uid: 2450,
-            session_gid: 2450,
-            session_shell: "/bin/bash".into(),
-            container_user: "alice".into(),
-            container_home: PathBuf::from("/home/alice"),
-            workspace: dir.path().join("workspace"),
-            container_state_dir,
-            container_state_dir_in_container: PathBuf::from(
-                "/home/alice/.aw-gateway/containers/ubuntu-dev",
-            ),
-            control_sockets: test_control_socket_paths(dir.path()),
-            container_name: "ubuntu-dev".into(),
-            container_runtime,
-        };
+        let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
 
         let agent_path = runtime.write_container_agent_config().unwrap();
         assert_file_mode(&agent_path, 0o600);
@@ -6000,35 +6154,10 @@ name = "{{image_slug}}"
         let target = cfg.effective_target("default").unwrap();
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
-        let runtime = Runtime {
-            cfg,
-            target_name: "default".into(),
-            target,
-            launch_name: None,
-            session_id: None,
-            user: UserContext {
-                uid: 2450,
-                gid: 2450,
-                user: "alice".into(),
-                home: PathBuf::from("/home/alice"),
-            },
-            bootstrap_user: "root".into(),
-            session_uid: 2450,
-            session_gid: 2450,
-            session_shell: "/bin/bash".into(),
-            container_user: "alice".into(),
-            container_home: PathBuf::from("/home/alice"),
-            workspace: dir.path().join("workspace"),
-            container_state_dir: dir
-                .path()
-                .join("workspace/.aw-gateway/containers/ubuntu-dev"),
-            container_state_dir_in_container: PathBuf::from(
-                "/home/alice/.aw-gateway/containers/ubuntu-dev",
-            ),
-            control_sockets: test_control_socket_paths(dir.path()),
-            container_name: "ubuntu-dev".into(),
-            container_runtime,
-        };
+        let container_state_dir = dir
+            .path()
+            .join("workspace/.aw-gateway/containers/ubuntu-dev");
+        let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
         let spec = runtime.container_run_spec(None, None).unwrap();
         assert_eq!(spec.env.get("START_ONLY"), Some(&"start".to_string()));
         assert!(!spec.env.contains_key("SESSION_ONLY"));
@@ -6036,7 +6165,7 @@ name = "{{image_slug}}"
         let exec_env = runtime.session_env().unwrap();
         assert_eq!(exec_env.get("SESSION_ONLY"), Some(&"session".to_string()));
 
-        std::fs::create_dir_all(&runtime.container_state_dir).unwrap();
+        std::fs::create_dir_all(&runtime.paths.container_state_dir).unwrap();
         let env_path = runtime.write_sshd_session_env_config().unwrap();
         assert_file_mode(&env_path, 0o600);
         let env_config = std::fs::read_to_string(env_path).unwrap();
@@ -6051,35 +6180,10 @@ name = "{{image_slug}}"
         let target = cfg.effective_target("default").unwrap();
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
-        let runtime = Runtime {
-            cfg,
-            target_name: "default".into(),
-            target,
-            launch_name: None,
-            session_id: None,
-            user: UserContext {
-                uid: 2450,
-                gid: 2450,
-                user: "alice".into(),
-                home: PathBuf::from("/home/alice"),
-            },
-            bootstrap_user: "root".into(),
-            session_uid: 2450,
-            session_gid: 2450,
-            session_shell: "/bin/bash".into(),
-            container_user: "alice".into(),
-            container_home: PathBuf::from("/home/alice"),
-            workspace: dir.path().join("workspace"),
-            container_state_dir: dir
-                .path()
-                .join("workspace/.aw-gateway/containers/ubuntu-dev"),
-            container_state_dir_in_container: PathBuf::from(
-                "/home/alice/.aw-gateway/containers/ubuntu-dev",
-            ),
-            control_sockets: test_control_socket_paths(dir.path()),
-            container_name: "ubuntu-dev".into(),
-            container_runtime,
-        };
+        let container_state_dir = dir
+            .path()
+            .join("workspace/.aw-gateway/containers/ubuntu-dev");
+        let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
 
         let args = runtime
             .container_runtime
@@ -6113,33 +6217,7 @@ name = "{{image_slug}}"
             .path()
             .join("workspace/.aw-gateway/containers/ubuntu-dev");
         std::fs::create_dir_all(&container_state_dir).unwrap();
-        let runtime = Runtime {
-            cfg,
-            target_name: "default".into(),
-            target,
-            launch_name: None,
-            session_id: None,
-            user: UserContext {
-                uid: 2450,
-                gid: 2450,
-                user: "alice".into(),
-                home: PathBuf::from("/home/alice"),
-            },
-            bootstrap_user: "root".into(),
-            session_uid: 2450,
-            session_gid: 2450,
-            session_shell: "/bin/bash".into(),
-            container_user: "alice".into(),
-            container_home: PathBuf::from("/home/alice"),
-            workspace: dir.path().join("workspace"),
-            container_state_dir,
-            container_state_dir_in_container: PathBuf::from(
-                "/home/alice/.aw-gateway/containers/ubuntu-dev",
-            ),
-            control_sockets: test_control_socket_paths(dir.path()),
-            container_name: "ubuntu-dev".into(),
-            container_runtime,
-        };
+        let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
 
         let policy_path = runtime.write_ssh_command_filter_policy().unwrap();
         assert_file_mode(&policy_path, 0o600);
@@ -6223,35 +6301,10 @@ name = "{{image_slug}}"
         let target = cfg.effective_target("default").unwrap();
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
-        let runtime = Runtime {
-            cfg,
-            target_name: "default".into(),
-            target,
-            launch_name: None,
-            session_id: None,
-            user: UserContext {
-                uid: 2450,
-                gid: 2450,
-                user: "alice".into(),
-                home: PathBuf::from("/home/alice"),
-            },
-            bootstrap_user: "root".into(),
-            session_uid: 2450,
-            session_gid: 2450,
-            session_shell: "/bin/bash".into(),
-            container_user: "alice".into(),
-            container_home: PathBuf::from("/home/alice"),
-            workspace: dir.path().join("workspace"),
-            container_state_dir: dir
-                .path()
-                .join("workspace/.aw-gateway/containers/ubuntu-dev"),
-            container_state_dir_in_container: PathBuf::from(
-                "/home/alice/.aw-gateway/containers/ubuntu-dev",
-            ),
-            control_sockets: test_control_socket_paths(dir.path()),
-            container_name: "ubuntu-dev".into(),
-            container_runtime,
-        };
+        let container_state_dir = dir
+            .path()
+            .join("workspace/.aw-gateway/containers/ubuntu-dev");
+        let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
 
         let args = runtime.container_runtime.run_args(
             &runtime
@@ -6275,7 +6328,7 @@ name = "{{image_slug}}"
             ]
         );
 
-        std::fs::create_dir_all(&runtime.container_state_dir).unwrap();
+        std::fs::create_dir_all(&runtime.paths.container_state_dir).unwrap();
         let bootstrap_path = runtime.write_container_bootstrap_config().unwrap();
         assert_file_mode(&bootstrap_path, 0o600);
         let bootstrap_config = std::fs::read_to_string(bootstrap_path).unwrap();
@@ -6303,35 +6356,10 @@ name = "{{image_slug}}"
         let target = cfg.effective_target("default").unwrap();
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
-        let runtime = Runtime {
-            cfg,
-            target_name: "default".into(),
-            target,
-            launch_name: None,
-            session_id: None,
-            user: UserContext {
-                uid: 2450,
-                gid: 2450,
-                user: "alice".into(),
-                home: PathBuf::from("/home/alice"),
-            },
-            bootstrap_user: "root".into(),
-            session_uid: 2450,
-            session_gid: 2450,
-            session_shell: "/bin/bash".into(),
-            container_user: "alice".into(),
-            container_home: PathBuf::from("/home/alice"),
-            workspace: dir.path().join("workspace"),
-            container_state_dir: dir
-                .path()
-                .join("workspace/.aw-gateway/containers/ubuntu-dev"),
-            container_state_dir_in_container: PathBuf::from(
-                "/home/alice/.aw-gateway/containers/ubuntu-dev",
-            ),
-            control_sockets: test_control_socket_paths(dir.path()),
-            container_name: "ubuntu-dev".into(),
-            container_runtime,
-        };
+        let container_state_dir = dir
+            .path()
+            .join("workspace/.aw-gateway/containers/ubuntu-dev");
+        let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
 
         let err = runtime.container_mounts().unwrap_err();
         assert!(

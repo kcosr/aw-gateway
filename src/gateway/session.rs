@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 impl Runtime {
     pub(super) async fn acquire_lifecycle_lock(&self) -> anyhow::Result<LifecycleLock> {
-        let lock_dir = self.user.state_dir().join("locks");
-        let lock_path = lock_dir.join(format!("{}.lock", self.container_name));
+        let lock_dir = self.identity.user.state_dir().join("locks");
+        let lock_path = lock_dir.join(format!("{}.lock", self.identity.container_name));
         tokio::task::spawn_blocking(move || {
             paths::ensure_private_dir(&lock_dir)?;
             let file = std::fs::OpenOptions::new()
@@ -37,7 +37,7 @@ impl Runtime {
     }
 
     pub(super) fn create_launch_session_marker(&self, kind: &str) -> anyhow::Result<SessionGuard> {
-        self.create_session_marker_with_launch(kind, self.launch_name.as_deref())
+        self.create_session_marker_with_launch(kind, self.identity.launch_name.as_deref())
     }
 
     fn create_session_marker_with_launch(
@@ -54,8 +54,8 @@ impl Runtime {
             kind: kind.to_string(),
             gateway_pid: std::process::id(),
             gateway_start_time: process_start_time(std::process::id()).unwrap_or_default(),
-            container: self.container_name.clone(),
-            target: self.target_name.clone(),
+            container: self.identity.container_name.clone(),
+            target: self.identity.target_name.clone(),
             launch: launch.map(str::to_string),
             created_at_ms: unix_time_ms()?,
         };
@@ -98,11 +98,13 @@ impl Runtime {
     }
 
     pub(super) fn session_marker_dir(&self) -> PathBuf {
-        self.container_state_dir.join("sessions")
+        self.paths.container_state_dir.join("sessions")
     }
 
     fn local_listener_status_path(&self) -> PathBuf {
-        self.container_state_dir.join("local-ssh-listener.json")
+        self.paths
+            .container_state_dir
+            .join("local-ssh-listener.json")
     }
 
     pub(super) fn active_local_listener_status(
