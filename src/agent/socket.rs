@@ -5,7 +5,7 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 
 use super::state::SocketOwner;
 
@@ -25,6 +25,25 @@ pub(super) async fn unlink_socket_if_present(path: &Path) -> anyhow::Result<()> 
         Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
     }
     Ok(())
+}
+
+pub(super) async fn bind_private_unix_socket(
+    path: &Path,
+    owner: Option<SocketOwner>,
+) -> anyhow::Result<UnixListener> {
+    if let Some(parent) = path.parent() {
+        crate::fileutil::ensure_private_dir(parent)?;
+        apply_path_owner(parent, owner)?;
+    }
+    unlink_socket_if_present(path).await?;
+    let listener = UnixListener::bind(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    apply_path_owner(path, owner)?;
+    Ok(listener)
 }
 
 pub(super) fn apply_path_owner(path: &Path, owner: Option<SocketOwner>) -> anyhow::Result<()> {

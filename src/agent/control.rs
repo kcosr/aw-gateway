@@ -2,7 +2,6 @@ use crate::agent_control::{
     AuthRequirement, ControlEnvelope, ControlFailure, ControlRequest, ControlRequestId,
     ControlSuccess, DecodedControlEnvelope, ReapResult, SessionHoldResult, ShutdownResult,
 };
-use crate::fileutil;
 use anyhow::Context;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -10,12 +9,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 use tokio::time::{Duration, sleep};
 
 use super::idle::reap_processes;
-use super::service::stop_services;
-use super::socket::{apply_path_owner, unlink_socket_if_present, validate_control_peer};
+use super::lifecycle::shutdown_agent;
+use super::socket::{bind_private_unix_socket, validate_control_peer};
 use super::state::AgentState;
 use super::status::status_payload;
 
@@ -23,18 +22,7 @@ const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONTROL_REQUEST_BYTES: usize = 64 * 1024;
 
 pub(super) async fn run_control_socket(state: Arc<AgentState>, path: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fileutil::ensure_private_dir(parent)?;
-        apply_path_owner(parent, state.socket_owner)?;
-    }
-    unlink_socket_if_present(path).await?;
-    let listener = UnixListener::bind(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
-    }
-    apply_path_owner(path, state.socket_owner)?;
+    let listener = bind_private_unix_socket(path, state.socket_owner).await?;
     let mut shutdown = Box::pin(shutdown_signal());
     loop {
         tokio::select! {
@@ -79,12 +67,6 @@ async fn shutdown_signal() -> anyhow::Result<()> {
         tokio::signal::ctrl_c().await.context("wait for Ctrl-C")?;
     }
     Ok(())
-}
-
-pub(super) async fn shutdown_agent(state: Arc<AgentState>) {
-    state.shutting_down.store(true, Ordering::SeqCst);
-    state.accepting_bridge.store(false, Ordering::SeqCst);
-    stop_services(&state).await;
 }
 
 async fn handle_control_connection(
@@ -149,9 +131,7 @@ async fn handle_control_connection(
             return Ok(());
         }
         ControlRequest::Shutdown(_) => {
-            state.shutting_down.store(true, Ordering::SeqCst);
-            state.accepting_bridge.store(false, Ordering::SeqCst);
-            stop_services(&state).await;
+            shutdown_agent(state.clone()).await;
             let response = ControlSuccess::new(
                 id,
                 ShutdownResult {
@@ -168,6 +148,7 @@ async fn handle_control_connection(
             let result = state
                 .idle_cleanup
                 .as_ref()
+                // ReapNow is a dry-run preview; managed service pids are intentionally included.
                 .map(|config| reap_processes(config, &BTreeSet::new(), true))
                 .unwrap_or(ReapResult {
                     dry_run: true,

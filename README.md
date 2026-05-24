@@ -1429,7 +1429,9 @@ then commits a fresh `Unreleased` section for the next cycle.
 - `src/config.rs` - TOML schema, defaults, validation, and sample config.
 - `src/gateway.rs` and `src/gateway/` - host-side CLI behavior, runtime
   orchestration, sessions, listeners, identity, and client config.
-- `src/agent.rs` - in-container service supervision and control socket.
+- `src/agent.rs` and `src/agent/` - in-container agent entrypoint, service
+  supervision, control socket dispatch, SSH bridge, idle cleanup/reaper,
+  process helpers, shared state, socket helpers, and status projection.
 - `src/runtime.rs` - Podman, Docker, and Colima command construction.
 - `src/ssh_dispatch.rs` - `SSH_ORIGINAL_COMMAND` parsing and restricted SSH
   dispatch.

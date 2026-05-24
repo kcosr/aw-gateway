@@ -1,11 +1,10 @@
-use crate::fileutil;
 use crate::template::{self, Vars};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tokio::net::{TcpStream, UnixListener, UnixStream};
+use tokio::net::{TcpStream, UnixStream};
 
-use super::socket::{apply_path_owner, unlink_socket_if_present};
+use super::socket::bind_private_unix_socket;
 use super::state::AgentState;
 
 pub(super) async fn run_bridge(
@@ -19,18 +18,7 @@ pub(super) async fn run_bridge(
         state.state_dir.display().to_string(),
     );
     let socket = PathBuf::from(template::render(&socket_template, &vars)?);
-    if let Some(parent) = socket.parent() {
-        fileutil::ensure_private_dir(parent)?;
-        apply_path_owner(parent, state.socket_owner)?;
-    }
-    unlink_socket_if_present(&socket).await?;
-    let listener = UnixListener::bind(&socket)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).await?;
-    }
-    apply_path_owner(&socket, state.socket_owner)?;
+    let listener = bind_private_unix_socket(&socket, state.socket_owner).await?;
     state.bridge_ready.store(true, Ordering::SeqCst);
     loop {
         let (client, _) = listener.accept().await?;

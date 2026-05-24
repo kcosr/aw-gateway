@@ -19,7 +19,6 @@ use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant, sleep};
 
 use super::process::process_exists;
-use super::state::AgentState;
 
 #[derive(Debug)]
 pub(super) struct ManagedService {
@@ -104,6 +103,18 @@ impl ManagedService {
             "container_state_dir".to_string(),
             self.state_dir.display().to_string(),
         )])
+    }
+
+    pub(super) fn required_health_restart(&self) -> bool {
+        self.config.required
+            && !matches!(self.config.health_check, None | Some(HealthCheck::Process))
+    }
+
+    pub(super) async fn stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        if let Some(child) = self.child.lock().await.take() {
+            stop_child_gracefully(self, child).await;
+        }
     }
 }
 
@@ -209,13 +220,6 @@ async fn wait_for_service_exit_or_unhealthy(service: &ManagedService) -> bool {
                 }
             }
         }
-    }
-}
-
-impl ManagedService {
-    pub(super) fn required_health_restart(&self) -> bool {
-        self.config.required
-            && !matches!(self.config.health_check, None | Some(HealthCheck::Process))
     }
 }
 
@@ -534,16 +538,6 @@ async fn http_health(
         check_json_fields(body, expect_json)?,
         JsonFieldCheck::Match
     ))
-}
-
-pub(super) async fn stop_services(state: &AgentState) {
-    let services = state.services.lock().await.clone();
-    for service in service_stop_order(&services) {
-        service.stopping.store(true, Ordering::SeqCst);
-        if let Some(child) = service.child.lock().await.take() {
-            stop_child_gracefully(&service, child).await;
-        }
-    }
 }
 
 pub(super) fn service_stop_order(services: &[Arc<ManagedService>]) -> Vec<Arc<ManagedService>> {

@@ -6,11 +6,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::time::{Duration, Instant, sleep};
 
+use super::lifecycle::shutdown_agent;
 use super::process::{
     ProcInfo, current_uid, read_process_table, signal_matching_processes, signal_number,
     signal_processes,
 };
-use super::service::stop_services;
 use super::state::AgentState;
 
 pub(super) async fn run_idle_cleanup(state: Arc<AgentState>) {
@@ -36,9 +36,7 @@ pub(super) async fn run_idle_cleanup(state: Arc<AgentState>) {
         match transition {
             IdleTransition::None => {}
             IdleTransition::ShutdownContainer => {
-                state.shutting_down.store(true, Ordering::SeqCst);
-                state.accepting_bridge.store(false, Ordering::SeqCst);
-                stop_services(&state).await;
+                shutdown_agent(state.clone()).await;
                 std::process::exit(0);
             }
             IdleTransition::ReapProcesses => {
@@ -154,7 +152,7 @@ pub(super) fn reap_processes(
     ReapResult { dry_run, ..plan }
 }
 
-pub(super) async fn run_reap_processes(
+async fn run_reap_processes(
     config: &IdleCleanupConfig,
     managed_pids: &BTreeSet<u32>,
     dry_run: bool,
@@ -222,7 +220,7 @@ pub(super) fn build_reap_plan(
     }
 }
 
-pub(super) async fn managed_service_pids(state: &AgentState) -> BTreeSet<u32> {
+async fn managed_service_pids(state: &AgentState) -> BTreeSet<u32> {
     let services = state.services.lock().await.clone();
     let mut pids = BTreeSet::new();
     for service in services {

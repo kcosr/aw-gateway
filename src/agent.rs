@@ -1,6 +1,7 @@
 mod bridge;
 mod control;
 mod idle;
+mod lifecycle;
 mod process;
 mod service;
 mod socket;
@@ -140,8 +141,9 @@ fn configured_control_socket(config: &Option<ControlSocketConfig>) -> Option<Str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::control::{shutdown_agent, unauthorized_if_needed};
+    use crate::agent::control::unauthorized_if_needed;
     use crate::agent::idle::build_reap_plan;
+    use crate::agent::lifecycle::shutdown_agent;
     use crate::agent::process::{ProcInfo, current_uid, process_exists};
     use crate::agent::service::{
         RotatingServiceLog, health_check_interval, health_check_timeout, resolve_service_user,

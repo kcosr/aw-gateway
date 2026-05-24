@@ -44,7 +44,10 @@ host filesystem.
   file utilities, health checks, HTTP API surface, identity/key handling,
   listener proxying, shared operation dispatch, status models, and session
   marker state.
-- `src/agent.rs` owns in-container service supervision and socket APIs.
+- `src/agent.rs` owns in-container agent entrypoint dispatch.
+- `src/agent/` contains focused container-agent support modules for SSH bridge,
+  control socket dispatch, idle cleanup/reaper, process helpers, service
+  supervision, shared agent state, socket helpers, and status projection.
 - `src/ssh_dispatch.rs` owns `SSH_ORIGINAL_COMMAND` parsing.
 - `src/runtime.rs` owns Podman, Docker, and Colima command construction.
 - `aw-gateway.sample.toml` and `container-agent.sample.toml` are the canonical
