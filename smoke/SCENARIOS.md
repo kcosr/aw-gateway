@@ -120,13 +120,32 @@ HTTP requests to the forwarded local port.
 | Unknown launches and invalid launch variables return stable errors | all enabled hosts |
 | A limited HTTP config blocks disabled actions with `403 disabled_action` | all enabled hosts |
 
+## Cleanup, Timeouts, And Reaping
+
+Implemented in `tests/test_35_cleanup_timeouts.py`.
+
+These tests write temporary remote configs derived from each host's deployed
+host-local config, with idle grace and poll intervals reduced to one or two
+seconds. The deployed smoke configs are not mutated.
+
+| Scenario | Hosts |
+| --- | --- |
+| Gateway-owned `exit_container` idle cleanup stops the target after a short grace period | all enabled hosts |
+| Agent-owned `exit_container` idle cleanup stops the target after a short grace period | `ubuntu`, `rocky10` |
+| Agent-owned cleanup preserves the container while a `tmux`-named process appears in the container process table | `ubuntu`, `rocky10` |
+| Agent-owned `reap_processes` remains paused while `tmux` is preserved, then terminates an unpreserved session process after the preserve process exits | `ubuntu`, `rocky10` |
+| Ephemeral target `workspace.cleanup = "always"` removes the session workspace after a successful command | all enabled hosts |
+
+The preserve-process test starts a short-lived executable whose process
+`comm` is `tmux`; this exercises the same process-table matching path as a
+real tmux session without requiring package installation in the base smoke
+image.
+
 ## Not Yet Covered
 
 The current suite does not yet exercise every gateway behavior. The following
 areas are intentionally left out of the first in-repo smoke harness:
 
-- Idle timeout, agent-owned reaping, preserve-process, and workspace cleanup
-  timing behavior.
 - Controller-side generated SSH config use from the controller into Linux
   remote hosts.
 - Concurrent lifecycle requests and stronger idempotence checks.

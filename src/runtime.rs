@@ -3,7 +3,7 @@ use crate::template::{self, Vars};
 use anyhow::Context;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -228,6 +228,24 @@ impl ContainerRuntime {
 
     pub async fn rm(&self, name: &str) -> anyhow::Result<()> {
         self.run_status("rm", [name]).await
+    }
+
+    pub async fn remove_host_dir_all(&self, path: &Path) -> anyhow::Result<()> {
+        if self.is_podman() {
+            let args = vec![
+                OsString::from("rm"),
+                OsString::from("-rf"),
+                OsString::from("--"),
+                path.as_os_str().to_os_string(),
+            ];
+            return self.run_status("unshare", args).await.with_context(|| {
+                format!("remove workspace {} with podman unshare", path.display())
+            });
+        }
+
+        tokio::fs::remove_dir_all(path)
+            .await
+            .with_context(|| format!("remove workspace {}", path.display()))
     }
 
     pub async fn exec(&self, spec: &ContainerExecSpec) -> anyhow::Result<i32> {
