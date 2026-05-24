@@ -1,7 +1,7 @@
 use super::ops::{
-    ExecutionOutcome, GatewayOperation, GatewayOperationResult, OperationExecutionOptions,
-    OperationMode, OutputSelection, SuppliedLaunchVarValue, SuppliedLaunchVars,
-    execute_gateway_operation,
+    ExecutionOutcome, GatewayOperation, GatewayOperationResult, OperationError,
+    OperationExecutionOptions, OperationMode, OutputSelection, SuppliedLaunchVarValue,
+    SuppliedLaunchVars, execute_gateway_operation,
 };
 use crate::config::{GatewayConfig, HttpAuthType};
 use crate::paths::{self, UserContext};
@@ -196,11 +196,11 @@ async fn handle_metadata(
     action: &'static str,
     operation: impl FnOnce() -> Result<GatewayOperation, HttpError>,
 ) -> Response {
-    let operation = match authorize_action(&state, &headers, action)
-        .await
-        .and_then(|()| operation())
-    {
-        Ok(operation) => operation,
+    let operation = match authorize_action(&state, &headers, action).await {
+        Ok(()) => match operation() {
+            Ok(operation) => operation,
+            Err(err) => return err.into_response(),
+        },
         Err(err) => return err.into_response(),
     };
     match execute_gateway_operation(state.config_path, operation).await {
@@ -215,11 +215,11 @@ async fn handle_execution(
     action: &'static str,
     operation: impl FnOnce() -> Result<GatewayOperation, HttpError>,
 ) -> Response {
-    let operation = match authorize_action(&state, &headers, action)
-        .await
-        .and_then(|()| operation())
-    {
-        Ok(operation) => operation,
+    let operation = match authorize_action(&state, &headers, action).await {
+        Ok(()) => match operation() {
+            Ok(operation) => operation,
+            Err(err) => return err.into_response(),
+        },
         Err(err) => return err.into_response(),
     };
     match execute_gateway_operation(state.config_path, operation).await {
@@ -237,7 +237,7 @@ async fn authorize_action(
     state: &AppState,
     headers: &HeaderMap,
     action: &'static str,
-) -> Result<(), HttpError> {
+) -> Result<(), ActionAuthorizationError> {
     authorize(state, headers).await?;
     if !state
         .config
@@ -246,11 +246,38 @@ async fn authorize_action(
         .iter()
         .any(|enabled| enabled == action)
     {
-        return Err(HttpError::disabled_action(format!(
-            "http action {action:?} is disabled"
-        )));
+        return Err(
+            OperationError::disabled_action(format!("http action {action:?} is disabled")).into(),
+        );
     }
     Ok(())
+}
+
+#[derive(Debug)]
+enum ActionAuthorizationError {
+    Http(HttpError),
+    Operation(OperationError),
+}
+
+impl IntoResponse for ActionAuthorizationError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Http(err) => err.into_response(),
+            Self::Operation(err) => operation_error_response(err),
+        }
+    }
+}
+
+impl From<HttpError> for ActionAuthorizationError {
+    fn from(err: HttpError) -> Self {
+        Self::Http(err)
+    }
+}
+
+impl From<OperationError> for ActionAuthorizationError {
+    fn from(err: OperationError) -> Self {
+        Self::Operation(err)
+    }
 }
 
 async fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), HttpError> {
@@ -403,25 +430,22 @@ fn wait_payload(
     Ok(serde_json::Value::Object(payload))
 }
 
-fn operation_error_response(err: anyhow::Error) -> Response {
+fn operation_error_response(err: OperationError) -> Response {
     let message = err.to_string();
-    if message.contains("launch variable") {
-        HttpError::new(
+    match err {
+        OperationError::InvalidRequest { .. } | OperationError::InvalidSession { .. } => {
+            HttpError::invalid_request(message)
+        }
+        OperationError::DisabledAction { .. } => HttpError::disabled_action(message),
+        OperationError::UnknownLaunch { .. } => HttpError::not_found(message),
+        OperationError::InvalidLaunchVariable { .. } => HttpError::new(
             StatusCode::BAD_REQUEST,
             ErrorCode::InvalidLaunchVar,
             message,
-        )
-        .into_response()
-    } else if message.contains("unknown launch") {
-        HttpError::not_found(message).into_response()
-    } else if message.contains("--session-id")
-        || message.contains("session_id")
-        || message.contains("invalid session id")
-    {
-        HttpError::invalid_request(message).into_response()
-    } else {
-        HttpError::operation_failed(message).into_response()
+        ),
+        OperationError::OperationFailed { .. } => HttpError::operation_failed(message),
     }
+    .into_response()
 }
 
 fn parse_body<T: for<'de> Deserialize<'de>>(
@@ -1037,17 +1061,86 @@ command = ["launch-command"]
 
     #[tokio::test]
     async fn operation_errors_map_launch_validation_to_invalid_launch_var() {
-        let response =
-            operation_error_response(anyhow::anyhow!("missing required launch variable \"repo\""));
+        let response = operation_error_response(OperationError::invalid_launch_variable(
+            "missing required launch variable \"repo\"",
+        ));
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_launch_var");
+
+        let response = operation_error_response(OperationError::invalid_launch_variable(
+            "unknown launch variable \"repo\"",
+        ));
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_launch_var");
+    }
+
+    #[tokio::test]
+    async fn operation_errors_map_all_typed_variants_to_http_codes() {
+        let cases = vec![
+            (
+                OperationError::invalid_request("bad request"),
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "bad request",
+            ),
+            (
+                OperationError::disabled_action("http action \"run\" is disabled"),
+                StatusCode::FORBIDDEN,
+                "disabled_action",
+                "http action \"run\" is disabled",
+            ),
+            (
+                OperationError::unknown_launch("unknown launch \"repo\""),
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "unknown launch \"repo\"",
+            ),
+            (
+                OperationError::invalid_launch_variable("invalid enum launch variable \"mode\""),
+                StatusCode::BAD_REQUEST,
+                "invalid_launch_var",
+                "invalid enum launch variable \"mode\"",
+            ),
+            (
+                OperationError::invalid_session("invalid session id \"../bad\""),
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "invalid session id \"../bad\"",
+            ),
+            (
+                OperationError::operation_failed(anyhow::anyhow!("runtime failed")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "operation_failed",
+                "runtime failed",
+            ),
+        ];
+
+        for (err, expected_status, expected_code, expected_message) in cases {
+            let response = operation_error_response(err);
+            let (status, body) = response_json(response).await;
+            assert_eq!(status, expected_status);
+            assert_eq!(body["ok"], false);
+            assert_eq!(body["error"]["code"], expected_code);
+            assert_eq!(body["error"]["message"], expected_message);
+        }
+    }
+
+    #[tokio::test]
+    async fn operation_error_mapping_distinguishes_launch_var_from_unknown_launch() {
+        let response = operation_error_response(OperationError::invalid_launch_variable(
+            "unknown launch variable \"repo\"",
+        ));
         let (status, body) = response_json(response).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid_launch_var");
 
         let response =
-            operation_error_response(anyhow::anyhow!("unknown launch variable \"repo\""));
+            operation_error_response(OperationError::unknown_launch("unknown launch \"repo\""));
         let (status, body) = response_json(response).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["code"], "invalid_launch_var");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "not_found");
     }
 
     #[tokio::test]
@@ -1062,8 +1155,12 @@ command = ["launch-command"]
         let response = authorize_action(&state, &HeaderMap::new(), "status")
             .await
             .unwrap_err();
-        assert_eq!(response.status, StatusCode::FORBIDDEN);
-        assert_eq!(response.code, ErrorCode::DisabledAction);
+        let ActionAuthorizationError::Operation(OperationError::DisabledAction { message }) =
+            response
+        else {
+            panic!("expected disabled-action operation error");
+        };
+        assert_eq!(message, "http action \"status\" is disabled");
 
         let response = not_found(
             State(state),
@@ -1209,6 +1306,21 @@ command = ["launch-command"]
         assert_eq!(body["ok"], true);
         assert_eq!(body["data"]["name"], "echo");
         assert_eq!(body["data"]["command"][0], "launch-command");
+    }
+
+    #[tokio::test]
+    async fn unknown_launch_route_returns_not_found_json_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_runtime = dir.path().join("runtime");
+        let log = dir.path().join("runtime.log");
+        write_fake_runtime(&fake_runtime, &fake_running_runtime_script(&log));
+        let app = app_for_config(http_operation_config(&dir, &fake_runtime));
+
+        let (status, body) = get_json(app, "/api/v1/launches/missing").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "not_found");
+        assert_eq!(body["error"]["message"], "unknown launch \"missing\"");
     }
 
     #[tokio::test]

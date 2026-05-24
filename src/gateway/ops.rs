@@ -9,11 +9,12 @@ use crate::cli::{
     ClientConfigArgs, LaunchShowArgs, LaunchesArgs, RunArgs, SetDefaultArgs, StatusArg, StopArgs,
     TargetArg, TargetsArgs,
 };
-use crate::config::LocalSshMode;
+use crate::config::{GatewayConfig, LaunchConfig, LocalSshMode};
 use crate::paths::{self, UserContext};
 use crate::runtime::ContainerRuntime;
 use crate::ssh_dispatch::{GatewayAction, RunAction, StatusAction};
 use anyhow::Context;
+use std::fmt;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,6 +81,98 @@ pub(super) enum GatewayOperationResult {
         rendered: String,
         written_path: Option<PathBuf>,
     },
+}
+
+#[derive(Debug)]
+pub(super) enum OperationError {
+    InvalidRequest { message: String },
+    // HTTP allowlist failures happen before operation dispatch, but use this
+    // variant so transport-visible operation denials share one projection path.
+    DisabledAction { message: String },
+    UnknownLaunch { message: String },
+    InvalidLaunchVariable { message: String },
+    InvalidSession { message: String },
+    OperationFailed { source: anyhow::Error },
+}
+
+impl OperationError {
+    pub(super) fn invalid_request(message: impl Into<String>) -> Self {
+        Self::InvalidRequest {
+            message: message.into(),
+        }
+    }
+
+    pub(super) fn disabled_action(message: impl Into<String>) -> Self {
+        Self::DisabledAction {
+            message: message.into(),
+        }
+    }
+
+    pub(super) fn unknown_launch(message: impl Into<String>) -> Self {
+        Self::UnknownLaunch {
+            message: message.into(),
+        }
+    }
+
+    pub(super) fn invalid_launch_variable(message: impl Into<String>) -> Self {
+        Self::InvalidLaunchVariable {
+            message: message.into(),
+        }
+    }
+
+    pub(super) fn invalid_session(message: impl Into<String>) -> Self {
+        Self::InvalidSession {
+            message: message.into(),
+        }
+    }
+
+    pub(super) fn operation_failed(source: anyhow::Error) -> Self {
+        Self::OperationFailed { source }
+    }
+}
+
+impl From<anyhow::Error> for OperationError {
+    fn from(source: anyhow::Error) -> Self {
+        Self::operation_failed(source)
+    }
+}
+
+impl fmt::Display for OperationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest { message }
+            | Self::DisabledAction { message }
+            | Self::UnknownLaunch { message }
+            | Self::InvalidLaunchVariable { message }
+            | Self::InvalidSession { message } => formatter.write_str(message),
+            Self::OperationFailed { source } => fmt::Display::fmt(source, formatter),
+        }
+    }
+}
+
+impl std::error::Error for OperationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::OperationFailed { source } => Some(source.as_ref()),
+            Self::InvalidRequest { .. }
+            | Self::DisabledAction { .. }
+            | Self::UnknownLaunch { .. }
+            | Self::InvalidLaunchVariable { .. }
+            | Self::InvalidSession { .. } => None,
+        }
+    }
+}
+
+pub(super) type OperationResult<T> = Result<T, OperationError>;
+
+pub(super) fn lookup_launch(cfg: &GatewayConfig, name: &str) -> OperationResult<LaunchConfig> {
+    if !cfg.launches.contains_key(name) {
+        return Err(OperationError::unknown_launch(format!(
+            "unknown launch {name:?}"
+        )));
+    }
+    cfg.effective_launch(name)
+        .map_err(OperationError::operation_failed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,11 +273,13 @@ pub(super) struct SuppliedLaunchVars {
 }
 
 impl SuppliedLaunchVars {
-    pub(super) fn from_cli_pairs(supplied: Vec<String>) -> anyhow::Result<Self> {
+    pub(super) fn from_cli_pairs(supplied: Vec<String>) -> OperationResult<Self> {
         let mut vars = Self::default();
         for raw in supplied {
             let Some((key, value)) = raw.split_once('=') else {
-                anyhow::bail!("--var must be key=value");
+                return Err(OperationError::invalid_launch_variable(
+                    "--var must be key=value",
+                ));
             };
             vars.insert(
                 key.to_string(),
@@ -198,9 +293,11 @@ impl SuppliedLaunchVars {
         &mut self,
         key: String,
         value: SuppliedLaunchVarValue,
-    ) -> anyhow::Result<()> {
+    ) -> OperationResult<()> {
         if self.values.insert(key.clone(), value).is_some() {
-            anyhow::bail!("duplicate launch variable {key:?}");
+            return Err(OperationError::invalid_launch_variable(format!(
+                "duplicate launch variable {key:?}"
+            )));
         }
         Ok(())
     }
@@ -251,11 +348,11 @@ impl GatewayOperation {
         }
     }
 
-    pub(super) fn from_run_args(args: RunArgs) -> anyhow::Result<Self> {
+    pub(super) fn from_run_args(args: RunArgs) -> OperationResult<Self> {
         if args.command.is_empty() {
-            anyhow::bail!(
-                "run requires -- followed by a command; use up to start or hold a target"
-            );
+            return Err(OperationError::invalid_request(
+                "run requires -- followed by a command; use up to start or hold a target",
+            ));
         }
         Ok(Self::Run {
             target: args.target,
@@ -300,13 +397,13 @@ impl GatewayOperation {
         }
     }
 
-    pub(super) fn from_set_default_args(args: SetDefaultArgs) -> anyhow::Result<Self> {
+    pub(super) fn from_set_default_args(args: SetDefaultArgs) -> OperationResult<Self> {
         if args.reset {
             return Ok(Self::ResetDefault);
         }
-        let target_or_image = args
-            .target_or_image
-            .ok_or_else(|| anyhow::anyhow!("target or image is required unless --reset is used"))?;
+        let target_or_image = args.target_or_image.ok_or_else(|| {
+            OperationError::invalid_request("target or image is required unless --reset is used")
+        })?;
         Ok(Self::SetDefault { target_or_image })
     }
 
@@ -317,7 +414,7 @@ impl GatewayOperation {
         }
     }
 
-    pub(super) fn from_ssh_action(action: GatewayAction) -> anyhow::Result<Option<Self>> {
+    pub(super) fn from_ssh_action(action: GatewayAction) -> OperationResult<Option<Self>> {
         Ok(match action {
             GatewayAction::Up(target) => Some(Self::Up {
                 target,
@@ -384,7 +481,7 @@ impl GatewayOperation {
 pub(super) async fn execute_gateway_operation(
     config_path: Option<PathBuf>,
     operation: GatewayOperation,
-) -> anyhow::Result<GatewayOperationResult> {
+) -> OperationResult<GatewayOperationResult> {
     match operation {
         GatewayOperation::Targets => {
             let cfg = load_config(config_path)?;
@@ -414,7 +511,7 @@ pub(super) async fn execute_gateway_operation(
         }
         GatewayOperation::LaunchShow { name } => {
             let cfg = load_config(config_path)?;
-            let launch = cfg.effective_launch(&name)?;
+            let launch = lookup_launch(&cfg, &name)?;
             Ok(GatewayOperationResult::LaunchShow(launch_detail(
                 &name, &launch,
             )))
@@ -468,9 +565,11 @@ async fn operation_run(
     cwd: Option<String>,
     command: Vec<String>,
     options: OperationExecutionOptions,
-) -> anyhow::Result<ExecutionOutcome> {
+) -> OperationResult<ExecutionOutcome> {
     let runtime = Runtime::load(config_path, target.as_deref(), session_id, true).await?;
-    run_container_command_with_runtime(runtime, cwd, command, options).await
+    run_container_command_with_runtime(runtime, cwd, command, options)
+        .await
+        .map_err(OperationError::operation_failed)
 }
 
 fn operation_set_default(
@@ -514,7 +613,7 @@ async fn operation_client_config(
     config_path: Option<PathBuf>,
     target: Option<String>,
     identity_file: Option<PathBuf>,
-) -> anyhow::Result<(String, PathBuf)> {
+) -> OperationResult<(String, PathBuf)> {
     let runtime = Runtime::load(config_path, target.as_deref(), None, false).await?;
     let config = runtime.render_client_config(identity_file.as_deref())?;
     let written_path = runtime.write_inner_config(&config)?;
@@ -525,9 +624,11 @@ async fn operation_up(
     config_path: Option<PathBuf>,
     target: Option<String>,
     session_id: Option<String>,
-) -> anyhow::Result<ReadyStatus> {
+) -> OperationResult<ReadyStatus> {
     let runtime = Runtime::load(config_path, target.as_deref(), session_id, true).await?;
-    operation_up_with_runtime(runtime).await
+    operation_up_with_runtime(runtime)
+        .await
+        .map_err(OperationError::operation_failed)
 }
 
 pub(super) async fn operation_up_with_runtime(runtime: Runtime) -> anyhow::Result<ReadyStatus> {
@@ -545,7 +646,7 @@ async fn operation_stop(
     config_path: Option<PathBuf>,
     target: Option<String>,
     session_id: Option<String>,
-) -> anyhow::Result<StopResult> {
+) -> OperationResult<StopResult> {
     let runtime = Runtime::load(config_path, target.as_deref(), session_id, false).await?;
     let _lock = runtime.acquire_lifecycle_lock().await?;
     let Some(inspect) = runtime
@@ -568,7 +669,7 @@ async fn operation_stop(
 async fn operation_remove(
     config_path: Option<PathBuf>,
     target: Option<String>,
-) -> anyhow::Result<RemoveResult> {
+) -> OperationResult<RemoveResult> {
     let runtime = Runtime::load(config_path, target.as_deref(), None, false).await?;
     let _lock = runtime.acquire_lifecycle_lock().await?;
     let Some(inspect) = runtime
@@ -611,9 +712,12 @@ async fn operation_status(
     config_path: Option<PathBuf>,
     target: Option<String>,
     session_id: Option<String>,
-) -> anyhow::Result<GatewayStatus> {
+) -> OperationResult<GatewayStatus> {
     let runtime = Runtime::load(config_path, target.as_deref(), session_id, false).await?;
-    runtime.status().await
+    runtime
+        .status()
+        .await
+        .map_err(OperationError::operation_failed)
 }
 
 async fn operation_status_all(config_path: Option<PathBuf>) -> anyhow::Result<Vec<AllStatusEntry>> {
@@ -630,6 +734,104 @@ async fn operation_status_all(config_path: Option<PathBuf>) -> anyhow::Result<Ve
 mod tests {
     use super::*;
     use crate::cli::{LaunchShowArgs, LaunchesArgs, RunArgs, StatusArg, TargetsArgs};
+
+    #[test]
+    fn operation_error_display_preserves_messages_and_source() {
+        for (err, expected) in [
+            (
+                OperationError::invalid_request("missing argument"),
+                "missing argument",
+            ),
+            (
+                OperationError::disabled_action("http action \"run\" is disabled"),
+                "http action \"run\" is disabled",
+            ),
+            (
+                OperationError::unknown_launch("unknown launch \"repo\""),
+                "unknown launch \"repo\"",
+            ),
+            (
+                OperationError::invalid_launch_variable(
+                    "missing required launch variable \"repo\"",
+                ),
+                "missing required launch variable \"repo\"",
+            ),
+            (
+                OperationError::invalid_session("invalid session id \"../bad\""),
+                "invalid session id \"../bad\"",
+            ),
+        ] {
+            assert_eq!(err.to_string(), expected);
+            assert!(std::error::Error::source(&err).is_none());
+        }
+
+        let err = OperationError::operation_failed(anyhow::anyhow!("runtime failed"));
+        assert_eq!(err.to_string(), "runtime failed");
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn operation_error_constructors_set_expected_variants() {
+        assert!(matches!(
+            OperationError::invalid_request("x"),
+            OperationError::InvalidRequest { .. }
+        ));
+        assert!(matches!(
+            OperationError::disabled_action("x"),
+            OperationError::DisabledAction { .. }
+        ));
+        assert!(matches!(
+            OperationError::unknown_launch("x"),
+            OperationError::UnknownLaunch { .. }
+        ));
+        assert!(matches!(
+            OperationError::invalid_launch_variable("x"),
+            OperationError::InvalidLaunchVariable { .. }
+        ));
+        assert!(matches!(
+            OperationError::invalid_session("x"),
+            OperationError::InvalidSession { .. }
+        ));
+        assert!(matches!(
+            OperationError::operation_failed(anyhow::anyhow!("x")),
+            OperationError::OperationFailed { .. }
+        ));
+    }
+
+    #[test]
+    fn launch_lookup_distinguishes_missing_launch_from_invalid_launch_config() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.agent]
+use = ["missing-template"]
+target = "default"
+command = ["true"]
+"#,
+        )
+        .unwrap();
+
+        let err = lookup_launch(&cfg, "missing").unwrap_err();
+        assert!(matches!(
+            err,
+            OperationError::UnknownLaunch { ref message }
+                if message == "unknown launch \"missing\""
+        ));
+
+        let err = lookup_launch(&cfg, "agent").unwrap_err();
+        assert!(matches!(err, OperationError::OperationFailed { .. }));
+        assert!(
+            err.to_string()
+                .contains("launch \"agent\" uses launch template \"missing-template\""),
+            "{err}"
+        );
+    }
 
     #[test]
     fn constructs_targets_request_without_rendering_flags() {

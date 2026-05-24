@@ -89,6 +89,10 @@
 
 ### Changed
 
+- Refactored shared gateway operation error handling to use typed internal
+  errors for stable HTTP projection
+  ([#25](https://github.com/kcosr/aw-gateway/pull/25)).
+
 - Gateway-managed container-agent control and SSH bridge sockets now live in
   the configured runtime socket directory instead of durable workspace state
   ([#6](https://github.com/kcosr/aw-gateway/pull/6)).
