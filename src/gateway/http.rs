@@ -259,7 +259,7 @@ enum ActionAuthorizationError {
     Operation(OperationError),
 }
 
-impl ActionAuthorizationError {
+impl IntoResponse for ActionAuthorizationError {
     fn into_response(self) -> Response {
         match self {
             Self::Http(err) => err.into_response(),
@@ -1306,6 +1306,21 @@ command = ["launch-command"]
         assert_eq!(body["ok"], true);
         assert_eq!(body["data"]["name"], "echo");
         assert_eq!(body["data"]["command"][0], "launch-command");
+    }
+
+    #[tokio::test]
+    async fn unknown_launch_route_returns_not_found_json_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake_runtime = dir.path().join("runtime");
+        let log = dir.path().join("runtime.log");
+        write_fake_runtime(&fake_runtime, &fake_running_runtime_script(&log));
+        let app = app_for_config(http_operation_config(&dir, &fake_runtime));
+
+        let (status, body) = get_json(app, "/api/v1/launches/missing").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"]["code"], "not_found");
+        assert_eq!(body["error"]["message"], "unknown launch \"missing\"");
     }
 
     #[tokio::test]

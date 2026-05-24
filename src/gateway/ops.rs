@@ -9,7 +9,7 @@ use crate::cli::{
     ClientConfigArgs, LaunchShowArgs, LaunchesArgs, RunArgs, SetDefaultArgs, StatusArg, StopArgs,
     TargetArg, TargetsArgs,
 };
-use crate::config::LocalSshMode;
+use crate::config::{GatewayConfig, LaunchConfig, LocalSshMode};
 use crate::paths::{self, UserContext};
 use crate::runtime::ContainerRuntime;
 use crate::ssh_dispatch::{GatewayAction, RunAction, StatusAction};
@@ -86,6 +86,8 @@ pub(super) enum GatewayOperationResult {
 #[derive(Debug)]
 pub(super) enum OperationError {
     InvalidRequest { message: String },
+    // HTTP allowlist failures happen before operation dispatch, but use this
+    // variant so transport-visible operation denials share one projection path.
     DisabledAction { message: String },
     UnknownLaunch { message: String },
     InvalidLaunchVariable { message: String },
@@ -152,12 +154,26 @@ impl std::error::Error for OperationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::OperationFailed { source } => Some(source.as_ref()),
-            _ => None,
+            Self::InvalidRequest { .. }
+            | Self::DisabledAction { .. }
+            | Self::UnknownLaunch { .. }
+            | Self::InvalidLaunchVariable { .. }
+            | Self::InvalidSession { .. } => None,
         }
     }
 }
 
 pub(super) type OperationResult<T> = Result<T, OperationError>;
+
+pub(super) fn lookup_launch(cfg: &GatewayConfig, name: &str) -> OperationResult<LaunchConfig> {
+    if !cfg.launches.contains_key(name) {
+        return Err(OperationError::unknown_launch(format!(
+            "unknown launch {name:?}"
+        )));
+    }
+    cfg.effective_launch(name)
+        .map_err(OperationError::operation_failed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -495,9 +511,7 @@ pub(super) async fn execute_gateway_operation(
         }
         GatewayOperation::LaunchShow { name } => {
             let cfg = load_config(config_path)?;
-            let launch = cfg
-                .effective_launch(&name)
-                .map_err(|err| OperationError::unknown_launch(err.to_string()))?;
+            let launch = lookup_launch(&cfg, &name)?;
             Ok(GatewayOperationResult::LaunchShow(launch_detail(
                 &name, &launch,
             )))
@@ -782,6 +796,41 @@ mod tests {
             OperationError::operation_failed(anyhow::anyhow!("x")),
             OperationError::OperationFailed { .. }
         ));
+    }
+
+    #[test]
+    fn launch_lookup_distinguishes_missing_launch_from_invalid_launch_config() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.agent]
+use = ["missing-template"]
+target = "default"
+command = ["true"]
+"#,
+        )
+        .unwrap();
+
+        let err = lookup_launch(&cfg, "missing").unwrap_err();
+        assert!(matches!(
+            err,
+            OperationError::UnknownLaunch { ref message }
+                if message == "unknown launch \"missing\""
+        ));
+
+        let err = lookup_launch(&cfg, "agent").unwrap_err();
+        assert!(matches!(err, OperationError::OperationFailed { .. }));
+        assert!(
+            err.to_string()
+                .contains("launch \"agent\" uses launch template \"missing-template\""),
+            "{err}"
+        );
     }
 
     #[test]

@@ -78,7 +78,7 @@ use ops::{
     ExecutionOutcome, GatewayOperation, GatewayOperationResult, OperationError,
     OperationExecutionOptions, OperationMode, OperationResult, OutputSelection, RemoveResult,
     StopResult, SuppliedLaunchVarValue, SuppliedLaunchVars, execute_gateway_operation,
-    operation_up_with_runtime,
+    lookup_launch, operation_up_with_runtime,
 };
 use session::{generate_session_id_value, validate_session_id};
 
@@ -1150,9 +1150,7 @@ async fn launch_execute_with_config(
     supplied: SuppliedLaunchVars,
     options: OperationExecutionOptions,
 ) -> OperationResult<ExecutionOutcome> {
-    let launch = cfg
-        .effective_launch(name)
-        .map_err(|err| OperationError::unknown_launch(err.to_string()))?;
+    let launch = lookup_launch(&cfg, name)?;
     let resolved_vars = resolve_launch_vars(name, &launch, &supplied)?;
     let target = launch.target.clone();
     let runtime =
