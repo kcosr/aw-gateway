@@ -76,10 +76,10 @@ pub struct GatewayConfigCandidate {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GatewayConfigResolution {
-    pub user: UserContext,
-    pub user_config_dir: PathBuf,
-    pub user_state_dir: PathBuf,
-    pub user_config_file: PathBuf,
+    pub user: Option<UserContext>,
+    pub user_config_dir: Option<PathBuf>,
+    pub user_state_dir: Option<PathBuf>,
+    pub user_config_file: Option<PathBuf>,
     pub system_config_file: PathBuf,
     pub candidates: Vec<GatewayConfigCandidate>,
     pub selected_source: GatewayConfigSource,
@@ -107,16 +107,7 @@ pub fn gateway_config_path(input: Option<PathBuf>) -> PathBuf {
 }
 
 pub fn resolve_gateway_config(input: Option<PathBuf>) -> anyhow::Result<GatewayConfigResolution> {
-    let user = UserContext::current()?;
-    let user_config_dir = user.config_dir();
-    let user_state_dir = user.state_dir();
-    let user_config_file = user_config_dir.join(USER_GATEWAY_CONFIG_FILE);
     let system_config_file = PathBuf::from(SYSTEM_GATEWAY_CONFIG_PATH);
-    let user_candidate = GatewayConfigCandidate {
-        source: GatewayConfigSource::User,
-        exists: user_config_file.exists(),
-        path: user_config_file.clone(),
-    };
     let system_candidate = GatewayConfigCandidate {
         source: GatewayConfigSource::System,
         exists: system_config_file.exists(),
@@ -124,14 +115,19 @@ pub fn resolve_gateway_config(input: Option<PathBuf>) -> anyhow::Result<GatewayC
     };
 
     let mut candidates = Vec::new();
+    let mut user = None;
     let (selected_source, selected_path) = if let Some(path) = input {
         candidates.push(GatewayConfigCandidate {
             source: GatewayConfigSource::ExplicitFlag,
             exists: path.exists(),
             path: path.clone(),
         });
-        candidates.push(user_candidate);
-        candidates.push(system_candidate);
+        if let Ok(context) = UserContext::current() {
+            let (_, _, user_candidate) = user_gateway_paths(&context);
+            candidates.push(user_candidate);
+            user = Some(context);
+        }
+        candidates.push(system_candidate.clone());
         (GatewayConfigSource::ExplicitFlag, Some(path))
     } else if let Some(path) = std::env::var_os("AW_GATEWAY_CONFIG").map(PathBuf::from) {
         candidates.push(GatewayConfigCandidate {
@@ -139,10 +135,16 @@ pub fn resolve_gateway_config(input: Option<PathBuf>) -> anyhow::Result<GatewayC
             exists: path.exists(),
             path: path.clone(),
         });
-        candidates.push(user_candidate);
-        candidates.push(system_candidate);
+        if let Ok(context) = UserContext::current() {
+            let (_, _, user_candidate) = user_gateway_paths(&context);
+            candidates.push(user_candidate);
+            user = Some(context);
+        }
+        candidates.push(system_candidate.clone());
         (GatewayConfigSource::Environment, Some(path))
     } else {
+        let context = UserContext::current()?;
+        let (_, _, user_candidate) = user_gateway_paths(&context);
         let selected = if user_candidate.exists {
             (GatewayConfigSource::User, Some(user_candidate.path.clone()))
         } else if system_candidate.exists {
@@ -154,9 +156,17 @@ pub fn resolve_gateway_config(input: Option<PathBuf>) -> anyhow::Result<GatewayC
             (GatewayConfigSource::None, None)
         };
         candidates.push(user_candidate);
-        candidates.push(system_candidate);
+        candidates.push(system_candidate.clone());
+        user = Some(context);
         selected
     };
+    let (user_config_dir, user_state_dir, user_config_file) = user
+        .as_ref()
+        .map(|user| {
+            let (config_dir, state_dir, candidate) = user_gateway_paths(user);
+            (Some(config_dir), Some(state_dir), Some(candidate.path))
+        })
+        .unwrap_or((None, None, None));
 
     Ok(GatewayConfigResolution {
         user,
@@ -168,6 +178,18 @@ pub fn resolve_gateway_config(input: Option<PathBuf>) -> anyhow::Result<GatewayC
         selected_source,
         selected_path,
     })
+}
+
+fn user_gateway_paths(user: &UserContext) -> (PathBuf, PathBuf, GatewayConfigCandidate) {
+    let user_config_dir = user.config_dir();
+    let user_state_dir = user.state_dir();
+    let user_config_file = user_config_dir.join(USER_GATEWAY_CONFIG_FILE);
+    let user_candidate = GatewayConfigCandidate {
+        source: GatewayConfigSource::User,
+        exists: user_config_file.exists(),
+        path: user_config_file,
+    };
+    (user_config_dir, user_state_dir, user_candidate)
 }
 
 pub fn agent_config_path(input: Option<PathBuf>) -> PathBuf {

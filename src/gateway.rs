@@ -199,17 +199,24 @@ fn config_paths(config: Option<PathBuf>, args: ConfigPathsArgs) -> anyhow::Resul
         return Ok(());
     }
 
-    println!("user: {}", resolution.user.user);
-    println!("uid: {}", resolution.user.uid);
-    println!("gid: {}", resolution.user.gid);
-    println!("home: {}", resolution.user.home.display());
-    println!("user_config_dir: {}", resolution.user_config_dir.display());
-    println!("user_state_dir: {}", resolution.user_state_dir.display());
-    println!(
-        "user_config_file: {} ({})",
-        resolution.user_config_file.display(),
-        exists_label(resolution.user_config_file.exists())
-    );
+    if let Some(user) = &resolution.user {
+        println!("user: {}", user.user);
+        println!("uid: {}", user.uid);
+        println!("gid: {}", user.gid);
+        println!("home: {}", user.home.display());
+    } else {
+        println!("user: unavailable");
+    }
+    print_optional_path("user_config_dir", resolution.user_config_dir.as_deref());
+    print_optional_path("user_state_dir", resolution.user_state_dir.as_deref());
+    match &resolution.user_config_file {
+        Some(path) => println!(
+            "user_config_file: {} ({})",
+            path.display(),
+            exists_label(path.exists())
+        ),
+        None => println!("user_config_file: unavailable"),
+    }
     println!(
         "system_config_file: {} ({})",
         resolution.system_config_file.display(),
@@ -224,6 +231,13 @@ fn config_paths(config: Option<PathBuf>, args: ConfigPathsArgs) -> anyhow::Resul
         None => println!("selected: none"),
     }
     Ok(())
+}
+
+fn print_optional_path(label: &str, path: Option<&std::path::Path>) {
+    match path {
+        Some(path) => println!("{label}: {}", path.display()),
+        None => println!("{label}: unavailable"),
+    }
 }
 
 fn exists_label(exists: bool) -> &'static str {
