@@ -83,7 +83,10 @@ pub(super) fn operation_error_response(err: OperationError) -> Response {
             ErrorCode::InvalidLaunchVar,
             message,
         ),
-        OperationError::OperationFailed { .. } => HttpError::operation_failed(message),
+        OperationError::AgentNotReady { .. }
+        | OperationError::ContainerNotFound { .. }
+        | OperationError::ContainerLabelMismatch { .. }
+        | OperationError::OperationFailed { .. } => HttpError::operation_failed(message),
     }
     .into_response()
 }

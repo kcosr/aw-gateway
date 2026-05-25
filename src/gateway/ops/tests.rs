@@ -224,6 +224,33 @@ fn operation_error_display_preserves_messages_and_source() {
 }
 
 #[test]
+fn operation_failure_classifier_preserves_typed_runtime_failures() {
+    let err = OperationError::operation_failed(anyhow::Error::new(
+        crate::gateway::failures::AgentNotReady,
+    ));
+    assert!(matches!(err, OperationError::AgentNotReady { .. }));
+    assert_eq!(err.to_string(), "container agent did not become ready");
+    assert!(std::error::Error::source(&err).is_some());
+
+    let err = OperationError::operation_failed(anyhow::Error::new(
+        crate::gateway::failures::ContainerNotFound::after_start(),
+    ));
+    assert!(matches!(err, OperationError::ContainerNotFound { .. }));
+    assert_eq!(err.to_string(), "container did not exist after start");
+
+    let err = OperationError::operation_failed(anyhow::Error::new(
+        crate::runtime::GatewayLabelError::Missing {
+            key: "io.aw-gateway.target".into(),
+        },
+    ));
+    assert!(matches!(err, OperationError::ContainerLabelMismatch { .. }));
+    assert_eq!(
+        err.to_string(),
+        "container missing required label \"io.aw-gateway.target\""
+    );
+}
+
+#[test]
 fn operation_error_constructors_set_expected_variants() {
     assert!(matches!(
         OperationError::invalid_request("x"),

@@ -1,4 +1,5 @@
 use super::Runtime;
+use super::failures::ContainerNotFound;
 use crate::config::{IdleCleanupAction, IdleCleanupConfig, IdleCleanupOwner, LifecyclePhase};
 use crate::runtime::ContainerInspect;
 use tokio::net::TcpStream;
@@ -66,7 +67,7 @@ impl Runtime {
         self.container_runtime
             .inspect(&self.identity.container_name)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("container did not exist after start"))
+            .ok_or_else(|| ContainerNotFound::after_start().into())
     }
 
     pub(super) async fn apply_gateway_idle_cleanup(&self) -> anyhow::Result<()> {

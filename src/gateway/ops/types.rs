@@ -1,4 +1,6 @@
 use crate::config;
+use crate::gateway::failures::{AgentNotReady, ContainerNotFound};
+use crate::runtime::GatewayLabelError;
 use std::fmt;
 
 #[derive(Debug)]
@@ -10,6 +12,9 @@ pub(in crate::gateway) enum OperationError {
     UnknownLaunch { message: String },
     InvalidLaunchVariable { message: String },
     InvalidSession { message: String },
+    AgentNotReady { source: anyhow::Error },
+    ContainerNotFound { source: anyhow::Error },
+    ContainerLabelMismatch { source: anyhow::Error },
     OperationFailed { source: anyhow::Error },
 }
 
@@ -45,6 +50,15 @@ impl OperationError {
     }
 
     pub(in crate::gateway) fn operation_failed(source: anyhow::Error) -> Self {
+        if source.chain().any(|err| err.is::<AgentNotReady>()) {
+            return Self::AgentNotReady { source };
+        }
+        if source.chain().any(|err| err.is::<ContainerNotFound>()) {
+            return Self::ContainerNotFound { source };
+        }
+        if source.chain().any(|err| err.is::<GatewayLabelError>()) {
+            return Self::ContainerLabelMismatch { source };
+        }
         Self::OperationFailed { source }
     }
 }
@@ -63,7 +77,10 @@ impl fmt::Display for OperationError {
             | Self::UnknownLaunch { message }
             | Self::InvalidLaunchVariable { message }
             | Self::InvalidSession { message } => formatter.write_str(message),
-            Self::OperationFailed { source } => fmt::Display::fmt(source, formatter),
+            Self::AgentNotReady { source }
+            | Self::ContainerNotFound { source }
+            | Self::ContainerLabelMismatch { source }
+            | Self::OperationFailed { source } => fmt::Display::fmt(source, formatter),
         }
     }
 }
@@ -71,7 +88,10 @@ impl fmt::Display for OperationError {
 impl std::error::Error for OperationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::OperationFailed { source } => Some(source.as_ref()),
+            Self::AgentNotReady { source }
+            | Self::ContainerNotFound { source }
+            | Self::ContainerLabelMismatch { source }
+            | Self::OperationFailed { source } => Some(source.as_ref()),
             Self::InvalidRequest { .. }
             | Self::DisabledAction { .. }
             | Self::UnknownLaunch { .. }
