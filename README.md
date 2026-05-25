@@ -944,7 +944,7 @@ partial object merge or override behavior. Include files may define nested
 `[targets.<name>]`, and `[launches.<name>]`.
 
 Gateway-wide policy and defaults remain root-owned. Include files must not
-define `schema_version`, `default_target`, `[runtime]`, `[logging]`,
+define `schema_version`, `default_target`, `extends`, `[runtime]`, `[logging]`,
 `[http]`, `[ssh_dispatch]`, `[client_config]`, `[target_defaults]`, or
 `[launch_defaults]`.
 
