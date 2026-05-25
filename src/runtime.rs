@@ -4,6 +4,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -618,15 +619,59 @@ pub fn validate_gateway_labels(
         match inspect.config.labels.get(key) {
             Some(actual) if actual == value => {}
             Some(actual) => {
-                anyhow::bail!(
-                    "container label mismatch for {key}: expected {value:?}, got {actual:?}"
-                );
+                return Err(GatewayLabelError::mismatch(key, value, actual).into());
             }
-            None => anyhow::bail!("container missing required label {key:?}"),
+            None => return Err(GatewayLabelError::missing(key).into()),
         }
     }
     Ok(())
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayLabelError {
+    Mismatch {
+        key: String,
+        expected: String,
+        actual: String,
+    },
+    Missing {
+        key: String,
+    },
+}
+
+impl GatewayLabelError {
+    fn mismatch(key: &str, expected: &str, actual: &str) -> Self {
+        Self::Mismatch {
+            key: key.into(),
+            expected: expected.into(),
+            actual: actual.into(),
+        }
+    }
+
+    fn missing(key: &str) -> Self {
+        Self::Missing { key: key.into() }
+    }
+}
+
+impl fmt::Display for GatewayLabelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mismatch {
+                key,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "container label mismatch for {key}: expected {expected:?}, got {actual:?}"
+            ),
+            Self::Missing { key } => {
+                write!(formatter, "container missing required label {key:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GatewayLabelError {}
 
 pub fn socket_is_safe(path: &Path) -> anyhow::Result<()> {
     socket_is_safe_for(path, unsafe { libc::geteuid() }, unsafe { libc::getegid() })
@@ -878,6 +923,43 @@ mod tests {
             "alice",
             2451
         ));
+    }
+
+    #[test]
+    fn validate_gateway_labels_returns_typed_label_errors() {
+        let mut expected = BTreeMap::new();
+        expected.insert("io.aw-gateway.target".into(), "default".into());
+        let inspect = ContainerInspect {
+            id: "abc".into(),
+            name: "aw-default".into(),
+            state: ContainerState {
+                running: true,
+                pid: 123,
+            },
+            config: ContainerConfig {
+                labels: BTreeMap::new(),
+            },
+        };
+
+        let err = validate_gateway_labels(&inspect, &expected).unwrap_err();
+        assert!(err.is::<GatewayLabelError>());
+        assert_eq!(
+            err.to_string(),
+            "container missing required label \"io.aw-gateway.target\""
+        );
+
+        let inspect = ContainerInspect {
+            config: ContainerConfig {
+                labels: BTreeMap::from([("io.aw-gateway.target".into(), "other".into())]),
+            },
+            ..inspect
+        };
+        let err = validate_gateway_labels(&inspect, &expected).unwrap_err();
+        assert!(err.is::<GatewayLabelError>());
+        assert_eq!(
+            err.to_string(),
+            "container label mismatch for io.aw-gateway.target: expected \"default\", got \"other\""
+        );
     }
 
     #[test]

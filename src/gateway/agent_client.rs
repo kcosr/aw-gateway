@@ -1,4 +1,5 @@
 use super::Runtime;
+use super::failures::AgentNotReady;
 use crate::agent_control::{
     AgentStatus, ControlEnvelope, ControlFailure, ControlSuccess, SessionHoldParams,
     SessionHoldResult, ShutdownParams, ShutdownResult,
@@ -24,7 +25,7 @@ impl Runtime {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                anyhow::bail!("container agent did not become ready");
+                return Err(AgentNotReady.into());
             }
             sleep(Duration::from_millis(250)).await;
         }

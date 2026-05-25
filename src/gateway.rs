@@ -52,6 +52,7 @@ mod client;
 mod container_spec;
 mod control_sockets;
 mod execution;
+mod failures;
 mod health;
 mod http;
 mod identity;

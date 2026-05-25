@@ -419,6 +419,32 @@ async fn operation_errors_map_all_typed_variants_to_http_codes() {
             "operation_failed",
             "runtime failed",
         ),
+        (
+            OperationError::operation_failed(anyhow::Error::new(
+                crate::gateway::failures::AgentNotReady,
+            )),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "operation_failed",
+            "container agent did not become ready",
+        ),
+        (
+            OperationError::operation_failed(anyhow::Error::new(
+                crate::gateway::failures::ContainerNotFound::after_start(),
+            )),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "operation_failed",
+            "container did not exist after start",
+        ),
+        (
+            OperationError::operation_failed(anyhow::Error::new(
+                crate::runtime::GatewayLabelError::Missing {
+                    key: "io.aw-gateway.target".into(),
+                },
+            )),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "operation_failed",
+            "container missing required label \"io.aw-gateway.target\"",
+        ),
     ];
 
     for (err, expected_status, expected_code, expected_message) in cases {
