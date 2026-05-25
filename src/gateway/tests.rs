@@ -3152,24 +3152,7 @@ fn detects_current_process_session_marker_as_active() {
 }
 
 #[test]
-fn old_shape_session_marker_deserializes_without_launch() {
-    let raw = r#"
-{
-  "id": "test",
-  "kind": "run-command",
-  "gateway_pid": 123,
-  "gateway_start_time": "456",
-  "container": "ubuntu-dev",
-  "target": "default",
-  "created_at_ms": 789
-}
-"#;
-    let marker: SessionMarker = serde_json::from_str(raw).unwrap();
-    assert_eq!(marker.launch, None);
-}
-
-#[test]
-fn session_marker_launch_round_trips_and_none_is_omitted() {
+fn session_marker_launch_round_trips_and_none_serializes_as_null() {
     let marker = SessionMarker {
         id: "test".into(),
         kind: "launch".into(),
@@ -3189,7 +3172,23 @@ fn session_marker_launch_round_trips_and_none_is_omitted() {
         ..marker
     };
     let raw = serde_json::to_string(&without_launch).unwrap();
-    assert!(!raw.contains("\"launch\":"));
+    assert!(raw.contains("\"launch\":null"));
+}
+
+#[test]
+fn session_marker_requires_launch_field() {
+    let raw = r#"
+{
+  "id": "test",
+  "kind": "run-command",
+  "gateway_pid": 123,
+  "gateway_start_time": "456",
+  "container": "ubuntu-dev",
+  "target": "default",
+  "created_at_ms": 789
+}
+"#;
+    serde_json::from_str::<SessionMarker>(raw).unwrap_err();
 }
 
 #[test]
