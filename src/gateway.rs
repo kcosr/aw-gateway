@@ -4,16 +4,13 @@ use crate::cli::{
     SetDefaultArgs, StatusArg, StopArgs, TargetArg, TargetsArgs, UpArgs,
 };
 use crate::config::{
-    ContainerMountMode, ContainerRuntimeType, ControlSocketConfig, GatewayConfig,
-    IdleCleanupAction, IdleCleanupOwner, LaunchConfig, LaunchStep, LaunchStepLocation,
-    LaunchVarConfig, LaunchVarType, LifecyclePhase, LifecycleStep, LocalSshBackend, LocalSshMode,
-    LocalSshReadiness, TargetConfig, TargetMode, validate_name, validate_passwd_scalar,
+    ContainerRuntimeType, ControlSocketConfig, GatewayConfig, IdleCleanupAction, IdleCleanupOwner,
+    LaunchConfig, LaunchStep, LaunchStepLocation, LaunchVarConfig, LaunchVarType, LifecyclePhase,
+    LifecycleStep, LocalSshBackend, LocalSshMode, LocalSshReadiness, TargetConfig, TargetMode,
+    validate_name, validate_passwd_scalar,
 };
 use crate::paths::{self, UserContext};
-use crate::runtime::{
-    self, ContainerExecSpec, ContainerInspect, ContainerMountSpec, ContainerRunSpec,
-    ContainerRuntime,
-};
+use crate::runtime::{ContainerExecSpec, ContainerInspect, ContainerRuntime};
 use crate::ssh_dispatch::{self, Dispatch, GatewayAction};
 use crate::ssh_filter::{
     is_sftp_server_command, legacy_scp_mode_allows, legacy_scp_server_direction,
@@ -29,7 +26,6 @@ use tokio::time::{Duration, Instant, sleep};
 pub const DEFAULT_GATEWAY_CONFIG: &str = include_str!("../aw-gateway.sample.toml");
 const MAX_SSH_ORIGINAL_COMMAND_BYTES: usize = 64 * 1024;
 const DEFAULT_HOST_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
-const DEFAULT_SESSION_SHELL_ENV: &str = "/usr/bin/bash";
 
 #[cfg(target_os = "linux")]
 const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
@@ -55,6 +51,7 @@ const UNIX_SOCKET_PATH_MAX_BYTES: usize = 103;
 
 mod agent_client;
 mod client;
+mod container_spec;
 mod control_sockets;
 mod execution;
 mod health;
@@ -72,6 +69,8 @@ mod workspace;
 
 use agent_client::AgentSessionHold;
 use client::{read_default_selection, resolve_target_selection};
+#[cfg(test)]
+use container_spec::DEFAULT_SESSION_SHELL_ENV;
 use control_sockets::{render_control_socket_paths, resolve_container_path};
 use execution::{OperationRunner, run_container_command_with_runtime};
 use health::{run_argv_with_options, run_argv_with_timeout, run_health_check};
@@ -95,7 +94,9 @@ use status_view::{status_all_entries, status_launch};
 use workspace::resolve_target_workspace;
 
 #[cfg(test)]
-use crate::config::{HealthCheck, WorkspaceCleanup};
+use crate::config::{ContainerMountMode, HealthCheck, WorkspaceCleanup};
+#[cfg(test)]
+use crate::runtime;
 #[cfg(test)]
 use crate::runtime::ManagedContainer;
 #[cfg(test)]
@@ -1599,150 +1600,6 @@ impl Runtime {
         Ok(false)
     }
 
-    fn labels(&self) -> BTreeMap<String, String> {
-        let mut labels = self.validation_labels();
-        labels.extend([
-            ("io.aw-gateway.image".into(), self.target.image.clone()),
-            (
-                "io.aw-gateway.mode".into(),
-                format!("{:?}", self.target.mode).to_lowercase(),
-            ),
-        ]);
-        if let Some(session_id) = &self.identity.session_id {
-            labels.insert("io.aw-gateway.session_id".into(), session_id.clone());
-        }
-        if self.target.mode == TargetMode::Ephemeral
-            && let Some(launch_name) = &self.identity.launch_name
-        {
-            labels.insert("io.aw-gateway.launch".into(), launch_name.clone());
-        }
-        labels
-    }
-
-    fn validation_labels(&self) -> BTreeMap<String, String> {
-        BTreeMap::from([
-            ("io.aw-gateway.gateway".into(), "true".into()),
-            ("io.aw-gateway.user".into(), self.identity.user.user.clone()),
-            (
-                "io.aw-gateway.uid".into(),
-                self.identity.user.uid.to_string(),
-            ),
-            (
-                "io.aw-gateway.target".into(),
-                self.identity.target_name.clone(),
-            ),
-            (
-                "io.aw-gateway.container_id".into(),
-                self.identity.container_name.clone(),
-            ),
-        ])
-    }
-
-    fn validate_labels(&self, inspect: &ContainerInspect) -> anyhow::Result<()> {
-        runtime::validate_gateway_labels(inspect, &self.validation_labels())
-    }
-
-    async fn start_container(&self) -> anyhow::Result<()> {
-        let identity_token = self
-            .target
-            .container_agent
-            .needs_identity_token()
-            .then(|| self.ensure_identity_token())
-            .transpose()?;
-        let control_token = self
-            .agent_control_enabled()
-            .then(|| self.ensure_control_token())
-            .transpose()?;
-        self.warn_about_unsafe_container_mounts()?;
-        let run_spec =
-            self.container_run_spec(identity_token.as_deref(), control_token.as_deref())?;
-        self.container_runtime.run_detached(&run_spec).await
-    }
-
-    fn container_run_spec(
-        &self,
-        identity_token: Option<&str>,
-        control_token: Option<&str>,
-    ) -> anyhow::Result<ContainerRunSpec> {
-        let mut env = BTreeMap::new();
-        if let Some(identity_token) = identity_token {
-            env.insert("AW_IDENTITY_TOKEN".into(), identity_token.to_string());
-        }
-        if let Some(control_token) = control_token {
-            env.insert(
-                "AW_CONTAINER_CONTROL_TOKEN".into(),
-                control_token.to_string(),
-            );
-        }
-        if self.agent_enabled() {
-            env.insert(
-                "AW_AUTHENTICATED_UID".into(),
-                self.identity.user.uid.to_string(),
-            );
-            env.insert(
-                "AW_AUTHENTICATED_GID".into(),
-                self.identity.user.gid.to_string(),
-            );
-        }
-        env.extend(self.render_env_map(&self.target.container_env)?);
-        let command = if self.agent_enabled() {
-            if self.target.container_bootstrap.enabled {
-                vec![
-                    self.render_value(&self.target.container_bootstrap.entrypoint)?,
-                    "--config".into(),
-                    self.container_agent_config_in_container()
-                        .display()
-                        .to_string(),
-                    "--bootstrap-config".into(),
-                    self.container_bootstrap_config_in_container()
-                        .display()
-                        .to_string(),
-                ]
-            } else {
-                vec![
-                    "aw-container-agent".into(),
-                    "--config".into(),
-                    self.container_agent_config_in_container()
-                        .display()
-                        .to_string(),
-                    "run".into(),
-                ]
-            }
-        } else {
-            vec!["sleep".into(), "infinity".into()]
-        };
-        Ok(ContainerRunSpec {
-            name: self.identity.container_name.clone(),
-            hostname: self.identity.container_name.clone(),
-            image: self.target.image.clone(),
-            workspace: self.paths.workspace.clone(),
-            container_home: self.identity.container_home.clone(),
-            container_user: if self.target.container_bootstrap.enabled {
-                self.bootstrap_identity()
-            } else {
-                self.identity.container_user.clone()
-            },
-            passwd_entry: self
-                .container_runtime
-                .is_podman()
-                .then(|| self.passwd_entry()),
-            state_dir_in_container: self.paths.container_state_dir_in_container.clone(),
-            mounts: self.container_mounts()?,
-            env,
-            labels: self.labels(),
-            publish_ssh: self.ssh_endpoint_configured()
-                && self.ssh_backend() == LocalSshBackend::PublishedPort,
-            extra_run_args: self
-                .target
-                .runtime
-                .extra_run_args
-                .iter()
-                .map(|arg| self.render_value(arg))
-                .collect::<anyhow::Result<Vec<_>>>()?,
-            command,
-        })
-    }
-
     async fn run_lifecycle_phase(
         &self,
         phase: LifecyclePhase,
@@ -1819,173 +1676,6 @@ impl Runtime {
             }
             sleep(Duration::from_millis(250)).await;
         }
-    }
-
-    fn vars(&self, container_pid: Option<&str>) -> Vars {
-        let mut vars = Vars::new();
-        vars.insert("user".into(), self.identity.user.user.clone());
-        vars.insert("uid".into(), self.identity.session_uid.to_string());
-        vars.insert("gid".into(), self.identity.session_gid.to_string());
-        vars.insert("home".into(), self.identity.user.home.display().to_string());
-        vars.insert(
-            "container_user".into(),
-            self.identity.container_user.clone(),
-        );
-        vars.insert(
-            "container_home".into(),
-            self.identity.container_home.display().to_string(),
-        );
-        vars.insert(
-            "workspace".into(),
-            self.paths.workspace.display().to_string(),
-        );
-        vars.insert(
-            "state".into(),
-            self.paths
-                .workspace
-                .join(&self.target.workspace.state_dir)
-                .display()
-                .to_string(),
-        );
-        vars.insert(
-            "state_dir".into(),
-            self.identity.user.state_dir().display().to_string(),
-        );
-        vars.insert("target".into(), self.identity.target_name.clone());
-        if let Some(session_id) = &self.identity.session_id {
-            vars.insert("session_id".into(), session_id.clone());
-        }
-        vars.insert("image".into(), self.target.image.clone());
-        vars.insert(
-            "image_slug".into(),
-            template::image_slug(&self.target.image),
-        );
-        vars.insert(
-            "container_name".into(),
-            self.identity.container_name.clone(),
-        );
-        vars.insert(
-            "container_state_dir".into(),
-            self.paths.container_state_dir.display().to_string(),
-        );
-        vars.insert(
-            "container_state_dir_in_container".into(),
-            self.paths
-                .container_state_dir_in_container
-                .display()
-                .to_string(),
-        );
-        if let Some(container_pid) = container_pid {
-            vars.insert("container_pid".into(), container_pid.to_string());
-        }
-        vars
-    }
-
-    fn passwd_entry(&self) -> String {
-        format!(
-            "{}:x:{}:{}:{}:{}:{}",
-            self.identity.container_user,
-            self.identity.session_uid,
-            self.identity.session_gid,
-            self.identity.container_user,
-            self.identity.container_home.display(),
-            self.identity.session_shell,
-        )
-    }
-
-    fn container_mounts(&self) -> anyhow::Result<Vec<ContainerMountSpec>> {
-        let mut mounts = self
-            .target
-            .container_mounts
-            .iter()
-            .enumerate()
-            .map(|(index, mount)| {
-                let vars = self.vars(None);
-                let source = PathBuf::from(template::render(&mount.source, &vars)?);
-                let source = source.canonicalize().with_context(|| {
-                    format!("container mount source #{index} {}", source.display())
-                })?;
-                Ok(ContainerMountSpec {
-                    source,
-                    target: PathBuf::from(template::render(&mount.target, &vars)?),
-                    readonly: mount.mode == ContainerMountMode::Ro,
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        mounts.push(ContainerMountSpec {
-            source: self.paths.control_sockets.host_dir.clone(),
-            target: self.paths.control_sockets.container_dir.clone(),
-            readonly: false,
-        });
-        Ok(mounts)
-    }
-
-    fn warn_about_unsafe_container_mounts(&self) -> anyhow::Result<()> {
-        for (index, mount) in self.container_mounts()?.into_iter().enumerate() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let metadata = std::fs::metadata(&mount.source).with_context(|| {
-                    format!(
-                        "stat container mount source #{} {}",
-                        index,
-                        mount.source.display()
-                    )
-                })?;
-                if metadata.permissions().mode() & 0o002 != 0 {
-                    tracing::warn!(
-                        mount = index,
-                        source = %mount.source.display(),
-                        "container mount source is world-writable"
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn render_value(&self, value: &str) -> anyhow::Result<String> {
-        template::render(value, &self.vars(None))
-    }
-
-    fn render_env_map(
-        &self,
-        env: &BTreeMap<String, String>,
-    ) -> anyhow::Result<BTreeMap<String, String>> {
-        env.iter()
-            .map(|(key, value)| Ok((key.clone(), self.render_value(value)?)))
-            .collect()
-    }
-
-    fn exec_identity(&self) -> String {
-        if self.container_runtime.is_podman() {
-            format!(
-                "{}:{}",
-                self.identity.session_uid, self.identity.session_gid
-            )
-        } else {
-            self.identity.container_user.clone()
-        }
-    }
-
-    fn bootstrap_identity(&self) -> String {
-        if self.container_runtime.is_podman() {
-            "0:0".into()
-        } else {
-            self.identity.bootstrap_user.clone()
-        }
-    }
-
-    fn session_env(&self) -> anyhow::Result<BTreeMap<String, String>> {
-        let mut env = BTreeMap::from([
-            ("SHELL".into(), DEFAULT_SESSION_SHELL_ENV.to_string()),
-            (
-                "PATH".into(),
-                "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
-            ),
-        ]);
-        env.extend(self.render_env_map(&self.target.session_env)?);
-        Ok(env)
     }
 
     fn ssh_backend(&self) -> LocalSshBackend {
