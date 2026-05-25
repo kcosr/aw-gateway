@@ -3740,6 +3740,308 @@ name = "default"
 }
 
 #[test]
+fn extends_merges_base_includes_before_child_overrides() {
+    let dir = tempfile::tempdir().unwrap();
+    let base_dir = dir.path().join("base");
+    let child_dir = dir.path().join("child");
+    std::fs::create_dir_all(base_dir.join("config.d")).unwrap();
+    std::fs::create_dir_all(&child_dir).unwrap();
+    std::fs::write(
+        base_dir.join("config.d/target.toml"),
+        r#"
+[targets.rocky8-sip]
+image = "rocky:8"
+mode = "fixed"
+name = "rocky8-sip"
+
+[[targets.rocky8-sip.container_agent.services]]
+name = "acl-proxy"
+command = ["acl-proxy"]
+restart = "always"
+"#,
+    )
+    .unwrap();
+    let base = base_dir.join("gateway.toml");
+    std::fs::write(
+        &base,
+        r#"
+schema_version = "1"
+default_target = "rocky8-sip"
+includes = ["config.d/*.toml"]
+"#,
+    )
+    .unwrap();
+    let child = child_dir.join("gateway.toml");
+    std::fs::write(
+        &child,
+        format!(
+            r#"
+extends = "{}"
+
+[[targets.rocky8-sip.container_agent.services]]
+name = "agent-runner"
+required = false
+cwd = "/home/aw/git/agent-runner"
+command = ["agent-runner", "serve"]
+restart = "always"
+depends_on = ["acl-proxy"]
+"#,
+            base.display()
+        ),
+    )
+    .unwrap();
+
+    let cfg = GatewayConfig::load(&child).unwrap();
+    let target = cfg.effective_target("rocky8-sip").unwrap();
+    let services = target.container_agent.services;
+    assert_eq!(services.len(), 2);
+    assert_eq!(services[0].name, "acl-proxy");
+    assert_eq!(services[1].name, "agent-runner");
+    assert_eq!(services[1].depends_on, ["acl-proxy"]);
+}
+
+#[test]
+fn extends_merges_named_entries_and_replaces_plain_arrays() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.toml");
+    std::fs::write(
+        &base,
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/base"
+mode = "fixed"
+name = "default"
+container_mounts = [
+  { source = "/base", target = "/data" },
+]
+
+[targets.default.runtime]
+extra_run_args = ["--base"]
+
+[[targets.default.container_agent.services]]
+name = "worker"
+command = ["old-worker"]
+restart = "never"
+
+[[targets.default.container_agent.services]]
+name = "base-only"
+command = ["base-only"]
+"#,
+    )
+    .unwrap();
+    let child = dir.path().join("child.toml");
+    std::fs::write(
+        &child,
+        format!(
+            r#"
+extends = "{}"
+
+[targets.default]
+container_mounts = [
+  {{ source = "/child", target = "/data" }},
+]
+
+[targets.default.runtime]
+extra_run_args = ["--child"]
+
+[[targets.default.container_agent.services]]
+name = "worker"
+command = ["new-worker"]
+required = false
+
+[[targets.default.container_agent.services]]
+name = "child-only"
+command = ["child-only"]
+"#,
+            base.display()
+        ),
+    )
+    .unwrap();
+
+    let cfg = GatewayConfig::load(&child).unwrap();
+    let target = cfg.targets.get("default").unwrap();
+    assert_eq!(
+        target
+            .container_mounts
+            .iter()
+            .map(|mount| mount.source.as_str())
+            .collect::<Vec<_>>(),
+        ["/child"]
+    );
+    assert_eq!(
+        target
+            .runtime
+            .as_ref()
+            .unwrap()
+            .extra_run_args
+            .as_ref()
+            .unwrap(),
+        &vec!["--child".to_string()]
+    );
+    let services = &target.container_agent.as_ref().unwrap().services;
+    assert_eq!(
+        services
+            .iter()
+            .map(|service| service.name.as_str())
+            .collect::<Vec<_>>(),
+        ["worker", "base-only", "child-only"]
+    );
+    assert_eq!(services[0].command, ["new-worker".to_string()]);
+    assert_eq!(services[0].restart, RestartPolicy::Never);
+    assert!(!services[0].required);
+}
+
+#[test]
+fn extends_replaces_service_env_values_by_variable_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.toml");
+    std::fs::write(
+        &base,
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/base"
+mode = "fixed"
+name = "default"
+
+[[targets.default.container_agent.services]]
+name = "worker"
+command = ["worker"]
+
+[targets.default.container_agent.services.env.SECRET]
+file = "/base/secret"
+"#,
+    )
+    .unwrap();
+    let child = dir.path().join("child.toml");
+    std::fs::write(
+        &child,
+        format!(
+            r#"
+extends = "{}"
+
+[[targets.default.container_agent.services]]
+name = "worker"
+
+[targets.default.container_agent.services.env.SECRET]
+value = "child"
+"#,
+            base.display()
+        ),
+    )
+    .unwrap();
+
+    let cfg = GatewayConfig::load(&child).unwrap();
+    let target = cfg.targets.get("default").unwrap();
+    let service = &target.container_agent.as_ref().unwrap().services[0];
+    let secret = service.env.get("SECRET").unwrap();
+    assert_eq!(secret.value.as_deref(), Some("child"));
+    assert_eq!(secret.file, None);
+}
+
+#[test]
+fn extends_resolves_each_root_includes_relative_to_declaring_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let base_dir = dir.path().join("base");
+    let child_dir = dir.path().join("child");
+    std::fs::create_dir_all(base_dir.join("config.d")).unwrap();
+    std::fs::create_dir_all(child_dir.join("config.d")).unwrap();
+    std::fs::write(
+        base_dir.join("config.d/base-target.toml"),
+        r#"
+[targets.default]
+image = "ubuntu/base"
+mode = "fixed"
+name = "default"
+"#,
+    )
+    .unwrap();
+    let base = base_dir.join("gateway.toml");
+    std::fs::write(
+        &base,
+        r#"
+schema_version = "1"
+includes = ["config.d/*.toml"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        child_dir.join("config.d/launch.toml"),
+        r#"
+[launches.child]
+target = "default"
+command = ["child"]
+"#,
+    )
+    .unwrap();
+    let child = child_dir.join("gateway.toml");
+    std::fs::write(
+        &child,
+        r#"
+extends = "../base/gateway.toml"
+includes = ["config.d/*.toml"]
+"#,
+    )
+    .unwrap();
+
+    let cfg = GatewayConfig::load(&child).unwrap();
+    assert_eq!(
+        cfg.effective_target("default").unwrap().image,
+        "ubuntu/base"
+    );
+    assert_eq!(cfg.effective_launch("child").unwrap().command, ["child"]);
+}
+
+#[test]
+fn extends_rejects_cycles_and_extends_inside_includes() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.toml");
+    let b = dir.path().join("b.toml");
+    std::fs::write(&a, format!("extends = \"{}\"\n", b.display())).unwrap();
+    std::fs::write(&b, format!("extends = \"{}\"\n", a.display())).unwrap();
+    let err = format!("{:#}", GatewayConfig::load(&a).unwrap_err());
+    assert!(err.contains("extends cycle"), "{err}");
+
+    let config_dir = dir.path().join("config.d");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("fragment.toml"),
+        "extends = \"../base.toml\"\n",
+    )
+    .unwrap();
+    let root = dir.path().join("gateway.toml");
+    std::fs::write(
+        &root,
+        r#"
+schema_version = "1"
+includes = ["config.d/*.toml"]
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "default"
+"#,
+    )
+    .unwrap();
+    let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
+    assert!(err.contains("root-only"), "{err}");
+    assert!(err.contains("extends"), "{err}");
+}
+
+#[test]
+fn extends_rejects_glob_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("gateway.toml");
+    std::fs::write(&root, "extends = \"config.d/*.toml\"\n").unwrap();
+
+    let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
+    assert!(err.contains("globs are not supported"), "{err}");
+}
+
+#[test]
 fn container_agent_rejects_service_dependency_cycles() {
     let cfg: ContainerAgentFile = toml::from_str(
         r#"

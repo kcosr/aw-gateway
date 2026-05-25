@@ -606,6 +606,8 @@ Gateway configs commonly include:
   launches opt into with ordered `use = [...]`.
 - `includes`: strict include globs for splitting target templates, launch
   templates, targets, and launches into separate TOML files.
+- `extends`: root config inheritance for layering a selected config over a
+  managed base config.
 - `[[target_defaults.container_mounts]]` and `[[targets.<name>.container_mounts]]`: extra
   host-to-container bind mounts, typically read-only bootstrap
   binaries/configs/certs.
@@ -942,9 +944,41 @@ partial object merge or override behavior. Include files may define nested
 `[targets.<name>]`, and `[launches.<name>]`.
 
 Gateway-wide policy and defaults remain root-owned. Include files must not
-define `schema_version`, `default_target`, `[runtime]`, `[logging]`,
+define `schema_version`, `default_target`, `extends`, `[runtime]`, `[logging]`,
 `[http]`, `[ssh_dispatch]`, `[client_config]`, `[target_defaults]`, or
 `[launch_defaults]`.
+
+Root configs may inherit another root config with `extends`:
+
+```toml
+extends = "/etc/aw-gateway/gateway.toml"
+```
+
+`extends` is honored only by the selected root config. Unlike include files, an
+extended root may define root-owned policy, defaults, templates, targets, and
+launches. The loader composes each file's own `includes` relative to that file,
+strips loader-only `extends` and `includes`, then merges base-to-child before
+normal validation.
+
+Root inheritance uses these merge rules:
+
+- Tables merge by key, except each service `env.<NAME>` value replaces the
+  inherited value as a whole.
+- Scalars and ordinary arrays replace the inherited value. This includes
+  `container_mounts`, runtime argument arrays, command arrays, dependency
+  arrays, allow-list arrays, and launch variable value arrays.
+- Named service arrays merge by `name` at `target_defaults.container_agent.services`,
+  `target_templates.<name>.container_agent.services`, and
+  `targets.<name>.container_agent.services`.
+- Named step arrays merge by `name` for target lifecycle, host, and container
+  bootstrap steps, and for launch `steps` in launch defaults, templates, and
+  launches.
+
+Named arrays preserve inherited order and append new child entries. Step patch
+controls such as `enabled = false`, `before`, and `after` are not deletion or
+reorder operations across `extends`; after root inheritance, the merged step must
+still pass normal validation. Use target or launch template overlays when a
+target or launch needs to remove or reorder inherited steps.
 
 When `sftp = "deny"`, `start-container-sshd` removes the SFTP subsystem from
 the runtime SSHD config. Modern OpenSSH SCP uses SFTP, so that blocks both.

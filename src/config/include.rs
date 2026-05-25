@@ -1,27 +1,36 @@
-use super::{GatewayConfig, LaunchConfigInput, TargetConfigInput};
 use anyhow::Context;
 use glob::glob;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use toml::Value;
 
-pub(super) fn compose_gateway_includes(
-    cfg: &mut GatewayConfig,
+pub(super) fn compose_gateway_includes_value(
+    value: &mut Value,
     root_path: &Path,
 ) -> anyhow::Result<()> {
+    let Some(root_table) = value.as_table_mut() else {
+        anyhow::bail!(
+            "gateway config {} must be a TOML table",
+            root_path.display()
+        );
+    };
+    let includes: Vec<String> = root_table
+        .get("includes")
+        .map(|value| value.clone().try_into())
+        .transpose()
+        .with_context(|| format!("parse includes from {}", root_path.display()))?
+        .unwrap_or_default();
     let mut seen = BTreeSet::new();
     let root_dir = root_path.parent().unwrap_or_else(|| Path::new("."));
     let root_canonical = canonical_existing_path(root_path)?;
     let mut stack = BTreeSet::from([root_canonical]);
-    IncludeComposer {
-        target_templates: &mut cfg.target_templates,
-        launch_templates: &mut cfg.launch_templates,
-        targets: &mut cfg.targets,
-        launches: &mut cfg.launches,
+    ValueIncludeComposer {
+        root: root_table,
         seen: &mut seen,
         stack: &mut stack,
     }
-    .compose(&cfg.includes, root_dir)?;
+    .compose(&includes, root_dir)?;
     Ok(())
 }
 
@@ -30,26 +39,23 @@ pub(super) fn compose_gateway_includes(
 struct ConfigIncludeFile {
     #[serde(default)]
     includes: Vec<String>,
-    #[serde(default)]
-    target_templates: BTreeMap<String, TargetConfigInput>,
-    #[serde(default)]
-    launch_templates: BTreeMap<String, LaunchConfigInput>,
-    #[serde(default)]
-    targets: BTreeMap<String, TargetConfigInput>,
-    #[serde(default)]
-    launches: BTreeMap<String, LaunchConfigInput>,
+    #[serde(default, rename = "target_templates")]
+    _target_templates: BTreeMap<String, Value>,
+    #[serde(default, rename = "launch_templates")]
+    _launch_templates: BTreeMap<String, Value>,
+    #[serde(default, rename = "targets")]
+    _targets: BTreeMap<String, Value>,
+    #[serde(default, rename = "launches")]
+    _launches: BTreeMap<String, Value>,
 }
 
-struct IncludeComposer<'a> {
-    target_templates: &'a mut BTreeMap<String, TargetConfigInput>,
-    launch_templates: &'a mut BTreeMap<String, LaunchConfigInput>,
-    targets: &'a mut BTreeMap<String, TargetConfigInput>,
-    launches: &'a mut BTreeMap<String, LaunchConfigInput>,
+struct ValueIncludeComposer<'a> {
+    root: &'a mut toml::map::Map<String, Value>,
     seen: &'a mut BTreeSet<PathBuf>,
     stack: &'a mut BTreeSet<PathBuf>,
 }
 
-impl IncludeComposer<'_> {
+impl ValueIncludeComposer<'_> {
     fn compose(&mut self, patterns: &[String], base_dir: &Path) -> anyhow::Result<()> {
         for path in expand_include_patterns(patterns, base_dir)? {
             let canonical = canonical_existing_path(&path)?;
@@ -65,54 +71,75 @@ impl IncludeComposer<'_> {
             reject_root_only_include_sections(&raw, &path)?;
             let include: ConfigIncludeFile =
                 toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+            let mut include_value: Value =
+                toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
             let include_dir = path.parent().unwrap_or(base_dir);
             self.compose(&include.includes, include_dir)?;
-            self.insert_definitions(include, &path)?;
+            strip_include_loader_fields(&mut include_value);
+            self.insert_definitions(include_value, &path)?;
             self.stack.remove(&canonical);
         }
         Ok(())
     }
 
-    fn insert_definitions(
-        &mut self,
-        include: ConfigIncludeFile,
-        path: &Path,
-    ) -> anyhow::Result<()> {
-        for (name, template) in include.target_templates {
-            if self
-                .target_templates
-                .insert(name.clone(), template)
-                .is_some()
-            {
-                anyhow::bail!(
-                    "duplicate target template {name:?} from include {}",
-                    path.display()
-                );
-            }
-        }
-        for (name, launch_template) in include.launch_templates {
-            if self
-                .launch_templates
-                .insert(name.clone(), launch_template)
-                .is_some()
-            {
-                anyhow::bail!(
-                    "duplicate launch template {name:?} from include {}",
-                    path.display()
-                );
-            }
-        }
-        for (name, target) in include.targets {
-            if self.targets.insert(name.clone(), target).is_some() {
-                anyhow::bail!("duplicate target {name:?} from include {}", path.display());
-            }
-        }
-        for (name, launch) in include.launches {
-            if self.launches.insert(name.clone(), launch).is_some() {
-                anyhow::bail!("duplicate launch {name:?} from include {}", path.display());
+    fn insert_definitions(&mut self, include: Value, path: &Path) -> anyhow::Result<()> {
+        let Some(include_table) = include.as_table() else {
+            return Ok(());
+        };
+        for key in [
+            "target_templates",
+            "launch_templates",
+            "targets",
+            "launches",
+        ] {
+            let Some(Value::Table(definitions)) = include_table.get(key) else {
+                continue;
+            };
+            let root_definitions = ensure_table(self.root, key, path)?;
+            for (name, definition) in definitions {
+                if root_definitions.contains_key(name) {
+                    anyhow::bail!(
+                        "duplicate {} {name:?} from include {}",
+                        singular_definition_kind(key),
+                        path.display()
+                    );
+                }
+                root_definitions.insert(name.clone(), definition.clone());
             }
         }
         Ok(())
+    }
+}
+
+fn ensure_table<'a>(
+    root: &'a mut toml::map::Map<String, Value>,
+    key: &str,
+    path: &Path,
+) -> anyhow::Result<&'a mut toml::map::Map<String, Value>> {
+    root.entry(key.to_owned())
+        .or_insert_with(|| Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "include {} cannot merge into non-table root field {key:?}",
+                path.display()
+            )
+        })
+}
+
+fn singular_definition_kind(key: &str) -> &'static str {
+    match key {
+        "target_templates" => "target template",
+        "launch_templates" => "launch template",
+        "targets" => "target",
+        "launches" => "launch",
+        _ => "definition",
+    }
+}
+
+fn strip_include_loader_fields(value: &mut Value) {
+    if let Some(table) = value.as_table_mut() {
+        table.remove("includes");
     }
 }
 
@@ -132,6 +159,7 @@ fn reject_root_only_include_sections(raw: &str, path: &Path) -> anyhow::Result<(
         "client_config",
         "target_defaults",
         "launch_defaults",
+        "extends",
     ] {
         if table.contains_key(key) {
             anyhow::bail!(
