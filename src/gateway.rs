@@ -6,8 +6,8 @@ use crate::cli::{
 use crate::config::{
     ContainerRuntimeType, ControlSocketConfig, GatewayConfig, IdleCleanupAction, IdleCleanupOwner,
     LaunchConfig, LaunchStep, LaunchStepLocation, LaunchVarConfig, LaunchVarType, LifecyclePhase,
-    LifecycleStep, LocalSshBackend, LocalSshMode, LocalSshReadiness, TargetConfig, TargetMode,
-    validate_name, validate_passwd_scalar,
+    LocalSshBackend, LocalSshMode, LocalSshReadiness, TargetConfig, TargetMode, validate_name,
+    validate_passwd_scalar,
 };
 use crate::paths::{self, UserContext};
 use crate::runtime::{ContainerExecSpec, ContainerInspect, ContainerRuntime};
@@ -25,7 +25,6 @@ use tokio::time::{Duration, Instant, sleep};
 
 pub const DEFAULT_GATEWAY_CONFIG: &str = include_str!("../aw-gateway.sample.toml");
 const MAX_SSH_ORIGINAL_COMMAND_BYTES: usize = 64 * 1024;
-const DEFAULT_HOST_HOOK_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[cfg(target_os = "linux")]
 const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
@@ -58,6 +57,7 @@ mod health;
 mod http;
 mod identity;
 mod lifecycle;
+mod lifecycle_hooks;
 mod listener;
 mod model;
 mod ops;
@@ -73,8 +73,11 @@ use client::{read_default_selection, resolve_target_selection};
 use container_spec::DEFAULT_SESSION_SHELL_ENV;
 use control_sockets::{render_control_socket_paths, resolve_container_path};
 use execution::{OperationRunner, run_container_command_with_runtime};
-use health::{run_argv_with_options, run_argv_with_timeout, run_health_check};
+use health::run_argv_with_options;
+#[cfg(test)]
+use health::run_health_check;
 use lifecycle::{FailedStartCleanup, readiness_plan};
+use lifecycle_hooks::host_hook_timeout;
 use model::{
     GatewayStatus, LaunchDetail, LaunchStepDetail, LaunchSummary, LaunchVarMetadata, ReadyStatus,
     TargetEntry, TcpEndpoint, gateway_status_name,
@@ -1600,67 +1603,6 @@ impl Runtime {
         Ok(false)
     }
 
-    async fn run_lifecycle_phase(
-        &self,
-        phase: LifecyclePhase,
-        container_pid: Option<&str>,
-    ) -> anyhow::Result<()> {
-        for step in self
-            .target
-            .lifecycle_steps
-            .iter()
-            .filter(|step| step.phase == phase)
-        {
-            self.run_step(step, container_pid).await?;
-        }
-        Ok(())
-    }
-
-    async fn run_step(
-        &self,
-        step: &LifecycleStep,
-        container_pid: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let vars = self.vars(container_pid);
-        let command = template::render_argv(&step.command, &vars)?;
-        let timeout = host_hook_timeout(step.timeout.as_deref())?;
-        match run_argv_with_timeout(&command, timeout).await {
-            Ok(()) => Ok(()),
-            Err(err) if !step.required => {
-                tracing::warn!(step = step.name, error = %err, "optional lifecycle step failed");
-                Ok(())
-            }
-            Err(err) => Err(err).with_context(|| format!("run lifecycle step {:?}", step.name)),
-        }
-    }
-
-    async fn run_host_steps(&self, container_pid: &str) -> anyhow::Result<()> {
-        for step in &self.target.host_steps {
-            let vars = self.vars(Some(container_pid));
-            let command = template::render_argv(&step.command, &vars)?;
-            let timeout = host_hook_timeout(step.timeout.as_deref())?;
-            let command_result = run_argv_with_timeout(&command, timeout).await;
-            if let Err(err) = command_result {
-                if step.required {
-                    return Err(err).with_context(|| format!("host step {:?}", step.name));
-                }
-                tracing::warn!(step = step.name, error = %err, "optional host step failed");
-                continue;
-            }
-            if let Some(health_check) = &step.health_check {
-                let health_result = run_health_check(health_check, &vars).await;
-                if let Err(err) = health_result {
-                    if step.required {
-                        return Err(err)
-                            .with_context(|| format!("host step {:?} health check", step.name));
-                    }
-                    tracing::warn!(step = step.name, error = %err, "optional host step health check failed");
-                }
-            }
-        }
-        Ok(())
-    }
-
     async fn wait_published_ssh_ready(&self) -> anyhow::Result<()> {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -1806,13 +1748,6 @@ impl Runtime {
             }
         }
     }
-}
-
-fn host_hook_timeout(configured: Option<&str>) -> anyhow::Result<Duration> {
-    configured
-        .map(crate::config::parse_duration)
-        .transpose()
-        .map(|timeout| timeout.unwrap_or(DEFAULT_HOST_HOOK_TIMEOUT))
 }
 
 fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<GatewayConfig> {
