@@ -6,15 +6,18 @@
 
 - Session marker JSON now requires the `launch` key; non-launch sessions are
   written as `launch = null`, and stale marker files from older unreleased
-  builds should be removed before relying on idle-session accounting.
+  builds should be removed before relying on idle-session accounting
+  ([#38](https://github.com/kcosr/aw-gateway/pull/38)).
 - Removed retired config aliases. Use `client_config.inner_alias_template`
   instead of `client_config.alias_template`; bearer HTTP auth now uses
   `http.auth.token` directly in config, and the retired `token_file` and
-  `bearer_token` keys are rejected.
+  `bearer_token` keys are rejected
+  ([#38](https://github.com/kcosr/aw-gateway/pull/38)).
 - Configured file logging is strict. If a configured logging directory template
   cannot be rendered or the file log writer cannot be initialized, gateway and
   container-agent startup fail instead of silently falling back to console
-  logging.
+  logging
+  ([#38](https://github.com/kcosr/aw-gateway/pull/38)).
 
 ### Added
 
@@ -26,18 +29,21 @@
 
 - Refactored gateway, runtime, config, HTTP, logging, and container-agent
   internals into smaller focused modules while preserving user-facing behavior
-  except for the breaking changes called out above.
+  except for the breaking changes called out above
+  ([#38](https://github.com/kcosr/aw-gateway/pull/38)).
 - Malformed container-agent status responses now report the agent as
   unavailable instead of present-but-not-ready
   ([#27](https://github.com/kcosr/aw-gateway/pull/27)).
 - Restricted-user smoke setup now avoids unnecessary `sshd` reloads when the
   managed `Match` snippet is unchanged, while still validating `sshd` config on
-  every run.
+  every run
+  ([#38](https://github.com/kcosr/aw-gateway/pull/38)).
 
 ### Fixed
 
 - Improved HTTP and SSH error classification for gateway operation failures so
-  key container/runtime failures map to more specific responses.
+  key container/runtime failures map to more specific responses
+  ([#38](https://github.com/kcosr/aw-gateway/pull/38)).
 - Fixed gateway-side parsing of successful typed container-agent status
   responses so agent readiness is detected correctly after container startup
   ([#31](https://github.com/kcosr/aw-gateway/pull/31)).
@@ -45,7 +51,8 @@
   subuid-owned files by removing them through `podman unshare`
   ([#17](https://github.com/kcosr/aw-gateway/pull/17)).
 - Fixed macOS smoke deployment packaging so the expected source path is sent to
-  the remote host.
+  the remote host
+  ([#38](https://github.com/kcosr/aw-gateway/pull/38)).
 
 ## [0.2.0] - 2026-05-23
 
