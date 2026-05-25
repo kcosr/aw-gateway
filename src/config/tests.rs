@@ -172,6 +172,25 @@ name = "{{image_slug}}"
 }
 
 #[test]
+fn client_config_rejects_retired_alias_template_key() {
+    let err = toml::from_str::<GatewayConfig>(
+        r#"
+schema_version = "1"
+
+[client_config]
+alias_template = "aw-{target}"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("unknown field"), "{err}");
+}
+
+#[test]
 fn http_config_rejects_non_socket_listen() {
     let cfg: GatewayConfig = toml::from_str(
         r#"

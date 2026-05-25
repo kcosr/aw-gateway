@@ -454,7 +454,7 @@ impl SshDispatchConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
-    #[serde(default = "default_inner_alias_template", alias = "alias_template")]
+    #[serde(default = "default_inner_alias_template")]
     pub inner_alias_template: String,
     #[serde(default = "default_container_host_template")]
     pub container_host_template: String,

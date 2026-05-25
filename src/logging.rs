@@ -17,56 +17,42 @@ pub fn init_gateway(
     level: Option<&str>,
     protocol_mode: bool,
 ) -> anyhow::Result<LoggingGuard> {
-    let (config, render_error) = config_path
-        .and_then(|path| GatewayConfig::load(path).ok())
-        .map(|cfg| {
+    let config = match config_path.and_then(|path| GatewayConfig::load(path).ok()) {
+        Some(cfg) => {
             let mut logging = cfg.logging.clone();
-            match cfg
-                .effective_workspace_defaults()
+            cfg.effective_workspace_defaults()
                 .and_then(|workspace| render_gateway_logging_directory(&mut logging, &workspace))
-            {
-                Ok(()) => (logging, None),
-                Err(err) => (fallback_config(!protocol_mode), Some(err)),
-            }
-        })
-        .unwrap_or_else(|| (fallback_config(!protocol_mode), None));
-    let guard = init(
+                .context("render gateway logging directory")?;
+            logging
+        }
+        None => fallback_config(!protocol_mode),
+    };
+    init(
         config,
         level,
         "AW_GATEWAY_LOG_LEVEL",
         "aw-gateway",
         protocol_mode,
-    )?;
-    if let Some(err) = render_error
-        && !protocol_mode
-    {
-        tracing::error!(error = %err, "failed to render gateway logging directory; file logging disabled");
-    }
-    Ok(guard)
+    )
 }
 
 pub fn init_agent(config_path: Option<&Path>, level: Option<&str>) -> anyhow::Result<LoggingGuard> {
-    let (config, render_error) = config_path
-        .and_then(|path| ContainerAgentFile::load(path).ok())
-        .map(|cfg| {
+    let config = match config_path.and_then(|path| ContainerAgentFile::load(path).ok()) {
+        Some(cfg) => {
             let mut logging = cfg.logging;
-            match render_agent_logging_directory(&mut logging) {
-                Ok(()) => (logging, None),
-                Err(err) => (fallback_config(true), Some(err)),
-            }
-        })
-        .unwrap_or_else(|| (fallback_config(true), None));
-    let guard = init(
+            render_agent_logging_directory(&mut logging)
+                .context("render container-agent logging directory")?;
+            logging
+        }
+        None => fallback_config(true),
+    };
+    init(
         config,
         level,
         "AW_CONTAINER_AGENT_LOG_LEVEL",
         "aw-container-agent",
         false,
-    )?;
-    if let Some(err) = render_error {
-        tracing::error!(error = %err, "failed to render container-agent logging directory; file logging disabled");
-    }
-    Ok(guard)
+    )
 }
 
 fn init(
@@ -86,24 +72,19 @@ fn init(
     }
 
     if let Some(directory) = config.directory {
-        match SizeRotatingMakeWriter::new(
+        let writer = SizeRotatingMakeWriter::new(
             PathBuf::from(directory),
             file_prefix,
             config.max_bytes.unwrap_or(100 * 1024 * 1024),
             config.max_files.unwrap_or(5),
-        ) {
-            Ok(writer) => {
-                let _ = tracing_subscriber::fmt()
-                    .with_env_filter(filter)
-                    .with_writer(writer)
-                    .json()
-                    .try_init();
-                return Ok(LoggingGuard);
-            }
-            Err(err) => {
-                eprintln!("failed to initialize file logging for {file_prefix}: {err:#}");
-            }
-        }
+        )
+        .with_context(|| format!("initialize file logging for {file_prefix}"))?;
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(writer)
+            .json()
+            .try_init();
+        return Ok(LoggingGuard);
     }
 
     if config.console || protocol_mode {
@@ -288,5 +269,26 @@ mod tests {
         writer.flush().unwrap();
         assert!(dir.path().join("test.log").exists());
         assert!(dir.path().join("test.log.1").exists());
+    }
+
+    #[test]
+    fn configured_file_logging_errors_instead_of_falling_back() {
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "block").unwrap();
+        let config = LoggingConfig {
+            directory: Some(blocker.join("logs").display().to_string()),
+            ..LoggingConfig::default()
+        };
+
+        let err = match init(config, None, "AW_TEST_LOG_LEVEL", "test", false) {
+            Ok(_) => panic!("expected configured file logging to fail"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("initialize file logging for test"),
+            "{message}"
+        );
     }
 }
