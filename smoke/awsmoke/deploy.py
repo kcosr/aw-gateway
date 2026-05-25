@@ -112,9 +112,12 @@ if [ -n {shlex.quote(extra_group)} ]; then
   sudo usermod -aG {shlex.quote(extra_group)} {shlex.quote(user)}
 fi
 sudo install -d -m 0700 -o {shlex.quote(user)} -g {shlex.quote(user)} /home/{shlex.quote(user)}/.ssh
-printf %s {shlex.quote(pubkey_b64)} | base64 -d | sudo tee /home/{shlex.quote(user)}/.ssh/authorized_keys >/dev/null
-sudo chown {shlex.quote(user)}:{shlex.quote(user)} /home/{shlex.quote(user)}/.ssh/authorized_keys
-sudo chmod 0600 /home/{shlex.quote(user)}/.ssh/authorized_keys
+key_tmp=$(mktemp)
+trap 'rm -f "${{key_tmp}}"' EXIT
+printf %s {shlex.quote(pubkey_b64)} | base64 -d >"${{key_tmp}}"
+if ! sudo test -f /home/{shlex.quote(user)}/.ssh/authorized_keys || ! sudo cmp -s "${{key_tmp}}" /home/{shlex.quote(user)}/.ssh/authorized_keys; then
+  sudo install -m 0600 -o {shlex.quote(user)} -g {shlex.quote(user)} "${{key_tmp}}" /home/{shlex.quote(user)}/.ssh/authorized_keys
+fi
 """
     remote_check(host.ssh, create_user, timeout=120)
 
@@ -143,9 +146,16 @@ sudo install -m 0755 {owner_args} {shlex.quote(remote_tmp)}/aw-ssh-command-filte
 sudo install -m 0755 {owner_args} {shlex.quote(remote_tmp)}/start-container-sshd {shlex.quote(install_root)}/runtime/linux/start-container-sshd
 sudo install -m 0644 {owner_args} {shlex.quote(remote_tmp)}/sshd_config_agent {shlex.quote(install_root)}/runtime/linux/sshd_config_agent
 sudo install -m 0644 {owner_args} {shlex.quote(remote_tmp)}/gateway.toml {shlex.quote(install_root)}/etc/gateway.toml
-sudo install -m 0644 {shlex.quote(remote_tmp)}/99-aw-gateway-smoke-{user}.conf /etc/ssh/sshd_config.d/99-aw-gateway-smoke-{user}.conf
-sudo sshd -t
-sudo systemctl reload sshd 2>/dev/null || sudo systemctl reload ssh 2>/dev/null || sudo service sshd reload 2>/dev/null || sudo service ssh reload
+sshd_config_changed=0
+sshd_config=/etc/ssh/sshd_config.d/99-aw-gateway-smoke-{user}.conf
+if ! sudo test -f "${{sshd_config}}" || ! sudo cmp -s {shlex.quote(remote_tmp)}/99-aw-gateway-smoke-{user}.conf "${{sshd_config}}"; then
+  sudo install -m 0644 {shlex.quote(remote_tmp)}/99-aw-gateway-smoke-{user}.conf "${{sshd_config}}"
+  sshd_config_changed=1
+fi
+if [ "${{sshd_config_changed}}" = "1" ]; then
+  sudo sshd -t
+  sudo systemctl reload sshd 2>/dev/null || sudo systemctl reload ssh 2>/dev/null || sudo service sshd reload 2>/dev/null || sudo service ssh reload
+fi
 """
     remote_check(host.ssh, install, timeout=120)
 
