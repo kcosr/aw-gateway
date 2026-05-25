@@ -220,7 +220,7 @@ def build_remote_macos_gateway(inventory: Inventory, host: Host, remote_tmp: str
     )
     command = (
         f"tar -C {shlex.quote(str(inventory.repo_root))} "
-        "--exclude .git --exclude target -cf - . | "
+        "--exclude ./.git --exclude ./target -cf - . | "
         f"ssh -o BatchMode=yes -o ConnectTimeout=10 {shlex.quote(host.ssh)} "
         f"{shlex.quote(remote_command)}"
     )
