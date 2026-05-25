@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 import tomllib
+
+SAFE_RESTRICTED_USER = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 @dataclass(frozen=True)
@@ -111,6 +114,11 @@ def load_inventory(path: str | Path = "inventory.toml") -> Inventory:
 
     hosts: dict[str, Host] = {}
     for name, raw in data.get("hosts", {}).items():
+        restricted_user = raw.get("restricted_user", "awsmoke")
+        if not SAFE_RESTRICTED_USER.fullmatch(restricted_user):
+            raise ValueError(
+                f"hosts.{name}.restricted_user must contain only letters, digits, '_' or '-'"
+            )
         hosts[name] = Host(
             name=name,
             ssh=raw["ssh"],
@@ -123,7 +131,7 @@ def load_inventory(path: str | Path = "inventory.toml") -> Inventory:
             image=raw["image"],
             target=raw.get("target", default_target),
             enabled=bool(raw.get("enabled", True)),
-            restricted_user=raw.get("restricted_user", "awsmoke"),
+            restricted_user=restricted_user,
             restricted_install_root=raw.get("restricted_install_root", raw["install_root"]),
             http_port=int(raw.get("http_port", 18080)),
         )

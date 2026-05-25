@@ -434,7 +434,7 @@ and non-finite numbers are rejected as `invalid_launch_var`.
 The initial HTTP API intentionally does not implement streaming, SSE/NDJSON,
 persistent jobs, TTY sessions, SSH key management, generated client config or
 bundles, proxy/tunnel helpers, stop/remove, default-target management, route
-aliases, or compatibility config shapes.
+aliases, or retired config-shape compatibility.
 
 ## Deployment Guides
 
