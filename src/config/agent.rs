@@ -42,7 +42,7 @@ impl ContainerAgentConfig {
         if let Some(bridge) = &self.ssh_bridge {
             bridge.validate_gateway()?;
         }
-        self.validate_common()
+        self.validate_common(ServiceUserTemplateMode::GatewayManaged)
     }
 
     pub fn validate_agent_file(&self) -> anyhow::Result<()> {
@@ -60,10 +60,13 @@ impl ContainerAgentConfig {
                 AGENT_TEMPLATE_VARS,
             )?;
         }
-        self.validate_common()
+        self.validate_common(ServiceUserTemplateMode::Literal)
     }
 
-    fn validate_common(&self) -> anyhow::Result<()> {
+    fn validate_common(
+        &self,
+        service_user_template_mode: ServiceUserTemplateMode,
+    ) -> anyhow::Result<()> {
         if !self.enabled {
             if !self.services.is_empty() {
                 anyhow::bail!("container_agent services require container_agent.enabled = true");
@@ -93,7 +96,7 @@ impl ContainerAgentConfig {
         }
         let mut names = BTreeSet::new();
         for service in &self.services {
-            service.validate()?;
+            service.validate(service_user_template_mode)?;
             if !names.insert(service.name.clone()) {
                 anyhow::bail!("duplicate container_agent service {:?}", service.name);
             }
@@ -131,6 +134,12 @@ impl ContainerAgentConfig {
                 })
             })
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ServiceUserTemplateMode {
+    GatewayManaged,
+    Literal,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -190,7 +199,7 @@ impl ContainerAgentConfigInput {
     pub(super) fn validate_partial(&self) -> anyhow::Result<()> {
         let mut names = BTreeSet::new();
         for service in &self.services {
-            service.validate()?;
+            service.validate(ServiceUserTemplateMode::GatewayManaged)?;
             if !names.insert(service.name.clone()) {
                 anyhow::bail!("duplicate container_agent service {:?}", service.name);
             }
@@ -324,8 +333,9 @@ pub struct ServiceConfig {
 }
 
 impl ServiceConfig {
-    pub fn validate(&self) -> anyhow::Result<()> {
+    fn validate(&self, user_template_mode: ServiceUserTemplateMode) -> anyhow::Result<()> {
         validate_name("service", &self.name)?;
+        validate_service_user(&self.user, user_template_mode)?;
         validate_command("service.command", &self.command)?;
         for dep in &self.depends_on {
             validate_name("depends_on", dep)?;
@@ -360,6 +370,15 @@ impl ServiceConfig {
         }
         Ok(())
     }
+}
+
+fn validate_service_user(user: &str, template_mode: ServiceUserTemplateMode) -> anyhow::Result<()> {
+    if user == SERVICE_USER_TEMPLATE
+        && matches!(template_mode, ServiceUserTemplateMode::GatewayManaged)
+    {
+        return Ok(());
+    }
+    validate_name("service.user", user)
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]

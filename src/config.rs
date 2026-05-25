@@ -41,6 +41,7 @@ pub use target::{
     TargetRuntimeConfig, TargetRuntimeConfigInput, WorkspaceCleanup, WorkspaceConfig,
     WorkspaceConfigInput,
 };
+pub(crate) use validation::SERVICE_USER_TEMPLATE;
 pub use validation::parse_duration;
 use validation::*;
 pub(crate) use validation::{canonical_number_string, validate_name, validate_passwd_scalar};

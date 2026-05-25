@@ -149,6 +149,7 @@ pub(super) const CLIENT_TEMPLATE_VARS: &[&str] = &[
 pub(super) const RUNTIME_TEMPLATE_VARS: &[&str] = &["user", "home"];
 
 pub(super) const IDENTITY_TEMPLATE_VARS: &[&str] = &["user", "uid", "gid", "home"];
+pub(crate) const SERVICE_USER_TEMPLATE: &str = "{container_user}";
 
 pub(super) const LAUNCH_TEMPLATE_BUILTINS: &[&str] = &[
     "user",
