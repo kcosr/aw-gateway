@@ -9,6 +9,7 @@ use crate::config::{
     LocalSshMode, LocalSshReadiness, TargetConfig, TargetMode, validate_name,
     validate_passwd_scalar,
 };
+use crate::launch_args::{LaunchRunArgRole, parse_launch_run_args_from};
 use crate::paths::{self, UserContext};
 use crate::runtime::{ContainerExecSpec, ContainerRuntime};
 use crate::ssh_dispatch::{self, Dispatch, GatewayAction};
@@ -703,59 +704,24 @@ fn parse_launch_run_args(
     raw: Vec<std::ffi::OsString>,
 ) -> anyhow::Result<(String, Option<String>, Vec<String>)> {
     let mut args = raw.into_iter();
-    let Some(name) = args.next() else {
-        anyhow::bail!("launch requires a launch name");
-    };
-    let name = name
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("launch name must be valid UTF-8"))?;
-    let mut vars = Vec::new();
-    let mut session_id = None;
-    while let Some(arg) = args.next() {
-        let arg = arg
-            .into_string()
-            .map_err(|_| anyhow::anyhow!("launch arguments must be valid UTF-8"))?;
-        if arg == "--json" {
-            anyhow::bail!("launch execution does not support --json");
-        }
-        if let Some(value) = arg.strip_prefix("--session-id=") {
-            if session_id.replace(value.to_string()).is_some() {
-                anyhow::bail!("--session-id may only be specified once");
-            }
-            continue;
-        }
-        if arg == "--session-id" {
-            if session_id.is_some() {
-                anyhow::bail!("--session-id may only be specified once");
-            }
-            let Some(value) = args.next() else {
-                anyhow::bail!("--session-id requires a value");
-            };
-            session_id = Some(
-                value
-                    .into_string()
-                    .map_err(|_| anyhow::anyhow!("session id must be valid UTF-8"))?,
-            );
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--var=") {
-            vars.push(value.to_string());
-            continue;
-        }
-        if arg == "--var" {
-            let Some(value) = args.next() else {
-                anyhow::bail!("--var must be key=value");
-            };
-            vars.push(
-                value
-                    .into_string()
-                    .map_err(|_| anyhow::anyhow!("launch variable must be valid UTF-8"))?,
-            );
-            continue;
-        }
-        anyhow::bail!("unexpected extra launch argument {arg:?}");
+    let parsed = parse_launch_run_args_from(|role| {
+        let Some(arg) = args.next() else {
+            return Ok(None);
+        };
+        arg.into_string()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!(launch_arg_utf8_error(role)))
+    })?;
+    Ok((parsed.name, parsed.session_id, parsed.vars))
+}
+
+fn launch_arg_utf8_error(role: LaunchRunArgRole) -> &'static str {
+    match role {
+        LaunchRunArgRole::Name => "launch name must be valid UTF-8",
+        LaunchRunArgRole::Argument => "launch arguments must be valid UTF-8",
+        LaunchRunArgRole::SessionId => "session id must be valid UTF-8",
+        LaunchRunArgRole::Variable => "launch variable must be valid UTF-8",
     }
-    Ok((name, session_id, vars))
 }
 
 async fn launch_show(

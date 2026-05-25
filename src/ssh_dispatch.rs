@@ -1,5 +1,6 @@
 use crate::action;
 use crate::config::SshDispatchConfig;
+use crate::launch_args::parse_launch_run_strings;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dispatch {
@@ -345,56 +346,13 @@ fn parse_launch_action(words: &[String]) -> anyhow::Result<GatewayAction> {
         });
     }
 
-    let mut vars = Vec::new();
-    let mut session_id = None;
-    let mut index = 2;
-    while let Some(arg) = words.get(index).map(String::as_str) {
-        if arg == "--json" {
-            anyhow::bail!("launch execution does not support --json");
-        }
-        if let Some(value) = arg.strip_prefix("--session-id=") {
-            set_session_id(&mut session_id, value.to_string())?;
-            index += 1;
-            continue;
-        }
-        if arg == "--session-id" {
-            let Some(value) = words.get(index + 1) else {
-                anyhow::bail!("--session-id requires a value");
-            };
-            set_session_id(&mut session_id, value.clone())?;
-            index += 2;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--var=") {
-            validate_launch_var_pair(value)?;
-            vars.push(value.to_string());
-            index += 1;
-            continue;
-        }
-        if arg == "--var" {
-            let Some(value) = words.get(index + 1) else {
-                anyhow::bail!("--var must be key=value");
-            };
-            validate_launch_var_pair(value)?;
-            vars.push(value.clone());
-            index += 2;
-            continue;
-        }
-        anyhow::bail!("unexpected extra launch argument {arg:?}");
-    }
+    let parsed = parse_launch_run_strings(words[1..].iter().cloned())?;
 
     Ok(GatewayAction::LaunchRun {
-        name: name.clone(),
-        session_id,
-        vars,
+        name: parsed.name,
+        session_id: parsed.session_id,
+        vars: parsed.vars,
     })
-}
-
-fn validate_launch_var_pair(value: &str) -> anyhow::Result<()> {
-    if value.split_once('=').is_none() {
-        anyhow::bail!("--var must be key=value");
-    }
-    Ok(())
 }
 
 fn parse_json_flag(words: &[String], command: &str) -> anyhow::Result<bool> {
