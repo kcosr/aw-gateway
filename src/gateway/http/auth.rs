@@ -2,7 +2,6 @@ use super::AppState;
 use super::response::{HttpError, operation_error_response};
 use crate::config::HttpAuthType;
 use crate::gateway::ops::OperationError;
-use crate::paths::{self, UserContext};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 
@@ -69,7 +68,13 @@ async fn authorize_bearer(state: &AppState, headers: &HeaderMap) -> Result<(), H
         .and_then(|value| value.strip_prefix("Bearer "))
         .filter(|value| !value.is_empty())
         .ok_or_else(|| HttpError::unauthorized("unauthorized"))?;
-    let expected = read_bearer_token(state).await?;
+    let expected = state
+        .config
+        .http
+        .auth
+        .token
+        .as_deref()
+        .ok_or_else(|| HttpError::unauthorized("unauthorized"))?;
     if !constant_time_eq(supplied.as_bytes(), expected.as_bytes()) {
         return Err(HttpError::unauthorized("unauthorized"));
     }
@@ -87,55 +92,4 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         diff |= usize::from(left_byte ^ right_byte);
     }
     diff == 0
-}
-
-async fn read_bearer_token(state: &AppState) -> Result<String, HttpError> {
-    let token_file = state
-        .config
-        .http
-        .auth
-        .token_file
-        .as_deref()
-        .ok_or_else(|| HttpError::unauthorized("unauthorized"))?;
-    let user = UserContext::current().map_err(|_| HttpError::unauthorized("unauthorized"))?;
-    let path = paths::expand_home(&user.home, token_file);
-    let metadata = tokio::fs::metadata(&path).await.map_err(|err| {
-        tracing::warn!(path = %path.display(), error = %err, "failed to stat http bearer token file");
-        HttpError::unauthorized("unauthorized")
-    })?;
-    validate_bearer_token_file(&path, &metadata)?;
-    let token = tokio::fs::read_to_string(&path).await.map_err(|err| {
-        tracing::warn!(path = %path.display(), error = %err, "failed to read http bearer token file");
-        HttpError::unauthorized("unauthorized")
-    })?;
-    let token = token.trim().to_string();
-    if token.is_empty() || token.len() > MAX_BEARER_TOKEN_BYTES {
-        return Err(HttpError::unauthorized("unauthorized"));
-    }
-    Ok(token)
-}
-
-#[cfg(unix)]
-fn validate_bearer_token_file(
-    path: &std::path::Path,
-    metadata: &std::fs::Metadata,
-) -> Result<(), HttpError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    if metadata.permissions().mode() & 0o077 != 0 {
-        tracing::warn!(
-            path = %path.display(),
-            "http bearer token file must not be group- or world-readable"
-        );
-        return Err(HttpError::unauthorized("unauthorized"));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn validate_bearer_token_file(
-    _path: &std::path::Path,
-    _metadata: &std::fs::Metadata,
-) -> Result<(), HttpError> {
-    Ok(())
 }

@@ -41,14 +41,13 @@ console = false
 # [http.auth]
 # type = "none"
 #
-# Bearer auth reads the token from the configured file and requires
+# Bearer auth reads the token from this config and requires
 # Authorization: Bearer <token> on /api/v1/* requests. Use loopback or a
-# TLS-terminating reverse proxy; on Unix, the token file must not be group- or
-# world-readable.
+# TLS-terminating reverse proxy.
 #
 # [http.auth]
 # type = "bearer"
-# token_file = "~/.config/aw-gateway/http-token"
+# token = "change-me"
 
 [target_defaults.workspace]
 path = "workspace"

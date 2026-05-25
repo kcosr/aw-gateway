@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import base64
+import json
 import shlex
 
 from .hosts import Host, Inventory
@@ -392,7 +393,7 @@ def append_http_smoke_config(text: str, host: Host, *, http_actions: list[str] |
         + "\n]\n\n"
         + "[http.auth]\n"
         + 'type = "bearer"\n'
-        + 'token_file = "~/.config/aw-gateway/http-token"\n'
+        + f"token = {json.dumps(host.http_token)}\n"
     )
 
 
@@ -432,9 +433,6 @@ set -euo pipefail
 {prefix}install -m 0644 {tmp}/gateway.toml {root}/etc/gateway.toml
 {prefix}install -m 0644 {tmp}/gateway-local.toml {root}/etc/gateway-local.toml
 {prefix}install -m 0644 {tmp}/gateway-http-limited.toml {root}/etc/gateway-http-limited.toml
-install -d -m 0700 ~/.config/aw-gateway
-printf '%s\n' {shlex.quote(host.http_token)} > ~/.config/aw-gateway/http-token
-chmod 0600 ~/.config/aw-gateway/http-token
 """
     remote_check(host.ssh, command, timeout=120)
 

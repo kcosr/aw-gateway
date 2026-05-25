@@ -171,31 +171,15 @@ fn test_state(http: HttpConfig) -> AppState {
     }
 }
 
-#[cfg(unix)]
-fn set_private_file_mode(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = std::fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o600);
-    std::fs::set_permissions(path, permissions).unwrap();
-}
-
-#[cfg(not(unix))]
-fn set_private_file_mode(_path: &std::path::Path) {}
-
 #[tokio::test]
 async fn bearer_auth_allows_matching_token_and_rejects_missing_or_wrong_header() {
-    let dir = tempfile::tempdir().unwrap();
-    let token_file = dir.path().join("token");
-    std::fs::write(&token_file, "secret-token\n").unwrap();
-    set_private_file_mode(&token_file);
     let state = test_state(HttpConfig {
         enabled: true,
         listen: "127.0.0.1:0".into(),
         enabled_actions: vec!["status".into()],
         auth: HttpAuthConfig {
             auth_type: HttpAuthType::Bearer,
-            token_file: Some(token_file.display().to_string()),
+            token: Some("secret-token".into()),
         },
     });
 
@@ -220,34 +204,6 @@ async fn bearer_auth_allows_matching_token_and_rejects_missing_or_wrong_header()
         authorize(&state, &wrong_token).await.unwrap_err().code,
         ErrorCode::Unauthorized
     );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn bearer_auth_rejects_group_or_world_readable_token_file() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = tempfile::tempdir().unwrap();
-    let token_file = dir.path().join("token");
-    std::fs::write(&token_file, "secret-token\n").unwrap();
-    let mut permissions = std::fs::metadata(&token_file).unwrap().permissions();
-    permissions.set_mode(0o644);
-    std::fs::set_permissions(&token_file, permissions).unwrap();
-    let state = test_state(HttpConfig {
-        enabled: true,
-        listen: "127.0.0.1:0".into(),
-        enabled_actions: vec!["status".into()],
-        auth: HttpAuthConfig {
-            auth_type: HttpAuthType::Bearer,
-            token_file: Some(token_file.display().to_string()),
-        },
-    });
-
-    let mut headers = HeaderMap::new();
-    headers.insert(AUTHORIZATION, "Bearer secret-token".parse().unwrap());
-    let err = authorize(&state, &headers).await.unwrap_err();
-    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
-    assert_eq!(err.code, ErrorCode::Unauthorized);
 }
 
 #[tokio::test]

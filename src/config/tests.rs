@@ -26,11 +26,11 @@ name = "{image_slug}"
     assert_eq!(cfg.http.listen, "127.0.0.1:8080");
     assert!(cfg.http.enabled_actions.is_empty());
     assert_eq!(cfg.http.auth.auth_type, HttpAuthType::None);
-    assert!(cfg.http.auth.token_file.is_none());
+    assert!(cfg.http.auth.token.is_none());
 }
 
 #[test]
-fn http_config_validates_bearer_token_file_rules() {
+fn http_config_validates_bearer_token_rules() {
     let cfg: GatewayConfig = toml::from_str(
         r#"
 schema_version = "1"
@@ -42,7 +42,7 @@ enabled_actions = ["status"]
 
 [http.auth]
 type = "bearer"
-token_file = "~/.config/aw-gateway/http-token"
+token = "secret-token"
 
 [targets.default]
 image = "ubuntu/dev"
@@ -53,7 +53,7 @@ name = "{image_slug}"
     .unwrap();
     cfg.validate().unwrap();
 
-    let missing_file: GatewayConfig = toml::from_str(
+    let missing_token: GatewayConfig = toml::from_str(
         r#"
 schema_version = "1"
 
@@ -71,10 +71,10 @@ name = "{image_slug}"
 "#,
     )
     .unwrap();
-    let err = missing_file.validate().unwrap_err().to_string();
-    assert!(err.contains("token_file is required"), "{err}");
+    let err = missing_token.validate().unwrap_err().to_string();
+    assert!(err.contains("token is required"), "{err}");
 
-    let unexpected_file: GatewayConfig = toml::from_str(
+    let unexpected_token: GatewayConfig = toml::from_str(
         r#"
 schema_version = "1"
 
@@ -84,7 +84,7 @@ enabled_actions = ["status"]
 
 [http.auth]
 type = "none"
-token_file = "/tmp/token"
+token = "secret-token"
 
 [targets.default]
 image = "ubuntu/dev"
@@ -93,8 +93,33 @@ name = "{image_slug}"
 "#,
     )
     .unwrap();
-    let err = unexpected_file.validate().unwrap_err().to_string();
+    let err = unexpected_token.validate().unwrap_err().to_string();
     assert!(err.contains("only valid"), "{err}");
+
+    let multiline_token: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[http]
+enabled = true
+enabled_actions = ["status"]
+
+[http.auth]
+type = "bearer"
+token = """
+secret
+token
+"""
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+    let err = multiline_token.validate().unwrap_err().to_string();
+    assert!(err.contains("single line"), "{err}");
 }
 
 #[test]
@@ -146,7 +171,7 @@ name = "{{image_slug}}"
         assert!(err.contains("http.enabled_actions"), "{action}: {err}");
     }
 
-    for alias in ["token", "bearer_token"] {
+    for retired_field in ["token_file", "bearer_token"] {
         let err = toml::from_str::<GatewayConfig>(&format!(
             r#"
 schema_version = "1"
@@ -157,8 +182,8 @@ enabled_actions = ["status"]
 
 [http.auth]
 type = "bearer"
-token_file = "/tmp/token"
-{alias} = "secret"
+token = "secret"
+{retired_field} = "retired"
 
 [targets.default]
 image = "ubuntu/dev"
@@ -167,7 +192,10 @@ name = "{{image_slug}}"
 "#
         ))
         .unwrap_err();
-        assert!(err.to_string().contains("unknown field"), "{alias}: {err}");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "{retired_field}: {err}"
+        );
     }
 }
 
