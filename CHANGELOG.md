@@ -8,8 +8,9 @@
   written as `launch = null`, and stale marker files from older unreleased
   builds should be removed before relying on idle-session accounting.
 - Removed retired config aliases. Use `client_config.inner_alias_template`
-  instead of `client_config.alias_template`, and use `http.auth.token_file`
-  instead of the retired `token` or `bearer_token` keys.
+  instead of `client_config.alias_template`; bearer HTTP auth now uses
+  `http.auth.token` directly in config, and the retired `token_file` and
+  `bearer_token` keys are rejected.
 - Configured file logging is strict. If a configured logging directory template
   cannot be rendered or the file log writer cannot be initialized, gateway and
   container-agent startup fail instead of silently falling back to console
