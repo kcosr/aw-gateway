@@ -1,4 +1,3 @@
-
 use super::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -1763,15 +1762,18 @@ fn readiness_plan_skips_pre_start_for_running_container() {
     let running = inspect_with_running(true);
     let stopped = inspect_with_running(false);
 
-    assert_eq!(
-        readiness_plan(Some(&running)),
-        ContainerReadinessPlan::ReuseRunning
-    );
-    assert_eq!(
-        readiness_plan(Some(&stopped)),
-        ContainerReadinessPlan::StartStopped
-    );
-    assert_eq!(readiness_plan(None), ContainerReadinessPlan::CreateMissing);
+    match readiness_plan(Some(running.clone())) {
+        ContainerReadinessPlan::ReuseRunning(inspect) => assert_eq!(inspect.name, running.name),
+        other => panic!("expected running container reuse, got {other:?}"),
+    }
+    match readiness_plan(Some(stopped.clone())) {
+        ContainerReadinessPlan::StartStopped(inspect) => assert_eq!(inspect.name, stopped.name),
+        other => panic!("expected stopped container start, got {other:?}"),
+    }
+    assert!(matches!(
+        readiness_plan(None),
+        ContainerReadinessPlan::CreateMissing
+    ));
 }
 
 #[tokio::test]
