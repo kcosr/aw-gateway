@@ -5,6 +5,7 @@
 *~
 .build-service/workspace-id
 .spec/
+.specs/
 smoke/.venv/
 smoke/.pytest_cache/
 smoke/aw_gateway_smoke.egg-info/

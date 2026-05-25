@@ -391,8 +391,9 @@ sudo install -m 0644 examples/podman/gateway-remote.toml \
   /etc/aw-gateway/gateway.toml
 ```
 
-`/etc/aw-gateway/gateway.toml` is the gateway's default host config path.
-These commands still pass `--config` so the guide remains explicit.
+`/etc/aw-gateway/gateway.toml` is the system gateway config path. This guide
+passes `--config` explicitly so managed-host commands do not depend on whether
+the user also has `~/.config/aw-gateway/gateway.toml`.
 
 Set the real host in `[client_config]`:
 

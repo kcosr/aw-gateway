@@ -1,7 +1,7 @@
 use crate::cli::{
     AddContainerKeyArgs, AddHostKeyArgs, AddKeyArgs, ClientBundleArgs, ClientConfigArgs,
-    ConfigCommand, ConnectArgs, GatewayArgs, GatewayCommand, LaunchCommand, LaunchesArgs, RunArgs,
-    SetDefaultArgs, StatusArg, StopArgs, TargetArg, TargetsArgs, UpArgs,
+    ConfigPathsArgs, ConnectArgs, GatewayArgs, GatewayCommand, GatewayConfigCommand, LaunchCommand,
+    LaunchesArgs, RunArgs, SetDefaultArgs, StatusArg, StopArgs, TargetArg, TargetsArgs, UpArgs,
 };
 use crate::config::{
     ContainerRuntimeType, ControlSocketConfig, GatewayConfig, LaunchConfig, LaunchStep,
@@ -180,31 +180,77 @@ pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
     }
 }
 
-async fn run_config(command: ConfigCommand, config: Option<PathBuf>) -> anyhow::Result<()> {
+async fn run_config(command: GatewayConfigCommand, config: Option<PathBuf>) -> anyhow::Result<()> {
     match command {
-        ConfigCommand::Validate => {
-            let path = paths::gateway_config_path(config);
+        GatewayConfigCommand::Validate => {
+            let path = paths::resolve_gateway_config(config)?.selected_path()?;
             GatewayConfig::load(&path)?;
             println!("ok");
             Ok(())
         }
-        ConfigCommand::Init(init) => {
-            let path = init
-                .path
-                .unwrap_or_else(|| paths::gateway_config_path(config));
-            if path.exists() && !init.force {
-                anyhow::bail!(
-                    "{} already exists; pass --force to overwrite",
-                    path.display()
-                );
-            }
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&path, DEFAULT_GATEWAY_CONFIG)?;
-            println!("{}", path.display());
-            Ok(())
-        }
+        GatewayConfigCommand::Paths(args) => config_paths(config, args),
+    }
+}
+
+fn config_paths(config: Option<PathBuf>, args: ConfigPathsArgs) -> anyhow::Result<()> {
+    let resolution = paths::resolve_gateway_config(config)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&resolution)?);
+        return Ok(());
+    }
+
+    if let Some(user) = &resolution.user {
+        println!("user: {}", user.user);
+        println!("uid: {}", user.uid);
+        println!("gid: {}", user.gid);
+        println!("home: {}", user.home.display());
+    } else {
+        println!("user: unavailable");
+    }
+    print_optional_path("user_config_dir", resolution.user_config_dir.as_deref());
+    print_optional_path("user_state_dir", resolution.user_state_dir.as_deref());
+    match &resolution.user_config_file {
+        Some(path) => println!(
+            "user_config_file: {} ({})",
+            path.display(),
+            exists_label(path.exists())
+        ),
+        None => println!("user_config_file: unavailable"),
+    }
+    println!(
+        "system_config_file: {} ({})",
+        resolution.system_config_file.display(),
+        exists_label(resolution.system_config_file.exists())
+    );
+    match &resolution.selected_path {
+        Some(path) => println!(
+            "selected: {} ({})",
+            path.display(),
+            source_label(resolution.selected_source)
+        ),
+        None => println!("selected: none"),
+    }
+    Ok(())
+}
+
+fn print_optional_path(label: &str, path: Option<&std::path::Path>) {
+    match path {
+        Some(path) => println!("{label}: {}", path.display()),
+        None => println!("{label}: unavailable"),
+    }
+}
+
+fn exists_label(exists: bool) -> &'static str {
+    if exists { "exists" } else { "missing" }
+}
+
+fn source_label(source: paths::GatewayConfigSource) -> &'static str {
+    match source {
+        paths::GatewayConfigSource::ExplicitFlag => "explicit_flag",
+        paths::GatewayConfigSource::Environment => "environment",
+        paths::GatewayConfigSource::User => "user",
+        paths::GatewayConfigSource::System => "system",
+        paths::GatewayConfigSource::None => "none",
     }
 }
 
@@ -1525,7 +1571,7 @@ impl Runtime {
 }
 
 fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<GatewayConfig> {
-    let path = paths::gateway_config_path(config_path);
+    let path = paths::resolve_gateway_config(config_path)?.selected_path()?;
     GatewayConfig::load(&path)
 }
 

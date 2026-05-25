@@ -275,19 +275,19 @@ install -m 0755 target/release/aw-ssh-command-filter /opt/aw-gateway/runtime/lin
 
 ## Configuration
 
-Default config paths:
+Gateway config lookup uses this precedence:
+
+1. `--config PATH`
+2. `AW_GATEWAY_CONFIG`
+3. User config file, when present:
+   `{AW_GATEWAY_CONFIG_HOME|XDG_CONFIG_HOME|~/.config}/aw-gateway/gateway.toml`
+4. System config file, when present: `/etc/aw-gateway/gateway.toml`
+
+The container-agent and bootstrap configs remain explicit/system-managed:
 
 ```text
-/etc/aw-gateway/gateway.toml
 /etc/aw-gateway/container-agent.toml
 /etc/aw-gateway/container-bootstrap.toml
-```
-
-Generate sample configs:
-
-```bash
-aw-gateway config init /tmp/gateway.toml
-aw-container-agent config init /tmp/container-agent.toml
 ```
 
 Validate configs:
@@ -297,28 +297,41 @@ aw-gateway --config /tmp/gateway.toml config validate
 aw-container-agent --config /tmp/container-agent.toml config validate
 ```
 
+Show resolved gateway config paths:
+
+```bash
+aw-gateway config paths
+aw-gateway config paths --json
+```
+
 Config path and log level can be overridden with flags or environment
 variables:
 
 ```text
 AW_GATEWAY_CONFIG
+AW_GATEWAY_CONFIG_HOME
+AW_GATEWAY_STATE_HOME
 AW_GATEWAY_LOG_LEVEL
 AW_CONTAINER_AGENT_CONFIG
 AW_CONTAINER_AGENT_LOG_LEVEL
 AW_CONTAINER_BOOTSTRAP_CONFIG
 ```
 
-`AW_GATEWAY_CONFIG` selects the host gateway config,
+`AW_GATEWAY_CONFIG` selects an explicit host gateway config. `AW_GATEWAY_CONFIG_HOME`
+and `AW_GATEWAY_STATE_HOME` override the user config and state roots.
 `AW_CONTAINER_AGENT_CONFIG` selects the in-container supervisor config, and
 `AW_CONTAINER_BOOTSTRAP_CONFIG` selects the rendered bootstrap config consumed
 by `aw-container-bootstrap`.
 
-The canonical sample configs are:
+The minimal gateway syntax sample and canonical agent sample are:
 
 ```text
 aw-gateway.sample.toml
 container-agent.sample.toml
 ```
+
+For working platform deployments, start from the guide and example config for
+Podman, Docker, or Colima instead of copying the minimal gateway sample.
 
 ## HTTP API
 
@@ -1042,9 +1055,10 @@ Match Group aw-gateway-users
     AllowAgentForwarding no
 ```
 
-The default config path is `/etc/aw-gateway/gateway.toml`. Deployments can use
-that path directly or pass `--config`/`AW_GATEWAY_CONFIG` when an explicit
-override is preferred.
+Managed SSH deployments should pass an explicit system config path when
+per-user overrides are not intended. Unrestricted users running `aw-gateway`
+directly can use their own default config at
+`~/.config/aw-gateway/gateway.toml`.
 
 Typical user actions through host SSH:
 
@@ -1174,7 +1188,7 @@ Gateway commands:
 
 ```text
 config validate
-config init [path] [--force]
+config paths [--json]
 connect [--session-id ID] [target]
 up [target] [--json] [--session-id ID]
 run [--session-id ID] [target] [--cwd DIR] -- <command> [args...]
@@ -1208,7 +1222,8 @@ and `launch`. Fixed targets reject `--session-id`.
 Gateway command behavior:
 
 - `config validate`: load and validate the gateway config.
-- `config init [path] [--force]`: write the embedded sample gateway config.
+- `config paths [--json]`: show the effective user, user config/state
+  directories, checked gateway config files, and selected config source.
 - `connect [--session-id ID] [target]`: start or reuse a target and proxy the
   current SSH stream to the container SSH bridge.
 - `up [target] [--json] [--session-id ID]`: start or reuse a target and report
@@ -1378,8 +1393,10 @@ console = false
 ```
 
 Protocol and proxy paths keep stdout quiet. Diagnostics go to stderr or the
-configured log files. Gateway log directories can interpolate `{user}`, `{uid}`,
-`{gid}`, `{home}`, `{workspace}`, `{state}`, and `{state_dir}`. Container-agent log
+configured log files. The minimal gateway sample uses console logging; managed
+deployment examples usually keep gateway file logs under target workspace
+state. Gateway log directories can interpolate `{user}`, `{uid}`, `{gid}`,
+`{home}`, `{workspace}`, `{state}`, and `{state_dir}`. Container-agent log
 directories can interpolate `{container_state_dir}`. Container service
 stdout/stderr is captured under the container state log directory with the
 configured rotation limits.

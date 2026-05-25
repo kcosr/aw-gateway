@@ -193,8 +193,9 @@ sudo install -m 0644 examples/docker/gateway-remote.toml /etc/aw-gateway/gateway
 /opt/aw-gateway/bin/aw-gateway --config /etc/aw-gateway/gateway.toml config validate
 ```
 
-`/etc/aw-gateway/gateway.toml` is the gateway's default host config path.
-These commands still pass `--config` so the guide remains explicit.
+`/etc/aw-gateway/gateway.toml` is the system gateway config path. This guide
+passes `--config` explicitly so managed-host commands do not depend on whether
+the user also has `~/.config/aw-gateway/gateway.toml`.
 
 Install the workstation public key from a remote host:
 
@@ -265,8 +266,8 @@ ssh aw-ubuntu 'pwd && id && hostname'
 ```
 
 For a remote Docker host, use `/etc/aw-gateway/gateway.toml` if that is where
-the host config was installed. For a local user-owned test layout, keep the same
-commands but point `--config` at the test config.
+the host config was installed. For a local user-owned test layout, keep the
+same commands but point `--config` at the test config.
 
 ## Optional Restricted Remote Users
 

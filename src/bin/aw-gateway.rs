@@ -1,4 +1,4 @@
-use aw_gateway::cli::{GatewayArgs, GatewayCommand};
+use aw_gateway::cli::{GatewayArgs, GatewayCommand, GatewayConfigCommand};
 use aw_gateway::paths;
 use aw_gateway::{gateway, logging};
 use clap::Parser;
@@ -7,8 +7,12 @@ use clap::Parser;
 async fn main() -> anyhow::Result<()> {
     let args = GatewayArgs::parse();
     let protocol_mode = matches!(args.command, Some(GatewayCommand::Connect(_)));
-    let config_path = (!matches!(args.command, Some(GatewayCommand::Config(_))))
-        .then(|| paths::gateway_config_path(args.config.clone()));
+    let config_path = match &args.command {
+        Some(GatewayCommand::Config(GatewayConfigCommand::Paths(_))) => None,
+        _ => paths::resolve_gateway_config(args.config.clone())?
+            .selected_path()
+            .ok(),
+    };
     let _logging = logging::init_gateway(
         config_path.as_deref(),
         args.log_level.as_deref(),

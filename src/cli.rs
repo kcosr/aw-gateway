@@ -10,7 +10,7 @@ use std::path::PathBuf;
     disable_help_subcommand = true
 )]
 pub struct GatewayArgs {
-    #[arg(long, env = "AW_GATEWAY_CONFIG", global = true)]
+    #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
     #[arg(long, env = "AW_GATEWAY_LOG_LEVEL", global = true)]
@@ -23,7 +23,7 @@ pub struct GatewayArgs {
 #[derive(Debug, Subcommand)]
 pub enum GatewayCommand {
     #[command(subcommand)]
-    Config(ConfigCommand),
+    Config(GatewayConfigCommand),
     Connect(ConnectArgs),
     Up(UpArgs),
     Run(RunArgs),
@@ -47,7 +47,19 @@ pub enum GatewayCommand {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum ConfigCommand {
+pub enum GatewayConfigCommand {
+    Validate,
+    Paths(ConfigPathsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigPathsArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentConfigCommand {
     Validate,
     Init(InitArgs),
 }
@@ -216,7 +228,7 @@ pub struct AgentArgs {
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
     #[command(subcommand)]
-    Config(ConfigCommand),
+    Config(AgentConfigCommand),
     Run,
 }
 
