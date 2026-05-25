@@ -1,4 +1,3 @@
-
 use super::super::model::GatewayStatus;
 use super::super::ops::{ExecutionOutcome, OperationError};
 use super::auth::ActionAuthorizationError;

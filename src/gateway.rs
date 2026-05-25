@@ -68,6 +68,7 @@ mod client;
 mod health;
 mod http;
 mod identity;
+mod lifecycle;
 mod listener;
 mod model;
 mod ops;
@@ -78,6 +79,7 @@ mod token;
 
 use client::{read_default_selection, resolve_target_selection};
 use health::{run_argv_with_options, run_argv_with_timeout, run_health_check};
+use lifecycle::{FailedStartCleanup, readiness_plan};
 use model::{
     GatewayStatus, LaunchDetail, LaunchStepDetail, LaunchSummary, LaunchVarMetadata, ReadyStatus,
     TargetEntry, TcpEndpoint, gateway_status_name,
@@ -106,6 +108,8 @@ use identity::{
     ensure_identity_token_file, is_plausible_public_key, validate_identity_token_content,
     validate_public_key_content,
 };
+#[cfg(test)]
+use lifecycle::ContainerReadinessPlan;
 #[cfg(test)]
 use model::{AllStatusEntry, LocalListenerStatus, SessionMarker};
 #[cfg(test)]
@@ -1607,8 +1611,9 @@ impl Runtime {
                 .container_runtime
                 .inspect(&self.identity.container_name)
                 .await?;
+            let plan = readiness_plan(inspect);
             let inspect = self
-                .ensure_container_for_readiness_plan(inspect, &mut failed_start_cleanup)
+                .ensure_container_for_readiness_plan(plan, &mut failed_start_cleanup)
                 .await?;
             self.validate_labels(&inspect)?;
             let container_pid = inspect.state.pid.to_string();
@@ -1656,46 +1661,6 @@ impl Runtime {
             local_ssh: None,
             client_config: None,
         })
-    }
-
-    async fn ensure_container_for_readiness_plan(
-        &self,
-        inspect: Option<ContainerInspect>,
-        failed_start_cleanup: &mut FailedStartCleanup,
-    ) -> anyhow::Result<ContainerInspect> {
-        match (readiness_plan(inspect.as_ref()), inspect) {
-            (ContainerReadinessPlan::ReuseRunning, Some(existing)) => {
-                self.validate_labels(&existing)?;
-                Ok(existing)
-            }
-            (ContainerReadinessPlan::StartStopped, Some(existing)) => {
-                self.validate_labels(&existing)?;
-                self.run_lifecycle_phase(LifecyclePhase::PreStart, None)
-                    .await?;
-                self.remove_stale_control_socket_files()?;
-                failed_start_cleanup.mark_runtime_start_attempted();
-                self.container_runtime
-                    .start(&self.identity.container_name)
-                    .await?;
-                self.inspect_container_after_start().await
-            }
-            (ContainerReadinessPlan::CreateMissing, None) => {
-                self.run_lifecycle_phase(LifecyclePhase::PreStart, None)
-                    .await?;
-                self.remove_stale_control_socket_files()?;
-                failed_start_cleanup.mark_runtime_start_attempted();
-                self.start_container().await?;
-                self.inspect_container_after_start().await
-            }
-            _ => unreachable!("readiness plan and inspect state should agree"),
-        }
-    }
-
-    async fn inspect_container_after_start(&self) -> anyhow::Result<ContainerInspect> {
-        self.container_runtime
-            .inspect(&self.identity.container_name)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("container did not exist after start"))
     }
 
     async fn status(&self) -> anyhow::Result<GatewayStatus> {
@@ -3373,39 +3338,6 @@ fn host_hook_timeout(configured: Option<&str>) -> anyhow::Result<Duration> {
 fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<GatewayConfig> {
     let path = paths::gateway_config_path(config_path);
     GatewayConfig::load(&path)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContainerReadinessPlan {
-    ReuseRunning,
-    StartStopped,
-    CreateMissing,
-}
-
-#[derive(Debug, Default)]
-struct FailedStartCleanup {
-    runtime_start_attempted: bool,
-}
-
-impl FailedStartCleanup {
-    fn mark_runtime_start_attempted(&mut self) {
-        self.runtime_start_attempted = true;
-    }
-
-    async fn run_if_needed(self, runtime: &Runtime) {
-        if self.runtime_start_attempted {
-            runtime.cleanup_failed_start().await;
-            runtime.cleanup_control_socket_dir();
-        }
-    }
-}
-
-fn readiness_plan(inspect: Option<&ContainerInspect>) -> ContainerReadinessPlan {
-    match inspect {
-        Some(inspect) if inspect.state.running => ContainerReadinessPlan::ReuseRunning,
-        Some(_) => ContainerReadinessPlan::StartStopped,
-        None => ContainerReadinessPlan::CreateMissing,
-    }
 }
 
 struct AgentSessionHold {
