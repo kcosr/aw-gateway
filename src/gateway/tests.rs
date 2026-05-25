@@ -2043,6 +2043,47 @@ name = "{{image_slug}}"
     }
 }
 
+#[tokio::test]
+async fn runtime_load_renders_target_container_home_identity_templates() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+
+[target_defaults.workspace]
+path = "{}"
+state_dir = ".aw-gateway"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+container_home = "/srv/{{user}}/{{uid}}"
+"#,
+            dir.path().join("workspace").display(),
+        ),
+    )
+    .unwrap();
+
+    let runtime = Runtime::load(Some(config), Some("default"), None, false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        runtime.identity.container_home,
+        PathBuf::from(format!(
+            "/srv/{}/{}",
+            runtime.identity.user.user, runtime.identity.user.uid
+        ))
+    );
+}
+
 #[test]
 fn unix_socket_path_inventory_includes_host_and_container_paths() {
     let dir = tempfile::tempdir().unwrap();
@@ -3013,6 +3054,43 @@ fn writes_container_ssh_policy_and_injects_sshd_policy_env() {
     assert!(agent_config.contains("socket = \"/run/aw-gateway/ssh.sock\""));
     assert!(!agent_config.contains("/home/alice/.aw-gateway/containers/ubuntu-dev/agent.sock"));
     assert!(!agent_config.contains("/home/alice/.aw-gateway/containers/ubuntu-dev/ssh.sock"));
+}
+
+#[test]
+fn gateway_managed_service_user_renders_container_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    enable_default_agent_services(&mut cfg);
+    cfg.target_defaults
+        .container_agent
+        .as_mut()
+        .unwrap()
+        .services
+        .iter_mut()
+        .find(|service| service.name == "acl-proxy")
+        .unwrap()
+        .user = "{container_user}".into();
+    cfg.validate().unwrap();
+    let target = cfg.effective_target("default").unwrap();
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    std::fs::create_dir_all(&container_state_dir).unwrap();
+    let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+
+    let agent_path = runtime.write_container_agent_config().unwrap();
+    let agent_config = std::fs::read_to_string(agent_path).unwrap();
+    let parsed: crate::config::ContainerAgentFile = toml::from_str(&agent_config).unwrap();
+    let service = parsed
+        .container_agent
+        .services
+        .iter()
+        .find(|service| service.name == "acl-proxy")
+        .unwrap();
+    assert_eq!(service.user, "alice");
+    assert!(!agent_config.contains("{container_user}"));
 }
 
 #[test]

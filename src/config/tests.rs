@@ -2147,6 +2147,44 @@ use = ["runtime"]
 }
 
 #[test]
+fn target_container_home_rejects_non_identity_templates() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+container_home = "/home/{container_user}"
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("target.container_home"), "{err}");
+    assert!(err.contains("{container_user}"), "{err}");
+}
+
+#[test]
+fn target_container_home_accepts_rendered_absolute_home_templates() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+container_home = "{home}/containers/{user}"
+"#,
+    )
+    .unwrap();
+
+    cfg.validate().unwrap();
+}
+
+#[test]
 fn target_chain_overlays_defaults_nested_templates_and_concrete_target() {
     let cfg: GatewayConfig = toml::from_str(
         r#"
@@ -4062,4 +4100,22 @@ depends_on = ["acl-proxy"]
 
     let err = cfg.validate().unwrap_err().to_string();
     assert!(err.contains("dependency cycle"), "{err}");
+}
+
+#[test]
+fn standalone_container_agent_rejects_gateway_service_user_templates() {
+    let cfg: ContainerAgentFile = toml::from_str(
+        r#"
+schema_version = "1"
+
+[[container_agent.services]]
+name = "worker"
+user = "{container_user}"
+command = ["worker"]
+"#,
+    )
+    .unwrap();
+
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("service.user"), "{err}");
 }

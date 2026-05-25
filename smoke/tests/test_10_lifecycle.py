@@ -79,6 +79,31 @@ EOF
     assert data["target"] == host.target
 
 
+def test_gateway_config_accepts_template_scoped_identity_and_service_user(host: Host) -> None:
+    command = f"""
+set -eu
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+cp {shlex.quote(host.config_path)} "$tmp/base.toml"
+cat > "$tmp/child.toml" <<'EOF'
+extends = "base.toml"
+
+[targets.{host.target}]
+container_home = "/tmp/aw-smoke-{{user}}"
+
+[[targets.{host.target}.container_agent.services]]
+name = "smoke-template-user"
+required = false
+user = "{{container_user}}"
+command = ["sleep", "infinity"]
+EOF
+{shlex.quote(host.gateway_path)} --config "$tmp/child.toml" config validate
+"""
+    result = remote(host.ssh, command)
+    result.assert_success()
+    assert "ok" in result.stdout.lower()
+
+
 def test_gateway_lists_targets(host: Host) -> None:
     result = gateway(host, "targets", "--json")
     result.assert_success()

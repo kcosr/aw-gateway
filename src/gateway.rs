@@ -1176,6 +1176,12 @@ impl RuntimeIdentity {
         container_name: String,
         container_runtime: &ContainerRuntime,
     ) -> anyhow::Result<Self> {
+        let mut identity_vars = Vars::new();
+        identity_vars.insert("user".into(), user.user.clone());
+        identity_vars.insert("uid".into(), user.uid.to_string());
+        identity_vars.insert("gid".into(), user.gid.to_string());
+        identity_vars.insert("home".into(), user.home.display().to_string());
+
         let default_container_user = target.container_user.clone().unwrap_or_else(|| {
             if container_runtime.kind() == ContainerRuntimeType::Podman {
                 user.user.clone()
@@ -1183,18 +1189,20 @@ impl RuntimeIdentity {
                 "root".into()
             }
         });
-        let default_container_home = target.container_home.clone().unwrap_or_else(|| {
-            if container_runtime.kind() == ContainerRuntimeType::Podman {
-                user.home.clone()
-            } else {
-                PathBuf::from("/root")
-            }
-        });
-        let mut identity_vars = Vars::new();
-        identity_vars.insert("user".into(), user.user.clone());
-        identity_vars.insert("uid".into(), user.uid.to_string());
-        identity_vars.insert("gid".into(), user.gid.to_string());
-        identity_vars.insert("home".into(), user.home.display().to_string());
+        let default_container_home = target
+            .container_home
+            .as_ref()
+            .map(|home| {
+                template::render(&home.display().to_string(), &identity_vars).map(PathBuf::from)
+            })
+            .transpose()?
+            .unwrap_or_else(|| {
+                if container_runtime.kind() == ContainerRuntimeType::Podman {
+                    user.home.clone()
+                } else {
+                    PathBuf::from("/root")
+                }
+            });
         let identity_cfg = target.identity.as_ref();
         let bootstrap_user = identity_cfg
             .and_then(|cfg| cfg.bootstrap_user.as_deref())

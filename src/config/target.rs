@@ -381,10 +381,8 @@ impl TargetConfigInput {
         if let Some(container_user) = &self.container_user {
             validate_name("target.container_user", container_user)?;
         }
-        if let Some(container_home) = &self.container_home
-            && !container_home.is_absolute()
-        {
-            anyhow::bail!("target {target_name:?} container_home must be absolute");
+        if let Some(container_home) = &self.container_home {
+            validate_container_home(target_name, container_home)?;
         }
         validate_env_map("target.container_env", &self.container_env)?;
         validate_env_map("target.session_env", &self.session_env)?;
@@ -526,10 +524,8 @@ impl TargetConfig {
         if let Some(container_user) = &self.container_user {
             validate_name("target.container_user", container_user)?;
         }
-        if let Some(container_home) = &self.container_home
-            && !container_home.is_absolute()
-        {
-            anyhow::bail!("target {target_name:?} container_home must be absolute");
+        if let Some(container_home) = &self.container_home {
+            validate_container_home(target_name, container_home)?;
         }
         if let Some(identity) = &self.identity {
             identity.validate(target_name)?;
@@ -665,6 +661,23 @@ impl TargetConfig {
         validate_container_name(&rendered)?;
         Ok(rendered)
     }
+}
+
+fn validate_container_home(target_name: &str, container_home: &Path) -> anyhow::Result<()> {
+    let value = container_home.display().to_string();
+    validate_template("target.container_home", &value, IDENTITY_TEMPLATE_VARS)?;
+
+    let mut vars = template::Vars::new();
+    vars.insert("user".into(), "user".into());
+    vars.insert("uid".into(), "1000".into());
+    vars.insert("gid".into(), "1000".into());
+    vars.insert("home".into(), "/home/user".into());
+    let rendered = template::render(&value, &vars)?;
+    if !Path::new(&rendered).is_absolute() {
+        anyhow::bail!("target {target_name:?} container_home must render to an absolute path");
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

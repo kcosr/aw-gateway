@@ -46,6 +46,7 @@ impl Runtime {
                 _ => None,
             };
         }
+        self.render_gateway_managed_service_fields(&mut container_agent)?;
         let cfg = ContainerAgentFile {
             schema_version: AGENT_SCHEMA_VERSION.to_string(),
             logging: LoggingConfig::default(),
@@ -55,6 +56,19 @@ impl Runtime {
         atomic_write_toml(&path, &cfg, AtomicWritePolicy::fixed_no_fsync(0o600))
             .with_context(|| format!("write {}", path.display()))?;
         Ok(path)
+    }
+
+    fn render_gateway_managed_service_fields(
+        &self,
+        container_agent: &mut crate::config::ContainerAgentConfig,
+    ) -> anyhow::Result<()> {
+        let vars = self.vars(None);
+        for service in &mut container_agent.services {
+            if service.user == crate::config::SERVICE_USER_TEMPLATE {
+                service.user = template::render(&service.user, &vars)?;
+            }
+        }
+        Ok(())
     }
 
     fn inject_container_sshd_env(&self, container_agent: &mut crate::config::ContainerAgentConfig) {

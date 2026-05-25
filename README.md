@@ -948,6 +948,8 @@ define `schema_version`, `default_target`, `extends`, `[runtime]`, `[logging]`,
 `[http]`, `[ssh_dispatch]`, `[client_config]`, `[target_defaults]`, or
 `[launch_defaults]`.
 
+### Root Config Extends
+
 Root configs may inherit another root config with `extends`:
 
 ```toml
@@ -956,9 +958,9 @@ extends = "/etc/aw-gateway/gateway.toml"
 
 `extends` is honored only by the selected root config. Unlike include files, an
 extended root may define root-owned policy, defaults, templates, targets, and
-launches. The loader composes each file's own `includes` relative to that file,
-strips loader-only `extends` and `includes`, then merges base-to-child before
-normal validation.
+launches. Extends chains may have multiple levels. The loader composes each
+file's own `includes` relative to that file, strips loader-only `extends` and
+`includes`, then merges deepest base-to-child before normal validation.
 
 Root inheritance uses these merge rules:
 
@@ -1412,6 +1414,40 @@ private state files:
 The SSHD helper also supports test/override hooks:
 `AW_SSHD_BASE_CONFIG`, `AW_SSHD_RUNTIME_CONFIG`, `AW_SSHD_RUN_DIR`,
 `AW_SSHD_DRY_RUN_CONFIG`, and `AW_SSH_COMMAND_FILTER`.
+
+## Template Variables
+
+Template variables are scoped to the phase that renders a field. Loader paths
+and config identifiers remain literal so includes, inheritance, validation,
+merging, and references are deterministic.
+
+| Field group | Render phase | Supported variables |
+| --- | --- | --- |
+| `target.identity.*` | Gateway identity resolution | `{user}`, `{uid}`, `{gid}`, `{home}` |
+| `target.container_home` | Gateway identity resolution | `{user}`, `{uid}`, `{gid}`, `{home}` |
+| `target.workspace.path` | Gateway target resolution | `{user}`, `{uid}`, `{gid}`, `{home}`, `{target}`, `{image}`, `{image_slug}`, `{session_id}` |
+| `target.workspace.state_dir`, `target.container_env`, `target.session_env`, `target.container_mounts.*`, `target.runtime.extra_run_args`, `target.container_bootstrap.*`, `target.container_bootstrap_steps.*` | Gateway runtime resolution | Gateway vars except `{container_pid}` |
+| `target.lifecycle_steps[].command` | Gateway lifecycle execution | Pre-start supports gateway vars except `{container_pid}`; later phases support all gateway vars |
+| `target.host_steps[].command` and HTTP health-check URLs | Gateway host-step execution | All gateway vars, including `{container_pid}` |
+| `container_agent.services[].user` in gateway config | Gateway-managed agent config render | `{container_user}` |
+| `container_agent.services[].command`, `cwd`, `env`, and health-check URL | Container-agent service execution | `{container_state_dir}` |
+| `container_agent.control_socket` and `ssh_bridge.socket` in standalone agent config | Container-agent startup | `{container_state_dir}` |
+| `launch.cwd`, `launch.command`, `launch.env`, and `launch.steps[]` command/cwd/env | Launch execution | Launch built-ins plus `{var.<name>}` |
+| `client_config.inner_alias_template`, `container_host_template`, `default_identity_dir` | Client config generation | `{user}`, `{home}`, `{container_user}`, `{container_home}`, `{workspace}`, `{state_dir}`, `{target}`, `{image}`, `{image_slug}`, `{container_name}`, `{container_state_dir}`, `{container_state_dir_in_container}`, `{session_id}`, `{host}` |
+| `logging.directory` | Gateway logging startup | `{user}`, `{uid}`, `{gid}`, `{home}`, `{workspace}`, `{state}`, `{state_dir}` |
+| Container-agent `logging.directory` | Container-agent logging startup | `{container_state_dir}` |
+| `runtime.docker_host` | Runtime initialization | `{user}`, `{home}` |
+
+Gateway vars are `{user}`, `{uid}`, `{gid}`, `{home}`, `{container_user}`,
+`{container_home}`, `{workspace}`, `{state}`, `{state_dir}`, `{target}`,
+`{image}`, `{image_slug}`, `{container_name}`, `{container_state_dir}`,
+`{container_state_dir_in_container}`, `{session_id}`, and, after the container
+starts, `{container_pid}`. Launch built-ins are the gateway vars available at
+launch execution time; caller variables use `{var.<name>}`.
+
+`target.container_home` must render to an absolute path. Literal absolute
+templates such as `/home/{user}` are valid, and `{home}` may also be used as
+the absolute leading path segment.
 
 ## Logging
 

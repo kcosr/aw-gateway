@@ -44,6 +44,7 @@ Implemented in `tests/test_10_lifecycle.py`.
 | `config paths --json` reports the deployed explicit config and checked paths | all enabled hosts |
 | `config paths --json` selects a temporary user config when no explicit config is passed | all enabled hosts |
 | A temporary root config can `extends` the deployed config and add a launch | all enabled hosts |
+| A temporary root config validates scoped `container_home` and service `user` templates | all enabled hosts |
 | Gateway target listing succeeds and includes the smoke target | all enabled hosts |
 | `run <target> -- id` starts or reuses the container and executes inside it | all enabled hosts |
 | Status JSON reports the target after execution | all enabled hosts |

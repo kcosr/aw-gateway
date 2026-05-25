@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Added scoped template support for `target.container_home` identity variables
+  and gateway-managed `container_agent.services[].user = "{container_user}"`
+  ([#41](https://github.com/kcosr/aw-gateway/pull/41)).
 
 ## [0.4.0] - 2026-05-25
 
