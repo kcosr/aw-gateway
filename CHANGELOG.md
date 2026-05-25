@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Session marker JSON now requires the `launch` key; non-launch sessions are
+  written as `launch = null`, and stale marker files from older unreleased
+  builds should be removed before relying on idle-session accounting.
+- Removed retired config aliases. Use `client_config.inner_alias_template`
+  instead of `client_config.alias_template`, and use `http.auth.token_file`
+  instead of the retired `token` or `bearer_token` keys.
+- Configured file logging is strict. If a configured logging directory template
+  cannot be rendered or the file log writer cannot be initialized, gateway and
+  container-agent startup fail instead of silently falling back to console
+  logging.
+
 ### Added
 
 - Added live smoke coverage for short-timer idle cleanup, preserve-process,

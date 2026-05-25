@@ -95,6 +95,9 @@ Refresh Linux restricted users:
 .venv/bin/awsmoke setup-restricted rocky10
 ```
 
+Restricted-user setup validates the generated `sshd` config on every run and
+reloads `sshd` only when the managed `Match` snippet changes.
+
 Run all enabled tests:
 
 ```bash

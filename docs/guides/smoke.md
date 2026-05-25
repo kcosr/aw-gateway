@@ -12,6 +12,9 @@ access paths:
 - Linux restricted OpenSSH `ForceCommand` users;
 - JSON HTTP API requests through SSH local forwards.
 
+Restricted-user deployment validates the generated `sshd` config on every run
+and reloads `sshd` only when the managed `Match` snippet changes.
+
 Use the committed `smoke/inventory.example.toml` as a starting point:
 
 ```bash
