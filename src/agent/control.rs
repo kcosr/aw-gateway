@@ -13,7 +13,7 @@ use tokio::net::UnixStream;
 use tokio::time::{Duration, sleep};
 
 use super::idle::reap_processes;
-use super::lifecycle::shutdown_agent;
+use super::lifecycle::{exit_pid1_agent_process_success, shutdown_agent};
 use super::socket::{bind_private_unix_socket, validate_control_peer};
 use super::state::AgentState;
 use super::status::status_payload;
@@ -141,7 +141,7 @@ async fn handle_control_connection(
             write_control_response(reader.into_inner(), response).await?;
             tokio::spawn(async {
                 sleep(Duration::from_millis(10)).await;
-                std::process::exit(0);
+                exit_pid1_agent_process_success();
             });
         }
         ControlRequest::ReapNow(_) => {

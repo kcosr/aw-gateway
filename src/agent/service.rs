@@ -3,7 +3,7 @@ use crate::config::{
     EnvValue, HealthCheck, LoggingConfig, RestartPolicy, ServiceConfig, parse_duration,
 };
 use crate::health_probe::{JsonFieldCheck, check_json_fields, http_get};
-use crate::rotating_log::RotationState;
+use crate::rotating_log::{RotationState, RotationStep};
 use crate::template::{self, Vars};
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet};
@@ -468,28 +468,26 @@ impl RotatingServiceLog {
             return Ok(());
         }
         self.file.flush().await?;
-        for generation in (1..=self.rotation.max_files()).rev() {
-            let path = self.rotation.path_for_generation(generation);
-            if generation == self.rotation.max_files() {
-                let _ = tokio::fs::remove_file(path).await;
-            } else {
-                let next = self.rotation.path_for_generation(generation + 1);
-                if tokio::fs::try_exists(&path).await? {
-                    tokio::fs::rename(path, next).await?;
+        let plan = self.rotation.rotation_plan();
+        for step in plan.steps() {
+            match step {
+                RotationStep::Remove { path } => {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+                RotationStep::Rename { from, to } => {
+                    if tokio::fs::try_exists(from).await? {
+                        tokio::fs::rename(from, to).await?;
+                    }
                 }
             }
-        }
-        let active = self.rotation.active_path().to_path_buf();
-        if tokio::fs::try_exists(&active).await? {
-            tokio::fs::rename(&active, self.rotation.path_for_generation(1)).await?;
         }
         self.file = tokio::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
-            .open(self.rotation.active_path())
+            .open(plan.active_path())
             .await
-            .with_context(|| format!("open {}", self.rotation.active_path().display()))?;
+            .with_context(|| format!("open {}", plan.active_path().display()))?;
         self.rotation.reset_after_rotation();
         Ok(())
     }

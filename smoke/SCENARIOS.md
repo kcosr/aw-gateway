@@ -15,7 +15,9 @@ Docker, rootless Podman, and Colima.
 
 Linux restricted access uses an `awsmoke` user in the `aw-gateway-users`
 group. Host `sshd` applies a `ForceCommand` that invokes `aw-gateway`, matching
-the repository's restricted SSH example pattern.
+the repository's restricted SSH example pattern. The deploy helper validates
+the generated `sshd` config every run and reloads `sshd` only when that managed
+snippet changes.
 
 macOS coverage focuses on the Colima runtime and home-directory install. It
 does not currently configure a restricted `ForceCommand` user because that is

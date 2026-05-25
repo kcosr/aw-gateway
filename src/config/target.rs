@@ -9,6 +9,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+mod container_ssh;
+mod idle_cleanup;
+mod local_ssh;
+
+use container_ssh::overlay_target_container_ssh;
+pub use container_ssh::{
+    ContainerSshConfig, ContainerSshTransferConfig, LegacyScpTransferMode, SftpTransferMode,
+    TargetContainerSshConfig, TargetContainerSshTransferConfig,
+};
+pub use idle_cleanup::{
+    IdleCleanupAction, IdleCleanupConfig, IdleCleanupConfigInput, IdleCleanupOwner,
+};
+pub use local_ssh::{
+    LocalSshBackend, LocalSshConfig, LocalSshConfigInput, LocalSshMode, LocalSshReadiness,
+};
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
@@ -716,85 +732,6 @@ fn overlay_control_sockets(
     current.unwrap_or_default().overlay(later)
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TargetContainerSshConfig {
-    pub transfer: Option<TargetContainerSshTransferConfig>,
-}
-
-impl Default for TargetContainerSshConfig {
-    fn default() -> Self {
-        Self {
-            transfer: Some(TargetContainerSshTransferConfig {
-                sftp: Some(SftpTransferMode::Allow),
-                legacy_scp: Some(LegacyScpTransferMode::Allow),
-            }),
-        }
-    }
-}
-
-impl TargetContainerSshConfig {
-    fn overlay(mut self, later: &Self) -> Self {
-        if let Some(transfer) = &later.transfer {
-            self.transfer = Some(self.transfer.take().unwrap_or_default().overlay(transfer));
-        }
-        self
-    }
-
-    pub(super) fn to_effective_config(&self) -> anyhow::Result<ContainerSshConfig> {
-        let transfer = match &self.transfer {
-            Some(transfer) => transfer.to_effective()?,
-            None => TargetContainerSshTransferConfig::default().to_effective()?,
-        };
-        Ok(ContainerSshConfig { transfer })
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TargetContainerSshTransferConfig {
-    pub sftp: Option<SftpTransferMode>,
-    pub legacy_scp: Option<LegacyScpTransferMode>,
-}
-
-impl Default for TargetContainerSshTransferConfig {
-    fn default() -> Self {
-        Self {
-            sftp: Some(SftpTransferMode::Allow),
-            legacy_scp: Some(LegacyScpTransferMode::Allow),
-        }
-    }
-}
-
-impl TargetContainerSshTransferConfig {
-    fn overlay(mut self, later: &Self) -> Self {
-        if let Some(sftp) = later.sftp {
-            self.sftp = Some(sftp);
-        }
-        if let Some(legacy_scp) = later.legacy_scp {
-            self.legacy_scp = Some(legacy_scp);
-        }
-        self
-    }
-
-    fn to_effective(&self) -> anyhow::Result<ContainerSshTransferConfig> {
-        let sftp = self
-            .sftp
-            .ok_or_else(|| anyhow::anyhow!("target container_ssh.transfer.sftp is required"))?;
-        let legacy_scp = self.legacy_scp.ok_or_else(|| {
-            anyhow::anyhow!("target container_ssh.transfer.legacy_scp is required")
-        })?;
-        Ok(ContainerSshTransferConfig { sftp, legacy_scp })
-    }
-}
-
-fn overlay_target_container_ssh(
-    current: Option<TargetContainerSshConfig>,
-    later: &TargetContainerSshConfig,
-) -> TargetContainerSshConfig {
-    current.unwrap_or_default().overlay(later)
-}
-
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetContainerBootstrapConfig {
@@ -1018,241 +955,6 @@ pub enum WorkspaceCleanup {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct IdleCleanupConfig {
-    #[serde(default)]
-    pub owner: IdleCleanupOwner,
-    #[serde(default)]
-    pub action: IdleCleanupAction,
-    pub idle_grace: Option<String>,
-    #[serde(default)]
-    pub preserve_processes: Vec<String>,
-    pub poll_interval: Option<String>,
-    pub shutdown_timeout: Option<String>,
-    #[serde(default = "default_reap_signal")]
-    pub reap_signal: String,
-    pub reap_kill_after: Option<String>,
-}
-
-impl Default for IdleCleanupConfig {
-    fn default() -> Self {
-        Self {
-            owner: IdleCleanupOwner::default(),
-            action: IdleCleanupAction::default(),
-            idle_grace: None,
-            preserve_processes: Vec::new(),
-            poll_interval: None,
-            shutdown_timeout: None,
-            reap_signal: default_reap_signal(),
-            reap_kill_after: None,
-        }
-    }
-}
-
-impl IdleCleanupConfig {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        for value in [
-            &self.idle_grace,
-            &self.poll_interval,
-            &self.shutdown_timeout,
-            &self.reap_kill_after,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            parse_duration(value)?;
-        }
-        for process in &self.preserve_processes {
-            validate_name("preserve_processes", process)?;
-        }
-        match self.reap_signal.as_str() {
-            "TERM" | "KILL" | "INT" | "HUP" => {}
-            _ => anyhow::bail!("unsupported reap_signal {:?}", self.reap_signal),
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct IdleCleanupConfigInput {
-    pub owner: Option<IdleCleanupOwner>,
-    pub action: Option<IdleCleanupAction>,
-    pub idle_grace: Option<String>,
-    pub preserve_processes: Option<Vec<String>>,
-    pub poll_interval: Option<String>,
-    pub shutdown_timeout: Option<String>,
-    pub reap_signal: Option<String>,
-    pub reap_kill_after: Option<String>,
-}
-
-impl IdleCleanupConfigInput {
-    pub(super) fn overlay(mut self, later: &Self) -> Self {
-        if let Some(owner) = later.owner {
-            self.owner = Some(owner);
-        }
-        if let Some(action) = later.action {
-            self.action = Some(action);
-        }
-        if let Some(idle_grace) = &later.idle_grace {
-            self.idle_grace = Some(idle_grace.clone());
-        }
-        if let Some(preserve_processes) = &later.preserve_processes {
-            self.preserve_processes = Some(preserve_processes.clone());
-        }
-        if let Some(poll_interval) = &later.poll_interval {
-            self.poll_interval = Some(poll_interval.clone());
-        }
-        if let Some(shutdown_timeout) = &later.shutdown_timeout {
-            self.shutdown_timeout = Some(shutdown_timeout.clone());
-        }
-        if let Some(reap_signal) = &later.reap_signal {
-            self.reap_signal = Some(reap_signal.clone());
-        }
-        if let Some(reap_kill_after) = &later.reap_kill_after {
-            self.reap_kill_after = Some(reap_kill_after.clone());
-        }
-        self
-    }
-
-    pub(super) fn into_effective(self) -> anyhow::Result<IdleCleanupConfig> {
-        let cleanup = IdleCleanupConfig {
-            owner: self.owner.unwrap_or_default(),
-            action: self.action.unwrap_or_default(),
-            idle_grace: self.idle_grace,
-            preserve_processes: self.preserve_processes.unwrap_or_default(),
-            poll_interval: self.poll_interval,
-            shutdown_timeout: self.shutdown_timeout,
-            reap_signal: self.reap_signal.unwrap_or_else(default_reap_signal),
-            reap_kill_after: self.reap_kill_after,
-        };
-        cleanup.validate()?;
-        Ok(cleanup)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum IdleCleanupOwner {
-    None,
-    Gateway,
-    #[default]
-    Agent,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum IdleCleanupAction {
-    None,
-    #[default]
-    ExitContainer,
-    ReapProcesses,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct LocalSshConfig {
-    #[serde(default)]
-    pub mode: LocalSshMode,
-    #[serde(default)]
-    pub backend: LocalSshBackend,
-    #[serde(default)]
-    pub readiness: LocalSshReadiness,
-    #[serde(default = "default_listen_host")]
-    pub host: String,
-    pub port: Option<u16>,
-}
-
-impl LocalSshConfig {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        if self.mode == LocalSshMode::Listen && self.host != "127.0.0.1" && self.host != "::1" {
-            anyhow::bail!("local_ssh listen host must be loopback-only");
-        }
-        if self.readiness == LocalSshReadiness::SshOnly
-            && self.backend != LocalSshBackend::PublishedPort
-        {
-            anyhow::bail!("local_ssh readiness \"ssh_only\" requires backend = \"published_port\"");
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct LocalSshConfigInput {
-    pub mode: Option<LocalSshMode>,
-    pub backend: Option<LocalSshBackend>,
-    pub readiness: Option<LocalSshReadiness>,
-    pub host: Option<String>,
-    pub port: Option<u16>,
-}
-
-impl LocalSshConfigInput {
-    fn overlay(mut self, later: &Self) -> Self {
-        if let Some(mode) = later.mode {
-            self.mode = Some(mode);
-        }
-        if let Some(backend) = later.backend {
-            self.backend = Some(backend);
-        }
-        if let Some(readiness) = later.readiness {
-            self.readiness = Some(readiness);
-        }
-        if let Some(host) = &later.host {
-            self.host = Some(host.clone());
-        }
-        if let Some(port) = later.port {
-            self.port = Some(port);
-        }
-        self
-    }
-
-    fn into_effective(self) -> LocalSshConfig {
-        LocalSshConfig {
-            mode: self.mode.unwrap_or_default(),
-            backend: self.backend.unwrap_or_default(),
-            readiness: self.readiness.unwrap_or_default(),
-            host: self.host.unwrap_or_else(default_listen_host),
-            port: self.port,
-        }
-    }
-
-    fn validate_partial(&self) -> anyhow::Result<()> {
-        if let Some(host) = &self.host
-            && host != "127.0.0.1"
-            && host != "::1"
-        {
-            anyhow::bail!("local_ssh listen host must be loopback-only");
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LocalSshMode {
-    #[default]
-    ProxyCommand,
-    Listen,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LocalSshBackend {
-    #[default]
-    Socket,
-    PublishedPort,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LocalSshReadiness {
-    #[default]
-    AgentControl,
-    SshOnly,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ContainerMountConfig {
     pub source: String,
     pub target: String,
@@ -1330,69 +1032,5 @@ impl ContainerBootstrapConfig {
             GATEWAY_TEMPLATE_VARS_NO_PID,
         )?;
         Ok(())
-    }
-}
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ContainerSshConfig {
-    #[serde(default)]
-    pub transfer: ContainerSshTransferConfig,
-}
-
-impl ContainerSshConfig {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ContainerSshTransferConfig {
-    #[serde(default)]
-    pub sftp: SftpTransferMode,
-    #[serde(default)]
-    pub legacy_scp: LegacyScpTransferMode,
-}
-
-impl Default for ContainerSshTransferConfig {
-    fn default() -> Self {
-        Self {
-            sftp: SftpTransferMode::Allow,
-            legacy_scp: LegacyScpTransferMode::Allow,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SftpTransferMode {
-    #[default]
-    Allow,
-    Deny,
-}
-
-impl SftpTransferMode {
-    pub fn allows(self) -> bool {
-        matches!(self, Self::Allow)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LegacyScpTransferMode {
-    #[default]
-    Allow,
-    Deny,
-    Inbound,
-    Outbound,
-}
-
-impl LegacyScpTransferMode {
-    pub fn allows_inbound(self) -> bool {
-        matches!(self, Self::Allow | Self::Inbound)
-    }
-
-    pub fn allows_outbound(self) -> bool {
-        matches!(self, Self::Allow | Self::Outbound)
     }
 }

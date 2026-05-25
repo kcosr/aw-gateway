@@ -4,6 +4,7 @@
 *.swp
 *~
 .build-service/workspace-id
+.spec/
 smoke/.venv/
 smoke/.pytest_cache/
 smoke/aw_gateway_smoke.egg-info/

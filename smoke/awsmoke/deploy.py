@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import base64
+import json
 import shlex
 
 from .hosts import Host, Inventory
@@ -87,6 +88,7 @@ def setup_restricted_user(inventory: Inventory, host: Host, public_key: Path) ->
         raise NotImplementedError("macOS restricted setup is pending host-specific details")
 
     user = host.restricted_user
+    user_q = shlex.quote(user)
     install_root = host.restricted_install_root
     generated_host_dir = inventory.generated_dir / host.name / "restricted"
     generated_host_dir.mkdir(parents=True, exist_ok=True)
@@ -104,22 +106,29 @@ def setup_restricted_user(inventory: Inventory, host: Host, public_key: Path) ->
     create_user = f"""
 set -euo pipefail
 sudo groupadd -f aw-gateway-users
-if ! id -u {shlex.quote(user)} >/dev/null 2>&1; then
-  sudo useradd -m -s /bin/bash {shlex.quote(user)}
+if ! id -u {user_q} >/dev/null 2>&1; then
+  sudo useradd -m -s /bin/bash {user_q}
 fi
-sudo usermod -aG aw-gateway-users {shlex.quote(user)}
+sudo usermod -aG aw-gateway-users {user_q}
 if [ -n {shlex.quote(extra_group)} ]; then
-  sudo usermod -aG {shlex.quote(extra_group)} {shlex.quote(user)}
+  sudo usermod -aG {shlex.quote(extra_group)} {user_q}
 fi
-sudo install -d -m 0700 -o {shlex.quote(user)} -g {shlex.quote(user)} /home/{shlex.quote(user)}/.ssh
-printf %s {shlex.quote(pubkey_b64)} | base64 -d | sudo tee /home/{shlex.quote(user)}/.ssh/authorized_keys >/dev/null
-sudo chown {shlex.quote(user)}:{shlex.quote(user)} /home/{shlex.quote(user)}/.ssh/authorized_keys
-sudo chmod 0600 /home/{shlex.quote(user)}/.ssh/authorized_keys
+sudo install -d -m 0700 -o {user_q} -g {user_q} /home/{user_q}/.ssh
+key_tmp=$(mktemp)
+trap 'rm -f "${{key_tmp}}"' EXIT
+printf %s {shlex.quote(pubkey_b64)} | base64 -d >"${{key_tmp}}"
+if ! sudo test -f /home/{user_q}/.ssh/authorized_keys || ! sudo cmp -s "${{key_tmp}}" /home/{user_q}/.ssh/authorized_keys; then
+  sudo install -m 0600 -o {user_q} -g {user_q} "${{key_tmp}}" /home/{user_q}/.ssh/authorized_keys
+fi
 """
     remote_check(host.ssh, create_user, timeout=120)
 
     remote_tmp = f"/tmp/aw-gateway-smoke-{host.name}-restricted"
     remote_check(host.ssh, f"rm -rf {shlex.quote(remote_tmp)} && mkdir -p {shlex.quote(remote_tmp)}")
+    match_config_name = f"99-aw-gateway-smoke-{user}.conf"
+    match_config_remote = f"{remote_tmp}/{match_config_name}"
+    match_config_remote_q = shlex.quote(match_config_remote)
+    sshd_config_q = shlex.quote(f"/etc/ssh/sshd_config.d/{match_config_name}")
 
     for binary in BINARIES:
         scp_to(host.ssh, inventory.repo_root / "target" / "release" / binary, f"{remote_tmp}/{binary}").assert_success()
@@ -127,10 +136,10 @@ sudo chmod 0600 /home/{shlex.quote(user)}/.ssh/authorized_keys
     for helper in ["start-container-sshd", "sshd_config_agent"]:
         scp_to(host.ssh, helper_dir / helper, f"{remote_tmp}/{helper}").assert_success()
     scp_to(host.ssh, rendered_config, f"{remote_tmp}/gateway.toml").assert_success()
-    scp_to(host.ssh, match_config, f"{remote_tmp}/99-aw-gateway-smoke-{user}.conf").assert_success()
+    scp_to(host.ssh, match_config, match_config_remote).assert_success()
 
     if install_root.startswith(f"/home/{user}/"):
-        owner_args = f"-o {shlex.quote(user)} -g {shlex.quote(user)}"
+        owner_args = f"-o {user_q} -g {user_q}"
     else:
         owner_args = ""
     install = f"""
@@ -143,9 +152,16 @@ sudo install -m 0755 {owner_args} {shlex.quote(remote_tmp)}/aw-ssh-command-filte
 sudo install -m 0755 {owner_args} {shlex.quote(remote_tmp)}/start-container-sshd {shlex.quote(install_root)}/runtime/linux/start-container-sshd
 sudo install -m 0644 {owner_args} {shlex.quote(remote_tmp)}/sshd_config_agent {shlex.quote(install_root)}/runtime/linux/sshd_config_agent
 sudo install -m 0644 {owner_args} {shlex.quote(remote_tmp)}/gateway.toml {shlex.quote(install_root)}/etc/gateway.toml
-sudo install -m 0644 {shlex.quote(remote_tmp)}/99-aw-gateway-smoke-{user}.conf /etc/ssh/sshd_config.d/99-aw-gateway-smoke-{user}.conf
+sshd_config_changed=0
+sshd_config={sshd_config_q}
+if ! sudo test -f "${{sshd_config}}" || ! sudo cmp -s {match_config_remote_q} "${{sshd_config}}"; then
+  sudo install -m 0644 {match_config_remote_q} "${{sshd_config}}"
+  sshd_config_changed=1
+fi
 sudo sshd -t
-sudo systemctl reload sshd 2>/dev/null || sudo systemctl reload ssh 2>/dev/null || sudo service sshd reload 2>/dev/null || sudo service ssh reload
+if [ "${{sshd_config_changed}}" = "1" ]; then
+  sudo systemctl reload sshd 2>/dev/null || sudo systemctl reload ssh 2>/dev/null || sudo service sshd reload 2>/dev/null || sudo service ssh reload
+fi
 """
     remote_check(host.ssh, install, timeout=120)
 
@@ -205,7 +221,7 @@ def build_remote_macos_gateway(inventory: Inventory, host: Host, remote_tmp: str
     )
     command = (
         f"tar -C {shlex.quote(str(inventory.repo_root))} "
-        "--exclude .git --exclude target -cf - . | "
+        "--exclude ./.git --exclude ./target -cf - . | "
         f"ssh -o BatchMode=yes -o ConnectTimeout=10 {shlex.quote(host.ssh)} "
         f"{shlex.quote(remote_command)}"
     )
@@ -377,7 +393,7 @@ def append_http_smoke_config(text: str, host: Host, *, http_actions: list[str] |
         + "\n]\n\n"
         + "[http.auth]\n"
         + 'type = "bearer"\n'
-        + 'token_file = "~/.config/aw-gateway/http-token"\n'
+        + f"token = {json.dumps(host.http_token)}\n"
     )
 
 
@@ -417,9 +433,6 @@ set -euo pipefail
 {prefix}install -m 0644 {tmp}/gateway.toml {root}/etc/gateway.toml
 {prefix}install -m 0644 {tmp}/gateway-local.toml {root}/etc/gateway-local.toml
 {prefix}install -m 0644 {tmp}/gateway-http-limited.toml {root}/etc/gateway-http-limited.toml
-install -d -m 0700 ~/.config/aw-gateway
-printf '%s\n' {shlex.quote(host.http_token)} > ~/.config/aw-gateway/http-token
-chmod 0600 ~/.config/aw-gateway/http-token
 """
     remote_check(host.ssh, command, timeout=120)
 

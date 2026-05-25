@@ -7,6 +7,7 @@ pub mod config;
 mod fileutil;
 pub mod gateway;
 mod health_probe;
+mod launch_args;
 pub mod logging;
 pub mod paths;
 mod rotating_log;

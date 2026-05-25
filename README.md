@@ -339,15 +339,14 @@ type = "none"
 
 When `auth.type = "none"`, no `Authorization` header is required. Bind to
 loopback or put the daemon behind an external auth boundary. Bearer auth reads
-a token from a file and requires `Authorization: Bearer <token>` on every
+the configured token and requires `Authorization: Bearer <token>` on every
 `/api/v1/*` route. The HTTP listener does not terminate TLS; use loopback or a
-TLS-terminating reverse proxy for bearer auth. On Unix, the token file must not
-be group- or world-readable.
+TLS-terminating reverse proxy for bearer auth.
 
 ```toml
 [http.auth]
 type = "bearer"
-token_file = "~/.config/aw-gateway/http-token"
+token = "change-me"
 ```
 
 `http.enabled_actions` is an HTTP-specific allow list. Supported values are
@@ -434,7 +433,7 @@ and non-finite numbers are rejected as `invalid_launch_var`.
 The initial HTTP API intentionally does not implement streaming, SSE/NDJSON,
 persistent jobs, TTY sessions, SSH key management, generated client config or
 bundles, proxy/tunnel helpers, stop/remove, default-target management, route
-aliases, or compatibility config shapes.
+aliases, or retired config-shape compatibility.
 
 ## Deployment Guides
 

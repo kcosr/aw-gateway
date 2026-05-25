@@ -4,6 +4,8 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 
+const MAX_HTTP_BEARER_TOKEN_BYTES: usize = 4096;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpConfig {
@@ -58,14 +60,14 @@ impl HttpConfig {
 pub struct HttpAuthConfig {
     #[serde(default, rename = "type")]
     pub auth_type: HttpAuthType,
-    pub token_file: Option<String>,
+    pub token: Option<String>,
 }
 
 impl Default for HttpAuthConfig {
     fn default() -> Self {
         Self {
             auth_type: HttpAuthType::None,
-            token_file: None,
+            token: None,
         }
     }
 }
@@ -74,20 +76,22 @@ impl HttpAuthConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         match self.auth_type {
             HttpAuthType::None => {
-                if self.token_file.is_some() {
-                    anyhow::bail!(
-                        "http.auth.token_file is only valid when http.auth.type = \"bearer\""
-                    );
+                if self.token.is_some() {
+                    anyhow::bail!("http.auth.token is only valid when http.auth.type = \"bearer\"");
                 }
             }
             HttpAuthType::Bearer => {
-                let Some(token_file) = &self.token_file else {
-                    anyhow::bail!(
-                        "http.auth.token_file is required when http.auth.type = \"bearer\""
-                    );
+                let Some(token) = &self.token else {
+                    anyhow::bail!("http.auth.token is required when http.auth.type = \"bearer\"");
                 };
-                if token_file.is_empty() {
-                    anyhow::bail!("http.auth.token_file must not be empty");
+                if token.is_empty() {
+                    anyhow::bail!("http.auth.token must not be empty");
+                }
+                if token.len() > MAX_HTTP_BEARER_TOKEN_BYTES {
+                    anyhow::bail!("http.auth.token must not exceed 4096 bytes");
+                }
+                if token.contains(['\r', '\n']) {
+                    anyhow::bail!("http.auth.token must be a single line");
                 }
             }
         }

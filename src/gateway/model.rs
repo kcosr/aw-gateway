@@ -1,5 +1,5 @@
 use crate::agent_control::AgentStatus;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -65,6 +65,13 @@ pub(super) struct GatewayStatus {
     pub(super) ssh_socket: PathBuf,
     pub(super) status: String,
     pub(super) agent: Option<Box<AgentStatus>>,
+}
+
+fn deserialize_required_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
 }
 
 #[derive(Debug, Serialize)]
@@ -149,7 +156,7 @@ pub(super) struct SessionMarker {
     pub(super) gateway_start_time: String,
     pub(super) container: String,
     pub(super) target: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_required_optional_string")]
     pub(super) launch: Option<String>,
     pub(super) created_at_ms: u128,
 }
