@@ -2,7 +2,8 @@ use super::*;
 use crate::cli::{LaunchShowArgs, LaunchesArgs, RunArgs, StatusArg, TargetsArgs};
 use crate::config::{LaunchVarConfig, LaunchVarType, LaunchVarValue};
 use crate::ssh_dispatch::{
-    ClientBundleAction, ClientConfigAction, KeyAction, KeySourceAction, TargetSessionAction,
+    ClientBundleAction, ClientConfigAction, GatewayAction, KeyAction, KeySourceAction, RunAction,
+    StatusAction, TargetSessionAction,
 };
 
 fn launch_var_config(var_type: LaunchVarType, values: Option<Vec<&str>>) -> LaunchVarConfig {
