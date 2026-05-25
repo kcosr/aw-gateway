@@ -1,6 +1,6 @@
 use crate::config::{ContainerAgentFile, GatewayConfig, LoggingConfig, WorkspaceConfig};
 use crate::paths::{self, UserContext};
-use crate::rotating_log::RotationState;
+use crate::rotating_log::{RotationState, RotationStep};
 use crate::template::{self, Vars};
 use anyhow::Context;
 use std::fs::{File, OpenOptions};
@@ -233,36 +233,29 @@ impl SizeRotatingFile {
         })
     }
 
-    fn path_for_generation(&self, generation: usize) -> PathBuf {
-        self.rotation.path_for_generation(generation)
-    }
-
     fn rotate_if_needed(&mut self, incoming: usize) -> io::Result<()> {
         if !self.rotation.should_rotate(incoming) {
             return Ok(());
         }
         self.file.flush()?;
-        for generation in (1..=self.rotation.max_files()).rev() {
-            let path = self.path_for_generation(generation);
-            if generation == self.rotation.max_files() {
-                let _ = std::fs::remove_file(path);
-            } else {
-                let next = self.path_for_generation(generation + 1);
-                if path.exists() {
-                    std::fs::rename(path, next)?;
+        let plan = self.rotation.rotation_plan();
+        for step in plan.steps() {
+            match step {
+                RotationStep::Remove { path } => {
+                    let _ = std::fs::remove_file(path);
+                }
+                RotationStep::Rename { from, to } => {
+                    if from.exists() {
+                        std::fs::rename(from, to)?;
+                    }
                 }
             }
-        }
-        let current = self.path_for_generation(0);
-        let first = self.path_for_generation(1);
-        if current.exists() {
-            std::fs::rename(&current, first)?;
         }
         self.file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
-            .open(current)?;
+            .open(plan.active_path())?;
         self.rotation.reset_after_rotation();
         Ok(())
     }
