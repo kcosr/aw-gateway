@@ -17,6 +17,7 @@
 
 - Added root-level `extends` for selected gateway configs to inherit a base
   root config after each file composes its own includes.
+  ([#40](https://github.com/kcosr/aw-gateway/pull/40))
 - Added user-level gateway config discovery before the system config fallback:
   `--config`, `AW_GATEWAY_CONFIG`, user config, then
   `/etc/aw-gateway/gateway.toml`.
