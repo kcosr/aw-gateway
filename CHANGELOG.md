@@ -8,23 +8,26 @@
   `~/.config/aw-gateway/gateway.toml` when present before falling back to
   `/etc/aw-gateway/gateway.toml`; managed SSH deployments that must ignore
   per-user configs should pass an explicit system config.
+  ([#39](https://github.com/kcosr/aw-gateway/pull/39))
 - Removed `aw-gateway config init`; use the platform-specific deployment
   examples for working configs and `aw-gateway.sample.toml` as a minimal syntax
-  sample.
+  sample. ([#39](https://github.com/kcosr/aw-gateway/pull/39))
 
 ### Added
 
 - Added user-level gateway config discovery before the system config fallback:
   `--config`, `AW_GATEWAY_CONFIG`, user config, then
   `/etc/aw-gateway/gateway.toml`.
+  ([#39](https://github.com/kcosr/aw-gateway/pull/39))
 - Added `aw-gateway config paths [--json]` to inspect effective user paths,
   checked gateway config files, and the selected config source.
+  ([#39](https://github.com/kcosr/aw-gateway/pull/39))
 
 ### Changed
 
 - Slimmed `aw-gateway.sample.toml` to a minimal valid gateway config while
   leaving deployment-ready configs in the platform-specific examples and
-  guides.
+  guides. ([#39](https://github.com/kcosr/aw-gateway/pull/39))
 
 ## [0.3.0] - 2026-05-25
 
