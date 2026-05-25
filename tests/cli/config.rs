@@ -467,6 +467,55 @@ includes = ["config.d/*.toml"]
 }
 
 #[test]
+fn gateway_config_validate_accepts_root_extends() {
+    let dir = tempdir().unwrap();
+    let base = dir.path().join("base.toml");
+    std::fs::write(
+        &base,
+        r#"
+schema_version = "1"
+default_target = "default"
+
+[targets.default]
+image = "ubuntu/base"
+mode = "fixed"
+name = "default"
+
+[[targets.default.container_agent.services]]
+name = "base-service"
+command = ["base-service"]
+"#,
+    )
+    .unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+extends = "{}"
+
+[[targets.default.container_agent.services]]
+name = "child-service"
+command = ["child-service"]
+depends_on = ["base-service"]
+"#,
+            base.display()
+        ),
+    )
+    .unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["config", "validate"])
+        .env_remove("AW_GATEWAY_CONFIG")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ok"));
+}
+
+#[test]
 fn gateway_config_validate_rejects_legacy_gateway_socket_paths() {
     for (config_name, config_body, expected) in [
         (

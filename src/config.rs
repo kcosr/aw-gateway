@@ -9,6 +9,7 @@ mod http;
 mod include;
 mod launch;
 mod resolver;
+mod root;
 mod steps;
 mod target;
 mod validation;
@@ -81,17 +82,12 @@ pub struct GatewayConfig {
 
 impl GatewayConfig {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let raw =
-            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let mut cfg: Self =
-            toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
-        cfg.compose_includes(path)?;
+        let value = root::load_gateway_root(path)?;
+        let cfg: Self = value
+            .try_into()
+            .with_context(|| format!("parse {}", path.display()))?;
         cfg.validate()?;
         Ok(cfg)
-    }
-
-    fn compose_includes(&mut self, root_path: &Path) -> anyhow::Result<()> {
-        include::compose_gateway_includes(self, root_path)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {

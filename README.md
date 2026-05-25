@@ -606,6 +606,8 @@ Gateway configs commonly include:
   launches opt into with ordered `use = [...]`.
 - `includes`: strict include globs for splitting target templates, launch
   templates, targets, and launches into separate TOML files.
+- `extends`: root config inheritance for layering a selected config over a
+  managed base config.
 - `[[target_defaults.container_mounts]]` and `[[targets.<name>.container_mounts]]`: extra
   host-to-container bind mounts, typically read-only bootstrap
   binaries/configs/certs.
@@ -945,6 +947,18 @@ Gateway-wide policy and defaults remain root-owned. Include files must not
 define `schema_version`, `default_target`, `[runtime]`, `[logging]`,
 `[http]`, `[ssh_dispatch]`, `[client_config]`, `[target_defaults]`, or
 `[launch_defaults]`.
+
+Root configs may inherit another root config with `extends`:
+
+```toml
+extends = "/etc/aw-gateway/gateway.toml"
+```
+
+`extends` is honored only by the selected root config. The loader composes each
+file's own `includes` relative to that file, strips loader-only `extends` and
+`includes`, then merges base-to-child before normal validation. Tables merge by
+key, scalars and ordinary arrays replace, and named service/step arrays merge by
+`name` while preserving inherited order and appending new child entries.
 
 When `sftp = "deny"`, `start-container-sshd` removes the SFTP subsystem from
 the runtime SSHD config. Modern OpenSSH SCP uses SFTP, so that blocks both.

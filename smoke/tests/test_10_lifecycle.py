@@ -56,6 +56,29 @@ AW_GATEWAY_CONFIG_HOME="$tmp" {shlex.quote(host.gateway_path)} config paths --js
     assert data["system_config_file"] == "/etc/aw-gateway/gateway.toml"
 
 
+def test_gateway_config_extends_deployed_config(host: Host) -> None:
+    command = f"""
+set -eu
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+cp {shlex.quote(host.config_path)} "$tmp/base.toml"
+cat > "$tmp/child.toml" <<'EOF'
+extends = "base.toml"
+
+[launches.smoke-extends]
+target = "{host.target}"
+command = ["true"]
+EOF
+{shlex.quote(host.gateway_path)} --config "$tmp/child.toml" config validate >/dev/null
+{shlex.quote(host.gateway_path)} --config "$tmp/child.toml" launch show smoke-extends --json
+"""
+    result = remote(host.ssh, command)
+    result.assert_success()
+    data = json.loads(result.stdout)
+    assert data["name"] == "smoke-extends"
+    assert data["target"] == host.target
+
+
 def test_gateway_lists_targets(host: Host) -> None:
     result = gateway(host, "targets", "--json")
     result.assert_success()
