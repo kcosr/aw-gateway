@@ -1,6 +1,68 @@
 use tempfile::TempDir;
 use toml::Value;
 
+const GATEWAY_CLI_FIXTURE: &str = r#"
+schema_version = "1"
+default_target = "default"
+
+[runtime]
+type = "podman"
+
+[logging]
+level = "info"
+directory = "{state}/logs/gateway"
+max_bytes = 104857600
+max_files = 5
+console = false
+
+[target_defaults.workspace]
+path = "workspace"
+state_dir = ".aw-gateway"
+cleanup = "never"
+
+[target_defaults.container_ssh.transfer]
+sftp = "allow"
+legacy_scp = "allow"
+
+[ssh_dispatch]
+allow_interactive_shell = true
+allow_container_commands = true
+enabled_actions = [
+  "connect",
+  "up",
+  "run",
+  "launches",
+  "launch",
+  "status",
+  "targets",
+  "stop",
+  "remove",
+  "set-default",
+  "show-default",
+  "reset-default",
+  "add-key",
+  "add-host-key",
+  "add-container-key",
+  "client-config",
+  "client-bundle",
+  "help",
+]
+
+[client_config]
+inner_alias_template = "aw-{target}"
+container_host_template = "aw-container-{target}"
+host = "gateway.example.com"
+gateway_path = "/opt/aw-gateway/bin/aw-gateway"
+default_identity_dir = "~/.ssh/aw-gateway"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+stop_when_idle = true
+remove_on_stop = false
+"#;
+
 pub(crate) fn launch_config_for_test() -> &'static str {
     r#"
 schema_version = "1"
@@ -69,7 +131,7 @@ struct GatewaySampleFixture {
 
 impl GatewaySampleFixture {
     fn parse() -> Self {
-        Self::parse_from(include_str!("../../aw-gateway.sample.toml"))
+        Self::parse_from(GATEWAY_CLI_FIXTURE)
     }
 
     fn parse_from(input: impl AsRef<str>) -> Self {

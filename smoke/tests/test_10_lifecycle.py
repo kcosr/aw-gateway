@@ -12,6 +12,19 @@ def test_gateway_config_validates(host: Host) -> None:
     assert "ok" in result.stdout.lower()
 
 
+def test_gateway_config_paths_reports_explicit_config(host: Host) -> None:
+    result = gateway(host, "config", "paths", "--json")
+    result.assert_success()
+    data = json.loads(result.stdout)
+    assert data["selected_source"] == "explicit_flag"
+    assert data["selected_path"] == host.config_path
+    assert data["candidates"][0]["source"] == "explicit_flag"
+    assert data["candidates"][0]["path"] == host.config_path
+    assert data["candidates"][0]["exists"] is True
+    assert data["user_config_file"].endswith("/aw-gateway/gateway.toml")
+    assert data["system_config_file"] == "/etc/aw-gateway/gateway.toml"
+
+
 def test_gateway_lists_targets(host: Host) -> None:
     result = gateway(host, "targets", "--json")
     result.assert_success()

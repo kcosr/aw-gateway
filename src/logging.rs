@@ -17,8 +17,9 @@ pub fn init_gateway(
     level: Option<&str>,
     protocol_mode: bool,
 ) -> anyhow::Result<LoggingGuard> {
-    let config = match config_path.and_then(|path| GatewayConfig::load(path).ok()) {
-        Some(cfg) => {
+    let config = match config_path {
+        Some(path) => {
+            let cfg = GatewayConfig::load(path)?;
             let mut logging = cfg.logging.clone();
             cfg.effective_workspace_defaults()
                 .and_then(|workspace| render_gateway_logging_directory(&mut logging, &workspace))
@@ -37,8 +38,9 @@ pub fn init_gateway(
 }
 
 pub fn init_agent(config_path: Option<&Path>, level: Option<&str>) -> anyhow::Result<LoggingGuard> {
-    let config = match config_path.and_then(|path| ContainerAgentFile::load(path).ok()) {
-        Some(cfg) => {
+    let config = match config_path {
+        Some(path) => {
+            let cfg = ContainerAgentFile::load(path)?;
             let mut logging = cfg.logging;
             render_agent_logging_directory(&mut logging)
                 .context("render container-agent logging directory")?;

@@ -8,6 +8,7 @@ fn example_gateway_configs_validate() {
         return;
     }
     for config in [
+        "aw-gateway.sample.toml",
         "examples/podman/gateway-local.toml",
         "examples/podman/gateway-remote.toml",
         "examples/docker/gateway-local.toml",

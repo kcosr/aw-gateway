@@ -230,6 +230,56 @@ fn enable_default_ssh_bridge(cfg: &mut GatewayConfig) {
     });
 }
 
+fn enable_default_agent_services(cfg: &mut GatewayConfig) {
+    cfg.target_defaults.container_agent = Some(crate::config::ContainerAgentConfigInput {
+        enabled: Some(true),
+        services: vec![
+            crate::config::ServiceConfig {
+                name: "acl-proxy".into(),
+                required: true,
+                user: "root".into(),
+                command: vec![
+                    "acl-proxy".into(),
+                    "--config".into(),
+                    "/etc/acl-proxy/acl-proxy.toml".into(),
+                ],
+                cwd: None,
+                restart: crate::config::RestartPolicy::Always,
+                restart_backoff: None,
+                restart_backoff_max: None,
+                startup_timeout: None,
+                shutdown_timeout: None,
+                depends_on: Vec::new(),
+                env: BTreeMap::new(),
+                health_check: None,
+            },
+            crate::config::ServiceConfig {
+                name: "container-sshd".into(),
+                required: true,
+                user: "root".into(),
+                command: vec!["start-container-sshd".into()],
+                cwd: None,
+                restart: crate::config::RestartPolicy::Always,
+                restart_backoff: None,
+                restart_backoff_max: None,
+                startup_timeout: None,
+                shutdown_timeout: None,
+                depends_on: vec!["acl-proxy".into()],
+                env: BTreeMap::new(),
+                health_check: None,
+            },
+        ],
+        ssh_bridge: Some(crate::config::SshBridgeConfigInput {
+            enabled: Some(true),
+            socket: None,
+            target: Some("127.0.0.1:22".into()),
+            mode: Some("0600".into()),
+        }),
+        control_socket: None,
+        idle_cleanup: None,
+    });
+}
+
 fn test_runtime(
     dir: &tempfile::TempDir,
     program: PathBuf,
@@ -2703,6 +2753,7 @@ fn target_workspace_override_resolves_relative_to_user_home() {
 fn target_service_override_is_written_to_container_agent_config() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    enable_default_agent_services(&mut cfg);
     let mut override_service = cfg
         .effective_target("default")
         .unwrap()
@@ -2922,6 +2973,7 @@ fn disabled_agent_run_spec_uses_plain_sleep_without_agent_tokens() {
 fn writes_container_ssh_policy_and_injects_sshd_policy_env() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    enable_default_agent_services(&mut cfg);
     cfg.targets.get_mut("default").unwrap().container_ssh =
         Some(crate::config::TargetContainerSshConfig {
             transfer: Some(crate::config::TargetContainerSshTransferConfig {

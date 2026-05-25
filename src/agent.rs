@@ -8,7 +8,7 @@ mod socket;
 mod state;
 mod status;
 
-use crate::cli::{AgentArgs, AgentCommand, ConfigCommand};
+use crate::cli::{AgentArgs, AgentCommand, AgentConfigCommand};
 use crate::config::{ContainerAgentFile, ControlSocketConfig};
 use crate::fileutil;
 use crate::paths;
@@ -26,13 +26,13 @@ pub const DEFAULT_AGENT_CONFIG: &str = include_str!("../container-agent.sample.t
 
 pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
     match args.command {
-        Some(AgentCommand::Config(ConfigCommand::Validate)) => {
+        Some(AgentCommand::Config(AgentConfigCommand::Validate)) => {
             let path = paths::agent_config_path(args.config);
             ContainerAgentFile::load(&path)?;
             println!("ok");
             Ok(())
         }
-        Some(AgentCommand::Config(ConfigCommand::Init(init))) => {
+        Some(AgentCommand::Config(AgentConfigCommand::Init(init))) => {
             let path = init
                 .path
                 .unwrap_or_else(|| paths::agent_config_path(args.config));
