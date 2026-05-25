@@ -121,6 +121,8 @@ name = "{image_slug}"
 fn gateway_config_paths_keeps_candidate_context_for_explicit_path() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
+    let config_home = dir.path().join("config-home");
+    let user_config = config_home.join("aw-gateway/gateway.toml");
     let explicit = dir.path().join("explicit.toml");
 
     let output = Command::cargo_bin("aw-gateway")
@@ -129,8 +131,8 @@ fn gateway_config_paths_keeps_candidate_context_for_explicit_path() {
         .arg(&explicit)
         .args(["config", "paths", "--json"])
         .env("AW_GATEWAY_TEST_HOME", &home)
+        .env("AW_GATEWAY_CONFIG_HOME", &config_home)
         .env_remove("AW_GATEWAY_CONFIG")
-        .env_remove("AW_GATEWAY_CONFIG_HOME")
         .env_remove("XDG_CONFIG_HOME")
         .assert()
         .success()
@@ -141,13 +143,30 @@ fn gateway_config_paths_keeps_candidate_context_for_explicit_path() {
     assert_eq!(value["selected_source"], "explicit_flag");
     assert_eq!(value["selected_path"], explicit.display().to_string());
     assert_eq!(value["candidates"][0]["source"], "explicit_flag");
+    assert_eq!(
+        value["candidates"][0]["path"],
+        explicit.display().to_string()
+    );
     assert_eq!(value["candidates"][0]["exists"], false);
+    assert_eq!(value["candidates"][1]["source"], "user");
+    assert_eq!(
+        value["candidates"][1]["path"],
+        user_config.display().to_string()
+    );
+    assert_eq!(value["candidates"][1]["exists"], false);
+    assert_eq!(value["candidates"][2]["source"], "system");
+    assert_eq!(
+        value["candidates"][2]["path"],
+        "/etc/aw-gateway/gateway.toml"
+    );
 }
 
 #[test]
 fn gateway_config_paths_reports_environment_config_source() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");
+    let config_home = dir.path().join("config-home");
+    let user_config = config_home.join("aw-gateway/gateway.toml");
     let config = dir.path().join("env.toml");
     std::fs::write(
         &config,
@@ -167,7 +186,7 @@ name = "{image_slug}"
         .args(["config", "paths", "--json"])
         .env("AW_GATEWAY_TEST_HOME", &home)
         .env("AW_GATEWAY_CONFIG", &config)
-        .env_remove("AW_GATEWAY_CONFIG_HOME")
+        .env("AW_GATEWAY_CONFIG_HOME", &config_home)
         .env_remove("XDG_CONFIG_HOME")
         .assert()
         .success()
@@ -177,6 +196,20 @@ name = "{image_slug}"
     let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(value["selected_source"], "environment");
     assert_eq!(value["selected_path"], config.display().to_string());
+    assert_eq!(value["candidates"][0]["source"], "environment");
+    assert_eq!(value["candidates"][0]["path"], config.display().to_string());
+    assert_eq!(value["candidates"][0]["exists"], true);
+    assert_eq!(value["candidates"][1]["source"], "user");
+    assert_eq!(
+        value["candidates"][1]["path"],
+        user_config.display().to_string()
+    );
+    assert_eq!(value["candidates"][1]["exists"], false);
+    assert_eq!(value["candidates"][2]["source"], "system");
+    assert_eq!(
+        value["candidates"][2]["path"],
+        "/etc/aw-gateway/gateway.toml"
+    );
 }
 
 #[test]

@@ -42,6 +42,7 @@ Implemented in `tests/test_10_lifecycle.py`.
 | --- | --- |
 | Deployed gateway config validates with `config validate` | all enabled hosts |
 | `config paths --json` reports the deployed explicit config and checked paths | all enabled hosts |
+| `config paths --json` selects a temporary user config when no explicit config is passed | all enabled hosts |
 | Gateway target listing succeeds and includes the smoke target | all enabled hosts |
 | `run <target> -- id` starts or reuses the container and executes inside it | all enabled hosts |
 | Status JSON reports the target after execution | all enabled hosts |
