@@ -954,11 +954,31 @@ Root configs may inherit another root config with `extends`:
 extends = "/etc/aw-gateway/gateway.toml"
 ```
 
-`extends` is honored only by the selected root config. The loader composes each
-file's own `includes` relative to that file, strips loader-only `extends` and
-`includes`, then merges base-to-child before normal validation. Tables merge by
-key, scalars and ordinary arrays replace, and named service/step arrays merge by
-`name` while preserving inherited order and appending new child entries.
+`extends` is honored only by the selected root config. Unlike include files, an
+extended root may define root-owned policy, defaults, templates, targets, and
+launches. The loader composes each file's own `includes` relative to that file,
+strips loader-only `extends` and `includes`, then merges base-to-child before
+normal validation.
+
+Root inheritance uses these merge rules:
+
+- Tables merge by key, except each service `env.<NAME>` value replaces the
+  inherited value as a whole.
+- Scalars and ordinary arrays replace the inherited value. This includes
+  `container_mounts`, runtime argument arrays, command arrays, dependency
+  arrays, allow-list arrays, and launch variable value arrays.
+- Named service arrays merge by `name` at `target_defaults.container_agent.services`,
+  `target_templates.<name>.container_agent.services`, and
+  `targets.<name>.container_agent.services`.
+- Named step arrays merge by `name` for target lifecycle, host, and container
+  bootstrap steps, and for launch `steps` in launch defaults, templates, and
+  launches.
+
+Named arrays preserve inherited order and append new child entries. Step patch
+controls such as `enabled = false`, `before`, and `after` are not deletion or
+reorder operations across `extends`; after root inheritance, the merged step must
+still pass normal validation. Use target or launch template overlays when a
+target or launch needs to remove or reorder inherited steps.
 
 When `sftp = "deny"`, `start-container-sshd` removes the SFTP subsystem from
 the runtime SSHD config. Modern OpenSSH SCP uses SFTP, so that blocks both.

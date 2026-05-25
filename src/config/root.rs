@@ -52,7 +52,15 @@ fn root_extends(value: &Value, path: &Path) -> anyhow::Result<Option<String>> {
     };
     match table.get("extends") {
         None => Ok(None),
-        Some(Value::String(path)) => Ok(Some(path.clone())),
+        Some(Value::String(extends)) => {
+            if extends.contains(['*', '?', '[']) {
+                anyhow::bail!(
+                    "gateway config {} extends must be a single path; globs are not supported",
+                    path.display()
+                );
+            }
+            Ok(Some(extends.clone()))
+        }
         Some(_) => anyhow::bail!("gateway config {} extends must be a string", path.display()),
     }
 }
@@ -96,6 +104,10 @@ fn merge_tables(
     for (key, child_value) in child {
         let mut child_path = path.to_vec();
         child_path.push(key.clone());
+        if is_service_env_table_path(path) {
+            base.insert(key, child_value);
+            continue;
+        }
         if let Some(base_value) = base.remove(&key) {
             base.insert(key, merge_values(base_value, child_value, &child_path)?);
         } else {
@@ -171,6 +183,25 @@ fn is_named_array_path(path: &[String]) -> bool {
         || matches_path(path, &["launch_defaults", "steps"])
         || matches_path(path, &["launch_templates", "*", "steps"])
         || matches_path(path, &["launches", "*", "steps"])
+}
+
+fn is_service_env_table_path(path: &[String]) -> bool {
+    matches_path(
+        path,
+        &["target_defaults", "container_agent", "services", "env"],
+    ) || matches_path(
+        path,
+        &[
+            "target_templates",
+            "*",
+            "container_agent",
+            "services",
+            "env",
+        ],
+    ) || matches_path(
+        path,
+        &["targets", "*", "container_agent", "services", "env"],
+    )
 }
 
 fn matches_path(path: &[String], pattern: &[&str]) -> bool {

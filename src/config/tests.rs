@@ -3894,6 +3894,55 @@ command = ["child-only"]
 }
 
 #[test]
+fn extends_replaces_service_env_values_by_variable_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.toml");
+    std::fs::write(
+        &base,
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/base"
+mode = "fixed"
+name = "default"
+
+[[targets.default.container_agent.services]]
+name = "worker"
+command = ["worker"]
+
+[targets.default.container_agent.services.env.SECRET]
+file = "/base/secret"
+"#,
+    )
+    .unwrap();
+    let child = dir.path().join("child.toml");
+    std::fs::write(
+        &child,
+        format!(
+            r#"
+extends = "{}"
+
+[[targets.default.container_agent.services]]
+name = "worker"
+
+[targets.default.container_agent.services.env.SECRET]
+value = "child"
+"#,
+            base.display()
+        ),
+    )
+    .unwrap();
+
+    let cfg = GatewayConfig::load(&child).unwrap();
+    let target = cfg.targets.get("default").unwrap();
+    let service = &target.container_agent.as_ref().unwrap().services[0];
+    let secret = service.env.get("SECRET").unwrap();
+    assert_eq!(secret.value.as_deref(), Some("child"));
+    assert_eq!(secret.file, None);
+}
+
+#[test]
 fn extends_resolves_each_root_includes_relative_to_declaring_file() {
     let dir = tempfile::tempdir().unwrap();
     let base_dir = dir.path().join("base");
@@ -3980,6 +4029,16 @@ name = "default"
     let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
     assert!(err.contains("root-only"), "{err}");
     assert!(err.contains("extends"), "{err}");
+}
+
+#[test]
+fn extends_rejects_glob_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("gateway.toml");
+    std::fs::write(&root, "extends = \"config.d/*.toml\"\n").unwrap();
+
+    let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
+    assert!(err.contains("globs are not supported"), "{err}");
 }
 
 #[test]
