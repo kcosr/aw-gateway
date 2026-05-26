@@ -31,7 +31,7 @@ pub enum GatewayCommand {
     Launch(LaunchCommand),
     Launches(LaunchesArgs),
     Stop(StopArgs),
-    Remove(TargetArg),
+    Remove(RemoveArgs),
     Status(StatusArg),
     Targets(TargetsArgs),
     Http,
@@ -118,6 +118,14 @@ pub struct TargetsArgs {
 
 #[derive(Debug, Args)]
 pub struct StopArgs {
+    pub target: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct RemoveArgs {
     pub target: Option<String>,
 
     #[arg(long)]

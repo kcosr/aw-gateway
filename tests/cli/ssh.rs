@@ -139,6 +139,8 @@ fn ssh_dispatch_accepts_session_id_forms_before_runtime_validation() {
         "connect default --session-id=abc123def456",
         "run default --session-id abc123def456 -- pwd",
         "run --session-id=abc123def456 default -- pwd",
+        "stop default --session-id abc123def456",
+        "remove default --session-id=abc123def456",
     ] {
         Command::cargo_bin("aw-gateway")
             .unwrap()

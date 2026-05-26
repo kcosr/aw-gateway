@@ -677,6 +677,32 @@ async fn remove_session_workspace_removes_only_resolved_workspace() {
 }
 
 #[tokio::test]
+async fn explicit_remove_workspace_cleanup_deletes_success_workspace_with_active_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "abc123def456";
+    let workspace_root = dir.path().join(".cache/aw-gateway/workspaces");
+    let workspace = workspace_root.join("default-abc123def456");
+    std::fs::create_dir_all(workspace.join(".aw-gateway")).unwrap();
+    std::fs::write(workspace.join("file.txt"), "data").unwrap();
+
+    let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+        cfg.runtime.runtime_type = crate::config::ContainerRuntimeType::Docker;
+    });
+    configure_workspace_cleanup_runtime(
+        &mut runtime,
+        WorkspaceCleanup::Success,
+        workspace.clone(),
+        dir.path().into(),
+        session_id,
+    );
+    let _session = runtime.create_session_marker("test").unwrap();
+
+    runtime.apply_explicit_remove_workspace_cleanup().await;
+
+    assert!(!workspace.exists());
+}
+
+#[tokio::test]
 async fn remove_session_workspace_uses_podman_unshare_for_podman() {
     let dir = tempfile::tempdir().unwrap();
     let session_id = "abc123def456";
