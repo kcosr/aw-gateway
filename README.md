@@ -1193,7 +1193,9 @@ Gateway command behavior:
 - `remove [target] [--session-id ID]`: stop a fixed target if needed, then
   remove its existing container so the next start recreates it from the current
   config, or remove one specific ephemeral session target. Explicit remove also
-  cleans the resolved session workspace when workspace cleanup is not `never`.
+  attempts to clean the resolved session workspace when workspace cleanup is
+  not `never`; workspace cleanup failures are logged and the command result
+  still reports the container removal outcome.
 - `status [target] [--json] [--session-id ID]`: report one
   configured/default target's container state.
 - `status --all [--json]`: list existing `aw-gateway`-managed containers for
