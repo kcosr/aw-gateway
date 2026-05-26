@@ -358,7 +358,7 @@ ssh user@host show-default
 ssh user@host reset-default
 ssh user@host stop
 ssh user@host remove internal-ubuntu-dev
-ssh user@host rm internal-ubuntu-dev
+ssh user@host rm internal-ubuntu-dev  # SSH dispatch alias for remove
 ssh user@host 'git status'  # container passthrough command
 ```
 
