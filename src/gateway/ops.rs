@@ -6,8 +6,8 @@ use super::{
     run_container_command_with_runtime, status_all_entries, target_entries,
 };
 use crate::cli::{
-    ClientConfigArgs, LaunchShowArgs, LaunchesArgs, RunArgs, SetDefaultArgs, StatusArg, StopArgs,
-    TargetArg, TargetsArgs,
+    ClientConfigArgs, LaunchShowArgs, LaunchesArgs, RemoveArgs, RunArgs, SetDefaultArgs, StatusArg,
+    StopArgs, TargetsArgs,
 };
 use crate::config::{GatewayConfig, LaunchConfig, LocalSshMode};
 use crate::paths::{self, UserContext};
@@ -59,6 +59,7 @@ pub(super) enum GatewayOperation {
     },
     Remove {
         target: Option<String>,
+        session_id: Option<String>,
     },
     SetDefault {
         target_or_image: String,
@@ -159,9 +160,10 @@ impl GatewayOperation {
         }
     }
 
-    pub(super) fn from_remove_args(args: TargetArg) -> Self {
+    pub(super) fn from_remove_args(args: RemoveArgs) -> Self {
         Self::Remove {
             target: args.target,
+            session_id: args.session_id,
         }
     }
 
@@ -235,8 +237,8 @@ pub(super) async fn execute_gateway_operation(
         GatewayOperation::Stop { target, session_id } => Ok(GatewayOperationResult::Stop(
             operation_stop(config_path, target, session_id).await?,
         )),
-        GatewayOperation::Remove { target } => Ok(GatewayOperationResult::Remove(
-            operation_remove(config_path, target).await?,
+        GatewayOperation::Remove { target, session_id } => Ok(GatewayOperationResult::Remove(
+            operation_remove(config_path, target, session_id).await?,
         )),
         GatewayOperation::SetDefault { target_or_image } => {
             Ok(GatewayOperationResult::DefaultSelection(
@@ -374,8 +376,9 @@ async fn operation_stop(
 async fn operation_remove(
     config_path: Option<PathBuf>,
     target: Option<String>,
+    session_id: Option<String>,
 ) -> OperationResult<RemoveResult> {
-    let runtime = Runtime::load(config_path, target.as_deref(), None, false).await?;
+    let runtime = Runtime::load(config_path, target.as_deref(), session_id, false).await?;
     let _lock = runtime.acquire_lifecycle_lock().await?;
     let Some(inspect) = runtime
         .container_runtime
@@ -383,6 +386,7 @@ async fn operation_remove(
         .await?
     else {
         runtime.cleanup_control_socket_dir();
+        runtime.apply_explicit_remove_workspace_cleanup().await;
         return Ok(RemoveResult {
             container: runtime.identity.container_name,
             removed: false,
@@ -407,6 +411,7 @@ async fn operation_remove(
     if !was_running {
         runtime.cleanup_control_socket_dir();
     }
+    runtime.apply_explicit_remove_workspace_cleanup().await;
     Ok(RemoveResult {
         container: runtime.identity.container_name,
         removed: true,

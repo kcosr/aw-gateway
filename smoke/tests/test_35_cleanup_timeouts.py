@@ -225,9 +225,107 @@ def test_ephemeral_workspace_cleanup_removes_session_workspace(host: Host) -> No
         _rm(host, config)
 
 
+def test_explicit_ephemeral_remove_cleans_session_workspace(host: Host) -> None:
+    session_id = f"remove-{host.name.replace('_', '-')}"
+    workspace = _ephemeral_workspace(host, session_id)
+    background: tuple[str, str, str] | None = None
+    config = _write_temp_config(
+        host,
+        owner="gateway",
+        action="exit_container",
+        preserve_processes=[],
+        idle_grace="5m",
+        poll_interval="1s",
+        shutdown_timeout="3s",
+        ephemeral_workspace=True,
+    )
+    try:
+        _cleanup_ephemeral(host, config, session_id, workspace)
+        background = _start_ephemeral_up_background(host, config, session_id, workspace)
+        _stop_background(host, background)
+        background = None
+
+        marker = remote_check(
+            host.ssh,
+            f"test -d {shlex.quote(workspace)} && printf explicit-remove > {shlex.quote(workspace)}/explicit-remove.txt",
+            timeout=30,
+        )
+        assert marker.returncode == 0
+
+        remove = _gateway(
+            host,
+            config,
+            "remove",
+            host.target,
+            "--session-id",
+            session_id,
+            timeout=180,
+        )
+        remove.assert_success()
+
+        missing = remote_check(host.ssh, f"test ! -e {shlex.quote(workspace)}", timeout=30)
+        assert missing.returncode == 0
+    finally:
+        if background is not None:
+            _stop_background(host, background)
+        _cleanup_ephemeral(host, config, session_id, workspace)
+        _rm(host, config)
+
+
+def test_ssh_dispatch_ephemeral_remove_cleans_session_workspace(host: Host) -> None:
+    session_id = f"ssh-remove-{host.name.replace('_', '-')}"
+    workspace = _ephemeral_workspace(host, session_id)
+    background: tuple[str, str, str] | None = None
+    config = _write_temp_config(
+        host,
+        owner="gateway",
+        action="exit_container",
+        preserve_processes=[],
+        idle_grace="5m",
+        poll_interval="1s",
+        shutdown_timeout="3s",
+        ephemeral_workspace=True,
+    )
+    try:
+        _cleanup_ephemeral(host, config, session_id, workspace)
+        background = _start_ephemeral_up_background(host, config, session_id, workspace)
+        _stop_background(host, background)
+        background = None
+
+        marker = remote_check(
+            host.ssh,
+            f"test -d {shlex.quote(workspace)} && printf ssh-remove > {shlex.quote(workspace)}/ssh-remove.txt",
+            timeout=30,
+        )
+        assert marker.returncode == 0
+
+        original_command = f"remove {host.target} --session-id={session_id}"
+        dispatched = remote(
+            host.ssh,
+            f"SSH_ORIGINAL_COMMAND={shlex.quote(original_command)} {gateway_command_for_config(host, config)}",
+            timeout=180,
+        )
+        dispatched.assert_success()
+
+        missing = remote_check(host.ssh, f"test ! -e {shlex.quote(workspace)}", timeout=30)
+        assert missing.returncode == 0
+    finally:
+        if background is not None:
+            _stop_background(host, background)
+        _cleanup_ephemeral(host, config, session_id, workspace)
+        _rm(host, config)
+
+
 def _skip_without_agent_control(host: Host) -> None:
     if host.runtime == "colima":
         pytest.skip("Colima smoke config uses gateway-owned cleanup and disables agent control")
+
+
+def _ephemeral_workspace(host: Host, session_id: str) -> str:
+    home = host.home_dir
+    if home == "~":
+        home = remote_check(host.ssh, 'printf "%s" "$HOME"', timeout=30).stdout
+    return f"{home}/.cache/aw-gateway/workspaces/{host.target}-{session_id}"
 
 
 def _write_temp_config(
@@ -307,10 +405,34 @@ def remove_key(lines, section, key):
             lines.pop(index)
 
 
+def ensure_array_item(lines, section, key, item):
+    start = ensure_section(lines, section)
+    end = section_end(lines, start)
+    for index in range(start + 1, end):
+        if lines[index].strip().startswith(f"{{key}} "):
+            array_start = index
+            break
+    else:
+        lines.insert(end, f"{{key}} = [")
+        lines.insert(end + 1, f"  {{json.dumps(item)}},")
+        lines.insert(end + 2, "]")
+        return
+
+    array_end = array_start
+    while array_end < end and "]" not in lines[array_end]:
+        array_end += 1
+    existing = "\\n".join(lines[array_start : array_end + 1])
+    if json.dumps(item) in existing:
+        return
+    lines.insert(array_end, f"  {{json.dumps(item)}},")
+
+
 source = Path(os.environ["SOURCE_CONFIG"])
 output = Path(os.environ["CONFIG"])
 target = os.environ["TARGET"]
 lines = source.read_text().splitlines()
+
+ensure_array_item(lines, "ssh_dispatch", "enabled_actions", "remove")
 
 idle = f"targets.{{target}}.idle_cleanup"
 set_key(lines, idle, "owner", json.dumps(os.environ["OWNER"]))
@@ -383,6 +505,77 @@ def _wait_for_status(
             return last
         time.sleep(1.0)
     raise AssertionError(f"condition was not met before timeout; last status={last!r}")
+
+
+def _start_ephemeral_up_background(
+    host: Host,
+    config: str,
+    session_id: str,
+    workspace: str,
+) -> tuple[str, str, str]:
+    token = uuid.uuid4().hex
+    pidfile = f"/tmp/aw-gateway-smoke-up-{host.name}-{token}.pid"
+    stdout = f"/tmp/aw-gateway-smoke-up-{host.name}-{token}.out"
+    stderr = f"/tmp/aw-gateway-smoke-up-{host.name}-{token}.err"
+    command = (
+        f"rm -f {shlex.quote(pidfile)} {shlex.quote(stdout)} {shlex.quote(stderr)}; "
+        f"nohup {gateway_command_for_config(host, config, 'up', host.target, '--session-id', session_id, '--json')} "
+        f"> {shlex.quote(stdout)} 2> {shlex.quote(stderr)} < /dev/null & "
+        f"echo $! > {shlex.quote(pidfile)}"
+    )
+    remote_check(host.ssh, command, timeout=30)
+    _wait_for_remote_path(host, workspace, pidfile, stdout, stderr)
+    return pidfile, stdout, stderr
+
+
+def _wait_for_remote_path(
+    host: Host,
+    path: str,
+    pidfile: str,
+    stdout: str,
+    stderr: str,
+    *,
+    timeout: float = 60.0,
+) -> None:
+    deadline = time.monotonic() + timeout
+    quoted_path = shlex.quote(path)
+    quoted_pidfile = shlex.quote(pidfile)
+    while time.monotonic() < deadline:
+        check = remote(
+            host.ssh,
+            f"test -d {quoted_path} && exit 0; "
+            f"if ! kill -0 $(cat {quoted_pidfile}) 2>/dev/null; then exit 2; fi; "
+            "exit 1",
+            timeout=30,
+        )
+        if check.returncode == 0:
+            return
+        if check.returncode == 2:
+            logs = remote(
+                host.ssh,
+                f"printf 'stdout:\\n'; cat {shlex.quote(stdout)} 2>/dev/null; "
+                f"printf '\\nstderr:\\n'; cat {shlex.quote(stderr)} 2>/dev/null",
+                timeout=30,
+            )
+            raise AssertionError(f"background up exited before workspace existed:\n{logs.stdout}")
+        time.sleep(1.0)
+    logs = remote(
+        host.ssh,
+        f"printf 'stdout:\\n'; cat {shlex.quote(stdout)} 2>/dev/null; "
+        f"printf '\\nstderr:\\n'; cat {shlex.quote(stderr)} 2>/dev/null",
+        timeout=30,
+    )
+    raise AssertionError(f"workspace did not appear before timeout: {path}\n{logs.stdout}")
+
+
+def _stop_background(host: Host, background: tuple[str, str, str]) -> None:
+    pidfile, stdout, stderr = background
+    remote(
+        host.ssh,
+        f"if [ -s {shlex.quote(pidfile)} ]; then kill $(cat {shlex.quote(pidfile)}) 2>/dev/null || true; fi; "
+        f"rm -f {shlex.quote(pidfile)} {shlex.quote(stdout)} {shlex.quote(stderr)}",
+        timeout=30,
+    )
 
 
 def _gateway_json(host: Host, config: str, *args: str, timeout: int = 60) -> dict[str, Any]:

@@ -677,6 +677,85 @@ async fn remove_session_workspace_removes_only_resolved_workspace() {
 }
 
 #[tokio::test]
+async fn explicit_remove_workspace_cleanup_deletes_success_workspace_with_active_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "abc123def456";
+    let workspace_root = dir.path().join(".cache/aw-gateway/workspaces");
+    let workspace = workspace_root.join("default-abc123def456");
+    std::fs::create_dir_all(workspace.join(".aw-gateway")).unwrap();
+    std::fs::write(workspace.join("file.txt"), "data").unwrap();
+
+    let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+        cfg.runtime.runtime_type = crate::config::ContainerRuntimeType::Docker;
+    });
+    configure_workspace_cleanup_runtime(
+        &mut runtime,
+        WorkspaceCleanup::Success,
+        workspace.clone(),
+        dir.path().into(),
+        session_id,
+    );
+    let _session = runtime.create_session_marker("test").unwrap();
+
+    runtime.apply_explicit_remove_workspace_cleanup().await;
+
+    assert!(!workspace.exists());
+}
+
+#[tokio::test]
+async fn explicit_remove_workspace_cleanup_preserves_workspace_when_cleanup_is_never() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "abc123def456";
+    let workspace_root = dir.path().join(".cache/aw-gateway/workspaces");
+    let workspace = workspace_root.join("default-abc123def456");
+    std::fs::create_dir_all(workspace.join(".aw-gateway")).unwrap();
+    std::fs::write(workspace.join("file.txt"), "data").unwrap();
+
+    let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+        cfg.runtime.runtime_type = crate::config::ContainerRuntimeType::Docker;
+    });
+    configure_workspace_cleanup_runtime(
+        &mut runtime,
+        WorkspaceCleanup::Never,
+        workspace.clone(),
+        dir.path().into(),
+        session_id,
+    );
+
+    runtime.apply_explicit_remove_workspace_cleanup().await;
+
+    assert!(workspace.exists());
+}
+
+#[tokio::test]
+async fn explicit_remove_workspace_cleanup_skips_when_session_id_is_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "abc123def456";
+    let workspace_root = dir.path().join(".cache/aw-gateway/workspaces");
+    let workspace = workspace_root.join("default-abc123def456");
+    std::fs::create_dir_all(workspace.join(".aw-gateway")).unwrap();
+    std::fs::write(workspace.join("file.txt"), "data").unwrap();
+
+    let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+        cfg.runtime.runtime_type = crate::config::ContainerRuntimeType::Docker;
+    });
+    configure_workspace_cleanup_runtime(
+        &mut runtime,
+        WorkspaceCleanup::Success,
+        workspace.clone(),
+        dir.path().into(),
+        session_id,
+    );
+    // Exercise the guard directly; Runtime::load rejects this state for
+    // ephemeral targets before operation dispatch.
+    runtime.identity.session_id = None;
+
+    runtime.apply_explicit_remove_workspace_cleanup().await;
+
+    assert!(workspace.exists());
+}
+
+#[tokio::test]
 async fn remove_session_workspace_uses_podman_unshare_for_podman() {
     let dir = tempfile::tempdir().unwrap();
     let session_id = "abc123def456";
@@ -1408,6 +1487,30 @@ exit 0
 }
 
 #[test]
+fn prepare_container_state_dir_precreates_agent_log_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+        enable_default_ssh_bridge(cfg);
+    });
+
+    runtime.prepare_container_state_dir().unwrap();
+
+    assert!(runtime.paths.container_state_dir.exists());
+    assert!(runtime.paths.container_state_dir.join("logs").exists());
+}
+
+#[test]
+fn prepare_container_state_dir_skips_log_dir_when_agent_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+
+    runtime.prepare_container_state_dir().unwrap();
+
+    assert!(runtime.paths.container_state_dir.exists());
+    assert!(!runtime.paths.container_state_dir.join("logs").exists());
+}
+
+#[test]
 fn launch_var_resolution_rejects_duplicates_and_normalizes_values() {
     let cfg: GatewayConfig = toml::from_str(
         r#"
@@ -1743,6 +1846,88 @@ stop_when_idle = true
     .await
     .unwrap_err();
     assert_invalid_session(err, "requires --session-id");
+}
+
+#[tokio::test]
+async fn remove_label_mismatch_preserves_session_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let workspace = dir.path().join("workspace/aw-gateway/default-abc123def456");
+    let runtime_log = dir.path().join("runtime.log");
+    std::fs::create_dir_all(workspace.join(".aw-gateway")).unwrap();
+    std::fs::write(workspace.join("file.txt"), "data").unwrap();
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<JSON
+[{{"Id":"id","Name":"ubuntu-dev-abc123def456","State":{{"Running":false,"Pid":0}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"other","io.aw-gateway.container_id":"ubuntu-dev-abc123def456"}}}}}}]
+JSON
+    ;;
+  rm)
+    echo "$@" >> "{runtime_log}"
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+            runtime_log = runtime_log.display(),
+        ),
+    );
+    let config = write_gateway_config(
+        &dir,
+        &format!(
+            r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+program = "{program}"
+
+[target_defaults.workspace]
+path = "{workspace_root}/aw-gateway/{{target}}-{{session_id}}"
+state_dir = ".aw-gateway"
+cleanup = "success"
+
+[target_defaults.container_agent]
+enabled = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "ephemeral"
+ephemeral_name = "ubuntu-dev-{{session_id}}"
+stop_when_idle = true
+
+[targets.default.idle_cleanup]
+owner = "gateway"
+action = "exit_container"
+"#,
+            program = fake_runtime.display(),
+            workspace_root = dir.path().join("workspace").display(),
+        ),
+    );
+
+    let err = execute_gateway_operation(
+        Some(config),
+        GatewayOperation::Remove {
+            target: Some("default".into()),
+            session_id: Some("abc123def456".into()),
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("container label mismatch for io.aw-gateway.target"),
+        "unexpected error: {err}"
+    );
+    assert!(workspace.exists());
+    assert!(!runtime_log.exists());
 }
 
 #[test]
