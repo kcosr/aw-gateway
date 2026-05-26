@@ -69,6 +69,23 @@ impl Runtime {
         }
     }
 
+    pub(super) async fn apply_explicit_remove_workspace_cleanup(&self) {
+        if self.target.workspace.cleanup == WorkspaceCleanup::Never {
+            return;
+        }
+        if self.identity.session_id.is_none() {
+            return;
+        }
+        if let Err(err) = self.remove_session_workspace().await {
+            tracing::warn!(
+                target = %self.identity.target_name,
+                workspace = %self.paths.workspace.display(),
+                error = %err,
+                "explicit remove workspace cleanup failed"
+            );
+        }
+    }
+
     pub(super) async fn validate_workspace_cleanup_path(&self) -> anyhow::Result<()> {
         if self.target.workspace.cleanup == WorkspaceCleanup::Never {
             return Ok(());
