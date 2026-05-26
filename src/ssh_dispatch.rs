@@ -31,8 +31,8 @@ pub enum GatewayAction {
     Targets {
         json: bool,
     },
-    Stop(Option<String>),
-    Remove(Option<String>),
+    Stop(TargetSessionAction),
+    Remove(TargetSessionAction),
     SetDefault(String),
     ShowDefault,
     ResetDefault,
@@ -156,7 +156,7 @@ fn parse_native(
     };
     let parsed = match action {
         "connect" if action_enabled(cfg, "connect") => {
-            GatewayAction::Connect(parse_target_session_action(words)?)
+            GatewayAction::Connect(parse_target_session_action("connect", words)?)
         }
         "up" if words.len() <= 2 && action_enabled(cfg, "up") => {
             GatewayAction::Up(words.get(1).cloned())
@@ -170,11 +170,11 @@ fn parse_native(
         "targets" if action_enabled(cfg, "targets") => GatewayAction::Targets {
             json: parse_json_flag(words, "targets")?,
         },
-        "stop" if words.len() <= 2 && action_enabled(cfg, "stop") => {
-            GatewayAction::Stop(words.get(1).cloned())
+        "stop" if action_enabled(cfg, "stop") => {
+            GatewayAction::Stop(parse_target_session_action("stop", words)?)
         }
-        "remove" if words.len() <= 2 && action_enabled(cfg, "remove") => {
-            GatewayAction::Remove(words.get(1).cloned())
+        "remove" if action_enabled(cfg, "remove") => {
+            GatewayAction::Remove(parse_target_session_action("remove", words)?)
         }
         "set-default" if words.len() == 2 && action_enabled(cfg, "set-default") => {
             GatewayAction::SetDefault(words[1].clone())
@@ -239,7 +239,10 @@ fn parse_status_action(words: &[String]) -> anyhow::Result<GatewayAction> {
     Ok(GatewayAction::Status(action))
 }
 
-fn parse_target_session_action(words: &[String]) -> anyhow::Result<TargetSessionAction> {
+fn parse_target_session_action(
+    action_name: &str,
+    words: &[String],
+) -> anyhow::Result<TargetSessionAction> {
     let mut action = TargetSessionAction::default();
     let mut index = 1;
     while let Some(arg) = words.get(index).map(String::as_str) {
@@ -262,7 +265,7 @@ fn parse_target_session_action(words: &[String]) -> anyhow::Result<TargetSession
                 }
                 index += 1;
             }
-            _ => anyhow::bail!("invalid connect option {arg:?}"),
+            _ => anyhow::bail!("invalid {action_name} option {arg:?}"),
         }
     }
     Ok(action)
@@ -587,11 +590,17 @@ mod tests {
             ),
             (
                 "stop default",
-                Some(GatewayAction::Stop(Some("default".into()))),
+                Some(GatewayAction::Stop(TargetSessionAction {
+                    target: Some("default".into()),
+                    session_id: None,
+                })),
             ),
             (
                 "remove default",
-                Some(GatewayAction::Remove(Some("default".into()))),
+                Some(GatewayAction::Remove(TargetSessionAction {
+                    target: Some("default".into()),
+                    session_id: None,
+                })),
             ),
             ("help", Some(GatewayAction::Help)),
         ] {
@@ -647,7 +656,17 @@ mod tests {
         assert!(parse_gateway_action("status --bad", &cfg).is_err());
         assert_eq!(
             parse_gateway_action("remove default", &cfg).unwrap(),
-            Some(GatewayAction::Remove(Some("default".into())))
+            Some(GatewayAction::Remove(TargetSessionAction {
+                target: Some("default".into()),
+                session_id: None,
+            }))
+        );
+        assert_eq!(
+            parse_gateway_action("remove default --session-id abc123def456", &cfg).unwrap(),
+            Some(GatewayAction::Remove(TargetSessionAction {
+                target: Some("default".into()),
+                session_id: Some("abc123def456".into()),
+            }))
         );
         assert!(parse_gateway_action("rm default", &cfg).unwrap().is_none());
         assert!(

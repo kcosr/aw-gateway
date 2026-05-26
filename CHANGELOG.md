@@ -4,6 +4,10 @@
 
 ### Added
 
+- Added `aw-gateway remove --session-id` and SSH-dispatched
+  `remove --session-id` for removing one concrete ephemeral session container.
+- Added JSON HTTP API `stop` and `remove` lifecycle routes gated by
+  `http.enabled_actions`.
 - Added scoped template support for `target.container_home` identity variables
   and gateway-managed `container_agent.services[].user = "{container_user}"`
   ([#41](https://github.com/kcosr/aw-gateway/pull/41)).
@@ -13,6 +17,8 @@
 
 ### Changed
 
+- Explicit ephemeral `remove --session-id` now applies configured session
+  workspace cleanup when cleanup is not `never`.
 - Reworked the README structure, onboarding flow, architecture diagrams, and
   config reference wording for clearer documentation
   ([#42](https://github.com/kcosr/aw-gateway/pull/42)).

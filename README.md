@@ -1146,7 +1146,7 @@ launches [--json]
 launch show <name> [--json]
 launch <name> [--session-id ID] [--var key=value]...
 stop [target] [--session-id ID]
-remove [target]
+remove [target] [--session-id ID]
 status [target] [--json] [--session-id ID]
 status --all [--json]
 targets [--json]
@@ -1166,9 +1166,10 @@ A session is one gateway connection or invocation tracked for lifecycle and
 idle cleanup decisions. Ephemeral targets generate a fresh 12-character
 lowercase hexadecimal session ID unless `--session-id ID` is supplied. Use an
 explicit session ID when another tool needs deterministic naming for local
-`connect`, `run`, `launch`, `up`, `status`, or `stop` commands against the same
-per-session container. SSH dispatch accepts `--session-id` for `connect`, `run`,
-and `launch`. Fixed targets reject `--session-id`.
+`connect`, `run`, `launch`, `up`, `status`, `stop`, or `remove` commands
+against the same per-session container. SSH dispatch accepts `--session-id` for
+`connect`, `run`, `launch`, `stop`, and `remove`. Fixed targets reject
+`--session-id`.
 
 Gateway command behavior:
 
@@ -1189,8 +1190,10 @@ Gateway command behavior:
   launch target, run any post-ready steps, and execute the launch command.
 - `stop [target] [--session-id ID]`: stop a target, or a specific ephemeral
   session target.
-- `remove [target]`: stop a fixed target if needed, then remove its existing
-  container so the next start recreates it from the current config.
+- `remove [target] [--session-id ID]`: stop a fixed target if needed, then
+  remove its existing container so the next start recreates it from the current
+  config, or remove one specific ephemeral session target. Explicit remove also
+  cleans the resolved session workspace when workspace cleanup is not `never`.
 - `status [target] [--json] [--session-id ID]`: report one
   configured/default target's container state.
 - `status --all [--json]`: list existing `aw-gateway`-managed containers for
@@ -1302,7 +1305,7 @@ socket string such as `127.0.0.1:8080` or `[::1]:8080`.
 [http]
 enabled = true
 listen = "127.0.0.1:8080"
-enabled_actions = ["status", "targets", "launches", "launch", "up", "run"]
+enabled_actions = ["status", "targets", "launches", "launch", "up", "run", "stop", "remove"]
 
 [http.auth]
 type = "none"
@@ -1321,8 +1324,8 @@ token = "change-me"
 ```
 
 `http.enabled_actions` is an HTTP-specific allow list. Supported values are
-exactly `status`, `targets`, `launches`, `launch`, `up`, and `run`. Other
-gateway actions such as `connect`, `stop`, `remove`, key management,
+exactly `status`, `targets`, `launches`, `launch`, `up`, `run`, `stop`, and
+`remove`. Other gateway actions such as `connect`, key management,
 client-config/bundle, proxy/tunnel helpers, and default-target management are
 not HTTP API actions.
 
@@ -1361,15 +1364,21 @@ Errors use a stable envelope:
 | `GET` | `/api/v1/status/all` | `status` | `GatewayOperation::StatusAll` |
 | `GET` | `/api/v1/targets` | `targets` | `GatewayOperation::Targets` |
 | `POST` | `/api/v1/up` | `up` | `GatewayOperation::Up` |
+| `POST` | `/api/v1/stop` | `stop` | `GatewayOperation::Stop` |
+| `POST` | `/api/v1/remove` | `remove` | `GatewayOperation::Remove` |
 | `GET` | `/api/v1/launches` | `launches` | `GatewayOperation::Launches` |
 | `GET` | `/api/v1/launches/{name}` | `launch` | `GatewayOperation::LaunchShow` |
 | `POST` | `/api/v1/launches/{name}/run` | `launch` | `GatewayOperation::Launch` |
 | `POST` | `/api/v1/run` | `run` | `GatewayOperation::Run` |
 
-Command-like POST bodies accept optional `mode` and `output` fields. `mode`
-defaults to `wait` and can be `wait` or `detach`; HTTP does not expose stream
-mode. `output` defaults to `["stdout", "stderr"]`, accepts only `stdout` and
-`stderr`, and applies only to wait responses.
+Lifecycle POST bodies accept optional `target` and `session_id` fields. Fixed
+targets reject `session_id`; ephemeral targets require it for `stop` and
+`remove`.
+
+Command-like POST bodies also accept optional `mode` and `output` fields.
+`mode` defaults to `wait` and can be `wait` or `detach`; HTTP does not expose
+stream mode. `output` defaults to `["stdout", "stderr"]`, accepts only
+`stdout` and `stderr`, and applies only to wait responses.
 
 ```json
 {
@@ -1403,8 +1412,8 @@ and non-finite numbers are rejected as `invalid_launch_var`.
 
 The initial HTTP API intentionally does not implement streaming, SSE/NDJSON,
 persistent jobs, TTY sessions, SSH key management, generated client config or
-bundles, proxy/tunnel helpers, stop/remove, default-target management, route
-aliases, or retired config-shape compatibility.
+bundles, proxy/tunnel helpers, default-target management, route aliases, or
+retired config-shape compatibility.
 
 ## Assets
 

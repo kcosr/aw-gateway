@@ -19,7 +19,9 @@ pub const GATEWAY_ACTION_NAMES: &[&str] = &[
     "help",
 ];
 
-pub const HTTP_ACTION_NAMES: &[&str] = &["status", "targets", "up", "launches", "launch", "run"];
+pub const HTTP_ACTION_NAMES: &[&str] = &[
+    "status", "targets", "up", "launches", "launch", "run", "stop", "remove",
+];
 
 pub fn is_gateway_action_name(name: &str) -> bool {
     GATEWAY_ACTION_NAMES.contains(&name)
@@ -68,7 +70,9 @@ mod tests {
         assert!(!is_gateway_action_name("rm"));
         assert_eq!(
             HTTP_ACTION_NAMES,
-            &["status", "targets", "up", "launches", "launch", "run"]
+            &[
+                "status", "targets", "up", "launches", "launch", "run", "stop", "remove",
+            ]
         );
         assert!(!is_http_action_name("connect"));
     }
