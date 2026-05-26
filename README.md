@@ -49,26 +49,25 @@ implement the gateway and in-container support processes.
 
 ## Why It Exists
 
-The goal is to let development tools run with normal local freedom inside a
-container while moving the security boundary to the sandbox edges. Site policy
-can be expressed through configured lifecycle hooks, mounted bootstrap assets,
-supervised services, and host or container network controls without hard-coding
-those policies into the gateway binary.
+Container runtimes already provide the isolation and process model. The purpose
+of `aw-gateway` is to make those containers easier to configure, prepare,
+access, and reuse as workspaces. It wraps Podman, Docker, or Colima with a
+validated config model, lifecycle hooks, readiness checks, service supervision,
+generated SSH client config, and optional HTTP automation.
 
-This matters when code or tools running in the workspace are not fully trusted,
-such as autonomous coding agents or untrusted build steps, and should feel like
-a normal development box without reaching the host filesystem or unrestricted
-network.
+The main value is operational convenience and consistent access. Operators can
+describe targets, launches, identity, mounts, cleanup, and policy once in TOML
+instead of stitching together runtime commands, shell scripts, SSH config, and
+ad hoc status checks. Users get familiar access paths through OpenSSH, SCP,
+SFTP, VS Code, Codex, Claude Code, the host CLI, or the JSON HTTP API while the
+gateway handles container startup and routing.
 
-Standard development tools still need a familiar interactive connection model.
-OpenSSH, SCP, SFTP, and desktop tools like VS Code, Codex, and Claude Code all
-know how to talk SSH, so `aw-gateway` provides an SSH bridge into the sandbox.
-Automation needs a stable control surface too, so the same gateway operations
-are available from the host CLI and, when enabled, the JSON HTTP API. On
-managed hosts, host SSHD authenticates the user and starts `aw-gateway`; the
-gateway prepares the target container, waits for required services, and
-connects the client to the container-local SSH daemon through a controlled
-bridge.
+This is especially useful for agent and build workspaces because the tools can
+run with normal local freedom inside a container while host access remains
+mediated by the configured gateway paths. Site policy can be expressed through
+configured lifecycle hooks, mounted bootstrap assets, supervised services, and
+host or container network controls without hard-coding those policies into the
+gateway binary.
 
 ## Features
 
