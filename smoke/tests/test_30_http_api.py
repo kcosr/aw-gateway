@@ -58,6 +58,23 @@ def test_http_up_route(host: Host) -> None:
         assert response.body["data"]["target"] == host.target
 
 
+def test_http_stop_and_remove_routes(host: Host) -> None:
+    gateway(host, "run", host.target, "--", "/bin/true", timeout=300).assert_success()
+
+    with HttpDaemon(host) as http:
+        stop = http.post("/api/v1/stop", {"target": host.target})
+        assert stop.status == HTTPStatus.OK
+        assert stop.body["ok"] is True
+        assert stop.body["data"]["container"]
+        assert stop.body["data"]["stopped"] is True
+
+        remove = http.post("/api/v1/remove", {"target": host.target})
+        assert remove.status == HTTPStatus.OK
+        assert remove.body["ok"] is True
+        assert remove.body["data"]["container"]
+        assert remove.body["data"]["removed"] is True
+
+
 def test_http_run_wait_exit_codes_and_output_selection(host: Host) -> None:
     with HttpDaemon(host) as http:
         success = http.post(
@@ -167,3 +184,9 @@ def test_http_action_allowlist_blocks_disabled_route(host: Host) -> None:
 
         run = http.post("/api/v1/run", {"target": host.target, "command": ["true"]})
         assert_error(run, HTTPStatus.FORBIDDEN, "disabled_action")
+
+        stop = http.post("/api/v1/stop", {"target": host.target})
+        assert_error(stop, HTTPStatus.FORBIDDEN, "disabled_action")
+
+        remove = http.post("/api/v1/remove", {"target": host.target})
+        assert_error(remove, HTTPStatus.FORBIDDEN, "disabled_action")

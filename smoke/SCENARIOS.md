@@ -119,12 +119,13 @@ HTTP requests to the forwarded local port.
 | `GET /api/v1/status?target=<target>` returns target status | all enabled hosts |
 | `GET /api/v1/status/all` returns a status list | all enabled hosts |
 | `POST /api/v1/up` starts supported targets, with expected unsupported-operation behavior for local-listen Colima targets | all enabled hosts |
+| `POST /api/v1/stop` and `POST /api/v1/remove` stop and remove a target | all enabled hosts |
 | `POST /api/v1/run` supports wait mode, output stream selection, nonzero exit reporting, and detach mode | all enabled hosts |
 | Invalid run requests return stable validation errors | all enabled hosts |
 | `GET /api/v1/launches` and launch detail routes expose launch metadata | all enabled hosts |
 | `POST /api/v1/launches/smoke-echo/run` validates typed variables and executes | all enabled hosts |
 | Unknown launches and invalid launch variables return stable errors | all enabled hosts |
-| A limited HTTP config blocks disabled actions with `403 disabled_action` | all enabled hosts |
+| A limited HTTP config blocks disabled `run`, `stop`, and `remove` actions with `403 disabled_action` | all enabled hosts |
 
 ## Cleanup, Timeouts, And Reaping
 
@@ -141,6 +142,8 @@ seconds. The deployed smoke configs are not mutated.
 | Agent-owned cleanup preserves the container while a `tmux`-named process appears in the container process table | `ubuntu`, `rocky10` |
 | Agent-owned `reap_processes` remains paused while `tmux` is preserved, then terminates an unpreserved session process after the preserve process exits | `ubuntu`, `rocky10` |
 | Ephemeral target `workspace.cleanup = "always"` removes the session workspace after a successful command | all enabled hosts |
+| Explicit ephemeral `remove --session-id` removes the session container and workspace | all enabled hosts |
+| SSH-dispatched ephemeral `remove --session-id` removes the session container and workspace | all enabled hosts |
 
 The preserve-process test starts a short-lived executable whose process
 `comm` is `tmux`; this exercises the same process-table matching path as a
