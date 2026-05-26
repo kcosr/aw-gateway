@@ -948,6 +948,45 @@ define `schema_version`, `default_target`, `extends`, `[runtime]`, `[logging]`,
 `[http]`, `[ssh_dispatch]`, `[client_config]`, `[target_defaults]`, or
 `[launch_defaults]`.
 
+### Config Composition Order
+
+Gateway config composition has two boundaries: include files split one root
+config into smaller files, while `extends` layers complete root configs. Each
+root config composes its own includes before it participates in root-to-root
+inheritance.
+
+```mermaid
+flowchart TD
+    selected["Selected root config: flag, env, user, or system"]
+
+    selected --> selectedIncludes["Compose selected root includes"]
+    selectedIncludes --> hasExtends{"extends?"}
+
+    hasExtends -- no --> selectedReady["Selected root value"]
+    hasExtends -- yes --> parent["Load parent root config"]
+
+    parent --> parentIncludes["Compose parent includes"]
+    parentIncludes --> parentExtends{"parent extends?"}
+    parentExtends -- yes --> ancestor["Repeat for ancestor roots"]
+    ancestor --> mergeAncestors["Merge ancestors base-to-child"]
+    parentExtends -- no --> mergeParent["Parent root value"]
+    mergeAncestors --> mergeParent
+
+    mergeParent --> mergeRoot["Merge parent root into selected root"]
+    selectedReady --> validate["Deserialize and validate gateway schema"]
+    mergeRoot --> validate
+
+    validate --> effectiveTargets["Resolve effective targets"]
+    validate --> effectiveLaunches["Resolve effective launches"]
+
+    effectiveTargets --> runtime["Runtime, CLI, SSH, HTTP use effective config"]
+    effectiveLaunches --> runtime
+```
+
+After this raw root composition step, normal schema validation and typed
+target/launch defaults, template chains, and concrete-definition overlays
+produce the effective config used by runtime operations.
+
 ### Root Config Extends
 
 Root configs may inherit another root config with `extends`:
@@ -1384,6 +1423,9 @@ The `assets/` directory contains deployable helpers and image files:
 - `assets/copy-skel`: copies top-level deployed skel files into a workspace
   without overwriting existing files. It takes explicit `--skel-dir` and
   `--workspace` arguments.
+- `assets/copy-workspace-template`: copies a workspace template into an empty
+  gateway-owned workspace path. It takes explicit `--template`, `--dest`, and
+  optional repeated `--exclude` arguments.
 - `assets/sshd_config_agent`: container-local SSHD policy intended for gateway
   targets.
 - `assets/start-container-sshd`: prepares `/run/sshd`, generates missing SSH

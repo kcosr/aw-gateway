@@ -17,6 +17,7 @@ fn asset_scripts_are_shell_syntax_valid() {
     for script in [
         "aw-iptables",
         "copy-skel",
+        "copy-workspace-template",
         "ensure-storage-conf",
         "start-container-sshd",
     ] {
