@@ -7,6 +7,20 @@
 - Added scoped template support for `target.container_home` identity variables
   and gateway-managed `container_agent.services[].user = "{container_user}"`
   ([#41](https://github.com/kcosr/aw-gateway/pull/41)).
+- Added `assets/copy-workspace-template` for preparing empty ephemeral
+  workspaces from a template directory
+  ([#42](https://github.com/kcosr/aw-gateway/pull/42)).
+
+### Changed
+
+- Reworked the README structure, onboarding flow, architecture diagrams, and
+  config reference wording for clearer documentation
+  ([#42](https://github.com/kcosr/aw-gateway/pull/42)).
+
+### Removed
+
+- Removed the SSH-dispatch `rm` alias; use `remove` for gateway removal
+  commands ([#42](https://github.com/kcosr/aw-gateway/pull/42)).
 
 ## [0.4.0] - 2026-05-25
 

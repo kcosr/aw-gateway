@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: copy-workspace-template --template DIR --dest DIR [--exclude PATTERN ...]
+
+Copies a workspace template into an empty destination directory. This helper is
+intended for aw-gateway pre_start lifecycle hooks that prepare per-session
+ephemeral workspaces.
+USAGE
+}
+
+template=
+dest=
+excludes=()
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --template)
+      [ "$#" -ge 2 ] || { echo "--template requires a value" >&2; exit 2; }
+      template=$2
+      shift 2
+      ;;
+    --dest)
+      [ "$#" -ge 2 ] || { echo "--dest requires a value" >&2; exit 2; }
+      dest=$2
+      shift 2
+      ;;
+    --exclude)
+      [ "$#" -ge 2 ] || { echo "--exclude requires a value" >&2; exit 2; }
+      excludes+=("--exclude=$2")
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+[ -n "$template" ] || { echo "--template is required" >&2; exit 2; }
+[ -n "$dest" ] || { echo "--dest is required" >&2; exit 2; }
+
+case "$template" in
+  /*) ;;
+  *) echo "--template must be absolute: $template" >&2; exit 2 ;;
+esac
+
+case "$dest" in
+  /*) ;;
+  *) echo "--dest must be absolute: $dest" >&2; exit 2 ;;
+esac
+
+if [ "$dest" = "/" ] || [ "$dest" = "$HOME" ]; then
+  echo "refusing unsafe destination: $dest" >&2
+  exit 2
+fi
+
+template_real=$(readlink -f "$template")
+dest_parent=$(dirname "$dest")
+mkdir -p "$dest_parent"
+dest_parent_real=$(readlink -f "$dest_parent")
+dest_real="$dest_parent_real/$(basename "$dest")"
+
+if [ ! -d "$template_real" ]; then
+  echo "template directory does not exist: $template" >&2
+  exit 1
+fi
+
+case "$dest_real" in
+  *"/aw-gateway/"*) ;;
+  *) echo "destination must be under an aw-gateway path component: $dest_real" >&2; exit 2 ;;
+esac
+
+if [ -e "$dest_real" ] && [ ! -d "$dest_real" ]; then
+  echo "destination exists but is not a directory: $dest_real" >&2
+  exit 1
+fi
+
+if [ -L "$dest_real" ]; then
+  echo "refusing symlink destination: $dest_real" >&2
+  exit 2
+fi
+
+if [ -d "$dest_real" ]; then
+  existing=$(find "$dest_real" -mindepth 1 -maxdepth 1 ! -name .aw-gateway -print -quit)
+  if [ -n "$existing" ]; then
+    echo "destination already contains non-gateway content: $existing" >&2
+    exit 1
+  fi
+fi
+
+mkdir -p "$dest_real"
+rsync -a "${excludes[@]}" "$template_real"/ "$dest_real"/
