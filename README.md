@@ -21,6 +21,32 @@ its naming mode, identity, cleanup policy, and SSH settings. "Agent
 Workspaces" is the descriptive name for these sandboxes; the `aw-` binaries
 implement the gateway and in-container support processes.
 
+## Contents
+
+- [Why It Exists](#why-it-exists)
+- [Features](#features)
+- [Quickstart](#quickstart)
+- [Core Concepts](#core-concepts)
+- [Lifecycle Diagrams](#lifecycle-diagrams)
+- [Binaries](#binaries)
+- [Build](#build)
+- [Configuration](#configuration)
+- [HTTP API](#http-api)
+- [Deployment Guides](#deployment-guides)
+- [Gateway Config Shape](#gateway-config-shape)
+- [Launches (Named Command Templates)](#launches-named-command-templates)
+- [Container Agent Services](#container-agent-services)
+- [SSH Workflows](#ssh-workflows)
+- [Local Workstation Mode](#local-workstation-mode)
+- [CLI](#cli)
+- [Assets](#assets)
+- [Runtime Environment Contracts](#runtime-environment-contracts)
+- [Template Variables](#template-variables)
+- [Logging](#logging)
+- [Development](#development)
+- [Release](#release)
+- [Project Structure](#project-structure)
+
 ## Why It Exists
 
 The goal is to let development tools run with normal local freedom inside a
@@ -70,6 +96,35 @@ bridge.
   processes after the last gateway session exits.
 - Protocol-safe logging for proxy modes and rotating JSON logs for
   diagnostics.
+
+## Quickstart
+
+For a working end-to-end deployment, pick the runtime guide that matches your
+host and follow it before using the README as a reference:
+
+1. Build the release binaries with `cargo build --release`.
+2. Pick a deployment guide: [Podman](docs/guides/podman.md),
+   [Docker](docs/guides/docker.md), or [Colima](docs/guides/colima.md).
+3. Install the host and container-side binaries using that guide's layout.
+4. Copy or adapt the guide's gateway config and validate it.
+5. Start a target with `aw-gateway --config PATH up TARGET --json`.
+6. Generate client config and connect with OpenSSH, SCP, SFTP, or VS Code.
+
+## Core Concepts
+
+- A target is a named container configuration. Fixed targets reuse one
+  container; ephemeral targets create one container per session id.
+- A session is one gateway connection or invocation tracked for lifecycle,
+  idle cleanup, and optional per-session workspace cleanup.
+- A workspace is the host directory mounted or used as the session working
+  area. Ephemeral targets may use a workspace path that includes
+  `{session_id}`.
+- `lifecycle_steps` are host hooks tied to start/stop phases. `host_steps` run
+  on the host after agent readiness. `container_bootstrap_steps` run inside
+  the container before the agent starts.
+- OpenSSH `ForceCommand` makes host SSHD run the gateway instead of the user's
+  shell. OpenSSH `ProxyCommand` lets a local SSH client tunnel through the
+  authenticated host connection into container SSH.
 
 ## Lifecycle Diagrams
 
@@ -258,20 +313,11 @@ target/release/aw-ssh-command-filter
 For managed deployments, `aw-gateway` is installed on the host.
 Container-side binaries can either be installed in the target image or mounted
 read-only through the bootstrap-mount mode.
-
-Example host install:
-
-```bash
-sudo install -m 0755 target/release/aw-gateway /opt/aw-gateway/bin/aw-gateway
-```
-
-Example container-runtime artifact install:
-
-```bash
-install -m 0755 target/release/aw-container-bootstrap /opt/aw-gateway/runtime/linux/aw-container-bootstrap
-install -m 0755 target/release/aw-container-agent /opt/aw-gateway/runtime/linux/aw-container-agent
-install -m 0755 target/release/aw-ssh-command-filter /opt/aw-gateway/runtime/linux/aw-ssh-command-filter
-```
+See [Podman](docs/guides/podman.md), [Docker](docs/guides/docker.md), or
+[Colima](docs/guides/colima.md) for the host and container install layout for
+your deployment. macOS readers should also follow the Colima guide's
+cross-build notes so container-side binaries match the Linux architecture used
+inside the VM.
 
 ## Configuration
 
@@ -290,12 +336,30 @@ The container-agent and bootstrap configs remain explicit/system-managed:
 /etc/aw-gateway/container-bootstrap.toml
 ```
 
-Validate configs:
+`schema_version` pins the config schema. The current value is `"1"`. Gateway
+and container-agent configs with a different value fail validation, so set it
+at the top of every config file.
+
+Create starter configs before validating them. For gateway configs, either
+copy the minimal syntax sample or start from a deployment guide's example. For
+container-agent configs, generate a starter file:
+
+```bash
+cp aw-gateway.sample.toml /tmp/gateway.toml
+aw-container-agent config init /tmp/container-agent.toml
+```
+
+Once installed on `PATH` or invoked through `./target/release/...`, validate
+the configs:
 
 ```bash
 aw-gateway --config /tmp/gateway.toml config validate
 aw-container-agent --config /tmp/container-agent.toml config validate
 ```
+
+On success, gateway config validation exits 0 without output. Container-agent
+validation prints `ok` and exits 0. Validation errors print a diagnostic and
+exit nonzero.
 
 Show resolved gateway config paths:
 
@@ -450,6 +514,10 @@ aliases, or retired config-shape compatibility.
 
 ## Deployment Guides
 
+Pick a runtime before following a guide. Podman is rootless-friendly and the
+default fit for managed Linux hosts. Docker uses a daemon and works well on
+shared Linux workstations. Colima wraps Docker inside a Linux VM for macOS.
+
 - [Podman](docs/guides/podman.md): generic local workstation and remote SSH
   deployment patterns with a minimal Ubuntu image and copyable example configs.
 - [Docker](docs/guides/docker.md): native Linux Docker local and remote SSH
@@ -513,6 +581,10 @@ stop_when_idle = true
 remove_on_stop = false
 ```
 
+Replace `ubuntu/dev` with a real container image. The deployment guides build
+and use working runtime-specific images from the included example
+Containerfiles.
+
 Fixed targets reuse one named container across connections. Ephemeral targets
 create a per-session container and require `mode = "ephemeral"`,
 `ephemeral_name` with `{session_id}`, and `stop_when_idle = true` so idle
@@ -532,6 +604,7 @@ path = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
 cleanup = "always"
 
 [targets.worker.idle_cleanup]
+# owner = "gateway" is required for workspace.cleanup.
 owner = "gateway"
 action = "exit_container"
 ```
@@ -583,7 +656,7 @@ Gateway configs commonly include:
   sockets. Durable config, logs, state, and session metadata remain under the
   workspace state directory.
 - `[ssh_dispatch]`: which host SSH commands are handled by the gateway and
-  whether container command passthrough is enabled.
+  whether interactive shell and container command passthrough are enabled.
 - `[http]`: optional JSON HTTP daemon listener, auth mode, and HTTP action
   allow list.
 - `[client_config]`: generated SSH alias templates, host name, gateway path,
@@ -610,7 +683,8 @@ Gateway configs commonly include:
   managed base config.
 - `[[target_defaults.container_mounts]]` and `[[targets.<name>.container_mounts]]`: extra
   host-to-container bind mounts, typically read-only bootstrap
-  binaries/configs/certs.
+  binaries/configs/certs. Each mount uses `source`, `target`, and `mode`
+  (`"ro"` or `"rw"`).
 - `[target_defaults.container_bootstrap]`: optional bootstrap entrypoint configuration and
   pre-agent container bootstrap steps. Targets may overlay
   `[targets.<name>.container_bootstrap]` field-by-field.
@@ -714,6 +788,15 @@ partial override must include the full replacement payload.
 Use `lifecycle_steps` for host hooks tied to a lifecycle phase, including stop
 and teardown phases. Use `host_steps` for post-start checks and setup that
 should run after the container agent is ready and can report readiness.
+Use `container_bootstrap_steps` for in-container setup after identity
+preparation and before the agent starts.
+
+| Step kind | Where | When |
+| --- | --- | --- |
+| `lifecycle_steps` | Host | `pre_start`, `post_start_host`, `pre_stop`, `post_stop` |
+| `host_steps` | Host | After container agent readiness |
+| `container_bootstrap_steps` | Container | After identity prep, before agent start |
+
 Lifecycle and host hook commands use `timeout = "60s"` by default. Set a larger
 per-step `timeout` when a hook legitimately needs more time. The timeout uses
 the same explicit units as other durations: `ms`, `s`, `m`, or `h`. Timed-out
@@ -775,13 +858,13 @@ path = "{home}/.cache/aw-gateway/workspaces/{target}-{session_id}"
 cleanup = "always"
 ```
 
-## Launches
+## Launches (Named Command Templates)
 
-Launches are stateless, configured command templates. They do not add a job
-history or background launch manager. A launch selects an existing target,
-validates typed caller variables, starts or reuses the target through the
-normal readiness path, runs optional `post_ready` steps, then executes the
-final command inside the ready container.
+Launches are stateless, configured command templates for repeatable workflows.
+They do not add a job history or background launch manager. A launch selects an
+existing target, validates typed caller variables, starts or reuses the target
+through the normal readiness path, runs optional `post_ready` steps, then
+executes the final command inside the ready container.
 
 Caller variables are referenced only as `{var.<name>}`. Built-ins such as
 `{workspace}`, `{container_home}`, `{session_id}`, `{target}`, and
@@ -1041,9 +1124,10 @@ SSH commands without arbitrary container exec, omit `run` from
 `ssh_dispatch.enabled_actions`; omit `launch` if users should not start
 configured launch workflows; omit `launches` if users should not discover
 configured launches; also omit `connect` if users should not receive a full
-container SSH session. `allow_container_commands = false` blocks non-gateway
-passthrough commands, but it does not disable explicitly enabled gateway
-actions.
+container SSH session. `allow_interactive_shell = false` blocks
+SSH-dispatched interactive shells, while `allow_container_commands = false`
+blocks non-gateway passthrough commands. Both default to `true`, and neither
+option disables explicitly enabled gateway actions.
 
 ## Container Agent Services
 
@@ -1149,28 +1233,28 @@ ssh user@host rm internal-ubuntu-dev
 ssh user@host 'git status'
 ```
 
-For direct SSH/SCP/SFTP/VS Code access to the container SSH daemon, generate
-client config:
+For direct SSH/SCP/SFTP/VS Code access to the container SSH daemon from your
+workstation, add your public key to the container and generate client config:
 
 ```bash
 cat ~/.ssh/id_rsa.pub | ssh user@host 'add-container-key ubuntu-dev --public-key -'
-ssh user@host 'client-config ubuntu-dev'
+ssh user@host 'client-config ubuntu-dev' > ~/.ssh/config.d/aw-gateway
+# Ensure your normal ~/.ssh/config includes: Include ~/.ssh/config.d/*
+ssh aw-ubuntu-dev
 ```
 
 The first command appends the workstation public key to the container
-authorized-key file under workspace state. The second prints SSH config for the
-container route. The generated config intentionally omits `User` and
-`IdentityFile`; keep those in your normal local SSH config when needed.
-`client-config` only prints config and does not create key material or modify
-authorized keys.
-
-Install the generated config by redirecting it into a file included by your
-local SSH config, or pass it explicitly with `ssh -F`:
+authorized-key file under workspace state. The second writes SSH config for the
+container route. If you do not use `Include ~/.ssh/config.d/*` in your main
+`~/.ssh/config`, either add it or pass the generated file explicitly:
 
 ```bash
-ssh user@host 'client-config ubuntu-dev' > ~/.ssh/config.d/aw-gateway
 ssh -F ~/.ssh/config.d/aw-gateway aw-ubuntu-dev
 ```
+
+The generated config intentionally omits `User` and `IdentityFile`; keep those
+in your normal local SSH config when needed. `client-config` only prints config
+and does not create key material or modify authorized keys.
 
 If an operator explicitly wants gateway-managed inner key material, generate a
 managed key bundle:
@@ -1275,7 +1359,8 @@ remove [target]
 status [target] [--json] [--session-id ID]
 status --all [--json]
 targets [--json]
-set-default <target-or-image>
+http
+set-default <target-or-image> [--reset]
 show-default
 reset-default
 add-key [target] [--public-key PATH|-]
@@ -1320,9 +1405,14 @@ Gateway command behavior:
 - `status --all [--json]`: list existing `aw-gateway`-managed containers for
   the current user from runtime labels. This omits configured targets that have
   never created a container and omits unrelated or unlabeled containers.
+  `--all` cannot be combined with `[target]` or `--session-id`.
 - `targets [--json]`: list configured targets without starting or inspecting
   containers.
-- `set-default <target-or-image>`: set the user's default target.
+- `http`: start the JSON HTTP listener configured by `[http]`. Fails with
+  `http listener is disabled in config` when `[http].enabled = false`.
+- `set-default <target-or-image> [--reset]`: set the user's default target.
+  If the argument is not a configured target name, the gateway tries to resolve
+  it as a known image name. `--reset` is equivalent to `reset-default`.
 - `show-default`: show the user's effective default target.
 - `reset-default`: clear the user's default and fall back to the configured
   default.
@@ -1475,7 +1565,7 @@ merging, and references are deterministic.
 | `container_agent.services[].command`, `cwd`, `env`, and health-check URL | Container-agent service execution | `{container_state_dir}` |
 | `container_agent.control_socket` and `ssh_bridge.socket` in standalone agent config | Container-agent startup | `{container_state_dir}` |
 | `launch.cwd`, `launch.command`, `launch.env`, and `launch.steps[]` command/cwd/env | Launch execution | Launch built-ins plus `{var.<name>}` |
-| `client_config.inner_alias_template`, `container_host_template`, `default_identity_dir` | Client config generation | `{user}`, `{home}`, `{container_user}`, `{container_home}`, `{workspace}`, `{state_dir}`, `{target}`, `{image}`, `{image_slug}`, `{container_name}`, `{container_state_dir}`, `{container_state_dir_in_container}`, `{session_id}`, `{host}` |
+| `client_config.inner_alias_template`, `container_host_template`, `default_identity_dir` | Client config generation | `{user}`, `{uid}`, `{gid}`, `{home}`, `{container_user}`, `{container_home}`, `{workspace}`, `{state}`, `{state_dir}`, `{target}`, `{image}`, `{image_slug}`, `{container_name}`, `{container_state_dir}`, `{container_state_dir_in_container}`, `{session_id}`, `{host}` |
 | `logging.directory` | Gateway logging startup | `{user}`, `{uid}`, `{gid}`, `{home}`, `{workspace}`, `{state}`, `{state_dir}` |
 | Container-agent `logging.directory` | Container-agent logging startup | `{container_state_dir}` |
 | `runtime.docker_host` | Runtime initialization | `{user}`, `{home}` |
@@ -1491,6 +1581,10 @@ launch execution time; caller variables use `{var.<name>}`.
 templates such as `/home/{user}` are valid, and `{home}` may also be used as
 the absolute leading path segment.
 
+`{session_id}` is available only when an ephemeral session is active or an
+explicit `--session-id` was supplied. Rendering a template that uses
+`{session_id}` for a fixed target without a session id fails.
+
 ## Logging
 
 Gateway and agent logs are configured in TOML:
@@ -1503,6 +1597,8 @@ max_bytes = 104857600
 max_files = 5
 console = false
 ```
+
+`max_bytes` accepts a raw byte integer; `104857600` is 100 MB.
 
 Protocol and proxy paths keep stdout quiet. Diagnostics go to stderr or the
 configured log files. The minimal gateway sample uses console logging; managed
@@ -1560,7 +1656,11 @@ then commits a fresh `Unreleased` section for the next cycle.
 - `src/agent.rs` and `src/agent/` - in-container agent entrypoint, service
   supervision, control socket dispatch, SSH bridge, idle cleanup/reaper,
   process helpers, shared state, socket helpers, and status projection.
-- `src/runtime.rs` - Podman, Docker, and Colima command construction.
+- `src/config/` - focused config support modules for targets, launches,
+  includes, root inheritance, steps, agent config, validation, and template
+  resolution.
+- `src/runtime.rs` and `src/runtime/` - Podman, Docker, and Colima command
+  construction and runtime support.
 - `src/ssh_dispatch.rs` - `SSH_ORIGINAL_COMMAND` parsing and restricted SSH
   dispatch.
 - `src/logging.rs` - tracing setup and rotating log files.
