@@ -1389,7 +1389,7 @@ impl Runtime {
         let _lock = self.acquire_lifecycle_lock().await?;
         let mut failed_start_cleanup = FailedStartCleanup::default();
         let result = async {
-            paths::ensure_private_dir(&self.paths.container_state_dir)?;
+            self.prepare_container_state_dir()?;
             self.prepare_control_socket_dir()?;
             self.write_sshd_session_env_config()?;
             self.write_ssh_command_filter_policy()?;
@@ -1457,6 +1457,14 @@ impl Runtime {
             local_ssh: None,
             client_config: None,
         })
+    }
+
+    fn prepare_container_state_dir(&self) -> anyhow::Result<()> {
+        paths::ensure_private_dir(&self.paths.container_state_dir)?;
+        if self.agent_enabled() {
+            paths::ensure_private_dir(&self.paths.container_state_dir.join("logs"))?;
+        }
+        Ok(())
     }
 
     async fn status(&self) -> anyhow::Result<GatewayStatus> {

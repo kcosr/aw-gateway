@@ -1485,6 +1485,30 @@ exit 0
 }
 
 #[test]
+fn prepare_container_state_dir_precreates_agent_log_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+        enable_default_ssh_bridge(cfg);
+    });
+
+    runtime.prepare_container_state_dir().unwrap();
+
+    assert!(runtime.paths.container_state_dir.exists());
+    assert!(runtime.paths.container_state_dir.join("logs").exists());
+}
+
+#[test]
+fn prepare_container_state_dir_skips_log_dir_when_agent_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
+
+    runtime.prepare_container_state_dir().unwrap();
+
+    assert!(runtime.paths.container_state_dir.exists());
+    assert!(!runtime.paths.container_state_dir.join("logs").exists());
+}
+
+#[test]
 fn launch_var_resolution_rejects_duplicates_and_normalizes_values() {
     let cfg: GatewayConfig = toml::from_str(
         r#"
