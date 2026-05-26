@@ -69,10 +69,10 @@ impl Runtime {
         }
     }
 
-    // Caller must already hold this runtime's lifecycle lock. Explicit remove
-    // intentionally bypasses the active-session marker check used by
-    // post-session cleanup because the operator asked to remove this concrete
-    // session footprint.
+    /// Caller must already hold this runtime's lifecycle lock. Explicit remove
+    /// intentionally bypasses the active-session marker check used by
+    /// post-session cleanup because the operator asked to remove this concrete
+    /// session footprint.
     pub(super) async fn apply_explicit_remove_workspace_cleanup(&self) {
         if self.target.workspace.cleanup == WorkspaceCleanup::Never {
             return;

@@ -746,6 +746,8 @@ async fn explicit_remove_workspace_cleanup_skips_when_session_id_is_absent() {
         dir.path().into(),
         session_id,
     );
+    // Exercise the guard directly; Runtime::load rejects this state for
+    // ephemeral targets before operation dispatch.
     runtime.identity.session_id = None;
 
     runtime.apply_explicit_remove_workspace_cleanup().await;
