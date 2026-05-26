@@ -1,25 +1,15 @@
 # Agent Workspaces Gateway
 
-`aw-gateway` is a gateway for disposable or reusable container workspaces. It
-starts or reuses configured containers, supervises required in-container
-services, and exposes workspace operations through the host CLI,
-SSH-compatible clients, and an optional JSON HTTP API. Users can work normally
-inside the workspace, while operators keep the host filesystem out of reach and
-attach policy hooks around the container, especially at the container network
-layer.
+`aw-gateway` is a configuration, orchestration, and access layer for
+disposable or reusable container workspaces. It wraps Podman, Docker, or Colima
+with validated target definitions, lifecycle hooks, readiness checks,
+in-container service supervision, generated SSH client config, and an optional
+JSON HTTP API.
 
-SSH remains the standard interactive attach path: OpenSSH, SCP, SFTP, and
-desktop tools connect to container-local SSH instead of to the host shell or
-host filesystem. The CLI and HTTP API expose the same managed lifecycle and
-operation model for automation and non-interactive integrations.
-
-It is a standalone gateway for managed hosts and local workstation profiles
-that use Podman, Docker, or Colima.
-
-In this project, a target is a named container configuration: an image plus
-its naming mode, identity, cleanup policy, and SSH settings. "Agent
-Workspaces" is the descriptive name for these sandboxes; the `aw-` binaries
-implement the gateway and in-container support processes.
+Users connect with familiar tools such as OpenSSH, SCP, SFTP, VS Code, the
+host CLI, or HTTP automation. The gateway starts or reuses the configured
+container, routes access to container-local services, and keeps host filesystem
+access behind explicit gateway paths and policy hooks.
 
 ## Contents
 
@@ -106,7 +96,7 @@ host and follow it before using the README as a reference:
    [Docker](docs/guides/docker.md), or [Colima](docs/guides/colima.md).
 3. Install the host and container-side binaries using that guide's layout.
 4. Copy or adapt the guide's gateway config and validate it.
-5. Start a target with `aw-gateway --config PATH up TARGET --json`.
+5. Start a target with `aw-gateway --config <path> up <target> --json`.
 6. Generate client config and connect with OpenSSH, SCP, SFTP, or VS Code.
 
 ## Core Concepts
@@ -171,7 +161,7 @@ flowchart LR
     gw -- "control socket" --> agent
     gw -- "SSH bridge" --> sshd
 
-    boot -- "exec" --> agent
+    boot -- "execs into" --> agent
     agent -- "supervises" --> sshd
     agent -- "supervises" --> svc
 ```
@@ -769,6 +759,36 @@ sftp = "deny"
 legacy_scp = "outbound"
 ```
 
+When `sftp = "deny"`, `start-container-sshd` removes the SFTP subsystem from
+the runtime SSHD config. Modern OpenSSH SCP uses SFTP, so that blocks both.
+When `legacy_scp` is not `"allow"`, the helper adds a container-side
+`ForceCommand` that runs `aw-ssh-command-filter`. Legacy SCP inbound means
+upload into the container (`scp -t`); outbound means download from the
+container (`scp -f`). SFTP has only allow/deny because the SFTP subsystem is a
+bidirectional protocol channel rather than separate upload/download server
+commands.
+
+Container-side `aw-ssh-command-filter` implements the legacy SCP checks. The
+`start-container-sshd` helper invokes it from the generated SSHD `ForceCommand`,
+so install or mount the binary alongside the agent when transfer policy uses
+legacy SCP restrictions.
+
+`target_defaults.container_ssh.transfer` only applies to traffic that
+traverses the container SSHD. Gateway actions such as `run` execute through the
+host container runtime, so they do not pass through the container SSHD
+`ForceCommand` and are not controlled by SFTP/SCP transfer policy.
+Host-gateway SSH dispatch checks the default transfer table before dispatch;
+per-target transfer overrides do not relax that host-side gate and only affect
+direct container-SSHD access. If a deployment intends to expose management-only
+SSH commands without arbitrary container exec, omit `run` from
+`ssh_dispatch.enabled_actions`; omit `launch` if users should not start
+configured launch workflows; omit `launches` if users should not discover
+configured launches; also omit `connect` if users should not receive a full
+container SSH session. `allow_interactive_shell = false` blocks
+SSH-dispatched interactive shells, while `allow_container_commands = false`
+blocks non-gateway passthrough commands. Both default to `true`, and neither
+option disables explicitly enabled gateway actions.
+
 Default lifecycle, host, and bootstrap step lists are inherited by every target.
 Target entries use the same key as the default list (`phase + name` for
 `lifecycle_steps`, `name` for `host_steps` and `container_bootstrap_steps`).
@@ -943,36 +963,6 @@ controls such as `enabled = false`, `before`, and `after` are not deletion or
 reorder operations across `extends`; after root inheritance, the merged step must
 still pass normal validation. Use target or launch template overlays when a
 target or launch needs to remove or reorder inherited steps.
-
-When `sftp = "deny"`, `start-container-sshd` removes the SFTP subsystem from
-the runtime SSHD config. Modern OpenSSH SCP uses SFTP, so that blocks both.
-When `legacy_scp` is not `"allow"`, the helper adds a container-side
-`ForceCommand` that runs `aw-ssh-command-filter`. Legacy SCP inbound means
-upload into the container (`scp -t`); outbound means download from the
-container (`scp -f`). SFTP has only allow/deny because the SFTP subsystem is a
-bidirectional protocol channel rather than separate upload/download server
-commands.
-
-Container-side `aw-ssh-command-filter` implements the legacy SCP checks. The
-`start-container-sshd` helper invokes it from the generated SSHD `ForceCommand`,
-so install or mount the binary alongside the agent when transfer policy uses
-legacy SCP restrictions.
-
-`target_defaults.container_ssh.transfer` only applies to traffic that
-traverses the container SSHD. Gateway actions such as `run` execute through the
-host container runtime, so they do not pass through the container SSHD
-`ForceCommand` and are not controlled by SFTP/SCP transfer policy.
-Host-gateway SSH dispatch checks the default transfer table before dispatch;
-per-target transfer overrides do not relax that host-side gate and only affect
-direct container-SSHD access. If a deployment intends to expose management-only
-SSH commands without arbitrary container exec, omit `run` from
-`ssh_dispatch.enabled_actions`; omit `launch` if users should not start
-configured launch workflows; omit `launches` if users should not discover
-configured launches; also omit `connect` if users should not receive a full
-container SSH session. `allow_interactive_shell = false` blocks
-SSH-dispatched interactive shells, while `allow_container_commands = false`
-blocks non-gateway passthrough commands. Both default to `true`, and neither
-option disables explicitly enabled gateway actions.
 
 ## Launches (Named Command Templates)
 
@@ -1514,6 +1504,9 @@ console = false
 ```
 
 `max_bytes` accepts a raw byte integer; `104857600` is 100 MB.
+`console = true` writes structured logs to stderr. `console = false` disables
+that console writer, so diagnostics go only to configured file logging and
+explicit stderr messages.
 
 Protocol and proxy paths keep stdout quiet. Diagnostics go to stderr or the
 configured log files. The minimal gateway sample uses console logging; managed
@@ -1523,6 +1516,7 @@ state. Gateway log directories can interpolate `{user}`, `{uid}`, `{gid}`,
 directories can interpolate `{container_state_dir}`. Container service
 stdout/stderr is captured under the container state log directory with the
 configured rotation limits.
+
 For managed deployments, resolve the target state path and follow the gateway
 log with a command such as `tail -F <state>/logs/gateway/gateway.log`; exact
 paths and rotated filenames depend on the rendered logging config.
