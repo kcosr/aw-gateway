@@ -173,7 +173,7 @@ fn parse_native(
         "stop" if words.len() <= 2 && action_enabled(cfg, "stop") => {
             GatewayAction::Stop(words.get(1).cloned())
         }
-        "remove" | "rm" if words.len() <= 2 && action_enabled(cfg, "remove") => {
+        "remove" if words.len() <= 2 && action_enabled(cfg, "remove") => {
             GatewayAction::Remove(words.get(1).cloned())
         }
         "set-default" if words.len() == 2 && action_enabled(cfg, "set-default") => {
@@ -201,7 +201,7 @@ fn parse_native(
             parse_client_bundle_action(words)?
         }
         "help" if words.len() == 1 && action_enabled(cfg, "help") => GatewayAction::Help,
-        _ if action::is_gateway_action_name(action) || action == "rm" => {
+        _ if action::is_gateway_action_name(action) => {
             anyhow::bail!(
                 "invalid or disabled gateway action shape: {}",
                 words.join(" ")
@@ -649,10 +649,7 @@ mod tests {
             parse_gateway_action("remove default", &cfg).unwrap(),
             Some(GatewayAction::Remove(Some("default".into())))
         );
-        assert_eq!(
-            parse_gateway_action("rm default", &cfg).unwrap(),
-            Some(GatewayAction::Remove(Some("default".into())))
-        );
+        assert!(parse_gateway_action("rm default", &cfg).unwrap().is_none());
         assert!(
             parse_gateway_action("gateway-help", &cfg)
                 .unwrap()

@@ -164,7 +164,7 @@ flowchart LR
     hostssh -- "ForceCommand" --> gw
     client -- "local listener or HTTP" --> gw
 
-    gw -- "exec / inspect / rm" --> runtime
+    gw -- "exec / inspect / remove" --> runtime
     runtime -- "bind mounts: binaries, configs, workspace" --> container
     runtime -- "manages" --> wsdir
 
@@ -358,7 +358,6 @@ ssh user@host show-default
 ssh user@host reset-default
 ssh user@host stop
 ssh user@host remove internal-ubuntu-dev
-ssh user@host rm internal-ubuntu-dev
 ssh user@host 'git status'  # container passthrough command
 ```
 
@@ -1233,8 +1232,7 @@ Gateway command behavior:
 
 When invoked by OpenSSH `ForceCommand`, the gateway parses
 `SSH_ORIGINAL_COMMAND` and exposes the restricted SSH command set. That set
-uses the same command names for most actions, and also accepts SSH-oriented
-aliases such as `rm`.
+uses the same command names as the host CLI for supported actions.
 
 CLI and SSH management commands share the same operation handling for target
 discovery, status, launch discovery, launch execution, lifecycle actions,
