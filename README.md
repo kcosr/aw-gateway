@@ -143,29 +143,29 @@ Component layout:
 ```mermaid
 flowchart LR
     subgraph workstation["Workstation"]
-        client["SSH / SCP / SFTP / VS Code\nor HTTP client"]
+        client["SSH / SCP / SFTP / VS Code or HTTP client"]
     end
 
     subgraph host["Managed host or local workstation"]
-        hostssh["Host sshd\n(managed deployments)"]
-        gw["aw-gateway\nCLI, SSH dispatch,\nHTTP listener,\nclient-config generation"]
+        hostssh["Host sshd (managed deployments)"]
+        gw["aw-gateway: CLI, SSH dispatch, HTTP listener, client-config generation"]
         runtime["Podman / Docker / Colima"]
-        wsdir["Host workspace\nand state directory"]
+        wsdir["Host workspace and state directory"]
     end
 
     subgraph container["Managed container"]
-        boot["aw-container-bootstrap\n(optional entrypoint)"]
-        agent["aw-container-agent\nservice supervisor,\ncontrol socket,\nSSH bridge"]
-        sshd["container sshd\nand aw-ssh-command-filter"]
+        boot["aw-container-bootstrap (optional entrypoint)"]
+        agent["aw-container-agent: service supervisor, control socket, SSH bridge"]
+        sshd["container sshd and aw-ssh-command-filter"]
         svc["configured services"]
     end
 
     client -- "ssh user@host" --> hostssh
     hostssh -- "ForceCommand" --> gw
-    client -- "local listener\nor HTTP" --> gw
+    client -- "local listener or HTTP" --> gw
 
     gw -- "exec / inspect / rm" --> runtime
-    runtime -- "bind mounts\nbinaries, configs,\nworkspace" --> container
+    runtime -- "bind mounts: binaries, configs, workspace" --> container
     runtime -- "manages" --> wsdir
 
     gw -- "control socket" --> agent
@@ -311,13 +311,13 @@ the JSON HTTP API is for non-interactive automation.
 ```mermaid
 flowchart TD
     user["User or tool"]
-    user --> ssh["Managed SSH\nhost SSHD ForceCommand"]
-    user --> local["Local listener\nloopback SSH"]
+    user --> ssh["Managed SSH through host SSHD ForceCommand"]
+    user --> local["Local listener loopback SSH"]
     user --> http["JSON HTTP API"]
     ssh --> op["Gateway operation layer"]
     local --> op
     http --> op
-    op --> runtime["Container runtime\nand agent control"]
+    op --> runtime["Container runtime and agent control"]
 ```
 
 On a managed host, OpenSSH authenticates the user and invokes `aw-gateway` with
@@ -359,8 +359,12 @@ ssh user@host reset-default
 ssh user@host stop
 ssh user@host remove internal-ubuntu-dev
 ssh user@host rm internal-ubuntu-dev
-ssh user@host 'git status'
+ssh user@host 'git status'  # container passthrough command
 ```
+
+Commands that match `ssh_dispatch.enabled_actions` run as gateway management
+actions. Other commands, such as `git status`, are passed through to the
+container when `allow_container_commands = true`.
 
 There are two direct-container client output modes. `client-config` prints SSH
 config that uses key material you manage locally; `client-bundle` creates a
