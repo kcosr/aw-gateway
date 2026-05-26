@@ -132,41 +132,6 @@ fn connect_and_run_cli_parse_session_id_forms() {
 }
 
 #[test]
-fn remove_cli_parses_session_id_forms() {
-    for args in [
-        vec![
-            "aw-gateway",
-            "remove",
-            "--session-id",
-            "abc123def456",
-            "code-review-worker",
-        ],
-        vec![
-            "aw-gateway",
-            "remove",
-            "--session-id=abc123def456",
-            "code-review-worker",
-        ],
-        vec![
-            "aw-gateway",
-            "remove",
-            "code-review-worker",
-            "--session-id",
-            "abc123def456",
-        ],
-    ] {
-        let args = GatewayArgs::try_parse_from(args).unwrap();
-        match args.command {
-            Some(GatewayCommand::Remove(remove)) => {
-                assert_eq!(remove.target.as_deref(), Some("code-review-worker"));
-                assert_eq!(remove.session_id.as_deref(), Some("abc123def456"));
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-}
-
-#[test]
 fn status_all_cli_rejects_target_and_session_id_at_handler_boundary() {
     let dir = tempdir().unwrap();
     let config = dir.path().join("gateway.toml");

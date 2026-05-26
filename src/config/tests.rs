@@ -144,7 +144,14 @@ name = "{image_slug}"
         "{err}"
     );
 
-    for action in ["connect", "add-key", "client-config", "bogus"] {
+    for action in [
+        "connect",
+        "add-key",
+        "client-config",
+        "stop",
+        "remove",
+        "bogus",
+    ] {
         let cfg: GatewayConfig = toml::from_str(&format!(
             r#"
 schema_version = "1"

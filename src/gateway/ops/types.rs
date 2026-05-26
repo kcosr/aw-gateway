@@ -1,7 +1,6 @@
 use crate::config;
 use crate::gateway::failures::{AgentNotReady, ContainerNotFound};
 use crate::runtime::GatewayLabelError;
-use serde::Serialize;
 use std::fmt;
 
 #[derive(Debug)]
@@ -365,13 +364,13 @@ fn canonical_cli_number(raw: &str, parsed: f64) -> String {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::gateway) struct StopResult {
     pub(in crate::gateway) container: String,
     pub(in crate::gateway) stopped: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::gateway) struct RemoveResult {
     pub(in crate::gateway) container: String,
     pub(in crate::gateway) removed: bool,

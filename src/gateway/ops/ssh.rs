@@ -54,17 +54,16 @@ impl SshGatewayOperation {
                 operation: GatewayOperation::Targets,
                 render: SshRenderOptions { json: *json },
             }),
-            GatewayAction::Stop(action) => Some(Self {
+            GatewayAction::Stop(target) => Some(Self {
                 operation: GatewayOperation::Stop {
-                    target: action.target.clone(),
-                    session_id: action.session_id.clone(),
+                    target: target.clone(),
+                    session_id: None,
                 },
                 render: SshRenderOptions::default(),
             }),
-            GatewayAction::Remove(action) => Some(Self {
+            GatewayAction::Remove(target) => Some(Self {
                 operation: GatewayOperation::Remove {
-                    target: action.target.clone(),
-                    session_id: action.session_id.clone(),
+                    target: target.clone(),
                 },
                 render: SshRenderOptions::default(),
             }),

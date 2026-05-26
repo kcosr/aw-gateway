@@ -483,24 +483,17 @@ fn constructs_operation_requests_from_ssh_actions() {
         SshRenderOptions::default(),
     );
     assert_ssh_operation_request(
-        GatewayAction::Stop(crate::ssh_dispatch::TargetSessionAction {
-            target: Some("dev".into()),
-            session_id: Some("abc123".into()),
-        }),
+        GatewayAction::Stop(Some("dev".into())),
         GatewayOperation::Stop {
             target: Some("dev".into()),
-            session_id: Some("abc123".into()),
+            session_id: None,
         },
         SshRenderOptions::default(),
     );
     assert_ssh_operation_request(
-        GatewayAction::Remove(crate::ssh_dispatch::TargetSessionAction {
-            target: Some("dev".into()),
-            session_id: Some("abc123".into()),
-        }),
+        GatewayAction::Remove(Some("dev".into())),
         GatewayOperation::Remove {
             target: Some("dev".into()),
-            session_id: Some("abc123".into()),
         },
         SshRenderOptions::default(),
     );

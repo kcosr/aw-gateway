@@ -13,8 +13,6 @@ pub(super) fn metadata_result_response(result: GatewayOperationResult) -> Respon
         GatewayOperationResult::Up(value) => success_data(value),
         GatewayOperationResult::Launches(value) => success_data(value),
         GatewayOperationResult::LaunchShow(value) => success_data(value),
-        GatewayOperationResult::Stop(value) => success_data(value),
-        GatewayOperationResult::Remove(value) => success_data(value),
         _ => HttpError::operation_failed("operation returned an unexpected result").into_response(),
     }
 }

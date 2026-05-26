@@ -29,15 +29,9 @@ fn fake_running_runtime_script(log: &std::path::Path) -> String {
         r#"#!/bin/sh
 case "$1" in
   inspect)
-    if [ -f "{stopped}" ]; then
-      cat <<'JSON'
-[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":false,"Pid":0}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
-JSON
-    else
-      cat <<'JSON'
+    cat <<'JSON'
 [{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
 JSON
-    fi
     ;;
   ps)
     cat <<'JSON'
@@ -50,20 +44,12 @@ JSON
     echo "captured stderr" >&2
     exit 23
     ;;
-  stop)
-    echo "$@" >> "{log}"
-    touch "{stopped}"
-    ;;
-  rm)
-    echo "$@" >> "{log}"
-    ;;
 esac
 exit 0
 "#,
         user = user.user,
         uid = user.uid,
-        log = log.display(),
-        stopped = log.with_extension("stopped").display()
+        log = log.display()
     )
 }
 
@@ -78,7 +64,7 @@ schema_version = "1"
 [http]
 enabled = true
 listen = "127.0.0.1:0"
-enabled_actions = ["status", "targets", "launches", "run", "launch", "up", "stop", "remove"]
+enabled_actions = ["status", "targets", "launches", "run", "launch", "up"]
 
 [runtime]
 type = "podman"
@@ -492,20 +478,6 @@ async fn router_exposes_declared_routes_without_aliases() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/v1/remove")
-                .header("content-type", "application/json")
-                .body(Body::from("{}"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-    let response = app
         .oneshot(
             Request::builder()
                 .uri("/api/v1/statuses")
@@ -549,30 +521,6 @@ async fn run_wait_and_detach_routes_use_shared_operations() {
     assert_eq!(body["mode"], "detach");
     assert_eq!(body["status"], "accepted");
     assert!(body["operation_id"].as_str().is_some());
-}
-
-#[tokio::test]
-async fn stop_and_remove_routes_use_shared_operations() {
-    let dir = tempfile::tempdir().unwrap();
-    let fake_runtime = dir.path().join("runtime");
-    let log = dir.path().join("runtime.log");
-    write_fake_runtime(&fake_runtime, &fake_running_runtime_script(&log));
-    let app = app_for_config(http_operation_config(&dir, &fake_runtime));
-
-    let (status, body) = post_json(app.clone(), "/api/v1/stop", r#"{"target":"default"}"#).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["ok"], true);
-    assert_eq!(body["data"]["container"], "ubuntu-dev");
-    assert_eq!(body["data"]["stopped"], true);
-
-    let (status, body) = post_json(app, "/api/v1/remove", r#"{"target":"default"}"#).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["ok"], true);
-    assert_eq!(body["data"]["container"], "ubuntu-dev");
-    assert_eq!(body["data"]["removed"], true);
-
-    let log = std::fs::read_to_string(log).unwrap();
-    assert!(log.contains("ubuntu-dev"), "{log}");
 }
 
 #[tokio::test]

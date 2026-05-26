@@ -54,8 +54,6 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/status/all", get(status_all))
         .route("/api/v1/targets", get(targets))
         .route("/api/v1/up", post(up))
-        .route("/api/v1/stop", post(stop))
-        .route("/api/v1/remove", post(remove))
         .route("/api/v1/launches", get(launches))
         .route("/api/v1/launches/{name}", get(launch_show))
         .route("/api/v1/launches/{name}/run", post(launch_run))
@@ -114,28 +112,6 @@ async fn up(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> R
     handle_metadata(state, headers, "up", || {
         let request: UpRequest = parse_body(&body, ErrorCode::InvalidRequest)?;
         Ok(GatewayOperation::Up {
-            target: request.target,
-            session_id: request.session_id,
-        })
-    })
-    .await
-}
-
-async fn stop(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    handle_metadata(state, headers, "stop", || {
-        let request: LifecycleRequest = parse_body(&body, ErrorCode::InvalidRequest)?;
-        Ok(GatewayOperation::Stop {
-            target: request.target,
-            session_id: request.session_id,
-        })
-    })
-    .await
-}
-
-async fn remove(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    handle_metadata(state, headers, "remove", || {
-        let request: LifecycleRequest = parse_body(&body, ErrorCode::InvalidRequest)?;
-        Ok(GatewayOperation::Remove {
             target: request.target,
             session_id: request.session_id,
         })
@@ -342,13 +318,6 @@ struct StatusQuery {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpRequest {
-    target: Option<String>,
-    session_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LifecycleRequest {
     target: Option<String>,
     session_id: Option<String>,
 }

@@ -1,7 +1,7 @@
 use crate::cli::{
     AddContainerKeyArgs, AddHostKeyArgs, AddKeyArgs, ClientBundleArgs, ClientConfigArgs,
     ConfigPathsArgs, ConnectArgs, GatewayArgs, GatewayCommand, GatewayConfigCommand, LaunchCommand,
-    LaunchesArgs, RemoveArgs, RunArgs, SetDefaultArgs, StatusArg, StopArgs, TargetsArgs, UpArgs,
+    LaunchesArgs, RunArgs, SetDefaultArgs, StatusArg, StopArgs, TargetArg, TargetsArgs, UpArgs,
 };
 use crate::config::{
     ContainerRuntimeType, ControlSocketConfig, GatewayConfig, LaunchConfig, LaunchStep,
@@ -649,7 +649,7 @@ async fn stop(config_path: Option<PathBuf>, args: StopArgs) -> anyhow::Result<()
     Ok(())
 }
 
-async fn remove(config_path: Option<PathBuf>, args: RemoveArgs) -> anyhow::Result<()> {
+async fn remove(config_path: Option<PathBuf>, args: TargetArg) -> anyhow::Result<()> {
     let operation = GatewayOperation::from_remove_args(args);
     let result = execute_gateway_operation(config_path, operation).await?;
     let GatewayOperationResult::Remove(result) = result else {
