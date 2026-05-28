@@ -1348,6 +1348,43 @@ exit code is nonzero:
 {"ok": true, "mode": "wait", "exit_code": 0, "stdout": "...", "stderr": "..."}
 ```
 
+Wait-mode callers can request JSON decoding for captured streams with
+`output_format`. A successfully decoded stream is returned as `stdout_json` or
+`stderr_json` instead of the text field for that stream:
+
+```json
+{
+  "ok": true,
+  "mode": "wait",
+  "exit_code": 0,
+  "stdout_json": {"status": "ok"}
+}
+```
+
+If a stream requested as JSON is valid UTF-8 but not valid JSON, the response
+still reports the completed command and returns the raw text stream with an
+`output_errors` entry:
+
+```json
+{
+  "ok": true,
+  "mode": "wait",
+  "exit_code": 1,
+  "stdout": "not-json",
+  "output_errors": {
+    "stdout": {
+      "format": "json",
+      "code": "invalid_json",
+      "message": "captured stdout is not valid JSON"
+    }
+  }
+}
+```
+
+If a selected stream is not valid UTF-8, the response still reports the
+completed command and omits only that stream, with an `invalid_utf8` entry in
+`output_errors`.
+
 Detach-mode command and launch responses return HTTP 202:
 
 ```json
@@ -1381,10 +1418,13 @@ Lifecycle POST bodies accept optional `target` and `session_id` fields. Fixed
 targets reject `session_id`; ephemeral targets require it for `stop` and
 `remove`.
 
-Command-like POST bodies also accept optional `mode` and `output` fields.
+Command-like POST bodies also accept optional `mode`, `output`, and
+`output_format` fields.
 `mode` defaults to `wait` and can be `wait` or `detach`; HTTP does not expose
 stream mode. `output` defaults to `["stdout", "stderr"]`, accepts only
-`stdout` and `stderr`, and applies only to wait responses.
+`stdout` and `stderr`, and applies only to wait responses. `output_format`
+accepts `text` or `json` for selected streams and defaults to `text`.
+`output` and `output_format` are rejected for detach requests.
 
 ```json
 {
@@ -1393,7 +1433,11 @@ stream mode. `output` defaults to `["stdout", "stderr"]`, accepts only
   "cwd": "~/workspace",
   "command": ["bash", "-lc", "echo hello"],
   "mode": "wait",
-  "output": ["stdout", "stderr"]
+  "output": ["stdout", "stderr"],
+  "output_format": {
+    "stdout": "text",
+    "stderr": "json"
+  }
 }
 ```
 

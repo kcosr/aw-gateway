@@ -8,6 +8,9 @@
   by canceling the active session and routing through normal idle/workspace
   cleanup; a second handled signal during cleanup aborts immediately
   ([#46](https://github.com/kcosr/aw-gateway/pull/46)).
+- HTTP wait-mode `run` and `launch` responses can now project selected captured
+  streams as JSON with `output_format`
+  ([#47](https://github.com/kcosr/aw-gateway/pull/47)).
 
 ## [0.4.1] - 2026-05-26
 

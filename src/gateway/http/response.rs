@@ -1,4 +1,5 @@
 use super::super::ops::{ExecutionOutcome, GatewayOperationResult, OperationError};
+use super::output_projection::{OutputFormats, project_wait_payload};
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -23,16 +24,17 @@ pub(super) fn success_data<T: Serialize>(data: T) -> Response {
     (StatusCode::OK, Json(json!({ "ok": true, "data": data }))).into_response()
 }
 
-pub(super) fn execution_response(outcome: ExecutionOutcome) -> Response {
+pub(super) fn execution_response(outcome: ExecutionOutcome, formats: OutputFormats) -> Response {
     match outcome {
         ExecutionOutcome::Captured {
             exit_code,
             stdout,
             stderr,
-        } => match wait_payload(exit_code, stdout, stderr) {
-            Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-            Err(err) => err.into_response(),
-        },
+        } => (
+            StatusCode::OK,
+            Json(project_wait_payload(exit_code, stdout, stderr, formats)),
+        )
+            .into_response(),
         ExecutionOutcome::Detached { operation_id } => (
             StatusCode::ACCEPTED,
             Json(json!({
@@ -48,28 +50,6 @@ pub(super) fn execution_response(outcome: ExecutionOutcome) -> Response {
                 .into_response()
         }
     }
-}
-
-fn wait_payload(
-    exit_code: i32,
-    stdout: Option<Vec<u8>>,
-    stderr: Option<Vec<u8>>,
-) -> Result<serde_json::Value, HttpError> {
-    let mut payload = serde_json::Map::new();
-    payload.insert("ok".into(), json!(true));
-    payload.insert("mode".into(), json!("wait"));
-    payload.insert("exit_code".into(), json!(exit_code));
-    if let Some(stdout) = stdout {
-        let stdout = String::from_utf8(stdout)
-            .map_err(|_| HttpError::operation_failed("captured stdout is not valid UTF-8"))?;
-        payload.insert("stdout".into(), json!(stdout));
-    }
-    if let Some(stderr) = stderr {
-        let stderr = String::from_utf8(stderr)
-            .map_err(|_| HttpError::operation_failed("captured stderr is not valid UTF-8"))?;
-        payload.insert("stderr".into(), json!(stderr));
-    }
-    Ok(serde_json::Value::Object(payload))
 }
 
 pub(super) fn operation_error_response(err: OperationError) -> Response {

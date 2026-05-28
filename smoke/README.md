@@ -186,7 +186,8 @@ The current suite covers:
   `scp -O` upload/download paths.
 - Linux restricted `ForceCommand` help, target listing, and `run`.
 - HTTP API bearer auth, metadata, lifecycle, command execution, launch
-  execution, validation errors, and action allow-listing over SSH tunnels.
+  execution, wait-mode JSON output projection, validation errors, and action
+  allow-listing over SSH tunnels.
 - Short-timer cleanup behavior for gateway-owned idle stop, Linux agent-owned
   idle stop, preserve-process handling, process reaping, and ephemeral
   workspace cleanup, including interrupted foreground launch cleanup.

@@ -121,6 +121,8 @@ HTTP requests to the forwarded local port.
 | `POST /api/v1/up` starts supported targets, with expected unsupported-operation behavior for local-listen Colima targets | all enabled hosts |
 | `POST /api/v1/stop` and `POST /api/v1/remove` stop and remove a target | all enabled hosts |
 | `POST /api/v1/run` supports wait mode, output stream selection, nonzero exit reporting, and detach mode | all enabled hosts |
+| `POST /api/v1/run` wait mode can project JSON stdout into `stdout_json` without escaping it as text | all enabled hosts |
+| `POST /api/v1/run` wait mode reports invalid JSON projection in `output_errors` while preserving command exit code and raw captured output | all enabled hosts |
 | Invalid run requests return stable validation errors | all enabled hosts |
 | `GET /api/v1/launches` and launch detail routes expose launch metadata | all enabled hosts |
 | `POST /api/v1/launches/smoke-echo/run` validates typed variables and executes | all enabled hosts |

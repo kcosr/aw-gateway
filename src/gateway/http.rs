@@ -11,15 +11,17 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 mod auth;
+mod output_projection;
 mod response;
 
 use auth::{authorize, authorize_action};
+use output_projection::{OutputFormat, OutputFormats};
 use response::{
     ErrorCode, HttpError, execution_response, metadata_result_response, operation_error_response,
 };
@@ -169,12 +171,19 @@ async fn launch_run(
 ) -> Response {
     handle_execution(state, headers, "launch", || {
         let request: LaunchRunRequest = parse_body(&body, ErrorCode::InvalidLaunchVar)?;
-        let options = operation_options(request.mode.as_deref(), request.output.as_deref())?;
-        Ok(GatewayOperation::Launch {
-            name,
-            session_id: request.session_id,
-            vars: request.vars.unwrap_or_default(),
-            options,
+        let execution = execution_request_options(
+            request.mode.as_deref(),
+            request.output.as_deref(),
+            request.output_format.as_ref(),
+        )?;
+        Ok(HttpExecutionRequest {
+            operation: GatewayOperation::Launch {
+                name,
+                session_id: request.session_id,
+                vars: request.vars.unwrap_or_default(),
+                options: execution.options,
+            },
+            output_formats: execution.output_formats,
         })
     })
     .await
@@ -191,13 +200,20 @@ async fn run(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> 
                 "command elements must not be empty",
             ));
         }
-        let options = operation_options(request.mode.as_deref(), request.output.as_deref())?;
-        Ok(GatewayOperation::Run {
-            target: request.target,
-            session_id: request.session_id,
-            cwd: request.cwd,
-            command: request.command,
-            options,
+        let execution = execution_request_options(
+            request.mode.as_deref(),
+            request.output.as_deref(),
+            request.output_format.as_ref(),
+        )?;
+        Ok(HttpExecutionRequest {
+            operation: GatewayOperation::Run {
+                target: request.target,
+                session_id: request.session_id,
+                cwd: request.cwd,
+                command: request.command,
+                options: execution.options,
+            },
+            output_formats: execution.output_formats,
         })
     })
     .await
@@ -240,24 +256,36 @@ async fn handle_execution(
     state: AppState,
     headers: HeaderMap,
     action: &'static str,
-    operation: impl FnOnce() -> Result<GatewayOperation, HttpError>,
+    operation: impl FnOnce() -> Result<HttpExecutionRequest, HttpError>,
 ) -> Response {
-    let operation = match authorize_action(&state, &headers, action).await {
+    let request = match authorize_action(&state, &headers, action).await {
         Ok(()) => match operation() {
-            Ok(operation) => operation,
+            Ok(request) => request,
             Err(err) => return err.into_response(),
         },
         Err(err) => return err.into_response(),
     };
-    match execute_gateway_operation(state.config_path, operation).await {
+    match execute_gateway_operation(state.config_path, request.operation).await {
         Ok(GatewayOperationResult::Run(outcome)) | Ok(GatewayOperationResult::Launch(outcome)) => {
-            execution_response(outcome)
+            execution_response(outcome, request.output_formats)
         }
         Ok(_) => {
             HttpError::operation_failed("operation returned an unexpected result").into_response()
         }
         Err(err) => operation_error_response(err),
     }
+}
+
+#[derive(Debug)]
+struct HttpExecutionRequest {
+    operation: GatewayOperation,
+    output_formats: OutputFormats,
+}
+
+#[derive(Debug)]
+struct HttpExecutionOptions {
+    options: OperationExecutionOptions,
+    output_formats: OutputFormats,
 }
 
 fn parse_body<T: for<'de> Deserialize<'de>>(
@@ -282,10 +310,11 @@ fn is_launch_var_error(err: &serde_json::Error) -> bool {
     text.contains("launch variable") || text.contains("launch var")
 }
 
-fn operation_options(
+fn execution_request_options(
     mode: Option<&str>,
     output: Option<&[String]>,
-) -> Result<OperationExecutionOptions, HttpError> {
+    output_format: Option<&BTreeMap<String, String>>,
+) -> Result<HttpExecutionOptions, HttpError> {
     let mode = match mode.unwrap_or("wait") {
         "wait" => OperationMode::Wait,
         "detach" => OperationMode::Detach,
@@ -295,9 +324,21 @@ fn operation_options(
             ));
         }
     };
-    Ok(OperationExecutionOptions {
-        mode,
-        output: output_selection(output)?,
+    if mode == OperationMode::Detach && output.is_some() {
+        return Err(HttpError::invalid_output(
+            "output is only supported for wait mode",
+        ));
+    }
+    if mode == OperationMode::Detach && output_format.is_some() {
+        return Err(HttpError::invalid_output(
+            "output_format is only supported for wait mode",
+        ));
+    }
+    let output = output_selection(output)?;
+    let output_formats = validate_output_formats(output_format, output)?;
+    Ok(HttpExecutionOptions {
+        options: OperationExecutionOptions { mode, output },
+        output_formats,
     })
 }
 
@@ -332,6 +373,43 @@ fn output_selection(output: Option<&[String]>) -> Result<OutputSelection, HttpEr
     Ok(selection)
 }
 
+fn validate_output_formats(
+    output_format: Option<&BTreeMap<String, String>>,
+    selection: OutputSelection,
+) -> Result<OutputFormats, HttpError> {
+    let mut formats = OutputFormats::TEXT;
+    let Some(output_format) = output_format else {
+        return Ok(formats);
+    };
+    for (stream, format) in output_format {
+        let (selected, slot) = match stream.as_str() {
+            "stdout" => (selection.stdout, &mut formats.stdout),
+            "stderr" => (selection.stderr, &mut formats.stderr),
+            _ => {
+                return Err(HttpError::invalid_output(format!(
+                    "unknown output_format stream {stream:?}"
+                )));
+            }
+        };
+        if !selected {
+            return Err(HttpError::invalid_output(format!(
+                "output_format stream {stream:?} is not selected"
+            )));
+        }
+        let parsed = match format.as_str() {
+            "text" => OutputFormat::Text,
+            "json" => OutputFormat::Json,
+            _ => {
+                return Err(HttpError::invalid_output(format!(
+                    "unknown output format {format:?} for stream {stream:?}"
+                )));
+            }
+        };
+        *slot = parsed;
+    }
+    Ok(formats)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StatusQuery {
@@ -362,6 +440,7 @@ struct RunRequest {
     command: Vec<String>,
     mode: Option<String>,
     output: Option<Vec<String>>,
+    output_format: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,6 +451,7 @@ struct LaunchRunRequest {
     vars: Option<SuppliedLaunchVars>,
     mode: Option<String>,
     output: Option<Vec<String>>,
+    output_format: Option<BTreeMap<String, String>>,
 }
 
 fn deserialize_launch_vars<'de, D>(deserializer: D) -> Result<Option<SuppliedLaunchVars>, D::Error>
