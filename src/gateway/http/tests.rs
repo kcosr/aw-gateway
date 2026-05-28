@@ -1,5 +1,6 @@
 use super::super::model::GatewayStatus;
 use super::super::ops::{ExecutionOutcome, OperationError};
+use super::super::output_projection::{OutputFormat, OutputFormats};
 use super::auth::ActionAuthorizationError;
 use super::response::success_data;
 use super::*;
@@ -9,6 +10,7 @@ use axum::body::Body;
 use axum::body::to_bytes;
 use axum::http::header::AUTHORIZATION;
 use axum::http::{Request, StatusCode};
+use std::collections::BTreeMap;
 use tower::ServiceExt;
 
 fn write_fake_runtime(path: &std::path::Path, script: &str) {
@@ -46,6 +48,17 @@ JSON
     ;;
   exec)
     echo "$@" >> "{log}"
+    case "$*" in
+      *invalid-json-output*)
+        printf 'not-json'
+        printf 'stderr-note' >&2
+        exit 7
+        ;;
+      *json-output*)
+        printf '{{"ok":true,"nested":{{"value":42}},"items":["a","b"]}}\n'
+        exit 0
+        ;;
+    esac
     echo "captured stdout"
     echo "captured stderr" >&2
     exit 23
@@ -233,42 +246,94 @@ async fn none_auth_allows_missing_authorization() {
 
 #[test]
 fn mode_and_output_parsing_accepts_wait_detach_and_rejects_bad_values() {
-    let wait = operation_options(None, None).unwrap();
-    assert_eq!(wait.mode, OperationMode::Wait);
-    assert_eq!(wait.output, OutputSelection::BOTH);
+    let wait = execution_request_options(None, None, None).unwrap();
+    assert_eq!(wait.options.mode, OperationMode::Wait);
+    assert_eq!(wait.options.output, OutputSelection::BOTH);
+    assert_eq!(wait.output_formats, OutputFormats::TEXT);
 
     let output = vec!["stdout".to_string()];
-    let detach = operation_options(Some("detach"), Some(&output)).unwrap();
-    assert_eq!(detach.mode, OperationMode::Detach);
+    let wait_stdout = execution_request_options(Some("wait"), Some(&output), None).unwrap();
     assert_eq!(
-        detach.output,
+        wait_stdout.options.output,
         OutputSelection {
             stdout: true,
             stderr: false,
         }
     );
 
+    let detach = execution_request_options(Some("detach"), None, None).unwrap();
+    assert_eq!(detach.options.mode, OperationMode::Detach);
+
     assert_eq!(
-        operation_options(Some("stream"), None).unwrap_err().code,
+        execution_request_options(Some("stream"), None, None)
+            .unwrap_err()
+            .code,
         ErrorCode::InvalidMode
     );
     let duplicate = vec!["stdout".to_string(), "stdout".to_string()];
     assert_eq!(
-        operation_options(Some("wait"), Some(&duplicate))
+        execution_request_options(Some("wait"), Some(&duplicate), None)
             .unwrap_err()
             .code,
         ErrorCode::InvalidOutput
     );
     let unknown = vec!["log".to_string()];
     assert_eq!(
-        operation_options(Some("wait"), Some(&unknown))
+        execution_request_options(Some("wait"), Some(&unknown), None)
             .unwrap_err()
             .code,
         ErrorCode::InvalidOutput
     );
     let empty: Vec<String> = Vec::new();
     assert_eq!(
-        operation_options(Some("wait"), Some(&empty))
+        execution_request_options(Some("wait"), Some(&empty), None)
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidOutput
+    );
+    assert_eq!(
+        execution_request_options(Some("detach"), Some(&output), None)
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidOutput
+    );
+}
+
+#[test]
+fn output_format_validation_uses_effective_output_selection() {
+    let mut format = BTreeMap::new();
+    format.insert("stdout".to_string(), "json".to_string());
+    let default_output = execution_request_options(Some("wait"), None, Some(&format)).unwrap();
+    assert_eq!(default_output.output_formats.stdout, OutputFormat::Json);
+
+    let output = vec!["stderr".to_string()];
+    assert_eq!(
+        execution_request_options(Some("wait"), Some(&output), Some(&format))
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidOutput
+    );
+
+    format.clear();
+    format.insert("log".to_string(), "json".to_string());
+    assert_eq!(
+        execution_request_options(Some("wait"), None, Some(&format))
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidOutput
+    );
+
+    format.clear();
+    format.insert("stdout".to_string(), "yaml".to_string());
+    assert_eq!(
+        execution_request_options(Some("wait"), None, Some(&format))
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidOutput
+    );
+
+    assert_eq!(
+        execution_request_options(Some("detach"), None, Some(&format))
             .unwrap_err()
             .code,
         ErrorCode::InvalidOutput
@@ -316,10 +381,16 @@ fn launch_vars_parse_typed_values_and_reject_duplicates_and_structured_values() 
 
 #[tokio::test]
 async fn execution_response_projects_wait_detach_and_invalid_utf8() {
-    let response = execution_response(ExecutionOutcome::captured(7, Some(b"out".to_vec()), None));
+    let response = execution_response(
+        ExecutionOutcome::captured(7, Some(b"out".to_vec()), None),
+        OutputFormats::TEXT,
+    );
     assert_eq!(response.status(), StatusCode::OK);
 
-    let response = execution_response(ExecutionOutcome::detached("abc123".into()));
+    let response = execution_response(
+        ExecutionOutcome::detached("abc123".into()),
+        OutputFormats::TEXT,
+    );
     let (status, body) = response_json(response).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     let object = body.as_object().unwrap();
@@ -329,7 +400,10 @@ async fn execution_response_projects_wait_detach_and_invalid_utf8() {
     assert_eq!(body["status"], "accepted");
     assert_eq!(body["operation_id"], "abc123");
 
-    let response = execution_response(ExecutionOutcome::captured(0, Some(vec![0xff]), None));
+    let response = execution_response(
+        ExecutionOutcome::captured(0, Some(vec![0xff]), None),
+        OutputFormats::TEXT,
+    );
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
@@ -539,7 +613,7 @@ async fn run_wait_and_detach_routes_use_shared_operations() {
     assert!(body.get("stderr").is_none());
 
     let (status, body) = post_json(
-        app,
+        app.clone(),
         "/api/v1/run",
         r#"{"command":["run-detach"],"mode":"detach"}"#,
     )
@@ -549,6 +623,67 @@ async fn run_wait_and_detach_routes_use_shared_operations() {
     assert_eq!(body["mode"], "detach");
     assert_eq!(body["status"], "accepted");
     assert!(body["operation_id"].as_str().is_some());
+
+    let (status, body) = post_json(
+        app,
+        "/api/v1/run",
+        r#"{"command":["run-detach"],"mode":"detach","output":["stdout"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_output");
+}
+
+#[tokio::test]
+async fn run_wait_can_project_stdout_as_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    write_fake_runtime(&fake_runtime, &fake_running_runtime_script(&log));
+    let app = app_for_config(http_operation_config(&dir, &fake_runtime));
+
+    let (status, body) = post_json(
+        app,
+        "/api/v1/run",
+        r#"{"command":["json-output"],"mode":"wait","output":["stdout"],"output_format":{"stdout":"json"}}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["mode"], "wait");
+    assert_eq!(body["exit_code"], 0);
+    assert_eq!(body["stdout_json"]["ok"], true);
+    assert_eq!(body["stdout_json"]["nested"]["value"], 42);
+    assert_eq!(body["stdout_json"]["items"], serde_json::json!(["a", "b"]));
+    assert!(body.get("stdout").is_none());
+    assert!(body.get("output_errors").is_none());
+}
+
+#[tokio::test]
+async fn run_wait_json_projection_failure_preserves_raw_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    write_fake_runtime(&fake_runtime, &fake_running_runtime_script(&log));
+    let app = app_for_config(http_operation_config(&dir, &fake_runtime));
+
+    let (status, body) = post_json(
+        app,
+        "/api/v1/run",
+        r#"{"command":["invalid-json-output"],"mode":"wait","output":["stdout","stderr"],"output_format":{"stdout":"json"}}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["mode"], "wait");
+    assert_eq!(body["exit_code"], 7);
+    assert_eq!(body["stdout"], "not-json");
+    assert_eq!(body["stderr"], "stderr-note");
+    assert!(body.get("stdout_json").is_none());
+    assert_eq!(body["output_errors"]["stdout"]["format"], "json");
+    assert_eq!(body["output_errors"]["stdout"]["code"], "invalid_json");
 }
 
 #[tokio::test]

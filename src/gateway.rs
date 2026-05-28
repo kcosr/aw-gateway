@@ -61,6 +61,7 @@ mod lifecycle_hooks;
 mod listener;
 mod model;
 mod ops;
+mod output_projection;
 mod render;
 mod session;
 mod status_view;

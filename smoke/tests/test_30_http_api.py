@@ -105,6 +105,56 @@ def test_http_run_wait_exit_codes_and_output_selection(host: Host) -> None:
         assert failed.body["stdout"] == "failed"
 
 
+def test_http_run_wait_json_output_projection(host: Host) -> None:
+    with HttpDaemon(host) as http:
+        projected = http.post(
+            "/api/v1/run",
+            {
+                "target": host.target,
+                "command": [
+                    "/bin/sh",
+                    "-lc",
+                    "printf '%s\\n' '{\"ok\":true,\"nested\":{\"value\":42},\"items\":[\"a\",\"b\"]}'",
+                ],
+                "mode": "wait",
+                "output": ["stdout"],
+                "output_format": {"stdout": "json"},
+            },
+        )
+        assert projected.status == HTTPStatus.OK
+        assert projected.body["ok"] is True
+        assert projected.body["mode"] == "wait"
+        assert projected.body["exit_code"] == 0
+        assert projected.body["stdout_json"]["ok"] is True
+        assert projected.body["stdout_json"]["nested"]["value"] == 42
+        assert projected.body["stdout_json"]["items"] == ["a", "b"]
+        assert "stdout" not in projected.body
+
+        invalid = http.post(
+            "/api/v1/run",
+            {
+                "target": host.target,
+                "command": [
+                    "/bin/sh",
+                    "-lc",
+                    "printf 'not-json'; printf 'stderr-note' >&2; exit 7",
+                ],
+                "mode": "wait",
+                "output": ["stdout", "stderr"],
+                "output_format": {"stdout": "json"},
+            },
+        )
+        assert invalid.status == HTTPStatus.OK
+        assert invalid.body["ok"] is True
+        assert invalid.body["mode"] == "wait"
+        assert invalid.body["exit_code"] == 7
+        assert invalid.body["stdout"] == "not-json"
+        assert invalid.body["stderr"] == "stderr-note"
+        assert "stdout_json" not in invalid.body
+        assert invalid.body["output_errors"]["stdout"]["format"] == "json"
+        assert invalid.body["output_errors"]["stdout"]["code"] == "invalid_json"
+
+
 def test_http_run_detach(host: Host) -> None:
     with HttpDaemon(host) as http:
         response = http.post(
@@ -138,6 +188,17 @@ def test_http_run_validation_errors(host: Host) -> None:
             {"target": host.target, "output": ["stdout", "stdout"], "command": ["true"]},
         )
         assert_error(output, HTTPStatus.BAD_REQUEST, "invalid_output")
+
+        detach_output = http.post(
+            "/api/v1/run",
+            {
+                "target": host.target,
+                "mode": "detach",
+                "output": ["stdout"],
+                "command": ["true"],
+            },
+        )
+        assert_error(detach_output, HTTPStatus.BAD_REQUEST, "invalid_output")
 
 
 def test_http_launch_metadata_and_run(host: Host) -> None:
