@@ -64,7 +64,7 @@ impl Runtime {
     pub(super) fn should_cleanup_workspace(&self, outcome: SessionOutcome) -> bool {
         match self.target.workspace.cleanup {
             WorkspaceCleanup::Never => false,
-            WorkspaceCleanup::Success => outcome == SessionOutcome::Success,
+            WorkspaceCleanup::Success => outcome.is_clean(),
             WorkspaceCleanup::Always => true,
         }
     }

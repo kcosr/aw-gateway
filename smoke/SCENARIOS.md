@@ -142,6 +142,7 @@ seconds. The deployed smoke configs are not mutated.
 | Agent-owned cleanup preserves the container while a `tmux`-named process appears in the container process table | `ubuntu`, `rocky10` |
 | Agent-owned `reap_processes` remains paused while `tmux` is preserved, then terminates an unpreserved session process after the preserve process exits | `ubuntu`, `rocky10` |
 | Ephemeral target `workspace.cleanup = "always"` removes the session workspace after a successful command | all enabled hosts |
+| Interrupted foreground ephemeral `launch` cleans the session workspace after `SIGHUP` | all enabled hosts |
 | Explicit ephemeral `remove --session-id` removes the session container and workspace | all enabled hosts |
 | SSH-dispatched ephemeral `remove --session-id` removes the session container and workspace | all enabled hosts |
 

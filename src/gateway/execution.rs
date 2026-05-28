@@ -10,6 +10,7 @@ use crate::gateway::ops::{
 };
 use crate::paths;
 use crate::template;
+use anyhow::Context;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy)]
@@ -157,18 +158,201 @@ async fn run_operation_session(
     body: OperationBody,
     options: OperationExecutionOptions,
 ) -> anyhow::Result<ExecutionOutcome> {
-    let result = async {
-        let ready = runtime.ensure_ready().await?;
-        runtime
-            .hold_operation_agent_session(&mut session, session_spec.kind())
-            .await?;
-        body.execute(&runtime, ready, options).await
+    let foreground = if options.mode == OperationMode::Stream {
+        run_foreground_operation_session(&runtime, session_spec, &mut session, body, options)
+            .await?
+    } else {
+        let result =
+            execute_operation_session_body(&runtime, session_spec, &mut session, body, options)
+                .await;
+        let outcome = SessionOutcome::from_execution_result(&result);
+        ForegroundOperationResult {
+            result,
+            outcome,
+            cleanup_signals: None,
+        }
+    };
+    let ForegroundOperationResult {
+        result,
+        outcome,
+        cleanup_signals,
+    } = foreground;
+    if let Some(signals) = cleanup_signals {
+        return finish_interrupted_operation_session(runtime, session, result, outcome, signals)
+            .await;
     }
-    .await;
-    let outcome = SessionOutcome::from_execution_result(&result);
     runtime
         .finish_operation_session(session, result, outcome)
         .await
+}
+
+async fn run_foreground_operation_session(
+    runtime: &Runtime,
+    session_spec: OperationSessionSpec,
+    session: &mut OperationSessionGuard,
+    body: OperationBody,
+    options: OperationExecutionOptions,
+) -> anyhow::Result<ForegroundOperationResult> {
+    let operation = execute_operation_session_body(runtime, session_spec, session, body, options);
+    tokio::pin!(operation);
+    let mut signals = match ForegroundSignalListener::new() {
+        Ok(signals) => signals,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "foreground signal handling disabled; operation will use default teardown"
+            );
+            let result = operation.await;
+            let outcome = SessionOutcome::from_execution_result(&result);
+            return Ok(ForegroundOperationResult {
+                result,
+                outcome,
+                cleanup_signals: None,
+            });
+        }
+    };
+    tokio::select! {
+        biased;
+        result = &mut operation => {
+            let outcome = SessionOutcome::from_execution_result(&result);
+            Ok(ForegroundOperationResult {
+                result,
+                outcome,
+                cleanup_signals: None,
+            })
+        }
+        signal = signals.recv() => {
+            tracing::info!(
+                signal = signal.name,
+                exit_code = signal.exit_code(),
+                "foreground operation canceled"
+            );
+            Ok(ForegroundOperationResult {
+                result: Ok(ExecutionOutcome::new(signal.exit_code())),
+                outcome: SessionOutcome::Canceled,
+                cleanup_signals: Some(signals),
+            })
+        }
+    }
+}
+
+struct ForegroundOperationResult {
+    result: anyhow::Result<ExecutionOutcome>,
+    outcome: SessionOutcome,
+    cleanup_signals: Option<ForegroundSignalListener>,
+}
+
+async fn finish_interrupted_operation_session(
+    runtime: Runtime,
+    session: OperationSessionGuard,
+    result: anyhow::Result<ExecutionOutcome>,
+    outcome: SessionOutcome,
+    mut signals: ForegroundSignalListener,
+) -> anyhow::Result<ExecutionOutcome> {
+    let cleanup = runtime.finish_operation_session(session, result, outcome);
+    tokio::pin!(cleanup);
+    tokio::select! {
+        biased;
+        result = &mut cleanup => result,
+        signal = signals.recv() => {
+            tracing::warn!(
+                signal = signal.name,
+                exit_code = signal.exit_code(),
+                "foreground cleanup interrupted by a second signal"
+            );
+            std::process::exit(signal.exit_code());
+        }
+    }
+}
+
+async fn execute_operation_session_body(
+    runtime: &Runtime,
+    session_spec: OperationSessionSpec,
+    session: &mut OperationSessionGuard,
+    body: OperationBody,
+    options: OperationExecutionOptions,
+) -> anyhow::Result<ExecutionOutcome> {
+    let ready = runtime.ensure_ready().await?;
+    runtime
+        .hold_operation_agent_session(session, session_spec.kind())
+        .await?;
+    body.execute(runtime, ready, options).await
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ForegroundCancelSignal {
+    name: &'static str,
+    number: i32,
+}
+
+impl ForegroundCancelSignal {
+    fn exit_code(self) -> i32 {
+        128 + self.number
+    }
+}
+
+#[cfg(unix)]
+struct ForegroundSignalListener {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ForegroundSignalListener {
+    fn new() -> anyhow::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).context("register SIGINT handler")?,
+            terminate: signal(SignalKind::terminate()).context("register SIGTERM handler")?,
+            hangup: signal(SignalKind::hangup()).context("register SIGHUP handler")?,
+        })
+    }
+
+    async fn recv(&mut self) -> ForegroundCancelSignal {
+        tokio::select! {
+            _ = self.interrupt.recv() => {
+                ForegroundCancelSignal {
+                    name: "SIGINT",
+                    number: libc::SIGINT,
+                }
+            },
+            _ = self.terminate.recv() => {
+                ForegroundCancelSignal {
+                    name: "SIGTERM",
+                    number: libc::SIGTERM,
+                }
+            },
+            _ = self.hangup.recv() => {
+                ForegroundCancelSignal {
+                    name: "SIGHUP",
+                    number: libc::SIGHUP,
+                }
+            },
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ForegroundSignalListener;
+
+#[cfg(not(unix))]
+impl ForegroundSignalListener {
+    fn new() -> anyhow::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) -> ForegroundCancelSignal {
+        if let Err(err) = tokio::signal::ctrl_c().await.context("wait for Ctrl-C") {
+            tracing::warn!(error = %err, "failed while waiting for Ctrl-C");
+        }
+        const SIGINT_EXIT_SIGNAL_NUMBER: i32 = 2;
+        ForegroundCancelSignal {
+            name: "SIGINT",
+            number: SIGINT_EXIT_SIGNAL_NUMBER,
+        }
+    }
 }
 
 enum OperationBody {
