@@ -137,6 +137,10 @@ pub(super) fn render_launch_detail(detail: LaunchDetail, json: bool) -> anyhow::
 fn print_launch_detail(detail: &LaunchDetail) {
     println!("Launch: {}", detail.name);
     println!("Target: {}", detail.target);
+    println!("Target mode: {}", detail.target_mode);
+    if let Some(container) = &detail.target_container {
+        println!("Target container: {container}");
+    }
     if let Some(description) = &detail.description {
         println!("Description: {description}");
     }

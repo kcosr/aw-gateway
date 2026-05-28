@@ -81,7 +81,7 @@ async fn authorize_bearer(state: &AppState, headers: &HeaderMap) -> Result<(), H
     Ok(())
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(super) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() > MAX_BEARER_TOKEN_BYTES || right.len() > MAX_BEARER_TOKEN_BYTES {
         return false;
     }

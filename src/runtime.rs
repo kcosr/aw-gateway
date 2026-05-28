@@ -5,11 +5,15 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 mod parse;
@@ -64,6 +68,38 @@ pub struct ContainerExecOutput {
     pub exit_code: i32,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerPtySize {
+    pub rows: u16,
+    pub cols: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+}
+
+#[derive(Debug)]
+pub struct ContainerPtySession {
+    pub output: mpsc::Receiver<Vec<u8>>,
+    pub input: mpsc::Sender<Vec<u8>>,
+    pub resize: mpsc::Sender<ContainerPtySize>,
+    pub exit: JoinHandle<anyhow::Result<i32>>,
+    killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
+}
+
+impl ContainerPtySession {
+    pub async fn terminate(&self) -> anyhow::Result<()> {
+        let killer = self.killer.clone();
+        tokio::task::spawn_blocking(move || {
+            killer
+                .lock()
+                .map_err(|_| anyhow::anyhow!("pty child killer lock poisoned"))?
+                .kill()
+                .map_err(anyhow::Error::from)
+        })
+        .await
+        .context("join pty child terminate task")?
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +314,83 @@ impl ContainerRuntime {
             format!("run {} exec {}", self.runtime_label(), spec.container_name)
         })?;
         Ok(exit_code(status))
+    }
+
+    pub fn exec_pty(
+        &self,
+        spec: &ContainerExecSpec,
+        size: ContainerPtySize,
+    ) -> anyhow::Result<ContainerPtySession> {
+        const PTY_OUTPUT_BUFFER: usize = 64;
+        const PTY_INPUT_BUFFER: usize = 64;
+        const PTY_RESIZE_BUFFER: usize = 16;
+
+        let mut pty_spec = spec.clone();
+        pty_spec.stdin_tty = true;
+        pty_spec.stdout_tty = true;
+
+        let pty_system = portable_pty::native_pty_system();
+        let pair = pty_system.openpty(pty_size(size))?;
+        let mut command = portable_pty::CommandBuilder::new(&self.program);
+        command.arg("exec");
+        command.args(self.exec_args(&pty_spec));
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+
+        let mut reader = pair.master.try_clone_reader()?;
+        let mut writer = pair.master.take_writer()?;
+        let mut child = pair.slave.spawn_command(command)?;
+        drop(pair.slave);
+        let killer = Arc::new(Mutex::new(child.clone_killer()));
+
+        let (output_tx, output) = mpsc::channel(PTY_OUTPUT_BUFFER);
+        let (input, mut input_rx) = mpsc::channel::<Vec<u8>>(PTY_INPUT_BUFFER);
+        let (resize, mut resize_rx) = mpsc::channel::<ContainerPtySize>(PTY_RESIZE_BUFFER);
+
+        std::thread::spawn(move || {
+            let mut buffer = [0_u8; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if output_tx.blocking_send(buffer[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        std::thread::spawn(move || {
+            while let Some(bytes) = input_rx.blocking_recv() {
+                if writer.write_all(&bytes).is_err() {
+                    break;
+                }
+            }
+        });
+
+        std::thread::spawn(move || {
+            while let Some(size) = resize_rx.blocking_recv() {
+                if let Err(err) = pair.master.resize(pty_size(size)) {
+                    tracing::warn!(error = %err, "pty resize failed");
+                }
+            }
+        });
+
+        let exit = tokio::task::spawn_blocking(move || {
+            let status = child.wait()?;
+            Ok(status.exit_code() as i32)
+        });
+
+        Ok(ContainerPtySession {
+            output,
+            input,
+            resize,
+            exit,
+            killer,
+        })
     }
 
     pub async fn exec_quiet<I, S>(&self, name: &str, args: I) -> anyhow::Result<i32>
@@ -522,6 +635,15 @@ impl ContainerRuntime {
             ContainerRuntimeType::Docker => "docker",
             ContainerRuntimeType::Colima => "colima/docker",
         }
+    }
+}
+
+fn pty_size(size: ContainerPtySize) -> portable_pty::PtySize {
+    portable_pty::PtySize {
+        rows: size.rows,
+        cols: size.cols,
+        pixel_width: size.pixel_width,
+        pixel_height: size.pixel_height,
     }
 }
 

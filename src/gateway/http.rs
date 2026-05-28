@@ -2,34 +2,52 @@ use super::ops::{
     CanonicalLaunchVarValue, GatewayOperation, GatewayOperationResult, OperationExecutionOptions,
     OperationMode, OutputSelection, SuppliedLaunchVars, execute_gateway_operation,
 };
+use super::{
+    PreparedExecution, SessionOutcome, prepare_launch_execution_with_config, prepare_run_execution,
+};
 use crate::config::GatewayConfig;
+use crate::gateway::ops::ExecutionOutcome;
+use crate::runtime::ContainerPtySize;
+use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::de::{self, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::time::Duration;
 
 mod auth;
 mod output_projection;
 mod response;
 
-use auth::{authorize, authorize_action};
+use auth::{authorize, authorize_action, constant_time_eq};
 use output_projection::{OutputFormat, OutputFormats};
 use response::{
     ErrorCode, HttpError, execution_response, metadata_result_response, operation_error_response,
 };
 
+const PTY_ATTACH_LEASE_TTL: Duration = Duration::from_secs(30);
+const PTY_ATTACH_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const MIN_TERMINAL_COLS: u16 = 10;
+const MAX_TERMINAL_COLS: u16 = 500;
+const MIN_TERMINAL_ROWS: u16 = 2;
+const MAX_TERMINAL_ROWS: u16 = 300;
+const MAX_WS_TEXT_BYTES: usize = 64 * 1024;
+
 #[derive(Clone)]
 pub(super) struct AppState {
     config_path: Option<PathBuf>,
     config: Arc<GatewayConfig>,
+    pty_leases: Arc<PtyLeaseManager>,
 }
 
 pub(super) async fn serve(config_path: Option<PathBuf>) -> anyhow::Result<()> {
@@ -38,15 +56,18 @@ pub(super) async fn serve(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         anyhow::bail!("http listener is disabled in config");
     }
     let addr = cfg.http.listen_addr()?;
+    let pty_leases = Arc::new(PtyLeaseManager::default());
     let app = router(AppState {
         config_path,
         config: Arc::new(cfg),
+        pty_leases: pty_leases.clone(),
     });
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(listen = %addr, "http listener started");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    pty_leases.cancel_all().await;
     Ok(())
 }
 
@@ -62,6 +83,7 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/launches/{name}", get(launch_show))
         .route("/api/v1/launches/{name}/run", post(launch_run))
         .route("/api/v1/run", post(run))
+        .route("/api/v1/pty/{pty_id}", get(pty_attach))
         .fallback(not_found)
         .with_state(state)
 }
@@ -86,6 +108,110 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[derive(Default)]
+struct PtyLeaseManager {
+    leases: Mutex<BTreeMap<String, PreparedPtyLease>>,
+}
+
+struct PreparedPtyLease {
+    attach_token: String,
+    terminal: ContainerPtySize,
+    execution: PreparedExecution,
+}
+
+#[derive(Serialize)]
+struct PtyLeaseCreated {
+    ok: bool,
+    mode: &'static str,
+    status: &'static str,
+    pty_id: String,
+    attach_token: String,
+    session_id: Option<String>,
+    attach_url: String,
+}
+
+impl PtyLeaseManager {
+    async fn insert(
+        self: &Arc<Self>,
+        execution: PreparedExecution,
+        terminal: ContainerPtySize,
+    ) -> anyhow::Result<PtyLeaseCreated> {
+        let pty_id = format!("pty_{}", super::token::random_hex_token()?);
+        let attach_token = format!("awpt_{}", super::token::random_hex_token()?);
+        let session_id = execution.ready().session_id.clone();
+        let lease = PreparedPtyLease {
+            attach_token: attach_token.clone(),
+            terminal,
+            execution,
+        };
+        self.leases.lock().await.insert(pty_id.clone(), lease);
+        let manager = self.clone();
+        let expiry_id = pty_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(PTY_ATTACH_LEASE_TTL).await;
+            manager.expire(&expiry_id).await;
+        });
+        Ok(PtyLeaseCreated {
+            ok: true,
+            mode: "pty",
+            status: "prepared",
+            pty_id: pty_id.clone(),
+            attach_token,
+            session_id,
+            attach_url: format!("/api/v1/pty/{pty_id}"),
+        })
+    }
+
+    async fn contains(&self, pty_id: &str) -> bool {
+        self.leases.lock().await.contains_key(pty_id)
+    }
+
+    async fn consume_if_token(&self, pty_id: &str, attach_token: &str) -> Option<PreparedPtyLease> {
+        let mut leases = self.leases.lock().await;
+        let matches = leases.get(pty_id).is_some_and(|lease| {
+            constant_time_eq(lease.attach_token.as_bytes(), attach_token.as_bytes())
+        });
+        if matches { leases.remove(pty_id) } else { None }
+    }
+
+    async fn expire(&self, pty_id: &str) {
+        let lease = self.leases.lock().await.remove(pty_id);
+        if let Some(lease) = lease {
+            finish_pty_lease(
+                lease,
+                Ok(ExecutionOutcome::new(130)),
+                SessionOutcome::Canceled,
+            )
+            .await;
+        }
+    }
+
+    async fn cancel_all(&self) {
+        let leases = {
+            let mut guard = self.leases.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        for (_, lease) in leases {
+            finish_pty_lease(
+                lease,
+                Ok(ExecutionOutcome::new(130)),
+                SessionOutcome::Canceled,
+            )
+            .await;
+        }
+    }
+}
+
+async fn finish_pty_lease(
+    lease: PreparedPtyLease,
+    result: anyhow::Result<ExecutionOutcome>,
+    outcome: SessionOutcome,
+) {
+    if let Err(err) = lease.execution.finish(result, outcome).await {
+        tracing::warn!(error = %err, "pty session cleanup failed");
     }
 }
 
@@ -169,54 +295,319 @@ async fn launch_run(
     Path(name): Path<String>,
     body: Bytes,
 ) -> Response {
-    handle_execution(state, headers, "launch", || {
-        let request: LaunchRunRequest = parse_body(&body, ErrorCode::InvalidLaunchVar)?;
-        let execution = execution_request_options(
-            request.mode.as_deref(),
-            request.output.as_deref(),
-            request.output_format.as_ref(),
-        )?;
-        Ok(HttpExecutionRequest {
-            operation: GatewayOperation::Launch {
-                name,
-                session_id: request.session_id,
-                vars: request.vars.unwrap_or_default(),
-                options: execution.options,
-            },
-            output_formats: execution.output_formats,
-        })
-    })
-    .await
+    let request: LaunchRunRequest = match authorize_action(&state, &headers, "launch").await {
+        Ok(()) => match parse_body(&body, ErrorCode::InvalidLaunchVar) {
+            Ok(request) => request,
+            Err(err) => return err.into_response(),
+        },
+        Err(err) => return err.into_response(),
+    };
+    if is_pty_mode(request.mode.as_deref()) {
+        return prepare_pty_launch(state, name, request).await;
+    }
+    let execution = match execution_request_options(
+        request.mode.as_deref(),
+        request.output.as_deref(),
+        request.output_format.as_ref(),
+    ) {
+        Ok(execution) => execution,
+        Err(err) => return err.into_response(),
+    };
+    let operation = GatewayOperation::Launch {
+        name,
+        session_id: request.session_id,
+        vars: request.vars.unwrap_or_default(),
+        options: execution.options,
+    };
+    execute_http_execution(state.config_path, operation, execution.output_formats).await
 }
 
 async fn run(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    handle_execution(state, headers, "run", || {
-        let request: RunRequest = parse_body(&body, ErrorCode::InvalidRequest)?;
-        if request.command.is_empty() {
-            return Err(HttpError::invalid_request("command must not be empty"));
+    let request: RunRequest = match authorize_action(&state, &headers, "run").await {
+        Ok(()) => match parse_body(&body, ErrorCode::InvalidRequest) {
+            Ok(request) => request,
+            Err(err) => return err.into_response(),
+        },
+        Err(err) => return err.into_response(),
+    };
+    if let Err(err) = validate_run_command(&request.command) {
+        return err.into_response();
+    }
+    if is_pty_mode(request.mode.as_deref()) {
+        return prepare_pty_run(state, request).await;
+    }
+    let execution = match execution_request_options(
+        request.mode.as_deref(),
+        request.output.as_deref(),
+        request.output_format.as_ref(),
+    ) {
+        Ok(execution) => execution,
+        Err(err) => return err.into_response(),
+    };
+    let operation = GatewayOperation::Run {
+        target: request.target,
+        session_id: request.session_id,
+        cwd: request.cwd,
+        command: request.command,
+        options: execution.options,
+    };
+    execute_http_execution(state.config_path, operation, execution.output_formats).await
+}
+
+async fn pty_attach(
+    State(state): State<AppState>,
+    Path(pty_id): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !state.pty_leases.contains(&pty_id).await {
+        return HttpError::not_found("pty lease not found").into_response();
+    }
+    ws.on_upgrade(move |socket| handle_pty_socket(state.pty_leases, pty_id, socket))
+}
+
+async fn handle_pty_socket(leases: Arc<PtyLeaseManager>, pty_id: String, mut socket: WebSocket) {
+    let auth = match tokio::time::timeout(PTY_ATTACH_AUTH_TIMEOUT, socket.recv()).await {
+        Ok(Some(Ok(Message::Text(text)))) => parse_pty_auth(&text),
+        Ok(Some(Ok(_))) => Err(HttpError::unauthorized("first pty message must be auth")),
+        Ok(Some(Err(err))) => Err(HttpError::unauthorized(err.to_string())),
+        Ok(None) => Err(HttpError::unauthorized("pty attach closed before auth")),
+        Err(_) => Err(HttpError::unauthorized("pty attach auth timed out")),
+    };
+    let token = match auth {
+        Ok(token) => token,
+        Err(err) => {
+            let _ = send_ws_error(&mut socket, err.code, err.message).await;
+            let _ = socket.send(Message::Close(None)).await;
+            return;
         }
-        if request.command.iter().any(|arg| arg.is_empty()) {
-            return Err(HttpError::invalid_request(
-                "command elements must not be empty",
-            ));
+    };
+    let Some(lease) = leases.consume_if_token(&pty_id, &token).await else {
+        let _ = send_ws_error(&mut socket, ErrorCode::Unauthorized, "unauthorized").await;
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    };
+    run_attached_pty(lease, socket).await;
+}
+
+async fn run_attached_pty(lease: PreparedPtyLease, mut socket: WebSocket) {
+    let ready = lease.execution.ready().clone();
+    let launch = lease.execution.launch_name().map(str::to_string);
+    let mut pty = match lease.execution.spawn_pty(lease.terminal) {
+        Ok(pty) => pty,
+        Err(err) => {
+            let message = err.to_string();
+            let _ = send_ws_error(&mut socket, ErrorCode::OperationFailed, message).await;
+            let _ = socket.send(Message::Close(None)).await;
+            finish_pty_lease(
+                lease,
+                Err(err.context("failed to spawn pty child")),
+                SessionOutcome::Failure,
+            )
+            .await;
+            return;
         }
-        let execution = execution_request_options(
-            request.mode.as_deref(),
-            request.output.as_deref(),
-            request.output_format.as_ref(),
-        )?;
-        Ok(HttpExecutionRequest {
-            operation: GatewayOperation::Run {
-                target: request.target,
-                session_id: request.session_id,
-                cwd: request.cwd,
-                command: request.command,
-                options: execution.options,
-            },
-            output_formats: execution.output_formats,
-        })
-    })
+    };
+
+    let ready_payload = serde_json::json!({
+        "type": "ready",
+        "session_id": ready.session_id,
+        "target": ready.target,
+        "target_mode": ready.mode,
+        "launch": launch,
+    });
+    if socket
+        .send(Message::Text(ready_payload.to_string().into()))
+        .await
+        .is_err()
+    {
+        let _ = pty.terminate().await;
+        drop(pty);
+        finish_pty_lease(
+            lease,
+            Ok(ExecutionOutcome::new(130)),
+            SessionOutcome::Canceled,
+        )
+        .await;
+        return;
+    }
+
+    let mut outcome = SessionOutcome::Canceled;
+    let mut result = Ok(ExecutionOutcome::new(130));
+    let mut output_open = true;
+    loop {
+        tokio::select! {
+            output = pty.output.recv(), if output_open => {
+                match output {
+                    Some(bytes) => {
+                        if socket.send(Message::Binary(bytes.into())).await.is_err() {
+                            let _ = pty.terminate().await;
+                            break;
+                        }
+                    }
+                    None => {
+                        output_open = false;
+                    }
+                }
+            }
+            message = socket.recv() => {
+                match message {
+                    Some(Ok(Message::Binary(bytes))) => {
+                        if pty.input.send(bytes.to_vec()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        match parse_pty_control(&text) {
+                            Ok(control) => match control {
+                                PtyClientControl::Resize { .. } => {
+                                    match control.resize_size() {
+                                        Ok(Some(size)) => {
+                                            let _ = pty.resize.send(size).await;
+                                        }
+                                        Ok(None) => {}
+                                        Err(err) => {
+                                            let _ = send_ws_error(&mut socket, err.code, err.message).await;
+                                        }
+                                    }
+                                }
+                                PtyClientControl::Close => {
+                                    let _ = pty.terminate().await;
+                                    break;
+                                }
+                                PtyClientControl::Auth { .. } => {
+                                    let _ = send_ws_error(&mut socket, ErrorCode::InvalidRequest, "auth is only valid as the first pty message").await;
+                                }
+                            },
+                            Err(err) => {
+                                let _ = send_ws_error(&mut socket, err.code, err.message).await;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        let _ = pty.terminate().await;
+                        break;
+                    }
+                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                    Some(Err(_)) => {
+                        let _ = pty.terminate().await;
+                        break;
+                    }
+                }
+            }
+            exit = &mut pty.exit => {
+                match exit {
+                    Ok(Ok(code)) => {
+                        let _ = drain_pty_output(&mut socket, &mut pty.output).await;
+                        outcome = if code == 0 {
+                            SessionOutcome::Success
+                        } else {
+                            SessionOutcome::Failure
+                        };
+                        result = Ok(ExecutionOutcome::new(code));
+                        let payload = serde_json::json!({
+                            "type": "exit",
+                            "exit_code": code,
+                            "outcome": if code == 0 { "success" } else { "failure" },
+                        });
+                        let _ = socket.send(Message::Text(payload.to_string().into())).await;
+                    }
+                    Ok(Err(err)) => {
+                        let _ = drain_pty_output(&mut socket, &mut pty.output).await;
+                        let message = err.to_string();
+                        result = Err(err);
+                        outcome = SessionOutcome::Failure;
+                        let _ = send_ws_error(&mut socket, ErrorCode::OperationFailed, message).await;
+                    }
+                    Err(err) => {
+                        let _ = drain_pty_output(&mut socket, &mut pty.output).await;
+                        result = Err(anyhow::Error::from(err));
+                        outcome = SessionOutcome::Failure;
+                        let _ = send_ws_error(&mut socket, ErrorCode::OperationFailed, "pty wait task failed").await;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    drop(pty);
+    finish_pty_lease(lease, result, outcome).await;
+}
+
+async fn drain_pty_output(
+    socket: &mut WebSocket,
+    output: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> Result<(), axum::Error> {
+    while let Some(bytes) = output.recv().await {
+        socket.send(Message::Binary(bytes.into())).await?;
+    }
+    Ok(())
+}
+
+async fn prepare_pty_run(state: AppState, request: RunRequest) -> Response {
+    if let Err(err) = reject_pty_output(request.output.as_ref(), request.output_format.as_ref()) {
+        return err.into_response();
+    }
+    let terminal = match terminal_size(request.terminal.as_ref()) {
+        Ok(terminal) => terminal,
+        Err(err) => return err.into_response(),
+    };
+    let prepared = match prepare_run_execution(
+        state.config_path,
+        request.target,
+        request.session_id,
+        request.cwd,
+        request.command,
+    )
     .await
+    {
+        Ok(prepared) => prepared,
+        Err(err) => return operation_error_response(err),
+    };
+    match state.pty_leases.insert(prepared, terminal).await {
+        Ok(created) => (StatusCode::CREATED, Json(created)).into_response(),
+        Err(err) => HttpError::operation_failed(err.to_string()).into_response(),
+    }
+}
+
+async fn prepare_pty_launch(state: AppState, name: String, request: LaunchRunRequest) -> Response {
+    if let Err(err) = reject_pty_output(request.output.as_ref(), request.output_format.as_ref()) {
+        return err.into_response();
+    }
+    let terminal = match terminal_size(request.terminal.as_ref()) {
+        Ok(terminal) => terminal,
+        Err(err) => return err.into_response(),
+    };
+    let prepared = match prepare_launch_execution_with_config(
+        (*state.config).clone(),
+        &name,
+        request.session_id,
+        request.vars.unwrap_or_default(),
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(err) => return operation_error_response(err),
+    };
+    match state.pty_leases.insert(prepared, terminal).await {
+        Ok(created) => (StatusCode::CREATED, Json(created)).into_response(),
+        Err(err) => HttpError::operation_failed(err.to_string()).into_response(),
+    }
+}
+
+async fn execute_http_execution(
+    config_path: Option<PathBuf>,
+    operation: GatewayOperation,
+    output_formats: OutputFormats,
+) -> Response {
+    match execute_gateway_operation(config_path, operation).await {
+        Ok(GatewayOperationResult::Run(outcome)) | Ok(GatewayOperationResult::Launch(outcome)) => {
+            execution_response(outcome, output_formats)
+        }
+        Ok(_) => {
+            HttpError::operation_failed("operation returned an unexpected result").into_response()
+        }
+        Err(err) => operation_error_response(err),
+    }
 }
 
 async fn not_found(
@@ -250,36 +641,6 @@ async fn handle_metadata(
         Ok(result) => metadata_result_response(result),
         Err(err) => operation_error_response(err),
     }
-}
-
-async fn handle_execution(
-    state: AppState,
-    headers: HeaderMap,
-    action: &'static str,
-    operation: impl FnOnce() -> Result<HttpExecutionRequest, HttpError>,
-) -> Response {
-    let request = match authorize_action(&state, &headers, action).await {
-        Ok(()) => match operation() {
-            Ok(request) => request,
-            Err(err) => return err.into_response(),
-        },
-        Err(err) => return err.into_response(),
-    };
-    match execute_gateway_operation(state.config_path, request.operation).await {
-        Ok(GatewayOperationResult::Run(outcome)) | Ok(GatewayOperationResult::Launch(outcome)) => {
-            execution_response(outcome, request.output_formats)
-        }
-        Ok(_) => {
-            HttpError::operation_failed("operation returned an unexpected result").into_response()
-        }
-        Err(err) => operation_error_response(err),
-    }
-}
-
-#[derive(Debug)]
-struct HttpExecutionRequest {
-    operation: GatewayOperation,
-    output_formats: OutputFormats,
 }
 
 #[derive(Debug)]
@@ -410,6 +771,135 @@ fn validate_output_formats(
     Ok(formats)
 }
 
+fn is_pty_mode(mode: Option<&str>) -> bool {
+    mode == Some("pty")
+}
+
+fn validate_run_command(command: &[String]) -> Result<(), HttpError> {
+    if command.is_empty() {
+        return Err(HttpError::invalid_request("command must not be empty"));
+    }
+    if command.iter().any(|arg| arg.is_empty()) {
+        return Err(HttpError::invalid_request(
+            "command elements must not be empty",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_pty_output(
+    output: Option<&Vec<String>>,
+    output_format: Option<&BTreeMap<String, String>>,
+) -> Result<(), HttpError> {
+    if output.is_some() {
+        return Err(HttpError::invalid_output(
+            "output is only supported for wait mode",
+        ));
+    }
+    if output_format.is_some() {
+        return Err(HttpError::invalid_output(
+            "output_format is only supported for wait mode",
+        ));
+    }
+    Ok(())
+}
+
+fn terminal_size(terminal: Option<&TerminalRequest>) -> Result<ContainerPtySize, HttpError> {
+    let terminal =
+        terminal.ok_or_else(|| HttpError::invalid_request("terminal is required for pty mode"))?;
+    Ok(ContainerPtySize {
+        cols: clamp_dimension(
+            "terminal.cols",
+            terminal.cols,
+            MIN_TERMINAL_COLS,
+            MAX_TERMINAL_COLS,
+        )?,
+        rows: clamp_dimension(
+            "terminal.rows",
+            terminal.rows,
+            MIN_TERMINAL_ROWS,
+            MAX_TERMINAL_ROWS,
+        )?,
+        pixel_width: terminal.cell_width_px.unwrap_or_default(),
+        pixel_height: terminal.cell_height_px.unwrap_or_default(),
+    })
+}
+
+fn clamp_dimension(name: &'static str, value: u16, min: u16, max: u16) -> Result<u16, HttpError> {
+    if value < min || value > max {
+        return Err(HttpError::invalid_request(format!(
+            "{name} must be between {min} and {max}"
+        )));
+    }
+    Ok(value)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PtyClientControl {
+    Auth {
+        token: String,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+        cell_width_px: Option<u16>,
+        cell_height_px: Option<u16>,
+    },
+    Close,
+}
+
+fn parse_pty_auth(text: &str) -> Result<String, HttpError> {
+    let control = parse_pty_control(text)?;
+    match control {
+        PtyClientControl::Auth { token } if !token.is_empty() => Ok(token),
+        PtyClientControl::Auth { .. } => Err(HttpError::unauthorized("attach token is required")),
+        _ => Err(HttpError::unauthorized("first pty message must be auth")),
+    }
+}
+
+fn parse_pty_control(text: &str) -> Result<PtyClientControl, HttpError> {
+    if text.len() > MAX_WS_TEXT_BYTES {
+        return Err(HttpError::invalid_request(
+            "pty control message is too large",
+        ));
+    }
+    serde_json::from_str(text)
+        .map_err(|err| HttpError::invalid_request(format!("invalid pty control message: {err}")))
+}
+
+impl PtyClientControl {
+    fn resize_size(&self) -> Result<Option<ContainerPtySize>, HttpError> {
+        match self {
+            Self::Resize {
+                cols,
+                rows,
+                cell_width_px,
+                cell_height_px,
+            } => Ok(Some(ContainerPtySize {
+                cols: clamp_dimension("cols", *cols, MIN_TERMINAL_COLS, MAX_TERMINAL_COLS)?,
+                rows: clamp_dimension("rows", *rows, MIN_TERMINAL_ROWS, MAX_TERMINAL_ROWS)?,
+                pixel_width: cell_width_px.unwrap_or_default(),
+                pixel_height: cell_height_px.unwrap_or_default(),
+            })),
+            _ => Ok(None),
+        }
+    }
+}
+
+async fn send_ws_error(
+    socket: &mut WebSocket,
+    code: ErrorCode,
+    message: impl Into<String>,
+) -> Result<(), axum::Error> {
+    let payload = serde_json::json!({
+        "type": "error",
+        "code": code.as_str(),
+        "message": message.into(),
+    });
+    socket.send(Message::Text(payload.to_string().into())).await
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StatusQuery {
@@ -439,6 +929,7 @@ struct RunRequest {
     cwd: Option<String>,
     command: Vec<String>,
     mode: Option<String>,
+    terminal: Option<TerminalRequest>,
     output: Option<Vec<String>>,
     output_format: Option<BTreeMap<String, String>>,
 }
@@ -450,8 +941,18 @@ struct LaunchRunRequest {
     #[serde(default, deserialize_with = "deserialize_launch_vars")]
     vars: Option<SuppliedLaunchVars>,
     mode: Option<String>,
+    terminal: Option<TerminalRequest>,
     output: Option<Vec<String>>,
     output_format: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalRequest {
+    cols: u16,
+    rows: u16,
+    cell_width_px: Option<u16>,
+    cell_height_px: Option<u16>,
 }
 
 fn deserialize_launch_vars<'de, D>(deserializer: D) -> Result<Option<SuppliedLaunchVars>, D::Error>

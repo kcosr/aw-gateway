@@ -220,8 +220,8 @@ pub(super) async fn execute_gateway_operation(
             let cfg = load_config(config_path)?;
             let launch = lookup_launch(&cfg, &name)?;
             Ok(GatewayOperationResult::LaunchShow(launch_detail(
-                &name, &launch,
-            )))
+                &cfg, &name, &launch,
+            )?))
         }
         GatewayOperation::Launch {
             name,

@@ -1,7 +1,7 @@
 use super::{
-    OperationSessionGuard, Runtime, SessionOutcome, exec_final_container_command_with_options,
-    launch_final_env, launch_template_vars, render_launch_cwd, render_template_map,
-    run_launch_steps,
+    OperationSessionGuard, Runtime, SessionOutcome, exec_container_command_with_options,
+    final_container_exec_spec, launch_final_env, launch_template_vars, render_launch_cwd,
+    render_template_map, run_launch_steps,
 };
 use crate::config::LaunchConfig;
 use crate::gateway::model::ReadyStatus;
@@ -9,12 +9,13 @@ use crate::gateway::ops::{
     ExecutionOutcome, OperationExecutionOptions, OperationMode, OutputSelection,
 };
 use crate::paths;
+use crate::runtime::{ContainerExecSpec, ContainerPtySession, ContainerPtySize};
 use crate::template;
 use anyhow::Context;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy)]
-enum OperationSessionSpec {
+pub(super) enum OperationSessionSpec {
     RunCommand,
     Launch,
 }
@@ -107,6 +108,24 @@ impl OperationRunner {
         let session = runtime
             .begin_operation_session(session_spec.kind(), session_spec.uses_launch_marker())?;
         run_operation_session(runtime, session_spec, session, body, options).await
+    }
+
+    pub(super) async fn prepare(self) -> anyhow::Result<PreparedExecution> {
+        let Self {
+            runtime,
+            session_spec,
+            body,
+            options: _,
+        } = self;
+        let mut session = runtime
+            .begin_operation_session(session_spec.kind(), session_spec.uses_launch_marker())?;
+        let prepared =
+            prepare_operation_session_body(&runtime, session_spec, &mut session, body).await?;
+        Ok(PreparedExecution {
+            runtime,
+            session,
+            prepared,
+        })
     }
 
     async fn spawn_detached(self) -> anyhow::Result<ExecutionOutcome> {
@@ -272,11 +291,21 @@ async fn execute_operation_session_body(
     body: OperationBody,
     options: OperationExecutionOptions,
 ) -> anyhow::Result<ExecutionOutcome> {
+    let prepared = prepare_operation_session_body(runtime, session_spec, session, body).await?;
+    exec_container_command_with_options(runtime, &prepared.exec_spec, options).await
+}
+
+async fn prepare_operation_session_body(
+    runtime: &Runtime,
+    session_spec: OperationSessionSpec,
+    session: &mut OperationSessionGuard,
+    body: OperationBody,
+) -> anyhow::Result<PreparedCommand> {
     let ready = runtime.ensure_ready().await?;
     runtime
         .hold_operation_agent_session(session, session_spec.kind())
         .await?;
-    body.execute(runtime, ready, options).await
+    body.prepare(runtime, ready).await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -367,25 +396,19 @@ enum OperationBody {
 }
 
 impl OperationBody {
-    async fn execute(
+    async fn prepare(
         self,
         runtime: &Runtime,
         ready: ReadyStatus,
-        options: OperationExecutionOptions,
-    ) -> anyhow::Result<ExecutionOutcome> {
+    ) -> anyhow::Result<PreparedCommand> {
         match self {
             Self::Run { cwd, command } => {
                 let cwd = cwd
                     .as_deref()
                     .map(|cwd| paths::expand_home(&runtime.identity.container_home, cwd));
-                exec_final_container_command_with_options(
-                    runtime,
-                    command,
-                    cwd,
-                    runtime.session_env()?,
-                    options,
-                )
-                .await
+                let exec_spec =
+                    final_container_exec_spec(runtime, command, cwd, runtime.session_env()?);
+                Ok(PreparedCommand { ready, exec_spec })
             }
             Self::Launch {
                 launch,
@@ -402,10 +425,57 @@ impl OperationBody {
                     runtime.identity.container_home.as_path(),
                 )?;
                 let command = template::render_argv(&launch.command, &vars)?;
-                exec_final_container_command_with_options(runtime, command, cwd, env, options).await
+                let exec_spec = final_container_exec_spec(runtime, command, cwd, env);
+                Ok(PreparedCommand { ready, exec_spec })
             }
         }
     }
+}
+
+pub(super) struct PreparedExecution {
+    runtime: Runtime,
+    session: OperationSessionGuard,
+    prepared: PreparedCommand,
+}
+
+impl PreparedExecution {
+    pub(super) fn ready(&self) -> &ReadyStatus {
+        &self.prepared.ready
+    }
+
+    pub(super) fn exec_spec(&self) -> &ContainerExecSpec {
+        &self.prepared.exec_spec
+    }
+
+    pub(super) fn launch_name(&self) -> Option<&str> {
+        self.runtime.identity.launch_name.as_deref()
+    }
+
+    pub(super) fn spawn_pty(&self, size: ContainerPtySize) -> anyhow::Result<ContainerPtySession> {
+        self.runtime
+            .container_runtime
+            .exec_pty(self.exec_spec(), size)
+    }
+
+    pub(super) async fn finish<T>(
+        self,
+        result: anyhow::Result<T>,
+        outcome: SessionOutcome,
+    ) -> anyhow::Result<T> {
+        let Self {
+            runtime,
+            session,
+            prepared: _,
+        } = self;
+        runtime
+            .finish_operation_session(session, result, outcome)
+            .await
+    }
+}
+
+struct PreparedCommand {
+    ready: ReadyStatus,
+    exec_spec: ContainerExecSpec,
 }
 
 pub(super) fn detach_discard_options() -> OperationExecutionOptions {

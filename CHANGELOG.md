@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added HTTP `mode = "pty"` for `run` and `launch` operations, with
+  short-lived WebSocket attach leases for interactive terminal sessions.
+- Added resolved target metadata to launch detail responses.
+
 ### Changed
 
 - Foreground `run` and `launch` now handle `SIGINT`, `SIGTERM`, and `SIGHUP`

@@ -6,6 +6,7 @@
 .build-service/workspace-id
 .spec/
 .specs/
+.scratch/
 smoke/.venv/
 smoke/.pytest_cache/
 smoke/aw_gateway_smoke.egg-info/

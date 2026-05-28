@@ -9,7 +9,7 @@ pub(super) enum SshTarget {
     Tcp(TcpEndpoint),
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(super) struct ReadyStatus {
     pub(super) target: String,
     pub(super) session_id: Option<String>,
@@ -96,6 +96,9 @@ pub(super) struct LaunchSummary {
 pub(super) struct LaunchDetail {
     pub(super) name: String,
     pub(super) target: String,
+    pub(super) target_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) target_container: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) description: Option<String>,
     pub(super) vars: BTreeMap<String, LaunchVarMetadata>,
