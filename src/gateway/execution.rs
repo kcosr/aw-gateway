@@ -252,6 +252,7 @@ async fn finish_interrupted_operation_session(
     let cleanup = runtime.finish_operation_session(session, result, outcome);
     tokio::pin!(cleanup);
     tokio::select! {
+        biased;
         result = &mut cleanup => result,
         signal = signals.recv() => {
             tracing::warn!(
