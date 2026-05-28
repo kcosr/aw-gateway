@@ -132,6 +132,15 @@ pub(crate) fn interrupted_cleanup_config(
     runtime: &std::path::Path,
     workspace_template: &std::path::Path,
 ) -> String {
+    interrupted_cleanup_config_with_idle_grace(dir, runtime, workspace_template, "0s")
+}
+
+pub(crate) fn interrupted_cleanup_config_with_idle_grace(
+    dir: &TempDir,
+    runtime: &std::path::Path,
+    workspace_template: &std::path::Path,
+    idle_grace: &str,
+) -> String {
     format!(
         r#"
 schema_version = "1"
@@ -164,7 +173,7 @@ cleanup = "success"
 [targets.default.idle_cleanup]
 owner = "gateway"
 action = "exit_container"
-idle_grace = "0s"
+idle_grace = "{idle_grace}"
 
 [launches.long]
 target = "default"
@@ -173,6 +182,7 @@ command = ["sleep", "30"]
         runtime = runtime.display(),
         logs = dir.path().join("logs").display(),
         workspace = workspace_template.display(),
+        idle_grace = idle_grace,
     )
 }
 

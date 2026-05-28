@@ -50,6 +50,14 @@ Foreground `run` and `launch` should handle:
 - `SIGHUP`
 - runtime exec completion caused by PTY/stdin teardown
 
+The signals above are cancellation triggers. PTY/stdin teardown normally arrives
+as runtime exec completion and should flow through the normal success/failure
+outcome path.
+
+After a handled cancellation, `aw-gateway` should keep supervising normal
+cleanup. A second handled signal during that cleanup should abort immediately
+with the second signal's interrupted exit code.
+
 `SIGKILL`, host crash, and immediate process death cannot be handled in-process.
 Those remain recovery or explicit-remove cases.
 
@@ -59,6 +67,7 @@ Add deterministic tests for:
 
 - interrupted foreground `run`
 - interrupted foreground `launch`
+- second signal abort while interrupted cleanup is waiting
 - `Canceled` cleanup policy semantics
 - another active marker appearing during gateway-owned idle grace
 

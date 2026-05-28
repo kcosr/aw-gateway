@@ -1489,6 +1489,61 @@ exit 0
     assert_eq!(std::fs::read_to_string(log).unwrap(), "stop ubuntu-dev\n");
 }
 
+#[tokio::test]
+async fn gateway_idle_cleanup_backs_off_when_session_marker_appears_during_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  stop)
+    echo "stop $2" >> "{log}"
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+            log = log.display()
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        let target = cfg.targets.get_mut("default").unwrap();
+        target.stop_when_idle = Some(true);
+        target.remove_on_stop = Some(false);
+        target.idle_cleanup = Some(crate::config::IdleCleanupConfigInput {
+            owner: Some(IdleCleanupOwner::Gateway),
+            action: Some(IdleCleanupAction::ExitContainer),
+            idle_grace: Some("100ms".into()),
+            ..Default::default()
+        });
+    });
+    std::fs::create_dir_all(&runtime.paths.container_state_dir).unwrap();
+
+    let cleanup = runtime.apply_gateway_idle_cleanup();
+    let marker = async {
+        sleep(Duration::from_millis(20)).await;
+        let session = runtime.create_launch_session_marker("launch").unwrap();
+        sleep(Duration::from_millis(150)).await;
+        session
+    };
+    let (cleanup, session) = tokio::join!(cleanup, marker);
+    cleanup.unwrap();
+
+    assert!(!log.exists());
+    assert_eq!(session_marker_count(&runtime.session_marker_dir()), 1);
+    drop(session);
+}
+
 #[test]
 fn prepare_container_state_dir_precreates_agent_log_dir() {
     let dir = tempfile::tempdir().unwrap();

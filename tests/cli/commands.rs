@@ -5,8 +5,9 @@ use predicates::prelude::*;
 use tempfile::tempdir;
 
 use crate::helpers::{
-    gateway_sample_for_test, interrupted_cleanup_config, interruptible_runtime_script,
-    signal_process, wait_for_file, write_executable,
+    gateway_sample_for_test, interrupted_cleanup_config,
+    interrupted_cleanup_config_with_idle_grace, interruptible_runtime_script, signal_process,
+    wait_for_file, write_executable,
 };
 
 #[test]
@@ -364,4 +365,46 @@ fn interrupted_run_cleans_ephemeral_workspace() {
     let log = std::fs::read_to_string(log).unwrap();
     assert!(log.contains(&format!("stop worker-{session_id}")), "{log}");
     assert!(log.contains(&format!("rm worker-{session_id}")), "{log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn second_signal_aborts_interrupted_run_cleanup() {
+    let dir = tempdir().unwrap();
+    let session_id = "abc123def456";
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    let started = dir.path().join("started");
+    write_executable(&fake_runtime, &interruptible_runtime_script(&log, &started));
+    let workspace_template = dir
+        .path()
+        .join("aw-gateway/workspaces/default-{session_id}");
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        interrupted_cleanup_config_with_idle_grace(&dir, &fake_runtime, &workspace_template, "5s"),
+    )
+    .unwrap();
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("aw-gateway"))
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "run",
+            "default",
+            "--session-id",
+            session_id,
+            "--",
+            "sleep",
+            "30",
+        ])
+        .spawn()
+        .unwrap();
+    wait_for_file(&started);
+    signal_process(child.id(), libc::SIGHUP);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    signal_process(child.id(), libc::SIGTERM);
+    let status = child.wait().unwrap();
+
+    assert_eq!(status.code(), Some(143));
 }
