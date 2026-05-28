@@ -2,7 +2,6 @@ use super::ops::{
     CanonicalLaunchVarValue, GatewayOperation, GatewayOperationResult, OperationExecutionOptions,
     OperationMode, OutputSelection, SuppliedLaunchVars, execute_gateway_operation,
 };
-use super::output_projection::{OutputFormat, OutputFormats};
 use crate::config::GatewayConfig;
 use axum::Router;
 use axum::body::Bytes;
@@ -18,9 +17,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod auth;
+mod output_projection;
 mod response;
 
 use auth::{authorize, authorize_action};
+use output_projection::{OutputFormat, OutputFormats};
 use response::{
     ErrorCode, HttpError, execution_response, metadata_result_response, operation_error_response,
 };
@@ -381,9 +382,9 @@ fn validate_output_formats(
         return Ok(formats);
     };
     for (stream, format) in output_format {
-        let selected = match stream.as_str() {
-            "stdout" => selection.stdout,
-            "stderr" => selection.stderr,
+        let (selected, slot) = match stream.as_str() {
+            "stdout" => (selection.stdout, &mut formats.stdout),
+            "stderr" => (selection.stderr, &mut formats.stderr),
             _ => {
                 return Err(HttpError::invalid_output(format!(
                     "unknown output_format stream {stream:?}"
@@ -404,11 +405,7 @@ fn validate_output_formats(
                 )));
             }
         };
-        match stream.as_str() {
-            "stdout" => formats.stdout = parsed,
-            "stderr" => formats.stderr = parsed,
-            _ => unreachable!("output_format stream was already validated"),
-        }
+        *slot = parsed;
     }
     Ok(formats)
 }

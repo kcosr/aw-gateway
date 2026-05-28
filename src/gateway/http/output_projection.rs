@@ -19,15 +19,33 @@ impl OutputFormats {
     };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CapturedOutputProjectionError {
-    InvalidUtf8 { stream: &'static str },
+impl OutputFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
 }
 
-impl CapturedOutputProjectionError {
-    pub(super) fn message(self) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputProjectionErrorCode {
+    InvalidJson,
+    InvalidUtf8,
+}
+
+impl OutputProjectionErrorCode {
+    fn as_str(self) -> &'static str {
         match self {
-            Self::InvalidUtf8 { stream } => format!("captured {stream} is not valid UTF-8"),
+            Self::InvalidJson => "invalid_json",
+            Self::InvalidUtf8 => "invalid_utf8",
+        }
+    }
+
+    fn message(self, stream: &'static str) -> String {
+        match self {
+            Self::InvalidJson => format!("captured {stream} is not valid JSON"),
+            Self::InvalidUtf8 => format!("captured {stream} is not valid UTF-8"),
         }
     }
 }
@@ -37,7 +55,7 @@ pub(super) fn project_wait_payload(
     stdout: Option<Vec<u8>>,
     stderr: Option<Vec<u8>>,
     formats: OutputFormats,
-) -> Result<serde_json::Value, CapturedOutputProjectionError> {
+) -> serde_json::Value {
     let mut payload = serde_json::Map::new();
     let mut output_errors = serde_json::Map::new();
     payload.insert("ok".into(), json!(true));
@@ -50,7 +68,7 @@ pub(super) fn project_wait_payload(
             "stdout",
             stdout,
             formats.stdout,
-        )?;
+        );
     }
     if let Some(stderr) = stderr {
         project_stream(
@@ -59,7 +77,7 @@ pub(super) fn project_wait_payload(
             "stderr",
             stderr,
             formats.stderr,
-        )?;
+        );
     }
     if !output_errors.is_empty() {
         payload.insert(
@@ -67,7 +85,7 @@ pub(super) fn project_wait_payload(
             serde_json::Value::Object(output_errors),
         );
     }
-    Ok(serde_json::Value::Object(payload))
+    serde_json::Value::Object(payload)
 }
 
 fn project_stream(
@@ -76,9 +94,19 @@ fn project_stream(
     stream: &'static str,
     bytes: Vec<u8>,
     format: OutputFormat,
-) -> Result<(), CapturedOutputProjectionError> {
-    let text = String::from_utf8(bytes)
-        .map_err(|_| CapturedOutputProjectionError::InvalidUtf8 { stream })?;
+) {
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            insert_output_error(
+                output_errors,
+                stream,
+                format,
+                OutputProjectionErrorCode::InvalidUtf8,
+            );
+            return;
+        }
+    };
     match format {
         OutputFormat::Text => {
             payload.insert(stream.into(), json!(text));
@@ -89,18 +117,31 @@ fn project_stream(
             }
             Err(_) => {
                 payload.insert(stream.into(), json!(text));
-                output_errors.insert(
-                    stream.into(),
-                    json!({
-                        "format": "json",
-                        "code": "invalid_json",
-                        "message": format!("captured {stream} is not valid JSON"),
-                    }),
+                insert_output_error(
+                    output_errors,
+                    stream,
+                    format,
+                    OutputProjectionErrorCode::InvalidJson,
                 );
             }
         },
     }
-    Ok(())
+}
+
+fn insert_output_error(
+    output_errors: &mut serde_json::Map<String, serde_json::Value>,
+    stream: &'static str,
+    format: OutputFormat,
+    code: OutputProjectionErrorCode,
+) {
+    output_errors.insert(
+        stream.into(),
+        json!({
+            "format": format.as_str(),
+            "code": code.as_str(),
+            "message": code.message(stream),
+        }),
+    );
 }
 
 #[cfg(test)]
@@ -114,8 +155,7 @@ mod tests {
             Some(b"out\n".to_vec()),
             Some(b"err\n".to_vec()),
             OutputFormats::TEXT,
-        )
-        .unwrap();
+        );
 
         assert_eq!(payload["ok"], true);
         assert_eq!(payload["mode"], "wait");
@@ -136,11 +176,27 @@ mod tests {
                 stdout: OutputFormat::Json,
                 stderr: OutputFormat::Text,
             },
-        )
-        .unwrap();
+        );
 
         assert_eq!(payload["stdout_json"]["nested"]["value"], 42);
         assert!(payload.get("stdout").is_none());
+        assert!(payload.get("output_errors").is_none());
+    }
+
+    #[test]
+    fn projects_stderr_json_output_to_json_field() {
+        let payload = project_wait_payload(
+            0,
+            None,
+            Some(br#"{"diagnostic":{"value":42}}"#.to_vec()),
+            OutputFormats {
+                stdout: OutputFormat::Text,
+                stderr: OutputFormat::Json,
+            },
+        );
+
+        assert_eq!(payload["stderr_json"]["diagnostic"]["value"], 42);
+        assert!(payload.get("stderr").is_none());
         assert!(payload.get("output_errors").is_none());
     }
 
@@ -154,8 +210,7 @@ mod tests {
                 stdout: OutputFormat::Json,
                 stderr: OutputFormat::Text,
             },
-        )
-        .unwrap();
+        );
 
         assert_eq!(payload["ok"], true);
         assert_eq!(payload["exit_code"], 1);
@@ -167,13 +222,39 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_is_projection_error() {
-        let err = project_wait_payload(0, Some(vec![0xff]), None, OutputFormats::TEXT).unwrap_err();
-
-        assert_eq!(
-            err,
-            CapturedOutputProjectionError::InvalidUtf8 { stream: "stdout" }
+    fn invalid_utf8_omits_stream_with_output_error() {
+        let payload = project_wait_payload(
+            2,
+            Some(vec![0xff]),
+            Some(b"diagnostic".to_vec()),
+            OutputFormats::TEXT,
         );
-        assert_eq!(err.message(), "captured stdout is not valid UTF-8");
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["exit_code"], 2);
+        assert!(payload.get("stdout").is_none());
+        assert_eq!(payload["stderr"], "diagnostic");
+        assert_eq!(payload["output_errors"]["stdout"]["format"], "text");
+        assert_eq!(payload["output_errors"]["stdout"]["code"], "invalid_utf8");
+    }
+
+    #[test]
+    fn invalid_utf8_under_json_format_omits_stream_with_requested_format_error() {
+        let payload = project_wait_payload(
+            2,
+            None,
+            Some(vec![0xff]),
+            OutputFormats {
+                stdout: OutputFormat::Text,
+                stderr: OutputFormat::Json,
+            },
+        );
+
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["exit_code"], 2);
+        assert!(payload.get("stderr").is_none());
+        assert!(payload.get("stderr_json").is_none());
+        assert_eq!(payload["output_errors"]["stderr"]["format"], "json");
+        assert_eq!(payload["output_errors"]["stderr"]["code"], "invalid_utf8");
     }
 }

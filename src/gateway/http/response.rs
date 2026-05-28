@@ -1,5 +1,5 @@
 use super::super::ops::{ExecutionOutcome, GatewayOperationResult, OperationError};
-use super::super::output_projection::{OutputFormats, project_wait_payload};
+use super::output_projection::{OutputFormats, project_wait_payload};
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -30,10 +30,11 @@ pub(super) fn execution_response(outcome: ExecutionOutcome, formats: OutputForma
             exit_code,
             stdout,
             stderr,
-        } => match project_wait_payload(exit_code, stdout, stderr, formats) {
-            Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-            Err(err) => HttpError::operation_failed(err.message()).into_response(),
-        },
+        } => (
+            StatusCode::OK,
+            Json(project_wait_payload(exit_code, stdout, stderr, formats)),
+        )
+            .into_response(),
         ExecutionOutcome::Detached { operation_id } => (
             StatusCode::ACCEPTED,
             Json(json!({

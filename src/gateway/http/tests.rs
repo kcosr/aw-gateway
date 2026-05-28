@@ -1,7 +1,7 @@
 use super::super::model::GatewayStatus;
 use super::super::ops::{ExecutionOutcome, OperationError};
-use super::super::output_projection::{OutputFormat, OutputFormats};
 use super::auth::ActionAuthorizationError;
+use super::output_projection::{OutputFormat, OutputFormats};
 use super::response::success_data;
 use super::*;
 use crate::config::{HttpAuthConfig, HttpAuthType, HttpConfig};
@@ -404,7 +404,14 @@ async fn execution_response_projects_wait_detach_and_invalid_utf8() {
         ExecutionOutcome::captured(0, Some(vec![0xff]), None),
         OutputFormats::TEXT,
     );
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let (status, body) = response_json(response).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["mode"], "wait");
+    assert_eq!(body["exit_code"], 0);
+    assert!(body.get("stdout").is_none());
+    assert_eq!(body["output_errors"]["stdout"]["format"], "text");
+    assert_eq!(body["output_errors"]["stdout"]["code"], "invalid_utf8");
 }
 
 #[tokio::test]
@@ -625,13 +632,22 @@ async fn run_wait_and_detach_routes_use_shared_operations() {
     assert!(body["operation_id"].as_str().is_some());
 
     let (status, body) = post_json(
-        app,
+        app.clone(),
         "/api/v1/run",
         r#"{"command":["run-detach"],"mode":"detach","output":["stdout"]}"#,
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "invalid_output");
+
+    let (status, body) = post_json(
+        app,
+        "/api/v1/run",
+        r#"{"command":["run-wait"],"output_format":{"stdout":5}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_request");
 }
 
 #[tokio::test]

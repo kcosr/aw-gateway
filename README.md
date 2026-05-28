@@ -1381,6 +1381,10 @@ still reports the completed command and returns the raw text stream with an
 }
 ```
 
+If a selected stream is not valid UTF-8, the response still reports the
+completed command and omits only that stream, with an `invalid_utf8` entry in
+`output_errors`.
+
 Detach-mode command and launch responses return HTTP 202:
 
 ```json
