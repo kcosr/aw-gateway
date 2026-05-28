@@ -6,7 +6,8 @@
 
 - Foreground `run` and `launch` now handle `SIGINT`, `SIGTERM`, and `SIGHUP`
   by canceling the active session and routing through normal idle/workspace
-  cleanup; a second handled signal during cleanup aborts immediately.
+  cleanup; a second handled signal during cleanup aborts immediately
+  ([#46](https://github.com/kcosr/aw-gateway/pull/46)).
 
 ## [0.4.1] - 2026-05-26
 
