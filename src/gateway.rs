@@ -1129,10 +1129,15 @@ struct ControlSocketPaths {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionOutcome {
     Success,
+    Canceled,
     Failure,
 }
 
 impl SessionOutcome {
+    fn is_clean(self) -> bool {
+        matches!(self, Self::Success | Self::Canceled)
+    }
+
     fn from_result<T>(result: &anyhow::Result<T>) -> Self {
         if result.is_ok() {
             Self::Success

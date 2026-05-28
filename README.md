@@ -1183,11 +1183,15 @@ Gateway command behavior:
 - `run [--session-id ID] [target] [--cwd DIR] -- <command> [args...]`: start or
   reuse a target and run one command inside the container. A command is
   required; use `up` to start or hold a target without running a command.
+  Foreground runs interrupted by `SIGINT`, `SIGTERM`, or `SIGHUP` are canceled
+  and then routed through normal session cleanup.
 - `launches [--json]`: list configured launches.
 - `launch show <name> [--json]`: show one configured launch's variables, steps,
   and final command.
 - `launch <name> [--session-id ID] [--var key=value]...`: start or reuse the
   launch target, run any post-ready steps, and execute the launch command.
+  Foreground launches interrupted by `SIGINT`, `SIGTERM`, or `SIGHUP` are
+  canceled and then routed through normal session cleanup.
 - `stop [target] [--session-id ID]`: stop a target, or a specific ephemeral
   session target.
 - `remove [target] [--session-id ID]`: stop a fixed target if needed, then

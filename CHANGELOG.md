@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Changed
+
+- Foreground `run` and `launch` now handle `SIGINT`, `SIGTERM`, and `SIGHUP`
+  by canceling the active session and routing through normal idle/workspace
+  cleanup.
 
 ## [0.4.1] - 2026-05-26
 

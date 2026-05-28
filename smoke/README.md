@@ -189,6 +189,6 @@ The current suite covers:
   execution, validation errors, and action allow-listing over SSH tunnels.
 - Short-timer cleanup behavior for gateway-owned idle stop, Linux agent-owned
   idle stop, preserve-process handling, process reaping, and ephemeral
-  workspace cleanup.
+  workspace cleanup, including interrupted foreground launch cleanup.
 
 Additional coverage notes are tracked in [SCENARIOS.md](SCENARIOS.md).

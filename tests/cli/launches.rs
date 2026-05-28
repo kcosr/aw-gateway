@@ -2,7 +2,10 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
-use crate::helpers::{gateway_sample_for_test, launch_config_for_test};
+use crate::helpers::{
+    gateway_sample_for_test, interrupted_cleanup_config, interruptible_runtime_script,
+    launch_config_for_test, signal_process, wait_for_file, write_executable,
+};
 
 #[test]
 fn launches_cli_lists_and_serializes_var_metadata() {
@@ -386,4 +389,48 @@ fn launch_cli_reports_unknown_launch() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("unknown launch \"missing\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_launch_cleans_ephemeral_workspace() {
+    let dir = tempdir().unwrap();
+    let session_id = "abc123def456";
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    let started = dir.path().join("started");
+    write_executable(&fake_runtime, &interruptible_runtime_script(&log, &started));
+    let workspace_template = dir
+        .path()
+        .join("aw-gateway/workspaces/default-{session_id}");
+    let workspace = dir
+        .path()
+        .join("aw-gateway/workspaces")
+        .join(format!("default-{session_id}"));
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        interrupted_cleanup_config(&dir, &fake_runtime, &workspace_template),
+    )
+    .unwrap();
+
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("aw-gateway"))
+        .arg("--config")
+        .arg(&config)
+        .args(["launch", "long", "--session-id", session_id])
+        .spawn()
+        .unwrap();
+    wait_for_file(&started);
+    signal_process(child.id(), libc::SIGHUP);
+    let status = child.wait().unwrap();
+
+    assert_eq!(status.code(), Some(129));
+    assert!(
+        !workspace.exists(),
+        "workspace still exists: {}",
+        workspace.display()
+    );
+    let log = std::fs::read_to_string(log).unwrap();
+    assert!(log.contains(&format!("stop worker-{session_id}")), "{log}");
+    assert!(log.contains(&format!("rm worker-{session_id}")), "{log}");
 }

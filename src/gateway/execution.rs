@@ -10,6 +10,7 @@ use crate::gateway::ops::{
 };
 use crate::paths;
 use crate::template;
+use anyhow::Context;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy)]
@@ -157,18 +158,104 @@ async fn run_operation_session(
     body: OperationBody,
     options: OperationExecutionOptions,
 ) -> anyhow::Result<ExecutionOutcome> {
-    let result = async {
-        let ready = runtime.ensure_ready().await?;
-        runtime
-            .hold_operation_agent_session(&mut session, session_spec.kind())
-            .await?;
-        body.execute(&runtime, ready, options).await
-    }
-    .await;
-    let outcome = SessionOutcome::from_execution_result(&result);
+    let (result, outcome) = if options.mode == OperationMode::Stream {
+        run_foreground_operation_session(&runtime, session_spec, &mut session, body, options)
+            .await?
+    } else {
+        let result =
+            execute_operation_session_body(&runtime, session_spec, &mut session, body, options)
+                .await;
+        let outcome = SessionOutcome::from_execution_result(&result);
+        (result, outcome)
+    };
     runtime
         .finish_operation_session(session, result, outcome)
         .await
+}
+
+async fn run_foreground_operation_session(
+    runtime: &Runtime,
+    session_spec: OperationSessionSpec,
+    session: &mut OperationSessionGuard,
+    body: OperationBody,
+    options: OperationExecutionOptions,
+) -> anyhow::Result<(anyhow::Result<ExecutionOutcome>, SessionOutcome)> {
+    let operation = execute_operation_session_body(runtime, session_spec, session, body, options);
+    tokio::pin!(operation);
+    tokio::select! {
+        result = &mut operation => {
+            let outcome = SessionOutcome::from_execution_result(&result);
+            Ok((result, outcome))
+        }
+        signal = foreground_cancel_signal() => {
+            let signal = signal?;
+            tracing::info!(
+                signal = signal.name,
+                exit_code = signal.exit_code(),
+                "foreground operation canceled"
+            );
+            Ok((Ok(ExecutionOutcome::new(signal.exit_code())), SessionOutcome::Canceled))
+        }
+    }
+}
+
+async fn execute_operation_session_body(
+    runtime: &Runtime,
+    session_spec: OperationSessionSpec,
+    session: &mut OperationSessionGuard,
+    body: OperationBody,
+    options: OperationExecutionOptions,
+) -> anyhow::Result<ExecutionOutcome> {
+    let ready = runtime.ensure_ready().await?;
+    runtime
+        .hold_operation_agent_session(session, session_spec.kind())
+        .await?;
+    body.execute(runtime, ready, options).await
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ForegroundCancelSignal {
+    name: &'static str,
+    number: i32,
+}
+
+impl ForegroundCancelSignal {
+    fn exit_code(self) -> i32 {
+        128 + self.number
+    }
+}
+
+#[cfg(unix)]
+async fn foreground_cancel_signal() -> anyhow::Result<ForegroundCancelSignal> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut interrupt = signal(SignalKind::interrupt()).context("register SIGINT handler")?;
+    let mut terminate = signal(SignalKind::terminate()).context("register SIGTERM handler")?;
+    let mut hangup = signal(SignalKind::hangup()).context("register SIGHUP handler")?;
+
+    tokio::select! {
+        _ = interrupt.recv() => Ok(ForegroundCancelSignal {
+            name: "SIGINT",
+            number: libc::SIGINT,
+        }),
+        _ = terminate.recv() => Ok(ForegroundCancelSignal {
+            name: "SIGTERM",
+            number: libc::SIGTERM,
+        }),
+        _ = hangup.recv() => Ok(ForegroundCancelSignal {
+            name: "SIGHUP",
+            number: libc::SIGHUP,
+        }),
+    }
+}
+
+#[cfg(not(unix))]
+async fn foreground_cancel_signal() -> anyhow::Result<ForegroundCancelSignal> {
+    tokio::signal::ctrl_c().await.context("wait for Ctrl-C")?;
+    Ok(ForegroundCancelSignal {
+        name: "SIGINT",
+        number: 2,
+    })
 }
 
 enum OperationBody {

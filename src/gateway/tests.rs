@@ -416,14 +416,17 @@ fn workspace_cleanup_policy_matches_outcome() {
 
     runtime.target.workspace.cleanup = WorkspaceCleanup::Never;
     assert!(!runtime.should_cleanup_workspace(SessionOutcome::Success));
+    assert!(!runtime.should_cleanup_workspace(SessionOutcome::Canceled));
     assert!(!runtime.should_cleanup_workspace(SessionOutcome::Failure));
 
     runtime.target.workspace.cleanup = WorkspaceCleanup::Success;
     assert!(runtime.should_cleanup_workspace(SessionOutcome::Success));
+    assert!(runtime.should_cleanup_workspace(SessionOutcome::Canceled));
     assert!(!runtime.should_cleanup_workspace(SessionOutcome::Failure));
 
     runtime.target.workspace.cleanup = WorkspaceCleanup::Always;
     assert!(runtime.should_cleanup_workspace(SessionOutcome::Success));
+    assert!(runtime.should_cleanup_workspace(SessionOutcome::Canceled));
     assert!(runtime.should_cleanup_workspace(SessionOutcome::Failure));
 }
 

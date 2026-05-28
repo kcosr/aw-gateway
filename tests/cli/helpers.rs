@@ -1,6 +1,8 @@
 use tempfile::TempDir;
 use toml::Value;
 
+use aw_gateway::paths::UserContext;
+
 const GATEWAY_CLI_FIXTURE: &str = r#"
 schema_version = "1"
 default_target = "default"
@@ -123,6 +125,119 @@ pub(crate) fn gateway_sample_with_transfer_denied(
         "deny",
     );
     sample.finish()
+}
+
+pub(crate) fn interrupted_cleanup_config(
+    dir: &TempDir,
+    runtime: &std::path::Path,
+    workspace_template: &std::path::Path,
+) -> String {
+    format!(
+        r#"
+schema_version = "1"
+default_target = "default"
+
+[runtime]
+type = "docker"
+program = "{runtime}"
+
+[logging]
+level = "info"
+directory = "{logs}"
+console = false
+
+[target_defaults.container_agent]
+enabled = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "ephemeral"
+ephemeral_name = "worker-{{session_id}}"
+stop_when_idle = true
+remove_on_stop = true
+
+[targets.default.workspace]
+path = "{workspace}"
+state_dir = ".aw-gateway"
+cleanup = "success"
+
+[targets.default.idle_cleanup]
+owner = "gateway"
+action = "exit_container"
+idle_grace = "0s"
+
+[launches.long]
+target = "default"
+command = ["sleep", "30"]
+"#,
+        runtime = runtime.display(),
+        logs = dir.path().join("logs").display(),
+        workspace = workspace_template.display(),
+    )
+}
+
+pub(crate) fn interruptible_runtime_script(
+    log: &std::path::Path,
+    started: &std::path::Path,
+) -> String {
+    let user = UserContext::current().unwrap();
+    format!(
+        r#"#!/bin/sh
+case "$1" in
+  inspect)
+    name="$2"
+    cat <<JSON
+[{{"Id":"id","Name":"$name","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"$name"}}}}}}]
+JSON
+    ;;
+  exec)
+    echo "exec $*" >> "{log}"
+    echo started > "{started}"
+    sleep 30
+    ;;
+  stop)
+    echo "stop $2" >> "{log}"
+    ;;
+  rm)
+    echo "rm $2" >> "{log}"
+    ;;
+esac
+exit 0
+"#,
+        user = user.user,
+        uid = user.uid,
+        log = log.display(),
+        started = started.display(),
+    )
+}
+
+#[cfg(unix)]
+pub(crate) fn signal_process(pid: u32, signal: i32) {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    assert_eq!(rc, 0, "failed to signal process {pid}");
+}
+
+pub(crate) fn wait_for_file(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    panic!("timed out waiting for {}", path.display());
+}
+
+pub(crate) fn write_executable(path: &std::path::Path, contents: &str) {
+    std::fs::write(path, contents).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
 }
 
 struct GatewaySampleFixture {
