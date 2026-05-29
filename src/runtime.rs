@@ -102,6 +102,21 @@ impl ContainerPtySession {
     }
 }
 
+impl Drop for ContainerPtySession {
+    fn drop(&mut self) {
+        match self.killer.lock() {
+            Ok(mut killer) => {
+                if let Err(err) = killer.kill() {
+                    tracing::debug!(error = %err, "pty child terminate on drop failed");
+                }
+            }
+            Err(_) => {
+                tracing::debug!("pty child killer lock poisoned during drop");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ContainerInspect {
     pub id: String,

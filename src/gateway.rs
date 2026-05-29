@@ -838,14 +838,14 @@ async fn launch_execute_with_config(
         .map_err(OperationError::operation_failed)
 }
 
-async fn prepare_run_execution(
-    config_path: Option<PathBuf>,
+async fn prepare_run_execution_with_config(
+    cfg: GatewayConfig,
     target: Option<String>,
     session_id: Option<String>,
     cwd: Option<String>,
     command: Vec<String>,
 ) -> OperationResult<PreparedExecution> {
-    let runtime = Runtime::load(config_path, target.as_deref(), session_id, true).await?;
+    let runtime = Runtime::from_config(cfg, target.as_deref(), session_id, true, None).await?;
     OperationRunner::run_command(runtime, OperationExecutionOptions::STREAM, cwd, command)
         .prepare()
         .await

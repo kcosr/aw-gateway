@@ -153,6 +153,7 @@ fn app_for_config(config: PathBuf) -> Router {
         config_path: Some(config),
         config: Arc::new(cfg),
         pty_leases: Arc::new(PtyLeaseManager::default()),
+        pty_shutdown: PtyShutdown::default(),
     })
 }
 
@@ -208,6 +209,7 @@ fn test_state(http: HttpConfig) -> AppState {
         config_path: None,
         config: Arc::new(cfg),
         pty_leases: Arc::new(PtyLeaseManager::default()),
+        pty_shutdown: PtyShutdown::default(),
     }
 }
 
@@ -799,6 +801,26 @@ async fn run_pty_creates_attach_lease_without_running_final_exec() {
 }
 
 #[tokio::test]
+async fn run_pty_uses_server_config_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    write_fake_runtime(&fake_runtime, &fake_running_runtime_script(&log));
+    let config = http_operation_config(&dir, &fake_runtime);
+    let app = app_for_config(config.clone());
+    std::fs::write(&config, "this is not valid toml").unwrap();
+
+    let (status, body) = post_json(
+        app,
+        "/api/v1/run",
+        r#"{"command":["bash"],"mode":"pty","terminal":{"cols":80,"rows":24}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["mode"], "pty");
+}
+
+#[tokio::test]
 async fn launch_pty_creates_attach_lease() {
     let dir = tempfile::tempdir().unwrap();
     let fake_runtime = dir.path().join("runtime");
@@ -817,6 +839,55 @@ async fn launch_pty_creates_attach_lease() {
     assert_eq!(body["mode"], "pty");
     assert!(body["pty_id"].as_str().unwrap().starts_with("pty_"));
     assert!(body["attach_token"].as_str().unwrap().starts_with("awpt_"));
+}
+
+#[tokio::test]
+async fn launch_detail_reports_ephemeral_target_mode_without_container() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    write_fake_runtime(
+        &fake_runtime,
+        &fake_running_runtime_script(&dir.path().join("runtime.log")),
+    );
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+
+[http]
+enabled = true
+listen = "127.0.0.1:0"
+enabled_actions = ["launches", "launch"]
+
+[runtime]
+type = "podman"
+program = "{program}"
+
+[target_defaults.container_agent]
+enabled = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "ephemeral"
+ephemeral_name = "worker-{{session_id}}"
+stop_when_idle = true
+
+[launches.ephemeral]
+target = "default"
+command = ["launch-command"]
+"#,
+            program = fake_runtime.display(),
+        ),
+    )
+    .unwrap();
+    let app = app_for_config(config);
+
+    let (status, body) = get_json(app, "/api/v1/launches/ephemeral").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["target_mode"], "ephemeral");
+    assert!(body["data"].get("target_container").is_none());
 }
 
 #[tokio::test]

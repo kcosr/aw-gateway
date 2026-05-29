@@ -119,8 +119,29 @@ impl OperationRunner {
         } = self;
         let mut session = runtime
             .begin_operation_session(session_spec.kind(), session_spec.uses_launch_marker())?;
-        let prepared =
-            prepare_operation_session_body(&runtime, session_spec, &mut session, body).await?;
+        let prepared = match prepare_operation_session_body(
+            &runtime,
+            session_spec,
+            &mut session,
+            body,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                return match runtime
+                    .finish_operation_session::<PreparedCommand>(
+                        session,
+                        Err(err),
+                        SessionOutcome::Failure,
+                    )
+                    .await
+                {
+                    Ok(_) => unreachable!("failed preparation cannot finish successfully"),
+                    Err(err) => Err(err),
+                };
+            }
+        };
         Ok(PreparedExecution {
             runtime,
             session,

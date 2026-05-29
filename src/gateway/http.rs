@@ -3,11 +3,12 @@ use super::ops::{
     OperationMode, OutputSelection, SuppliedLaunchVars, execute_gateway_operation,
 };
 use super::{
-    PreparedExecution, SessionOutcome, prepare_launch_execution_with_config, prepare_run_execution,
+    PreparedExecution, SessionOutcome, prepare_launch_execution_with_config,
+    prepare_run_execution_with_config,
 };
 use crate::config::GatewayConfig;
 use crate::gateway::ops::ExecutionOutcome;
-use crate::runtime::ContainerPtySize;
+use crate::runtime::{ContainerPtySession, ContainerPtySize};
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
@@ -22,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tokio::time::Duration;
 
 mod auth;
@@ -42,12 +43,15 @@ const MAX_TERMINAL_COLS: u16 = 500;
 const MIN_TERMINAL_ROWS: u16 = 2;
 const MAX_TERMINAL_ROWS: u16 = 300;
 const MAX_WS_TEXT_BYTES: usize = 64 * 1024;
+const MAX_WS_BINARY_BYTES: usize = 256 * 1024;
+const PTY_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 pub(super) struct AppState {
     config_path: Option<PathBuf>,
     config: Arc<GatewayConfig>,
     pty_leases: Arc<PtyLeaseManager>,
+    pty_shutdown: PtyShutdown,
 }
 
 pub(super) async fn serve(config_path: Option<PathBuf>) -> anyhow::Result<()> {
@@ -57,17 +61,23 @@ pub(super) async fn serve(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     }
     let addr = cfg.http.listen_addr()?;
     let pty_leases = Arc::new(PtyLeaseManager::default());
+    let pty_shutdown = PtyShutdown::default();
     let app = router(AppState {
         config_path,
         config: Arc::new(cfg),
         pty_leases: pty_leases.clone(),
+        pty_shutdown: pty_shutdown.clone(),
     });
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(listen = %addr, "http listener started");
+    let shutdown_leases = pty_leases.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            pty_shutdown.cancel_active();
+            shutdown_leases.cancel_all().await;
+        })
         .await?;
-    pty_leases.cancel_all().await;
     Ok(())
 }
 
@@ -120,6 +130,28 @@ struct PreparedPtyLease {
     attach_token: String,
     terminal: ContainerPtySize,
     execution: PreparedExecution,
+}
+
+#[derive(Clone)]
+struct PtyShutdown {
+    sender: watch::Sender<bool>,
+}
+
+impl Default for PtyShutdown {
+    fn default() -> Self {
+        let (sender, _) = watch::channel(false);
+        Self { sender }
+    }
+}
+
+impl PtyShutdown {
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.sender.subscribe()
+    }
+
+    fn cancel_active(&self) {
+        let _ = self.sender.send(true);
+    }
 }
 
 #[derive(Serialize)]
@@ -362,17 +394,18 @@ async fn pty_attach(
     if !state.pty_leases.contains(&pty_id).await {
         return HttpError::not_found("pty lease not found").into_response();
     }
-    ws.on_upgrade(move |socket| handle_pty_socket(state.pty_leases, pty_id, socket))
+    ws.on_upgrade(move |socket| {
+        handle_pty_socket(state.pty_leases, state.pty_shutdown, pty_id, socket)
+    })
 }
 
-async fn handle_pty_socket(leases: Arc<PtyLeaseManager>, pty_id: String, mut socket: WebSocket) {
-    let auth = match tokio::time::timeout(PTY_ATTACH_AUTH_TIMEOUT, socket.recv()).await {
-        Ok(Some(Ok(Message::Text(text)))) => parse_pty_auth(&text),
-        Ok(Some(Ok(_))) => Err(HttpError::unauthorized("first pty message must be auth")),
-        Ok(Some(Err(err))) => Err(HttpError::unauthorized(err.to_string())),
-        Ok(None) => Err(HttpError::unauthorized("pty attach closed before auth")),
-        Err(_) => Err(HttpError::unauthorized("pty attach auth timed out")),
-    };
+async fn handle_pty_socket(
+    leases: Arc<PtyLeaseManager>,
+    pty_shutdown: PtyShutdown,
+    pty_id: String,
+    mut socket: WebSocket,
+) {
+    let auth = read_pty_auth_frame(&mut socket).await;
     let token = match auth {
         Ok(token) => token,
         Err(err) => {
@@ -386,17 +419,47 @@ async fn handle_pty_socket(leases: Arc<PtyLeaseManager>, pty_id: String, mut soc
         let _ = socket.send(Message::Close(None)).await;
         return;
     };
-    run_attached_pty(lease, socket).await;
+    run_attached_pty(lease, socket, pty_shutdown.subscribe()).await;
 }
 
-async fn run_attached_pty(lease: PreparedPtyLease, mut socket: WebSocket) {
+async fn read_pty_auth_frame(socket: &mut WebSocket) -> Result<String, HttpError> {
+    match tokio::time::timeout(PTY_ATTACH_AUTH_TIMEOUT, async {
+        loop {
+            match socket.recv().await {
+                Some(Ok(Message::Text(text))) => return parse_pty_auth(&text),
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(_)) => {
+                    return Err(HttpError::unauthorized("first pty message must be auth"));
+                }
+                Some(Err(err)) => return Err(HttpError::unauthorized(err.to_string())),
+                None => return Err(HttpError::unauthorized("pty attach closed before auth")),
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(HttpError::unauthorized("pty attach auth timed out")),
+    }
+}
+
+async fn run_attached_pty(
+    lease: PreparedPtyLease,
+    mut socket: WebSocket,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let ready = lease.execution.ready().clone();
     let launch = lease.execution.launch_name().map(str::to_string);
     let mut pty = match lease.execution.spawn_pty(lease.terminal) {
         Ok(pty) => pty,
         Err(err) => {
-            let message = err.to_string();
-            let _ = send_ws_error(&mut socket, ErrorCode::OperationFailed, message).await;
+            tracing::warn!(error = %err, "failed to spawn pty child");
+            let _ = send_ws_error(
+                &mut socket,
+                ErrorCode::OperationFailed,
+                "failed to start interactive session",
+            )
+            .await;
             let _ = socket.send(Message::Close(None)).await;
             finish_pty_lease(
                 lease,
@@ -449,10 +512,24 @@ async fn run_attached_pty(lease: PreparedPtyLease, mut socket: WebSocket) {
                     }
                 }
             }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    let _ = pty.terminate().await;
+                    break;
+                }
+            }
             message = socket.recv() => {
                 match message {
                     Some(Ok(Message::Binary(bytes))) => {
+                        if bytes.len() > MAX_WS_BINARY_BYTES {
+                            let _ = send_ws_error(&mut socket, ErrorCode::InvalidRequest, "pty input message is too large").await;
+                            continue;
+                        }
                         if pty.input.send(bytes.to_vec()).await.is_err() {
+                            let _ = pty.terminate().await;
+                            let (exit_result, exit_outcome) = finish_pty_exit(&mut socket, &mut pty).await;
+                            result = exit_result;
+                            outcome = exit_outcome;
                             break;
                         }
                     }
@@ -495,36 +572,7 @@ async fn run_attached_pty(lease: PreparedPtyLease, mut socket: WebSocket) {
                 }
             }
             exit = &mut pty.exit => {
-                match exit {
-                    Ok(Ok(code)) => {
-                        let _ = drain_pty_output(&mut socket, &mut pty.output).await;
-                        outcome = if code == 0 {
-                            SessionOutcome::Success
-                        } else {
-                            SessionOutcome::Failure
-                        };
-                        result = Ok(ExecutionOutcome::new(code));
-                        let payload = serde_json::json!({
-                            "type": "exit",
-                            "exit_code": code,
-                            "outcome": if code == 0 { "success" } else { "failure" },
-                        });
-                        let _ = socket.send(Message::Text(payload.to_string().into())).await;
-                    }
-                    Ok(Err(err)) => {
-                        let _ = drain_pty_output(&mut socket, &mut pty.output).await;
-                        let message = err.to_string();
-                        result = Err(err);
-                        outcome = SessionOutcome::Failure;
-                        let _ = send_ws_error(&mut socket, ErrorCode::OperationFailed, message).await;
-                    }
-                    Err(err) => {
-                        let _ = drain_pty_output(&mut socket, &mut pty.output).await;
-                        result = Err(anyhow::Error::from(err));
-                        outcome = SessionOutcome::Failure;
-                        let _ = send_ws_error(&mut socket, ErrorCode::OperationFailed, "pty wait task failed").await;
-                    }
-                }
+                (result, outcome) = handle_pty_exit(&mut socket, &mut pty.output, exit).await;
                 break;
             }
         }
@@ -537,10 +585,64 @@ async fn drain_pty_output(
     socket: &mut WebSocket,
     output: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Result<(), axum::Error> {
-    while let Some(bytes) = output.recv().await {
-        socket.send(Message::Binary(bytes.into())).await?;
+    loop {
+        match tokio::time::timeout(PTY_EXIT_DRAIN_TIMEOUT, output.recv()).await {
+            Ok(Some(bytes)) => socket.send(Message::Binary(bytes.into())).await?,
+            Ok(None) | Err(_) => return Ok(()),
+        }
     }
-    Ok(())
+}
+
+async fn finish_pty_exit(
+    socket: &mut WebSocket,
+    pty: &mut ContainerPtySession,
+) -> (anyhow::Result<ExecutionOutcome>, SessionOutcome) {
+    match (&mut pty.exit).await {
+        Ok(exit) => handle_pty_exit(socket, &mut pty.output, Ok(exit)).await,
+        Err(err) => handle_pty_exit(socket, &mut pty.output, Err(err)).await,
+    }
+}
+
+async fn handle_pty_exit(
+    socket: &mut WebSocket,
+    output: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    exit: Result<anyhow::Result<i32>, tokio::task::JoinError>,
+) -> (anyhow::Result<ExecutionOutcome>, SessionOutcome) {
+    match exit {
+        Ok(Ok(code)) => {
+            let _ = drain_pty_output(socket, output).await;
+            let outcome = if code == 0 {
+                SessionOutcome::Success
+            } else {
+                SessionOutcome::Failure
+            };
+            let payload = serde_json::json!({
+                "type": "exit",
+                "exit_code": code,
+                "outcome": if code == 0 { "success" } else { "failure" },
+            });
+            let _ = socket.send(Message::Text(payload.to_string().into())).await;
+            (Ok(ExecutionOutcome::new(code)), outcome)
+        }
+        Ok(Err(err)) => {
+            let _ = drain_pty_output(socket, output).await;
+            tracing::warn!(error = %err, "pty wait failed");
+            let _ = send_ws_error(
+                socket,
+                ErrorCode::OperationFailed,
+                "interactive session failed",
+            )
+            .await;
+            (Err(err), SessionOutcome::Failure)
+        }
+        Err(err) => {
+            let _ = drain_pty_output(socket, output).await;
+            let err = anyhow::Error::from(err);
+            tracing::warn!(error = %err, "pty wait task failed");
+            let _ = send_ws_error(socket, ErrorCode::OperationFailed, "pty wait task failed").await;
+            (Err(err), SessionOutcome::Failure)
+        }
+    }
 }
 
 async fn prepare_pty_run(state: AppState, request: RunRequest) -> Response {
@@ -551,8 +653,8 @@ async fn prepare_pty_run(state: AppState, request: RunRequest) -> Response {
         Ok(terminal) => terminal,
         Err(err) => return err.into_response(),
     };
-    let prepared = match prepare_run_execution(
-        state.config_path,
+    let prepared = match prepare_run_execution_with_config(
+        (*state.config).clone(),
         request.target,
         request.session_id,
         request.cwd,
@@ -681,7 +783,7 @@ fn execution_request_options(
         "detach" => OperationMode::Detach,
         _ => {
             return Err(HttpError::invalid_mode(
-                "mode must be \"wait\" or \"detach\"",
+                "mode must be \"wait\", \"detach\", or \"pty\"",
             ));
         }
     };
@@ -808,13 +910,13 @@ fn terminal_size(terminal: Option<&TerminalRequest>) -> Result<ContainerPtySize,
     let terminal =
         terminal.ok_or_else(|| HttpError::invalid_request("terminal is required for pty mode"))?;
     Ok(ContainerPtySize {
-        cols: clamp_dimension(
+        cols: validate_dimension(
             "terminal.cols",
             terminal.cols,
             MIN_TERMINAL_COLS,
             MAX_TERMINAL_COLS,
         )?,
-        rows: clamp_dimension(
+        rows: validate_dimension(
             "terminal.rows",
             terminal.rows,
             MIN_TERMINAL_ROWS,
@@ -825,7 +927,12 @@ fn terminal_size(terminal: Option<&TerminalRequest>) -> Result<ContainerPtySize,
     })
 }
 
-fn clamp_dimension(name: &'static str, value: u16, min: u16, max: u16) -> Result<u16, HttpError> {
+fn validate_dimension(
+    name: &'static str,
+    value: u16,
+    min: u16,
+    max: u16,
+) -> Result<u16, HttpError> {
     if value < min || value > max {
         return Err(HttpError::invalid_request(format!(
             "{name} must be between {min} and {max}"
@@ -877,8 +984,8 @@ impl PtyClientControl {
                 cell_width_px,
                 cell_height_px,
             } => Ok(Some(ContainerPtySize {
-                cols: clamp_dimension("cols", *cols, MIN_TERMINAL_COLS, MAX_TERMINAL_COLS)?,
-                rows: clamp_dimension("rows", *rows, MIN_TERMINAL_ROWS, MAX_TERMINAL_ROWS)?,
+                cols: validate_dimension("cols", *cols, MIN_TERMINAL_COLS, MAX_TERMINAL_COLS)?,
+                rows: validate_dimension("rows", *rows, MIN_TERMINAL_ROWS, MAX_TERMINAL_ROWS)?,
                 pixel_width: cell_width_px.unwrap_or_default(),
                 pixel_height: cell_height_px.unwrap_or_default(),
             })),

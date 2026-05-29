@@ -1412,6 +1412,8 @@ HTTP 201 with a short-lived single-use attach lease:
 }
 ```
 
+For fixed targets, `session_id` is `null`.
+
 The POST is the authorized `run` or `launch` action and may block while the
 target becomes ready and launch steps run. The client then opens the WebSocket
 attach URL and sends the first text frame as `{"type":"auth","token":"..."}`.
@@ -1420,6 +1422,7 @@ used on the WebSocket route so browser-native clients can attach. After auth,
 binary WebSocket frames carry terminal bytes, text `resize` frames update the
 PTY size, and closing the WebSocket cancels the foreground PTY exec while normal
 idle/workspace cleanup policy decides whether the container remains available.
+Gateway shutdown also cancels active PTY execs and expires prepared leases.
 
 Errors use a stable envelope:
 
