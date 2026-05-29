@@ -18,6 +18,11 @@
   streams as JSON with `output_format`
   ([#47](https://github.com/kcosr/aw-gateway/pull/47)).
 
+### Fixed
+
+- HTTP PTY close and WebSocket disconnect now terminate the in-container
+  attached process tree instead of relying only on the host-side runtime client.
+
 ## [0.4.1] - 2026-05-26
 
 ### Added

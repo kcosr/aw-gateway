@@ -12,6 +12,7 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::{Request, StatusCode};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::BTreeMap;
+use tokio::time::{Duration, sleep};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tower::ServiceExt;
 
@@ -79,6 +80,53 @@ exit 0
         uid = user.uid,
         log = log.display(),
         stopped = log.with_extension("stopped").display()
+    )
+}
+
+fn fake_long_running_pty_runtime_script(
+    log: &std::path::Path,
+    parent_pid: &std::path::Path,
+    child_pid: &std::path::Path,
+    child_done: &std::path::Path,
+) -> String {
+    let user = UserContext::current().unwrap();
+    format!(
+        r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  ps)
+    cat <<'JSON'
+[{{"Names":["ubuntu-dev"],"Image":"ubuntu/dev","State":"running","Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev","io.aw-gateway.image":"ubuntu/dev"}}}}]
+JSON
+    ;;
+  exec)
+    echo "$@" >> "{log}"
+    case "$*" in
+      *aw-gateway-pty-cleanup*)
+        pid="$(cat "{child_pid}" 2>/dev/null || true)"
+        if [ -n "$pid" ]; then
+          kill -KILL "$pid" 2>/dev/null || true
+        fi
+        echo done > "{child_done}"
+        exit 0
+        ;;
+    esac
+    echo "$$" > "{parent_pid}"
+    exec sh -c 'trap "" HUP TERM; trap "echo done > \"$2\"; exit 0" INT; echo "$$" > "$1"; while :; do sleep 1; done' sh "{child_pid}" "{child_done}"
+    ;;
+esac
+exit 0
+"#,
+        user = user.user,
+        uid = user.uid,
+        log = log.display(),
+        parent_pid = parent_pid.display(),
+        child_pid = child_pid.display(),
+        child_done = child_done.display(),
     )
 }
 
@@ -200,6 +248,41 @@ async fn serve_live_app(app: Router) -> (String, tokio::task::JoinHandle<()>) {
         axum::serve(listener, app).await.unwrap();
     });
     (format!("ws://{addr}"), handle)
+}
+
+async fn wait_for_path(path: &std::path::Path) {
+    for _ in 0..50 {
+        if path.exists() {
+            return;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for {}", path.display());
+}
+
+fn read_pid(path: &std::path::Path) -> libc::pid_t {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+fn process_is_alive(pid: libc::pid_t) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+async fn wait_for_process_exit(pid: libc::pid_t, marker: &std::path::Path) {
+    for _ in 0..100 {
+        if marker.exists() || !process_is_alive(pid) {
+            return;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    panic!("process {pid} remained alive after websocket close");
 }
 
 fn test_state(http: HttpConfig) -> AppState {
@@ -981,6 +1064,107 @@ async fn websocket_attach_authenticates_starts_pty_and_streams_output() {
     assert!(output.contains("captured stderr"), "{output}");
     assert_eq!(exit.unwrap()["exit_code"], 23);
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn websocket_close_control_terminates_running_pty_exec() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    let parent_pid = dir.path().join("parent.pid");
+    let child_pid = dir.path().join("child.pid");
+    let child_done = dir.path().join("child.done");
+    write_fake_runtime(
+        &fake_runtime,
+        &fake_long_running_pty_runtime_script(&log, &parent_pid, &child_pid, &child_done),
+    );
+    let app = app_for_config(http_operation_config(&dir, &fake_runtime));
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/api/v1/run",
+        r#"{"command":["bash"],"mode":"pty","terminal":{"cols":80,"rows":24}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let pty_id = body["pty_id"].as_str().unwrap().to_string();
+    let attach_token = body["attach_token"].as_str().unwrap().to_string();
+
+    let (base, server) = serve_live_app(app).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/api/v1/pty/{pty_id}"))
+        .await
+        .unwrap();
+    ws.send(WsMessage::Text(
+        serde_json::json!({"type":"auth","token":attach_token})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let ready = ws.next().await.unwrap().unwrap();
+    assert!(matches!(ready, WsMessage::Text(_)));
+    wait_for_path(&child_pid).await;
+    let child_pid = read_pid(&child_pid);
+    assert!(process_is_alive(child_pid));
+
+    ws.send(WsMessage::Text(
+        serde_json::json!({"type":"close"}).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    drop(ws);
+
+    wait_for_process_exit(child_pid, &child_done).await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn websocket_disconnect_terminates_running_pty_exec() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    let parent_pid = dir.path().join("parent.pid");
+    let child_pid = dir.path().join("child.pid");
+    let child_done = dir.path().join("child.done");
+    write_fake_runtime(
+        &fake_runtime,
+        &fake_long_running_pty_runtime_script(&log, &parent_pid, &child_pid, &child_done),
+    );
+    let app = app_for_config(http_operation_config(&dir, &fake_runtime));
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/api/v1/run",
+        r#"{"command":["bash"],"mode":"pty","terminal":{"cols":80,"rows":24}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let pty_id = body["pty_id"].as_str().unwrap().to_string();
+    let attach_token = body["attach_token"].as_str().unwrap().to_string();
+
+    let (base, server) = serve_live_app(app).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("{base}/api/v1/pty/{pty_id}"))
+        .await
+        .unwrap();
+    ws.send(WsMessage::Text(
+        serde_json::json!({"type":"auth","token":attach_token})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+
+    let ready = ws.next().await.unwrap().unwrap();
+    assert!(matches!(ready, WsMessage::Text(_)));
+    wait_for_path(&child_pid).await;
+    let child_pid = read_pid(&child_pid);
+    assert!(process_is_alive(child_pid));
+
+    drop(ws);
+
+    wait_for_process_exit(child_pid, &child_done).await;
     server.abort();
 }
 

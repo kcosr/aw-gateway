@@ -5,12 +5,16 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::{Read, Write};
+#[cfg(not(unix))]
+use std::io::Read;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -85,12 +89,24 @@ pub struct ContainerPtySession {
     pub resize: mpsc::Sender<ContainerPtySize>,
     pub exit: JoinHandle<anyhow::Result<i32>>,
     killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
+    child_pid: Option<u32>,
+    cleanup_runtime: ContainerRuntime,
+    cleanup_spec: ContainerExecSpec,
 }
 
 impl ContainerPtySession {
     pub async fn terminate(&self) -> anyhow::Result<()> {
+        let _ = self
+            .cleanup_runtime
+            .exec_with_timeout(&self.cleanup_spec, Some(Duration::from_secs(2)))
+            .await;
         let killer = self.killer.clone();
+        let child_pid = self.child_pid;
         tokio::task::spawn_blocking(move || {
+            #[cfg(unix)]
+            if let Some(child_pid) = child_pid {
+                terminate_process_group(child_pid);
+            }
             killer
                 .lock()
                 .map_err(|_| anyhow::anyhow!("pty child killer lock poisoned"))?
@@ -104,6 +120,10 @@ impl ContainerPtySession {
 
 impl Drop for ContainerPtySession {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(child_pid) = self.child_pid {
+            terminate_process_group_nonblocking(child_pid);
+        }
         match self.killer.lock() {
             Ok(mut killer) => {
                 if let Err(err) = killer.kill() {
@@ -113,6 +133,172 @@ impl Drop for ContainerPtySession {
             Err(_) => {
                 tracing::debug!("pty child killer lock poisoned during drop");
             }
+        }
+    }
+}
+
+static NEXT_PTY_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(unix)]
+fn terminate_process_group(child_pid: u32) {
+    terminate_process_group_nonblocking(child_pid);
+    std::thread::sleep(Duration::from_millis(100));
+    signal_process_group(child_pid, libc::SIGKILL);
+    signal_process(child_pid, libc::SIGKILL);
+}
+
+#[cfg(unix)]
+fn terminate_process_group_nonblocking(child_pid: u32) {
+    signal_process_group(child_pid, libc::SIGHUP);
+    signal_process_group(child_pid, libc::SIGTERM);
+    signal_process(child_pid, libc::SIGHUP);
+    signal_process(child_pid, libc::SIGTERM);
+}
+
+#[cfg(unix)]
+fn signal_process_group(child_pid: u32, signal: libc::c_int) {
+    let pid = child_pid as libc::pid_t;
+    if pid > 1 {
+        unsafe {
+            libc::kill(-pid, signal);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_process(child_pid: u32, signal: libc::c_int) {
+    let pid = child_pid as libc::pid_t;
+    if pid > 1 {
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+}
+
+fn run_pty_master_pump(
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    output_tx: mpsc::Sender<Vec<u8>>,
+    mut resize_rx: mpsc::Receiver<ContainerPtySize>,
+) {
+    #[cfg(unix)]
+    {
+        run_unix_pty_master_pump(master, output_tx, &mut resize_rx);
+    }
+    #[cfg(not(unix))]
+    {
+        let mut reader = match master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(err) => {
+                tracing::warn!(error = %err, "pty reader clone failed");
+                return;
+            }
+        };
+        let mut buffer = [0_u8; 8192];
+        loop {
+            while let Ok(size) = resize_rx.try_recv() {
+                if let Err(err) = master.resize(pty_size(size)) {
+                    tracing::warn!(error = %err, "pty resize failed");
+                }
+            }
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if output_tx.blocking_send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_unix_pty_master_pump(
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    output_tx: mpsc::Sender<Vec<u8>>,
+    resize_rx: &mut mpsc::Receiver<ContainerPtySize>,
+) {
+    use std::io;
+    use std::os::fd::RawFd;
+
+    const POLL_TIMEOUT_MS: libc::c_int = 100;
+
+    let Some(fd) = master.as_raw_fd() else {
+        tracing::warn!("pty master does not expose a unix fd");
+        return;
+    };
+    let mut buffer = [0_u8; 8192];
+    loop {
+        if !drain_pty_resize_requests(&*master, resize_rx) {
+            break;
+        }
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        };
+        let poll_result = unsafe { libc::poll(&mut poll_fd, 1, POLL_TIMEOUT_MS) };
+        if poll_result < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            tracing::warn!(error = %err, "pty poll failed");
+            break;
+        }
+        if poll_result == 0 {
+            continue;
+        }
+        if poll_fd.revents & (libc::POLLERR | libc::POLLHUP) != 0
+            && poll_fd.revents & libc::POLLIN == 0
+        {
+            break;
+        }
+        if poll_fd.revents & libc::POLLIN == 0 {
+            continue;
+        }
+        let bytes_read = unsafe {
+            libc::read(
+                fd as RawFd,
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer.len(),
+            )
+        };
+        if bytes_read == 0 {
+            break;
+        }
+        if bytes_read < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            tracing::warn!(error = %err, "pty read failed");
+            break;
+        }
+        let bytes_read = bytes_read as usize;
+        if output_tx
+            .blocking_send(buffer[..bytes_read].to_vec())
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn drain_pty_resize_requests(
+    master: &dyn portable_pty::MasterPty,
+    resize_rx: &mut mpsc::Receiver<ContainerPtySize>,
+) -> bool {
+    loop {
+        match resize_rx.try_recv() {
+            Ok(size) => {
+                if let Err(err) = master.resize(pty_size(size)) {
+                    tracing::warn!(error = %err, "pty resize failed");
+                }
+            }
+            Err(mpsc::error::TryRecvError::Empty) => return true,
+            Err(mpsc::error::TryRecvError::Disconnected) => return false,
         }
     }
 }
@@ -343,6 +529,9 @@ impl ContainerRuntime {
         let mut pty_spec = spec.clone();
         pty_spec.stdin_tty = true;
         pty_spec.stdout_tty = true;
+        let marker = next_pty_marker();
+        pty_spec.command = wrap_pty_command(&spec.command, &marker);
+        let cleanup_spec = pty_cleanup_spec(spec, &marker);
 
         let pty_system = portable_pty::native_pty_system();
         let pair = pty_system.openpty(pty_size(size))?;
@@ -353,43 +542,22 @@ impl ContainerRuntime {
             command.env(key, value);
         }
 
-        let mut reader = pair.master.try_clone_reader()?;
         let mut writer = pair.master.take_writer()?;
         let mut child = pair.slave.spawn_command(command)?;
         drop(pair.slave);
+        let child_pid = child.process_id();
         let killer = Arc::new(Mutex::new(child.clone_killer()));
 
         let (output_tx, output) = mpsc::channel(PTY_OUTPUT_BUFFER);
         let (input, mut input_rx) = mpsc::channel::<Vec<u8>>(PTY_INPUT_BUFFER);
-        let (resize, mut resize_rx) = mpsc::channel::<ContainerPtySize>(PTY_RESIZE_BUFFER);
+        let (resize, resize_rx) = mpsc::channel::<ContainerPtySize>(PTY_RESIZE_BUFFER);
 
-        std::thread::spawn(move || {
-            let mut buffer = [0_u8; 8192];
-            loop {
-                match reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if output_tx.blocking_send(buffer[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        std::thread::spawn(move || run_pty_master_pump(pair.master, output_tx, resize_rx));
 
         std::thread::spawn(move || {
             while let Some(bytes) = input_rx.blocking_recv() {
                 if writer.write_all(&bytes).is_err() {
                     break;
-                }
-            }
-        });
-
-        std::thread::spawn(move || {
-            while let Some(size) = resize_rx.blocking_recv() {
-                if let Err(err) = pair.master.resize(pty_size(size)) {
-                    tracing::warn!(error = %err, "pty resize failed");
                 }
             }
         });
@@ -405,6 +573,9 @@ impl ContainerRuntime {
             resize,
             exit,
             killer,
+            child_pid,
+            cleanup_runtime: self.clone(),
+            cleanup_spec,
         })
     }
 
@@ -660,6 +831,72 @@ fn pty_size(size: ContainerPtySize) -> portable_pty::PtySize {
         pixel_width: size.pixel_width,
         pixel_height: size.pixel_height,
     }
+}
+
+struct PtyMarker {
+    path: String,
+    token: String,
+}
+
+fn next_pty_marker() -> PtyMarker {
+    let id = NEXT_PTY_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    PtyMarker {
+        path: format!("/tmp/aw-gateway-pty-{}-{id}.pid", std::process::id()),
+        token: format!("{:x}{id:x}{nanos:x}", std::process::id()),
+    }
+}
+
+fn wrap_pty_command(command: &[String], marker: &PtyMarker) -> Vec<String> {
+    let mut wrapped = vec![
+        "/bin/sh".to_string(),
+        "-lc".to_string(),
+        r#"printf "%s %s\n" "$$" "$2" > "$1"; shift 2; exec "$@""#.to_string(),
+        "aw-gateway-pty".to_string(),
+        marker.path.clone(),
+        marker.token.clone(),
+    ];
+    wrapped.extend(command.iter().cloned());
+    wrapped
+}
+
+fn pty_cleanup_spec(spec: &ContainerExecSpec, marker: &PtyMarker) -> ContainerExecSpec {
+    let mut cleanup = spec.clone();
+    cleanup.stdin_tty = false;
+    cleanup.stdout_tty = false;
+    cleanup.command = vec![
+        "/bin/sh".to_string(),
+        "-lc".to_string(),
+        r#"read pid token < "$1" 2>/dev/null || exit 0
+[ "$token" = "$2" ] || exit 0
+rm -f "$1"
+case "$pid" in ""|*[!0-9]*|0|1) exit 0 ;; esac
+frontier=$pid
+descendants=
+while [ -n "$frontier" ]; do
+  next=
+  for parent in $frontier; do
+    children=$(ps -e -o pid= -o ppid= 2>/dev/null | awk -v parent="$parent" '$2 == parent { print $1 }')
+    next="$next $children"
+  done
+  descendants="$descendants $next"
+  frontier=$next
+done
+kill -HUP "-$pid" 2>/dev/null || kill -HUP "$pid" 2>/dev/null || true
+kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+[ -z "$descendants" ] || kill -TERM $descendants 2>/dev/null || true
+sleep 0.2
+kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+[ -z "$descendants" ] || kill -KILL $descendants 2>/dev/null || true"#
+            .to_string(),
+        "aw-gateway-pty-cleanup".to_string(),
+        marker.path.clone(),
+        marker.token.clone(),
+    ];
+    cleanup
 }
 
 fn render_runtime_value(value: &str, user: &str, home: &Path) -> anyhow::Result<String> {

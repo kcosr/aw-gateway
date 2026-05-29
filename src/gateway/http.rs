@@ -498,7 +498,7 @@ async fn run_attached_pty(
     let mut result = Ok(ExecutionOutcome::new(130));
     let mut output_open = true;
     if *shutdown.borrow() {
-        let _ = pty.terminate().await;
+        cancel_pty_session(&pty).await;
         drop(pty);
         finish_pty_lease(lease, result, outcome).await;
         return;
@@ -509,7 +509,7 @@ async fn run_attached_pty(
                 match output {
                     Some(bytes) => {
                         if socket.send(Message::Binary(bytes.into())).await.is_err() {
-                            let _ = pty.terminate().await;
+                            cancel_pty_session(&pty).await;
                             break;
                         }
                     }
@@ -520,7 +520,7 @@ async fn run_attached_pty(
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    let _ = pty.terminate().await;
+                    cancel_pty_session(&pty).await;
                     break;
                 }
             }
@@ -554,7 +554,7 @@ async fn run_attached_pty(
                                     }
                                 }
                                 PtyClientControl::Close => {
-                                    let _ = pty.terminate().await;
+                                    cancel_pty_session(&pty).await;
                                     break;
                                 }
                                 PtyClientControl::Auth { .. } => {
@@ -567,12 +567,12 @@ async fn run_attached_pty(
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => {
-                        let _ = pty.terminate().await;
+                        cancel_pty_session(&pty).await;
                         break;
                     }
                     Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
                     Some(Err(_)) => {
-                        let _ = pty.terminate().await;
+                        cancel_pty_session(&pty).await;
                         break;
                     }
                 }
@@ -585,6 +585,10 @@ async fn run_attached_pty(
     }
     drop(pty);
     finish_pty_lease(lease, result, outcome).await;
+}
+
+async fn cancel_pty_session(pty: &ContainerPtySession) {
+    let _ = pty.terminate().await;
 }
 
 async fn drain_pty_output(
