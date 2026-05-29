@@ -95,7 +95,7 @@ pub struct ContainerPtySession {
 
 const PTY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_HOST_TERMINATE_DELAY: Duration = Duration::from_millis(100);
-const PTY_INITIAL_CLEANUP_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
+const PTY_INITIAL_CLEANUP_JOIN_TIMEOUT: Duration = Duration::from_millis(2500);
 
 impl ContainerPtySession {
     pub async fn terminate(&self) -> anyhow::Result<()> {
@@ -980,7 +980,7 @@ fn random_pty_marker_token() -> anyhow::Result<String> {
 fn wrap_pty_command(command: &[String], marker: &PtyMarker) -> Vec<String> {
     let mut wrapped = vec![
         "/bin/sh".to_string(),
-        "-lc".to_string(),
+        "-c".to_string(),
         r#"printf "%s %s\n" "$$" "$2" > "$1"; shift 2; exec "$@""#.to_string(),
         "aw-gateway-pty".to_string(),
         marker.path.clone(),
@@ -996,28 +996,42 @@ fn pty_cleanup_spec(spec: &ContainerExecSpec, marker: &PtyMarker) -> ContainerEx
     cleanup.stdout_tty = false;
     cleanup.command = vec![
         "/bin/sh".to_string(),
-        "-lc".to_string(),
+        "-c".to_string(),
         r#"read pid token < "$1" 2>/dev/null || exit 0
 [ "$token" = "$2" ] || exit 0
-rm -f "$1"
 case "$pid" in ""|*[!0-9]*|0|1) exit 0 ;; esac
-frontier=$pid
-descendants=
-while [ -n "$frontier" ]; do
-  next=
-  for parent in $frontier; do
-    children=$(ps -e -o pid= -o ppid= 2>/dev/null | awk -v parent="$parent" '$2 == parent { print $1 }')
-    next="$next $children"
-  done
-  descendants="$descendants $next"
-  frontier=$next
-done
+descendants=$(ps -e -o pid= -o ppid= 2>/dev/null | awk -v root="$pid" '
+  {
+    children[$2] = children[$2] " " $1
+  }
+  END {
+    frontier = root
+    while (frontier != "") {
+      next_frontier = ""
+      count = split(frontier, parents, /[[:space:]]+/)
+      for (i = 1; i <= count; i++) {
+        if (parents[i] == "") {
+          continue
+        }
+        count_children = split(children[parents[i]], ids, /[[:space:]]+/)
+        for (j = 1; j <= count_children; j++) {
+          if (ids[j] == "") {
+            continue
+          }
+          print ids[j]
+          next_frontier = next_frontier " " ids[j]
+        }
+      }
+      frontier = next_frontier
+    }
+  }')
 kill -HUP "-$pid" 2>/dev/null || kill -HUP "$pid" 2>/dev/null || true
 kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
 [ -z "$descendants" ] || kill -TERM $descendants 2>/dev/null || true
 sleep 0.2
 kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-[ -z "$descendants" ] || kill -KILL $descendants 2>/dev/null || true"#
+[ -z "$descendants" ] || kill -KILL $descendants 2>/dev/null || true
+rm -f "$1""#
             .to_string(),
         "aw-gateway-pty-cleanup".to_string(),
         marker.path.clone(),
@@ -1277,6 +1291,50 @@ mod tests {
         assert_eq!(exec_stdio_arg(true, false), Some("-i"));
         assert_eq!(exec_stdio_arg(false, true), None);
         assert_eq!(exec_stdio_arg(false, false), None);
+    }
+
+    #[test]
+    fn pty_wrapper_and_cleanup_commands_are_stable() {
+        let marker = PtyMarker {
+            path: "/tmp/aw-gateway-pty-test.pid".into(),
+            token: "test-token".into(),
+        };
+        let command = vec!["/bin/bash".into(), "-lc".into(), "echo ok".into()];
+
+        let wrapped = wrap_pty_command(&command, &marker);
+        assert_eq!(wrapped[0], "/bin/sh");
+        assert_eq!(wrapped[1], "-c");
+        assert_eq!(wrapped[3], "aw-gateway-pty");
+        assert_eq!(wrapped[4], marker.path.as_str());
+        assert_eq!(wrapped[5], marker.token.as_str());
+        assert_eq!(&wrapped[6..], command.as_slice());
+
+        let spec = ContainerExecSpec {
+            stdin_tty: true,
+            stdout_tty: true,
+            user: "2450:100".into(),
+            cwd: Some(PathBuf::from("/home/alice/project")),
+            env: BTreeMap::new(),
+            container_name: "ubuntu-dev".into(),
+            command,
+        };
+        let cleanup = pty_cleanup_spec(&spec, &marker);
+        assert!(!cleanup.stdin_tty);
+        assert!(!cleanup.stdout_tty);
+        assert_eq!(cleanup.command[0], "/bin/sh");
+        assert_eq!(cleanup.command[1], "-c");
+
+        let script = &cleanup.command[2];
+        let kill_pos = script.rfind("kill -KILL").expect("kill command");
+        let rm_pos = script.rfind("rm -f \"$1\"").expect("marker removal");
+        assert!(rm_pos > kill_pos);
+        assert!(script.contains("ps -e -o pid= -o ppid="));
+
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", script])
+            .status()
+            .expect("run shell syntax check");
+        assert!(status.success());
     }
 
     #[cfg(unix)]

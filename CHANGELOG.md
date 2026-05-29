@@ -24,6 +24,8 @@
   attached process tree instead of relying only on the host-side runtime client.
 - HTTP daemon shutdown now waits briefly for active PTY sessions to run the same
   in-container cleanup path before the listener exits.
+- HTTP PTY cleanup retries now keep the in-container marker until after the
+  termination sequence completes.
 
 ## [0.4.1] - 2026-05-26
 
