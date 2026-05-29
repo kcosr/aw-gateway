@@ -497,6 +497,12 @@ async fn run_attached_pty(
     let mut outcome = SessionOutcome::Canceled;
     let mut result = Ok(ExecutionOutcome::new(130));
     let mut output_open = true;
+    if *shutdown.borrow() {
+        let _ = pty.terminate().await;
+        drop(pty);
+        finish_pty_lease(lease, result, outcome).await;
+        return;
+    }
     loop {
         tokio::select! {
             output = pty.output.recv(), if output_open => {
@@ -512,8 +518,8 @@ async fn run_attached_pty(
                     }
                 }
             }
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
                     let _ = pty.terminate().await;
                     break;
                 }
