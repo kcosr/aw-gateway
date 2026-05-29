@@ -90,30 +90,134 @@ pub struct ContainerPtySession {
     child_pid: Option<u32>,
     cleanup_runtime: ContainerRuntime,
     cleanup_spec: ContainerExecSpec,
+    cleanup_marker_path: String,
 }
+
+const PTY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const PTY_HOST_TERMINATE_DELAY: Duration = Duration::from_millis(100);
+const PTY_INITIAL_CLEANUP_JOIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 impl ContainerPtySession {
     pub async fn terminate(&self) -> anyhow::Result<()> {
-        let _ = self
-            .cleanup_runtime
-            .exec_with_timeout(&self.cleanup_spec, Some(Duration::from_secs(2)))
-            .await;
+        tracing::info!(
+            container = %self.cleanup_spec.container_name,
+            marker = %self.cleanup_marker_path,
+            child_pid = ?self.child_pid,
+            "terminating container pty session"
+        );
+        let cleanup_runtime = self.cleanup_runtime.clone();
+        let cleanup_spec = self.cleanup_spec.clone();
+        let cleanup_marker_path = self.cleanup_marker_path.clone();
+        let cleanup_container_name = self.cleanup_spec.container_name.clone();
+        let initial_cleanup_runtime = cleanup_runtime.clone();
+        let initial_cleanup_spec = cleanup_spec.clone();
+        let initial_cleanup_marker_path = cleanup_marker_path.clone();
+        let initial_cleanup_container_name = cleanup_container_name.clone();
+        let mut cleanup = tokio::spawn(async move {
+            run_container_pty_cleanup(
+                initial_cleanup_runtime,
+                initial_cleanup_spec,
+                initial_cleanup_marker_path,
+                initial_cleanup_container_name,
+                "initial",
+            )
+            .await
+        });
         let killer = self.killer.clone();
         let child_pid = self.child_pid;
-        tokio::task::spawn_blocking(move || {
-            #[cfg(unix)]
-            if let Some(child_pid) = child_pid {
-                terminate_process_group(child_pid);
-            }
-            killer
-                .lock()
-                .map_err(|_| anyhow::anyhow!("pty child killer lock poisoned"))?
-                .kill()
-                .map_err(anyhow::Error::from)
-        })
-        .await
-        .context("join pty child terminate task")?
+        let host_terminate = async move {
+            tokio::time::sleep(PTY_HOST_TERMINATE_DELAY).await;
+            terminate_host_pty_child(killer, child_pid).await
+        };
+
+        let host_result = host_terminate.await;
+        let initial_cleanup_finished =
+            match tokio::time::timeout(PTY_INITIAL_CLEANUP_JOIN_TIMEOUT, &mut cleanup).await {
+                Ok(Ok(ok)) => ok,
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        error = %err,
+                        container = %cleanup_container_name,
+                        marker = %cleanup_marker_path,
+                        "initial container pty cleanup task failed"
+                    );
+                    false
+                }
+                Err(_) => {
+                    cleanup.abort();
+                    tracing::warn!(
+                        container = %cleanup_container_name,
+                        marker = %cleanup_marker_path,
+                        "initial container pty cleanup task timed out"
+                    );
+                    false
+                }
+            };
+        if !initial_cleanup_finished {
+            run_container_pty_cleanup(
+                cleanup_runtime,
+                cleanup_spec,
+                cleanup_marker_path,
+                cleanup_container_name,
+                "post-host-terminate",
+            )
+            .await;
+        }
+        host_result
     }
+}
+
+async fn run_container_pty_cleanup(
+    runtime: ContainerRuntime,
+    spec: ContainerExecSpec,
+    marker_path: String,
+    container_name: String,
+    phase: &'static str,
+) -> bool {
+    match runtime
+        .exec_discard_with_timeout(&spec, Some(PTY_CLEANUP_TIMEOUT))
+        .await
+    {
+        Ok(exit_code) => {
+            tracing::info!(
+                container = %container_name,
+                marker = %marker_path,
+                phase,
+                exit_code,
+                "container pty cleanup exec finished"
+            );
+            true
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                container = %container_name,
+                marker = %marker_path,
+                phase,
+                "container pty cleanup exec failed"
+            );
+            false
+        }
+    }
+}
+
+async fn terminate_host_pty_child(
+    killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
+    child_pid: Option<u32>,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        #[cfg(unix)]
+        if let Some(child_pid) = child_pid {
+            terminate_process_group(child_pid);
+        }
+        killer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pty child killer lock poisoned"))?
+            .kill()
+            .map_err(anyhow::Error::from)
+    })
+    .await
+    .context("join pty child terminate task")?
 }
 
 impl Drop for ContainerPtySession {
@@ -501,6 +605,14 @@ impl ContainerRuntime {
     }
 
     pub async fn exec_discard(&self, spec: &ContainerExecSpec) -> anyhow::Result<i32> {
+        self.exec_discard_with_timeout(spec, None).await
+    }
+
+    pub async fn exec_discard_with_timeout(
+        &self,
+        spec: &ContainerExecSpec,
+        timeout_duration: Option<Duration>,
+    ) -> anyhow::Result<i32> {
         let mut command = self.command();
         command
             .arg("exec")
@@ -509,9 +621,20 @@ impl ContainerRuntime {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let status = command.status().await.with_context(|| {
-            format!("run {} exec {}", self.runtime_label(), spec.container_name)
-        })?;
+        let status = match timeout_duration {
+            Some(timeout_duration) => tokio::time::timeout(timeout_duration, command.status())
+                .await
+                .with_context(|| {
+                    format!(
+                        "{} exec {} timed out after {:?}",
+                        self.runtime_label(),
+                        spec.container_name,
+                        timeout_duration
+                    )
+                })?,
+            None => command.status().await,
+        }
+        .with_context(|| format!("run {} exec {}", self.runtime_label(), spec.container_name))?;
         Ok(exit_code(status))
     }
 
@@ -574,6 +697,7 @@ impl ContainerRuntime {
             child_pid,
             cleanup_runtime: self.clone(),
             cleanup_spec,
+            cleanup_marker_path: marker.path,
         })
     }
 

@@ -183,28 +183,9 @@ def test_http_run_detach(host: Host) -> None:
 def test_http_run_pty_close_terminates_container_process(host: Host) -> None:
     pidfile = f"/tmp/aw-gateway-pty-close-{host.name}.pid"
     child_pidfile = f"/tmp/aw-gateway-pty-close-{host.name}.child.pid"
-    command = (
-        f"rm -f {pidfile} {child_pidfile}; "
-        "trap '' HUP INT TERM; "
-        f"/bin/bash -lc 'trap \"\" HUP INT TERM; printf \"%s\" $$ > {child_pidfile}; "
-        "while :; do sleep 1; done' & "
-        f"printf '%s' $$ > {pidfile}; "
-        "wait"
-    )
 
     with HttpDaemon(host) as http:
-        response = http.post(
-            "/api/v1/run",
-            {
-                "target": host.target,
-                "mode": "pty",
-                "command": ["/bin/bash", "-lc", command],
-                "terminal": {"cols": 80, "rows": 24},
-            },
-        )
-        assert response.status == HTTPStatus.CREATED
-        assert response.body["ok"] is True
-        assert response.body["mode"] == "pty"
+        response = _start_long_running_pty(http, host, pidfile, child_pidfile)
 
         with _WebSocket(http, response.body["attach_url"]) as ws:
             ws.send_text(json.dumps({"type": "auth", "token": response.body["attach_token"]}))
@@ -224,6 +205,32 @@ def test_http_run_pty_close_terminates_container_process(host: Host) -> None:
             host,
             f"pid=$(cat {child_pidfile}) && ! kill -0 \"$pid\" 2>/dev/null",
         )
+
+
+def test_http_shutdown_signal_terminates_active_pty_process(host: Host) -> None:
+    pidfile = f"/tmp/aw-gateway-pty-sigint-{host.name}.pid"
+    child_pidfile = f"/tmp/aw-gateway-pty-sigint-{host.name}.child.pid"
+
+    daemon = HttpDaemon(host)
+    with daemon as http:
+        response = _start_long_running_pty(http, host, pidfile, child_pidfile)
+
+        with _WebSocket(http, response.body["attach_url"]) as ws:
+            ws.send_text(json.dumps({"type": "auth", "token": response.body["attach_token"]}))
+            ready = ws.recv_json()
+            assert ready["type"] == "ready"
+            _wait_for_http_command(http, host, f"test -s {pidfile}")
+            _wait_for_http_command(http, host, f"test -s {child_pidfile}")
+            daemon.signal_remote("INT")
+            daemon.wait_remote_stopped(timeout=20)
+            _wait_for_gateway_command(
+                host,
+                f"pid=$(cat {pidfile}) && ! kill -0 \"$pid\" 2>/dev/null",
+            )
+            _wait_for_gateway_command(
+                host,
+                f"pid=$(cat {child_pidfile}) && ! kill -0 \"$pid\" 2>/dev/null",
+            )
 
 
 def test_http_run_validation_errors(host: Host) -> None:
@@ -431,3 +438,47 @@ def _wait_for_http_command(http: HttpClient, host: Host, command: str) -> None:
             return
         time.sleep(0.25)
     raise AssertionError(f"command did not succeed before timeout: {command!r}; last={last.body!r}")
+
+
+def _wait_for_gateway_command(host: Host, command: str) -> None:
+    deadline = time.monotonic() + 30
+    last = None
+    while time.monotonic() < deadline:
+        last = gateway(host, "run", host.target, "--", "/bin/bash", "-lc", command, timeout=300)
+        if last.returncode == 0:
+            return
+        time.sleep(0.5)
+    assert last is not None
+    raise AssertionError(
+        f"command did not succeed before timeout: {command!r}\n"
+        f"stdout:\n{last.stdout}\nstderr:\n{last.stderr}"
+    )
+
+
+def _start_long_running_pty(
+    http: HttpClient,
+    host: Host,
+    pidfile: str,
+    child_pidfile: str,
+) -> object:
+    command = (
+        f"rm -f {pidfile} {child_pidfile}; "
+        "trap '' HUP INT TERM; "
+        f"/bin/bash -lc 'trap \"\" HUP INT TERM; printf \"%s\" $$ > {child_pidfile}; "
+        "while :; do sleep 1; done' & "
+        f"printf '%s' $$ > {pidfile}; "
+        "wait"
+    )
+    response = http.post(
+        "/api/v1/run",
+        {
+            "target": host.target,
+            "mode": "pty",
+            "command": ["/bin/bash", "-lc", command],
+            "terminal": {"cols": 80, "rows": 24},
+        },
+    )
+    assert response.status == HTTPStatus.CREATED
+    assert response.body["ok"] is True
+    assert response.body["mode"] == "pty"
+    return response

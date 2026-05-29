@@ -22,6 +22,8 @@
 
 - HTTP PTY close and WebSocket disconnect now terminate the in-container
   attached process tree instead of relying only on the host-side runtime client.
+- HTTP daemon shutdown now waits briefly for active PTY sessions to run the same
+  in-container cleanup path before the listener exits.
 
 ## [0.4.1] - 2026-05-26
 

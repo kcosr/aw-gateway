@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, watch};
 use tokio::time::Duration;
 
@@ -45,6 +46,7 @@ const MAX_TERMINAL_ROWS: u16 = 300;
 const MAX_WS_TEXT_BYTES: usize = 64 * 1024;
 const MAX_WS_BINARY_BYTES: usize = 256 * 1024;
 const PTY_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+const PTY_SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub(super) struct AppState {
@@ -74,8 +76,13 @@ pub(super) async fn serve(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
-            pty_shutdown.cancel_active();
+            tracing::info!("http shutdown signal received; canceling active pty sessions");
+            pty_shutdown
+                .cancel_active_and_wait(PTY_SHUTDOWN_WAIT_TIMEOUT)
+                .await;
+            tracing::info!("http shutdown canceling prepared pty leases");
             shutdown_leases.cancel_all().await;
+            tracing::info!("http shutdown pty cancellation complete");
         })
         .await?;
     Ok(())
@@ -135,12 +142,16 @@ struct PreparedPtyLease {
 #[derive(Clone)]
 struct PtyShutdown {
     sender: watch::Sender<bool>,
+    active: Arc<AtomicUsize>,
 }
 
 impl Default for PtyShutdown {
     fn default() -> Self {
         let (sender, _) = watch::channel(false);
-        Self { sender }
+        Self {
+            sender,
+            active: Arc::new(AtomicUsize::new(0)),
+        }
     }
 }
 
@@ -149,8 +160,37 @@ impl PtyShutdown {
         self.sender.subscribe()
     }
 
-    fn cancel_active(&self) {
+    fn track_active(&self) -> ActivePtySession {
+        self.active.fetch_add(1, Ordering::Relaxed);
+        ActivePtySession {
+            active: self.active.clone(),
+        }
+    }
+
+    async fn cancel_active_and_wait(&self, timeout: Duration) {
+        tracing::info!("broadcasting pty shutdown");
         let _ = self.sender.send(true);
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.active.load(Ordering::Relaxed) > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    active = self.active.load(Ordering::Relaxed),
+                    "timed out waiting for active pty sessions to finish"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+struct ActivePtySession {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ActivePtySession {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -405,7 +445,8 @@ async fn handle_pty_socket(
     pty_id: String,
     mut socket: WebSocket,
 ) {
-    let auth = read_pty_auth_frame(&mut socket).await;
+    let _active = pty_shutdown.track_active();
+    let auth = read_pty_auth_frame(&mut socket, pty_shutdown.subscribe()).await;
     let token = match auth {
         Ok(token) => token,
         Err(err) => {
@@ -422,17 +463,32 @@ async fn handle_pty_socket(
     run_attached_pty(lease, socket, pty_shutdown.subscribe()).await;
 }
 
-async fn read_pty_auth_frame(socket: &mut WebSocket) -> Result<String, HttpError> {
+async fn read_pty_auth_frame(
+    socket: &mut WebSocket,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<String, HttpError> {
     match tokio::time::timeout(PTY_ATTACH_AUTH_TIMEOUT, async {
         loop {
-            match socket.recv().await {
-                Some(Ok(Message::Text(text))) => return parse_pty_auth(&text),
-                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
-                Some(Ok(_)) => {
-                    return Err(HttpError::unauthorized("first pty message must be auth"));
+            if *shutdown.borrow() {
+                return Err(HttpError::unauthorized("pty attach canceled by shutdown"));
+            }
+            tokio::select! {
+                message = socket.recv() => {
+                    match message {
+                        Some(Ok(Message::Text(text))) => return parse_pty_auth(&text),
+                        Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                        Some(Ok(_)) => {
+                            return Err(HttpError::unauthorized("first pty message must be auth"));
+                        }
+                        Some(Err(err)) => return Err(HttpError::unauthorized(err.to_string())),
+                        None => return Err(HttpError::unauthorized("pty attach closed before auth")),
+                    }
                 }
-                Some(Err(err)) => return Err(HttpError::unauthorized(err.to_string())),
-                None => return Err(HttpError::unauthorized("pty attach closed before auth")),
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Err(HttpError::unauthorized("pty attach canceled by shutdown"));
+                    }
+                }
             }
         }
     })
@@ -498,6 +554,7 @@ async fn run_attached_pty(
     let mut result = Ok(ExecutionOutcome::new(130));
     let mut output_open = true;
     if *shutdown.borrow() {
+        tracing::info!("pty session started after shutdown; terminating immediately");
         cancel_pty_session(&pty).await;
         drop(pty);
         finish_pty_lease(lease, result, outcome).await;
@@ -520,6 +577,7 @@ async fn run_attached_pty(
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
+                    tracing::info!("pty session observed http shutdown; terminating");
                     cancel_pty_session(&pty).await;
                     break;
                 }
@@ -588,7 +646,9 @@ async fn run_attached_pty(
 }
 
 async fn cancel_pty_session(pty: &ContainerPtySession) {
+    tracing::info!("canceling pty session");
     let _ = pty.terminate().await;
+    tracing::info!("pty session cancel request complete");
 }
 
 async fn drain_pty_output(
