@@ -1507,10 +1507,8 @@ optional:
 }
 ```
 
-The HTTP API intentionally does not implement SSE/NDJSON streaming, persistent
-queryable jobs, multi-attach PTY replay, SSH key management, generated client
-config or bundles, proxy/tunnel helpers, default-target management, route
-aliases, or retired config-shape compatibility.
+PTY attach leases are single-use. A PTY session cannot be replayed or attached
+by multiple clients.
 
 ## Assets
 
