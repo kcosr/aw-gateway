@@ -5,7 +5,6 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-#[cfg(not(unix))]
 use std::io::Read;
 use std::io::Write;
 #[cfg(unix)]
@@ -14,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -529,7 +527,7 @@ impl ContainerRuntime {
         let mut pty_spec = spec.clone();
         pty_spec.stdin_tty = true;
         pty_spec.stdout_tty = true;
-        let marker = next_pty_marker();
+        let marker = next_pty_marker()?;
         pty_spec.command = wrap_pty_command(&spec.command, &marker);
         let cleanup_spec = pty_cleanup_spec(spec, &marker);
 
@@ -838,16 +836,21 @@ struct PtyMarker {
     token: String,
 }
 
-fn next_pty_marker() -> PtyMarker {
+fn next_pty_marker() -> anyhow::Result<PtyMarker> {
     let id = NEXT_PTY_ID.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    PtyMarker {
+    Ok(PtyMarker {
         path: format!("/tmp/aw-gateway-pty-{}-{id}.pid", std::process::id()),
-        token: format!("{:x}{id:x}{nanos:x}", std::process::id()),
-    }
+        token: random_pty_marker_token()?,
+    })
+}
+
+fn random_pty_marker_token() -> anyhow::Result<String> {
+    let mut bytes = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .context("open /dev/urandom")?
+        .read_exact(&mut bytes)
+        .context("read /dev/urandom")?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn wrap_pty_command(command: &[String], marker: &PtyMarker) -> Vec<String> {
