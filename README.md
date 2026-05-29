@@ -656,8 +656,8 @@ Gateway configs commonly include:
   as firewall setup, with per-step command timeouts and optional command health
   checks.
 - `[launches.<name>]`: named command templates that select a target, validate
-  caller variables, optionally run post-ready setup steps, and execute a final
-  command inside the ready container.
+  caller variables and optional passthrough args, optionally run post-ready
+  setup steps, and execute a final command inside the ready container.
 - `[launch_templates.<name>]`: reusable partial launch-shaped templates that
   launches opt into with ordered `use = [...]`.
 - `includes`: strict include globs for splitting target templates, launch
@@ -1059,6 +1059,32 @@ Boolean CLI values must be `true` or `false`; number values must parse as
 finite numbers; enum values must exactly match the configured `values`.
 Optional variables referenced by templates must define a default.
 
+Launches can also opt into caller-supplied argv passthrough with
+`allow_args = true`. The configured command owns the executable and places one
+whole-argv `{args}` sentinel where caller args should be spliced. `{args}` is
+not a template variable, cannot be embedded inside a larger string, and cannot
+be `argv[0]`.
+
+```toml
+[launches.agent-pack-review]
+target = "default"
+allow_args = true
+command = [
+  "agent-pack",
+  "run",
+  "--manifest", "{var.manifest}",
+  "--json",
+  "{args}",
+]
+
+[launches.agent-pack-review.vars]
+manifest = { type = "string", required = true }
+```
+
+Callers pass launch args after `--`. Empty passthrough args are equivalent to
+no args; non-empty args are rejected unless the effective launch has
+`allow_args = true`.
+
 Launch commands:
 
 ```bash
@@ -1068,6 +1094,7 @@ aw-gateway launch show repo-shell
 aw-gateway launch show repo-shell --json
 aw-gateway launch repo-shell --var repo=https://example.invalid/YOUR-REPO.git --var branch=main
 aw-gateway launch repo-shell --session-id abc123def456 --var repo=https://example.invalid/YOUR-REPO.git
+aw-gateway launch agent-pack-review --var manifest=/opt/agent-pack/review.yaml -- --skill engineering/fresh-eyes "Review this branch."
 ```
 
 When `launches` and `launch` are present in
@@ -1079,6 +1106,7 @@ ssh host launches
 ssh host 'launch show repo-shell --json'
 ssh host 'launch repo-shell --var repo=https://example.invalid/YOUR-REPO.git --var branch=main'
 ssh host 'launch repo-shell --session-id=abc123def456 --var=repo=https://example.invalid/YOUR-REPO.git'
+ssh host 'launch agent-pack-review --var manifest=/opt/agent-pack/review.yaml -- --skill engineering/fresh-eyes "Review this branch."'
 ```
 
 Omit `launch` from `ssh_dispatch.enabled_actions` if SSH users should
@@ -1086,11 +1114,12 @@ not start configured launch workflows. Omit `launches` if SSH users should not
 list configured launches.
 
 `launches --json` emits a bare array of launch summaries. Each summary includes
-`name`, `target`, optional `description`, and a `vars` object keyed by variable
-name with `type`, `required`, optional `default`, optional enum `values`, and
-optional `description`. `launch show --json` emits one detail object with the
-same variable metadata plus resolved target mode, fixed-target container name,
-`steps`, optional final `cwd`, optional final `env`, and final `command`.
+`name`, `target`, `allow_args`, optional `description`, and a `vars` object
+keyed by variable name with `type`, `required`, optional `default`, optional
+enum `values`, and optional `description`. `launch show --json` emits one
+detail object with the same variable metadata plus `allow_args`, resolved
+target mode, fixed-target container name, `steps`, optional final `cwd`,
+optional final `env`, and final `command`.
 Ephemeral launch detail omits the concrete container name because it is not
 known until a session id is selected.
 
@@ -1098,7 +1127,8 @@ Launch execution order is:
 
 1. Load, include, and validate config.
 2. Resolve the named launch.
-3. Validate supplied `--var key=value` values and apply defaults.
+3. Validate supplied `--var key=value` values, passthrough args, and apply
+   defaults.
 4. Resolve and prepare the configured target.
 5. Run the existing target lifecycle, readiness checks, and target
    `host_steps`.
@@ -1146,7 +1176,7 @@ up [target] [--json] [--session-id ID]
 run [--session-id ID] [target] [--cwd DIR] -- <command> [args...]
 launches [--json]
 launch show <name> [--json]
-launch <name> [--session-id ID] [--var key=value]...
+launch <name> [--session-id ID] [--var key=value]... [-- <args...>]
 stop [target] [--session-id ID]
 remove [target] [--session-id ID]
 status [target] [--json] [--session-id ID]
@@ -1190,8 +1220,10 @@ Gateway command behavior:
 - `launches [--json]`: list configured launches.
 - `launch show <name> [--json]`: show one configured launch's variables, steps,
   and final command.
-- `launch <name> [--session-id ID] [--var key=value]...`: start or reuse the
-  launch target, run any post-ready steps, and execute the launch command.
+- `launch <name> [--session-id ID] [--var key=value]... [-- <args...>]`: start
+  or reuse the launch target, run any post-ready steps, and execute the launch
+  command. Args after `--` are accepted only for launches with
+  `allow_args = true` and are spliced at the configured `{args}` argv element.
   Foreground launches interrupted by `SIGINT`, `SIGTERM`, or `SIGHUP` are
   canceled and then routed through normal session cleanup.
 - `stop [target] [--session-id ID]`: stop a target, or a specific ephemeral
@@ -1475,7 +1507,10 @@ PTY requests.
 Launch run requests accept typed JSON variables. Strings, booleans, integers,
 and finite numbers are passed to launch validation; nulls, arrays, objects,
 duplicate keys, unknown vars, missing required vars, enum/range/type failures,
-and non-finite numbers are rejected as `invalid_launch_var`.
+and non-finite numbers are rejected as `invalid_launch_var`. Launch run
+requests also accept optional `args`, an array of non-empty strings. Non-empty
+`args` require the effective launch to set `allow_args = true`; malformed or
+disallowed args are rejected as `invalid_launch_args`.
 
 ```json
 {
@@ -1486,6 +1521,7 @@ and non-finite numbers are rejected as `invalid_launch_var`.
     "count": 3,
     "mode": "safe"
   },
+  "args": ["--skill", "engineering/fresh-eyes", "Review this branch."],
   "mode": "wait",
   "output": ["stdout", "stderr"]
 }

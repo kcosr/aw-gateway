@@ -26,6 +26,7 @@ pub enum GatewayAction {
         name: String,
         session_id: Option<String>,
         vars: Vec<String>,
+        args: Vec<String>,
     },
     Status(StatusAction),
     Targets {
@@ -355,6 +356,7 @@ fn parse_launch_action(words: &[String]) -> anyhow::Result<GatewayAction> {
         name: parsed.name,
         session_id: parsed.session_id,
         vars: parsed.vars,
+        args: parsed.args,
     })
 }
 
@@ -800,6 +802,7 @@ mod tests {
                         "repo=https://example.test/repo.git".into(),
                         "branch=main".into(),
                     ],
+                    args: Vec::new(),
                 }),
             ),
             (
@@ -808,6 +811,7 @@ mod tests {
                     name: "repo-shell".into(),
                     session_id: None,
                     vars: vec!["repo=https://example.test/repo.git".into()],
+                    args: Vec::new(),
                 }),
             ),
             (
@@ -816,6 +820,7 @@ mod tests {
                     name: "repo-shell".into(),
                     session_id: Some("abc123def456".into()),
                     vars: vec!["repo=https://example.test/repo.git".into()],
+                    args: Vec::new(),
                 }),
             ),
             (
@@ -824,6 +829,16 @@ mod tests {
                     name: "repo-shell".into(),
                     session_id: Some("abc123def456".into()),
                     vars: vec!["repo=https://example.test/repo.git".into()],
+                    args: Vec::new(),
+                }),
+            ),
+            (
+                "launch repo-shell --var=repo=https://example.test/repo.git -- --skill fresh-eyes 'review this'",
+                Some(GatewayAction::LaunchRun {
+                    name: "repo-shell".into(),
+                    session_id: None,
+                    vars: vec!["repo=https://example.test/repo.git".into()],
+                    args: vec!["--skill".into(), "fresh-eyes".into(), "review this".into()],
                 }),
             ),
         ] {

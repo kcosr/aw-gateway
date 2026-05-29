@@ -12,6 +12,7 @@ pub(in crate::gateway) enum OperationError {
     DisabledAction { message: String },
     UnknownLaunch { message: String },
     InvalidLaunchVariable { message: String },
+    InvalidLaunchArgs { message: String },
     InvalidSession { message: String },
     AgentNotReady { source: anyhow::Error },
     ContainerNotFound { source: anyhow::Error },
@@ -40,6 +41,12 @@ impl OperationError {
 
     pub(in crate::gateway) fn invalid_launch_variable(message: impl Into<String>) -> Self {
         Self::InvalidLaunchVariable {
+            message: message.into(),
+        }
+    }
+
+    pub(in crate::gateway) fn invalid_launch_args(message: impl Into<String>) -> Self {
+        Self::InvalidLaunchArgs {
             message: message.into(),
         }
     }
@@ -77,6 +84,7 @@ impl fmt::Display for OperationError {
             | Self::DisabledAction { message }
             | Self::UnknownLaunch { message }
             | Self::InvalidLaunchVariable { message }
+            | Self::InvalidLaunchArgs { message }
             | Self::InvalidSession { message } => formatter.write_str(message),
             Self::AgentNotReady { source }
             | Self::ContainerNotFound { source }
@@ -97,6 +105,7 @@ impl std::error::Error for OperationError {
             | Self::DisabledAction { .. }
             | Self::UnknownLaunch { .. }
             | Self::InvalidLaunchVariable { .. }
+            | Self::InvalidLaunchArgs { .. }
             | Self::InvalidSession { .. } => None,
         }
     }
@@ -197,6 +206,30 @@ impl ExecutionOutcome {
             Self::Streamed { exit_code } | Self::Captured { exit_code, .. } => Some(*exit_code),
             Self::Detached { .. } => None,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(in crate::gateway) struct LaunchPassthroughArgs {
+    values: Vec<String>,
+}
+
+impl LaunchPassthroughArgs {
+    pub(in crate::gateway) fn from_strings(values: Vec<String>) -> OperationResult<Self> {
+        if values.iter().any(|value| value.is_empty()) {
+            return Err(OperationError::invalid_launch_args(
+                "launch args must not contain empty strings",
+            ));
+        }
+        Ok(Self { values })
+    }
+
+    pub(in crate::gateway) fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub(in crate::gateway) fn as_slice(&self) -> &[String] {
+        &self.values
     }
 }
 

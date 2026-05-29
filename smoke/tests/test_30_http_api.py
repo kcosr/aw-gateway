@@ -267,12 +267,17 @@ def test_http_launch_metadata_and_run(host: Host) -> None:
         launches = http.get("/api/v1/launches")
         assert launches.status == HTTPStatus.OK
         assert launches.body["ok"] is True
-        assert "smoke-echo" in {entry["name"] for entry in launches.body["data"]}
+        launch_metadata = {entry["name"]: entry for entry in launches.body["data"]}
+        assert "smoke-echo" in launch_metadata
+        assert "smoke-args" in launch_metadata
+        assert launch_metadata["smoke-echo"]["allow_args"] is False
+        assert launch_metadata["smoke-args"]["allow_args"] is True
 
         detail = http.get("/api/v1/launches/smoke-echo")
         assert detail.status == HTTPStatus.OK
         assert detail.body["ok"] is True
         assert detail.body["data"]["target"] == host.target
+        assert detail.body["data"]["allow_args"] is False
         assert set(detail.body["data"]["vars"]) == {"flag", "name"}
 
         run = http.post(
@@ -286,6 +291,17 @@ def test_http_launch_metadata_and_run(host: Host) -> None:
         assert run.body["exit_code"] == 0
         assert run.body["stdout"] == f"smoke:{host.name}:true"
 
+        args_run = http.post(
+            "/api/v1/launches/smoke-args/run",
+            {
+                "args": ["left", "right"],
+            },
+        )
+        assert args_run.status == HTTPStatus.OK
+        assert args_run.body["ok"] is True
+        assert args_run.body["exit_code"] == 0
+        assert args_run.body["stdout"] == "args:left:right"
+
 
 def test_http_launch_validation_errors(host: Host) -> None:
     with HttpDaemon(host) as http:
@@ -297,6 +313,12 @@ def test_http_launch_validation_errors(host: Host) -> None:
             {"vars": {"name": ["bad"]}},
         )
         assert_error(invalid, HTTPStatus.BAD_REQUEST, "invalid_launch_var")
+
+        invalid_args = http.post(
+            "/api/v1/launches/smoke-echo/run",
+            {"vars": {"name": host.name}, "args": ["not-allowed"]},
+        )
+        assert_error(invalid_args, HTTPStatus.BAD_REQUEST, "invalid_launch_args")
 
 
 def test_http_action_allowlist_blocks_disabled_route(host: Host) -> None:

@@ -408,6 +408,11 @@ def append_smoke_launch(text: str, host: Host) -> str:
         + "[launches.smoke-echo.vars]\n"
         + 'name = { type = "string", required = true }\n'
         + 'flag = { type = "boolean", default = false }\n'
+        + "\n\n[launches.smoke-args]\n"
+        + f'target = "{host.target}"\n'
+        + 'description = "HTTP API smoke launch with passthrough args."\n'
+        + "allow_args = true\n"
+        + 'command = ["/bin/sh", "-c", "printf \'args:%s:%s\' \\"$1\\" \\"$2\\"", "aw-smoke", "{args}"]\n'
     )
 
 

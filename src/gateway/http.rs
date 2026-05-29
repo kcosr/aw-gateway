@@ -1,6 +1,7 @@
 use super::ops::{
-    CanonicalLaunchVarValue, GatewayOperation, GatewayOperationResult, OperationExecutionOptions,
-    OperationMode, OutputSelection, SuppliedLaunchVars, execute_gateway_operation,
+    CanonicalLaunchVarValue, GatewayOperation, GatewayOperationResult, LaunchPassthroughArgs,
+    OperationExecutionOptions, OperationMode, OutputSelection, SuppliedLaunchVars,
+    execute_gateway_operation,
 };
 use super::{
     PreparedExecution, SessionOutcome, prepare_launch_execution_with_config,
@@ -389,6 +390,7 @@ async fn launch_run(
         name,
         session_id: request.session_id,
         vars: request.vars.unwrap_or_default(),
+        args: request.args.unwrap_or_default(),
         options: execution.options,
     };
     execute_http_execution(state.config_path, operation, execution.output_formats).await
@@ -754,6 +756,7 @@ async fn prepare_pty_launch(state: AppState, name: String, request: LaunchRunReq
         &name,
         request.session_id,
         request.vars.unwrap_or_default(),
+        request.args.unwrap_or_default(),
     )
     .await
     {
@@ -826,6 +829,13 @@ fn parse_body<T: for<'de> Deserialize<'de>>(
     semantic_code: ErrorCode,
 ) -> Result<T, HttpError> {
     serde_json::from_slice(body).map_err(|err| {
+        if is_launch_args_error(&err) {
+            return HttpError::new(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidLaunchArgs,
+                err.to_string(),
+            );
+        }
         if semantic_code == ErrorCode::InvalidLaunchVar && is_launch_var_error(&err) {
             HttpError::new(
                 StatusCode::BAD_REQUEST,
@@ -836,6 +846,10 @@ fn parse_body<T: for<'de> Deserialize<'de>>(
             HttpError::invalid_request(err.to_string())
         }
     })
+}
+
+fn is_launch_args_error(err: &serde_json::Error) -> bool {
+    err.to_string().contains("invalid launch args") || err.to_string().contains("launch args must")
 }
 
 fn is_launch_var_error(err: &serde_json::Error) -> bool {
@@ -1117,6 +1131,8 @@ struct LaunchRunRequest {
     session_id: Option<String>,
     #[serde(default, deserialize_with = "deserialize_launch_vars")]
     vars: Option<SuppliedLaunchVars>,
+    #[serde(default, deserialize_with = "deserialize_launch_args")]
+    args: Option<LaunchPassthroughArgs>,
     mode: Option<String>,
     terminal: Option<TerminalRequest>,
     output: Option<Vec<String>>,
@@ -1137,6 +1153,45 @@ where
     D: Deserializer<'de>,
 {
     deserializer.deserialize_option(LaunchVarsOptionVisitor)
+}
+
+fn deserialize_launch_args<'de, D>(
+    deserializer: D,
+) -> Result<Option<LaunchPassthroughArgs>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_option(LaunchArgsOptionVisitor)
+}
+
+struct LaunchArgsOptionVisitor;
+
+impl<'de> Visitor<'de> for LaunchArgsOptionVisitor {
+    type Value = Option<LaunchPassthroughArgs>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a launch args array")
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(de::Error::custom(
+            "invalid launch args: args must be an array",
+        ))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let values = Vec::<String>::deserialize(deserializer)
+            .map_err(|err| de::Error::custom(format!("invalid launch args: {err}")))?;
+        LaunchPassthroughArgs::from_strings(values)
+            .map(Some)
+            .map_err(de::Error::custom)
+    }
 }
 
 struct LaunchVarsOptionVisitor;

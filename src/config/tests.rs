@@ -2644,6 +2644,103 @@ command = ["host-prep"]
 }
 
 #[test]
+fn launch_allow_args_overlay_and_validation_rules() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launch_defaults]
+target = "default"
+allow_args = true
+command = ["agent-pack", "run", "{args}"]
+
+[launches.inherits]
+
+[launches.disables]
+allow_args = false
+command = ["true"]
+"#,
+    )
+    .unwrap();
+    cfg.validate().unwrap();
+
+    let inherits = cfg.effective_launch("inherits").unwrap();
+    assert!(inherits.allow_args);
+    assert_eq!(inherits.command, ["agent-pack", "run", "{args}"]);
+
+    let disables = cfg.effective_launch("disables").unwrap();
+    assert!(!disables.allow_args);
+    assert_eq!(disables.command, ["true"]);
+
+    for (body, expected) in [
+        (
+            r#"
+[launches.bad]
+target = "default"
+command = ["agent-pack", "{args}"]
+"#,
+            "uses {args} but allow_args is false",
+        ),
+        (
+            r#"
+[launches.bad]
+target = "default"
+allow_args = true
+command = ["agent-pack"]
+"#,
+            "allow_args = true requires exactly one {args}",
+        ),
+        (
+            r#"
+[launches.bad]
+target = "default"
+allow_args = true
+command = ["agent-pack", "{args}", "{args}"]
+"#,
+            "must not contain duplicate {args}",
+        ),
+        (
+            r#"
+[launches.bad]
+target = "default"
+allow_args = true
+command = ["agent-pack", "prefix-{args}"]
+"#,
+            "must use {args} only as a whole argv element",
+        ),
+        (
+            r#"
+[launches.bad]
+target = "default"
+allow_args = true
+command = ["{args}", "agent-pack"]
+"#,
+            "must not place {args} at argv[0]",
+        ),
+    ] {
+        let raw = format!(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+{body}
+"#
+        );
+        let cfg: GatewayConfig = toml::from_str(&raw).unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains(expected), "{err}");
+    }
+}
+
+#[test]
 fn launch_templates_overlay_in_use_order_and_allow_concrete_overrides() {
     let cfg: GatewayConfig = toml::from_str(
         r#"

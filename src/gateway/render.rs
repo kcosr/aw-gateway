@@ -138,6 +138,10 @@ fn print_launch_detail(detail: &LaunchDetail) {
     println!("Launch: {}", detail.name);
     println!("Target: {}", detail.target);
     println!("Target mode: {}", detail.target_mode);
+    println!(
+        "Passthrough args: {}",
+        if detail.allow_args { "yes" } else { "no" }
+    );
     if let Some(container) = &detail.target_container {
         println!("Target container: {container}");
     }

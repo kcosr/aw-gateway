@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_GATEWAY_CONFIG: &str = include_str!("../aw-gateway.sample.toml");
 const MAX_SSH_ORIGINAL_COMMAND_BYTES: usize = 64 * 1024;
+type ParsedLaunchRunArgs = (String, Option<String>, Vec<String>, Vec<String>);
 
 #[cfg(target_os = "linux")]
 const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
@@ -84,9 +85,9 @@ use model::{
 };
 use ops::{
     CanonicalLaunchVarValue, ExecutionOutcome, GatewayOperation, GatewayOperationResult,
-    OperationError, OperationExecutionOptions, OperationMode, OperationResult, SshGatewayOperation,
-    SshRenderOptions, SuppliedLaunchVars, execute_gateway_operation, lookup_launch,
-    operation_up_with_runtime,
+    LaunchPassthroughArgs, OperationError, OperationExecutionOptions, OperationMode,
+    OperationResult, SshGatewayOperation, SshRenderOptions, SuppliedLaunchVars,
+    execute_gateway_operation, lookup_launch, operation_up_with_runtime,
 };
 use render::{
     render_default_selection, render_launch_detail, render_launches, render_remove_result,
@@ -759,15 +760,13 @@ async fn launch(config_path: Option<PathBuf>, command: LaunchCommand) -> anyhow:
     match command {
         LaunchCommand::Show(args) => launch_show(config_path, args).await,
         LaunchCommand::Run(raw) => {
-            let (name, session_id, vars) = parse_launch_run_args(raw)?;
-            launch_execute(config_path, &name, session_id, vars).await
+            let (name, session_id, vars, args) = parse_launch_run_args(raw)?;
+            launch_execute(config_path, &name, session_id, vars, args).await
         }
     }
 }
 
-fn parse_launch_run_args(
-    raw: Vec<std::ffi::OsString>,
-) -> anyhow::Result<(String, Option<String>, Vec<String>)> {
+fn parse_launch_run_args(raw: Vec<std::ffi::OsString>) -> anyhow::Result<ParsedLaunchRunArgs> {
     let mut args = raw.into_iter();
     let parsed = parse_launch_run_args_from(|role| {
         let Some(arg) = args.next() else {
@@ -777,7 +776,7 @@ fn parse_launch_run_args(
             .map(Some)
             .map_err(|_| anyhow::anyhow!(launch_arg_utf8_error(role)))
     })?;
-    Ok((parsed.name, parsed.session_id, parsed.vars))
+    Ok((parsed.name, parsed.session_id, parsed.vars, parsed.args))
 }
 
 fn launch_arg_utf8_error(role: LaunchRunArgRole) -> &'static str {
@@ -786,6 +785,7 @@ fn launch_arg_utf8_error(role: LaunchRunArgRole) -> &'static str {
         LaunchRunArgRole::Argument => "launch arguments must be valid UTF-8",
         LaunchRunArgRole::SessionId => "session id must be valid UTF-8",
         LaunchRunArgRole::Variable => "launch variable must be valid UTF-8",
+        LaunchRunArgRole::Passthrough => "launch passthrough argument must be valid UTF-8",
     }
 }
 
@@ -807,11 +807,13 @@ async fn launch_execute(
     name: &str,
     session_id: Option<String>,
     supplied: Vec<String>,
+    args: Vec<String>,
 ) -> anyhow::Result<()> {
     let supplied = SuppliedLaunchVars::from_cli_pairs(supplied)?;
+    let args = LaunchPassthroughArgs::from_strings(args)?;
     let result = execute_gateway_operation(
         config_path,
-        GatewayOperation::launch_run(name.to_string(), session_id, supplied),
+        GatewayOperation::launch_run(name.to_string(), session_id, supplied, args),
     )
     .await?;
     let GatewayOperationResult::Launch(outcome) = result else {
@@ -825,14 +827,16 @@ async fn launch_execute_with_config(
     name: &str,
     session_id: Option<String>,
     supplied: SuppliedLaunchVars,
+    args: LaunchPassthroughArgs,
     options: OperationExecutionOptions,
 ) -> OperationResult<ExecutionOutcome> {
     let launch = lookup_launch(&cfg, name)?;
     let resolved_vars = resolve_launch_vars(name, &launch, &supplied)?;
+    validate_launch_passthrough_args(name, &launch, &args)?;
     let target = launch.target.clone();
     let runtime =
         Runtime::from_config(cfg, Some(&target), session_id, true, Some(name.to_string())).await?;
-    OperationRunner::launch(runtime, options, launch, resolved_vars)
+    OperationRunner::launch(runtime, options, launch, resolved_vars, args)
         .run()
         .await
         .map_err(OperationError::operation_failed)
@@ -857,9 +861,11 @@ async fn prepare_launch_execution_with_config(
     name: &str,
     session_id: Option<String>,
     supplied: SuppliedLaunchVars,
+    args: LaunchPassthroughArgs,
 ) -> OperationResult<PreparedExecution> {
     let launch = lookup_launch(&cfg, name)?;
     let resolved_vars = resolve_launch_vars(name, &launch, &supplied)?;
+    validate_launch_passthrough_args(name, &launch, &args)?;
     let target = launch.target.clone();
     let runtime =
         Runtime::from_config(cfg, Some(&target), session_id, true, Some(name.to_string())).await?;
@@ -868,10 +874,24 @@ async fn prepare_launch_execution_with_config(
         OperationExecutionOptions::STREAM,
         launch,
         resolved_vars,
+        args,
     )
     .prepare()
     .await
     .map_err(OperationError::operation_failed)
+}
+
+fn validate_launch_passthrough_args(
+    name: &str,
+    launch: &LaunchConfig,
+    args: &LaunchPassthroughArgs,
+) -> OperationResult<()> {
+    if args.is_empty() || launch.allow_args {
+        return Ok(());
+    }
+    Err(OperationError::invalid_launch_args(format!(
+        "launch {name:?} does not allow passthrough args"
+    )))
 }
 
 fn launch_summaries(cfg: &GatewayConfig) -> anyhow::Result<Vec<LaunchSummary>> {
@@ -881,6 +901,7 @@ fn launch_summaries(cfg: &GatewayConfig) -> anyhow::Result<Vec<LaunchSummary>> {
         .map(|(name, launch)| LaunchSummary {
             name: name.clone(),
             target: launch.target.clone(),
+            allow_args: launch.allow_args,
             description: launch.description.clone(),
             vars: launch_var_metadata(&launch.vars),
         })
@@ -897,6 +918,7 @@ fn launch_detail(
         name: name.to_string(),
         target: launch.target.clone(),
         target_mode: target_mode_name(target.mode).into(),
+        allow_args: launch.allow_args,
         target_container: if target.mode == TargetMode::Fixed {
             Some(target.container_name(None)?)
         } else {

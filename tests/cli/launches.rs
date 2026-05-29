@@ -239,6 +239,84 @@ command = ["true"]
 }
 
 #[test]
+fn launch_cli_splices_passthrough_args_after_separator() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    let fake_runtime = dir.path().join("runtime");
+    let runtime_log = dir.path().join("runtime.log");
+    write_executable(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  exec)
+    echo "$@" >> "{runtime_log}"
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+            user = std::env::var("USER").unwrap_or_else(|_| "unknown".into()),
+            uid = unsafe { libc::geteuid() },
+            runtime_log = runtime_log.display(),
+        ),
+    );
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+program = "{}"
+
+[target_defaults.container_agent]
+enabled = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "ubuntu-dev"
+
+[launches.args]
+target = "default"
+allow_args = true
+command = ["launch-command", "before", "{{args}}", "after"]
+"#,
+            fake_runtime.display(),
+        ),
+    )
+    .unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args([
+            "launch",
+            "args",
+            "--",
+            "--skill",
+            "fresh-eyes",
+            "review this",
+        ])
+        .assert()
+        .success();
+
+    let log = std::fs::read_to_string(runtime_log).unwrap();
+    assert!(
+        log.contains("ubuntu-dev launch-command before --skill fresh-eyes review this after"),
+        "{log}"
+    );
+}
+
+#[test]
 fn launch_cli_rejects_bad_vars_before_startup() {
     let dir = tempdir().unwrap();
     let config = dir.path().join("gateway.toml");
