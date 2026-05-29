@@ -86,7 +86,7 @@ pub(super) enum ErrorCode {
 }
 
 impl ErrorCode {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Unauthorized => "unauthorized",
             Self::DisabledAction => "disabled_action",

@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 from http import HTTPStatus
+import json
+import os
+import socket
+import struct
+import time
+from urllib.parse import urlparse
 
 from awsmoke.gateway import gateway
 from awsmoke.hosts import Host
-from awsmoke.http_api import HttpDaemon
+from awsmoke.http_api import HttpClient, HttpDaemon
 
 
 def assert_error(response, status: HTTPStatus, code: str) -> None:
@@ -172,6 +180,59 @@ def test_http_run_detach(host: Host) -> None:
         assert response.body["operation_id"]
 
 
+def test_http_run_pty_close_terminates_container_process(host: Host) -> None:
+    pidfile = f"/tmp/aw-gateway-pty-close-{host.name}.pid"
+    child_pidfile = f"/tmp/aw-gateway-pty-close-{host.name}.child.pid"
+
+    with HttpDaemon(host) as http:
+        response = _start_long_running_pty(http, host, pidfile, child_pidfile)
+
+        with _WebSocket(http, response.body["attach_url"]) as ws:
+            ws.send_text(json.dumps({"type": "auth", "token": response.body["attach_token"]}))
+            ready = ws.recv_json()
+            assert ready["type"] == "ready"
+            _wait_for_http_command(http, host, f"test -s {pidfile}")
+            _wait_for_http_command(http, host, f"test -s {child_pidfile}")
+            ws.send_text(json.dumps({"type": "close"}))
+
+        _wait_for_http_command(
+            http,
+            host,
+            f"pid=$(cat {pidfile}) && ! kill -0 \"$pid\" 2>/dev/null",
+        )
+        _wait_for_http_command(
+            http,
+            host,
+            f"pid=$(cat {child_pidfile}) && ! kill -0 \"$pid\" 2>/dev/null",
+        )
+
+
+def test_http_shutdown_signal_terminates_active_pty_process(host: Host) -> None:
+    pidfile = f"/tmp/aw-gateway-pty-sigint-{host.name}.pid"
+    child_pidfile = f"/tmp/aw-gateway-pty-sigint-{host.name}.child.pid"
+
+    daemon = HttpDaemon(host)
+    with daemon as http:
+        response = _start_long_running_pty(http, host, pidfile, child_pidfile)
+
+        with _WebSocket(http, response.body["attach_url"]) as ws:
+            ws.send_text(json.dumps({"type": "auth", "token": response.body["attach_token"]}))
+            ready = ws.recv_json()
+            assert ready["type"] == "ready"
+            _wait_for_http_command(http, host, f"test -s {pidfile}")
+            _wait_for_http_command(http, host, f"test -s {child_pidfile}")
+            daemon.signal_remote("INT")
+            daemon.wait_remote_stopped(timeout=20)
+            _wait_for_gateway_command(
+                host,
+                f"pid=$(cat {pidfile}) && ! kill -0 \"$pid\" 2>/dev/null",
+            )
+            _wait_for_gateway_command(
+                host,
+                f"pid=$(cat {child_pidfile}) && ! kill -0 \"$pid\" 2>/dev/null",
+            )
+
+
 def test_http_run_validation_errors(host: Host) -> None:
     with HttpDaemon(host) as http:
         empty = http.post("/api/v1/run", {"target": host.target, "command": []})
@@ -251,3 +312,173 @@ def test_http_action_allowlist_blocks_disabled_route(host: Host) -> None:
 
         remove = http.post("/api/v1/remove", {"target": host.target})
         assert_error(remove, HTTPStatus.FORBIDDEN, "disabled_action")
+
+
+class _WebSocket:
+    def __init__(self, http: HttpClient, path: str):
+        self.http = http
+        self.path = path
+        self.sock: socket.socket | None = None
+
+    def __enter__(self) -> "_WebSocket":
+        parsed = urlparse(self.http.base_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 80
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        sock = socket.create_connection((host, port), timeout=30)
+        request = (
+            f"GET {self.path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            "\r\n"
+        )
+        sock.sendall(request.encode("ascii"))
+        header = self._read_http_header(sock)
+        if not header.startswith(b"HTTP/1.1 101 "):
+            raise AssertionError(header.decode("utf-8", errors="replace"))
+        expected_accept = base64.b64encode(
+            hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+        ).decode("ascii")
+        if f"sec-websocket-accept: {expected_accept}".lower().encode("ascii") not in header.lower():
+            raise AssertionError("websocket accept header did not match")
+        self.sock = sock
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
+
+    def send_text(self, text: str) -> None:
+        assert self.sock is not None
+        self.sock.sendall(_masked_ws_frame(0x1, text.encode("utf-8")))
+
+    def recv_json(self) -> dict:
+        deadline = 20
+        assert self.sock is not None
+        self.sock.settimeout(deadline)
+        while True:
+            opcode, payload = _read_ws_frame(self.sock)
+            if opcode == 0x1:
+                return json.loads(payload.decode("utf-8"))
+            if opcode == 0x8:
+                raise AssertionError("websocket closed before JSON frame")
+            if opcode == 0x9:
+                self.sock.sendall(_masked_ws_frame(0xA, payload))
+
+    @staticmethod
+    def _read_http_header(sock: socket.socket) -> bytes:
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return data
+
+
+def _masked_ws_frame(opcode: int, payload: bytes) -> bytes:
+    first = 0x80 | opcode
+    length = len(payload)
+    if length < 126:
+        header = struct.pack("!BB", first, 0x80 | length)
+    elif length <= 0xFFFF:
+        header = struct.pack("!BBH", first, 0x80 | 126, length)
+    else:
+        header = struct.pack("!BBQ", first, 0x80 | 127, length)
+    mask = os.urandom(4)
+    masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+    return header + mask + masked
+
+
+def _read_ws_frame(sock: socket.socket) -> tuple[int, bytes]:
+    header = _recv_exact(sock, 2)
+    first, second = header
+    opcode = first & 0x0F
+    masked = second & 0x80
+    length = second & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", _recv_exact(sock, 2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", _recv_exact(sock, 8))[0]
+    mask = _recv_exact(sock, 4) if masked else b""
+    payload = _recv_exact(sock, length)
+    if mask:
+        payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+    return opcode, payload
+
+
+def _recv_exact(sock: socket.socket, count: int) -> bytes:
+    data = b""
+    while len(data) < count:
+        chunk = sock.recv(count - len(data))
+        if not chunk:
+            raise AssertionError("websocket closed while reading frame")
+        data += chunk
+    return data
+
+
+def _wait_for_http_command(http: HttpClient, host: Host, command: str) -> None:
+    deadline = time.monotonic() + 20
+    last = None
+    while time.monotonic() < deadline:
+        last = http.post(
+            "/api/v1/run",
+            {
+                "target": host.target,
+                "command": ["/bin/bash", "-lc", command],
+            },
+        )
+        assert last.status == HTTPStatus.OK
+        assert last.body["ok"] is True
+        if last.body["exit_code"] == 0:
+            return
+        time.sleep(0.25)
+    raise AssertionError(f"command did not succeed before timeout: {command!r}; last={last.body!r}")
+
+
+def _wait_for_gateway_command(host: Host, command: str) -> None:
+    deadline = time.monotonic() + 30
+    last = None
+    while time.monotonic() < deadline:
+        last = gateway(host, "run", host.target, "--", "/bin/bash", "-lc", command, timeout=300)
+        if last.returncode == 0:
+            return
+        time.sleep(0.5)
+    assert last is not None
+    raise AssertionError(
+        f"command did not succeed before timeout: {command!r}\n"
+        f"stdout:\n{last.stdout}\nstderr:\n{last.stderr}"
+    )
+
+
+def _start_long_running_pty(
+    http: HttpClient,
+    host: Host,
+    pidfile: str,
+    child_pidfile: str,
+) -> object:
+    command = (
+        f"rm -f {pidfile} {child_pidfile}; "
+        "trap '' HUP INT TERM; "
+        f"/bin/bash -lc 'trap \"\" HUP INT TERM; printf \"%s\" $$ > {child_pidfile}; "
+        "while :; do sleep 1; done' & "
+        f"printf '%s' $$ > {pidfile}; "
+        "wait"
+    )
+    response = http.post(
+        "/api/v1/run",
+        {
+            "target": host.target,
+            "mode": "pty",
+            "command": ["/bin/bash", "-lc", command],
+            "terminal": {"cols": 80, "rows": 24},
+        },
+    )
+    assert response.status == HTTPStatus.CREATED
+    assert response.body["ok"] is True
+    assert response.body["mode"] == "pty"
+    return response

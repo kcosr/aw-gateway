@@ -114,6 +114,34 @@ class HttpDaemon:
     def __exit__(self, exc_type, exc, tb) -> None:
         self._cleanup()
 
+    def signal_remote(self, signal: str) -> None:
+        command = f"""
+set -eu
+pids="$({_listener_pids_script(self.remote_port)})"
+test -n "$pids"
+kill -{shlex.quote(signal)} $pids
+"""
+        remote(self.host.ssh, command, timeout=30).assert_success()
+
+    def wait_exited(self, timeout: int = 20) -> None:
+        if self.process is None:
+            return
+        try:
+            self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as err:
+            raise AssertionError(
+                f"http daemon did not exit within {timeout}s{self._stderr_tail()}"
+            ) from err
+
+    def wait_remote_stopped(self, timeout: int = 20) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            result = remote(self.host.ssh, _listener_pids_script(self.remote_port), timeout=30)
+            if not result.stdout.strip():
+                return
+            time.sleep(0.25)
+        raise AssertionError(f"remote http daemon still listening after {timeout}s")
+
     def _cleanup(self) -> None:
         if self.process is not None:
             if self.process.poll() is None:
@@ -181,25 +209,11 @@ class HttpDaemon:
     def _stop_remote_http(self) -> None:
         command = f"""
 set +e
-pids=""
-if command -v lsof >/dev/null 2>&1; then
-  pids="$(lsof -ti tcp:{self.remote_port} -sTCP:LISTEN 2>/dev/null)"
-elif command -v ss >/dev/null 2>&1; then
-  pids="$(ss -H -ltnp 'sport = :{self.remote_port}' 2>/dev/null | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | sort -u)"
-elif command -v fuser >/dev/null 2>&1; then
-  pids="$(fuser {self.remote_port}/tcp 2>/dev/null)"
-fi
+pids="$({_listener_pids_script(self.remote_port)})"
 if [ -n "$pids" ]; then
   kill $pids 2>/dev/null
   sleep 0.5
-  pids=""
-  if command -v lsof >/dev/null 2>&1; then
-    pids="$(lsof -ti tcp:{self.remote_port} -sTCP:LISTEN 2>/dev/null)"
-  elif command -v ss >/dev/null 2>&1; then
-    pids="$(ss -H -ltnp 'sport = :{self.remote_port}' 2>/dev/null | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | sort -u)"
-  elif command -v fuser >/dev/null 2>&1; then
-    pids="$(fuser {self.remote_port}/tcp 2>/dev/null)"
-  fi
+  pids="$({_listener_pids_script(self.remote_port)})"
   if [ -n "$pids" ]; then
     kill -9 $pids 2>/dev/null
   fi
@@ -217,3 +231,17 @@ def _free_local_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _listener_pids_script(port: int) -> str:
+    return f"""
+pids=""
+if command -v lsof >/dev/null 2>&1; then
+  pids="$(lsof -ti tcp:{port} -sTCP:LISTEN 2>/dev/null)"
+elif command -v ss >/dev/null 2>&1; then
+  pids="$(ss -H -ltnp 'sport = :{port}' 2>/dev/null | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | sort -u)"
+elif command -v fuser >/dev/null 2>&1; then
+  pids="$(fuser {port}/tcp 2>/dev/null)"
+fi
+printf '%s\\n' "$pids"
+"""

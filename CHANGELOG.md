@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added HTTP `mode = "pty"` for `run` and `launch` operations, with
+  short-lived WebSocket attach leases for interactive terminal sessions
+  ([#49](https://github.com/kcosr/aw-gateway/pull/49)).
+- Added resolved target metadata to launch detail responses
+  ([#49](https://github.com/kcosr/aw-gateway/pull/49)).
+
 ### Changed
 
 - Foreground `run` and `launch` now handle `SIGINT`, `SIGTERM`, and `SIGHUP`
@@ -11,6 +19,18 @@
 - HTTP wait-mode `run` and `launch` responses can now project selected captured
   streams as JSON with `output_format`
   ([#47](https://github.com/kcosr/aw-gateway/pull/47)).
+
+### Fixed
+
+- HTTP PTY close and WebSocket disconnect now terminate the in-container
+  attached process tree instead of relying only on the host-side runtime client
+  ([#49](https://github.com/kcosr/aw-gateway/pull/49)).
+- HTTP daemon shutdown now waits briefly for active PTY sessions to run the same
+  in-container cleanup path before the listener exits
+  ([#49](https://github.com/kcosr/aw-gateway/pull/49)).
+- HTTP PTY cleanup retries now keep the in-container marker until after the
+  termination sequence completes
+  ([#49](https://github.com/kcosr/aw-gateway/pull/49)).
 
 ## [0.4.1] - 2026-05-26
 

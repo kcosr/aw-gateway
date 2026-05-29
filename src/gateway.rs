@@ -72,7 +72,7 @@ use client::{read_default_selection, resolve_target_selection};
 #[cfg(test)]
 use container_spec::DEFAULT_SESSION_SHELL_ENV;
 use control_sockets::{render_control_socket_paths, resolve_container_path};
-use execution::{OperationRunner, run_container_command_with_runtime};
+use execution::{OperationRunner, PreparedExecution, run_container_command_with_runtime};
 use health::run_argv_with_options;
 #[cfg(test)]
 use health::run_health_check;
@@ -605,6 +605,7 @@ async fn exec_final_container_command(
     .await
 }
 
+#[cfg(test)]
 async fn exec_final_container_command_with_options(
     runtime: &Runtime,
     command: Vec<String>,
@@ -612,7 +613,17 @@ async fn exec_final_container_command_with_options(
     env: BTreeMap<String, String>,
     options: OperationExecutionOptions,
 ) -> anyhow::Result<ExecutionOutcome> {
-    let exec_spec = ContainerExecSpec {
+    let exec_spec = final_container_exec_spec(runtime, command, cwd, env);
+    exec_container_command_with_options(runtime, &exec_spec, options).await
+}
+
+fn final_container_exec_spec(
+    runtime: &Runtime,
+    command: Vec<String>,
+    cwd: Option<PathBuf>,
+    env: BTreeMap<String, String>,
+) -> ContainerExecSpec {
+    ContainerExecSpec {
         stdin_tty: std::io::stdin().is_terminal(),
         stdout_tty: std::io::stdout().is_terminal(),
         user: runtime.exec_identity(),
@@ -620,13 +631,20 @@ async fn exec_final_container_command_with_options(
         env,
         container_name: runtime.identity.container_name.clone(),
         command,
-    };
+    }
+}
+
+async fn exec_container_command_with_options(
+    runtime: &Runtime,
+    exec_spec: &ContainerExecSpec,
+    options: OperationExecutionOptions,
+) -> anyhow::Result<ExecutionOutcome> {
     match options.mode {
         OperationMode::Stream => Ok(ExecutionOutcome::new(
-            runtime.container_runtime.exec(&exec_spec).await?,
+            runtime.container_runtime.exec(exec_spec).await?,
         )),
         OperationMode::Wait => {
-            let output = runtime.container_runtime.exec_capture(&exec_spec).await?;
+            let output = runtime.container_runtime.exec_capture(exec_spec).await?;
             Ok(ExecutionOutcome::captured(
                 output.exit_code,
                 options.output.stdout.then_some(output.stdout),
@@ -634,7 +652,7 @@ async fn exec_final_container_command_with_options(
             ))
         }
         OperationMode::Detach => Ok(ExecutionOutcome::new(
-            runtime.container_runtime.exec_discard(&exec_spec).await?,
+            runtime.container_runtime.exec_discard(exec_spec).await?,
         )),
     }
 }
@@ -820,6 +838,42 @@ async fn launch_execute_with_config(
         .map_err(OperationError::operation_failed)
 }
 
+async fn prepare_run_execution_with_config(
+    cfg: GatewayConfig,
+    target: Option<String>,
+    session_id: Option<String>,
+    cwd: Option<String>,
+    command: Vec<String>,
+) -> OperationResult<PreparedExecution> {
+    let runtime = Runtime::from_config(cfg, target.as_deref(), session_id, true, None).await?;
+    OperationRunner::run_command(runtime, OperationExecutionOptions::STREAM, cwd, command)
+        .prepare()
+        .await
+        .map_err(OperationError::operation_failed)
+}
+
+async fn prepare_launch_execution_with_config(
+    cfg: GatewayConfig,
+    name: &str,
+    session_id: Option<String>,
+    supplied: SuppliedLaunchVars,
+) -> OperationResult<PreparedExecution> {
+    let launch = lookup_launch(&cfg, name)?;
+    let resolved_vars = resolve_launch_vars(name, &launch, &supplied)?;
+    let target = launch.target.clone();
+    let runtime =
+        Runtime::from_config(cfg, Some(&target), session_id, true, Some(name.to_string())).await?;
+    OperationRunner::launch(
+        runtime,
+        OperationExecutionOptions::STREAM,
+        launch,
+        resolved_vars,
+    )
+    .prepare()
+    .await
+    .map_err(OperationError::operation_failed)
+}
+
 fn launch_summaries(cfg: &GatewayConfig) -> anyhow::Result<Vec<LaunchSummary>> {
     Ok(cfg
         .effective_launches()?
@@ -833,17 +887,28 @@ fn launch_summaries(cfg: &GatewayConfig) -> anyhow::Result<Vec<LaunchSummary>> {
         .collect())
 }
 
-fn launch_detail(name: &str, launch: &LaunchConfig) -> LaunchDetail {
-    LaunchDetail {
+fn launch_detail(
+    cfg: &GatewayConfig,
+    name: &str,
+    launch: &LaunchConfig,
+) -> anyhow::Result<LaunchDetail> {
+    let target = cfg.effective_target(&launch.target)?;
+    Ok(LaunchDetail {
         name: name.to_string(),
         target: launch.target.clone(),
+        target_mode: target_mode_name(target.mode).into(),
+        target_container: if target.mode == TargetMode::Fixed {
+            Some(target.container_name(None)?)
+        } else {
+            None
+        },
         description: launch.description.clone(),
         vars: launch_var_metadata(&launch.vars),
         steps: launch.steps.iter().map(launch_step_detail).collect(),
         cwd: launch.cwd.clone(),
         env: launch.env.clone(),
         command: launch.command.clone(),
-    }
+    })
 }
 
 fn launch_var_metadata(
@@ -1063,7 +1128,7 @@ fn target_entries(cfg: &GatewayConfig) -> anyhow::Result<Vec<TargetEntry>> {
             Ok(TargetEntry {
                 target: name.clone(),
                 image: target.image.clone(),
-                mode: format!("{:?}", target.mode).to_lowercase(),
+                mode: target_mode_name(target.mode).into(),
                 container: target_container_display(target)?,
                 default: name == &default_target,
             })
@@ -1081,6 +1146,13 @@ fn target_container_display(target: &TargetConfig) -> anyhow::Result<String> {
             .unwrap_or("{image_slug}-{session_id}")
             .to_string(),
     })
+}
+
+fn target_mode_name(mode: TargetMode) -> &'static str {
+    match mode {
+        TargetMode::Fixed => "fixed",
+        TargetMode::Ephemeral => "ephemeral",
+    }
 }
 
 #[derive(Debug)]

@@ -5,11 +5,17 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::io::Read;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::process::Command;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
 mod parse;
@@ -64,6 +70,339 @@ pub struct ContainerExecOutput {
     pub exit_code: i32,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerPtySize {
+    pub rows: u16,
+    pub cols: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+}
+
+#[derive(Debug)]
+pub struct ContainerPtySession {
+    pub output: mpsc::Receiver<Vec<u8>>,
+    pub input: mpsc::Sender<Vec<u8>>,
+    pub resize: mpsc::Sender<ContainerPtySize>,
+    pub exit: JoinHandle<anyhow::Result<i32>>,
+    killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
+    child_pid: Option<u32>,
+    cleanup_runtime: ContainerRuntime,
+    cleanup_spec: ContainerExecSpec,
+    cleanup_marker_path: String,
+}
+
+const PTY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const PTY_HOST_TERMINATE_DELAY: Duration = Duration::from_millis(100);
+const PTY_INITIAL_CLEANUP_JOIN_TIMEOUT: Duration = Duration::from_millis(2500);
+
+impl ContainerPtySession {
+    pub async fn terminate(&self) -> anyhow::Result<()> {
+        tracing::info!(
+            container = %self.cleanup_spec.container_name,
+            marker = %self.cleanup_marker_path,
+            child_pid = ?self.child_pid,
+            "terminating container pty session"
+        );
+        let cleanup_runtime = self.cleanup_runtime.clone();
+        let cleanup_spec = self.cleanup_spec.clone();
+        let cleanup_marker_path = self.cleanup_marker_path.clone();
+        let cleanup_container_name = self.cleanup_spec.container_name.clone();
+        let initial_cleanup_runtime = cleanup_runtime.clone();
+        let initial_cleanup_spec = cleanup_spec.clone();
+        let initial_cleanup_marker_path = cleanup_marker_path.clone();
+        let initial_cleanup_container_name = cleanup_container_name.clone();
+        let mut cleanup = tokio::spawn(async move {
+            run_container_pty_cleanup(
+                initial_cleanup_runtime,
+                initial_cleanup_spec,
+                initial_cleanup_marker_path,
+                initial_cleanup_container_name,
+                "initial",
+            )
+            .await
+        });
+        let killer = self.killer.clone();
+        let child_pid = self.child_pid;
+        let host_terminate = async move {
+            tokio::time::sleep(PTY_HOST_TERMINATE_DELAY).await;
+            terminate_host_pty_child(killer, child_pid).await
+        };
+
+        let host_result = host_terminate.await;
+        let initial_cleanup_finished =
+            match tokio::time::timeout(PTY_INITIAL_CLEANUP_JOIN_TIMEOUT, &mut cleanup).await {
+                Ok(Ok(ok)) => ok,
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        error = %err,
+                        container = %cleanup_container_name,
+                        marker = %cleanup_marker_path,
+                        "initial container pty cleanup task failed"
+                    );
+                    false
+                }
+                Err(_) => {
+                    cleanup.abort();
+                    tracing::warn!(
+                        container = %cleanup_container_name,
+                        marker = %cleanup_marker_path,
+                        "initial container pty cleanup task timed out"
+                    );
+                    false
+                }
+            };
+        if !initial_cleanup_finished {
+            run_container_pty_cleanup(
+                cleanup_runtime,
+                cleanup_spec,
+                cleanup_marker_path,
+                cleanup_container_name,
+                "post-host-terminate",
+            )
+            .await;
+        }
+        host_result
+    }
+}
+
+async fn run_container_pty_cleanup(
+    runtime: ContainerRuntime,
+    spec: ContainerExecSpec,
+    marker_path: String,
+    container_name: String,
+    phase: &'static str,
+) -> bool {
+    match runtime
+        .exec_discard_with_timeout(&spec, Some(PTY_CLEANUP_TIMEOUT))
+        .await
+    {
+        Ok(exit_code) => {
+            tracing::info!(
+                container = %container_name,
+                marker = %marker_path,
+                phase,
+                exit_code,
+                "container pty cleanup exec finished"
+            );
+            true
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                container = %container_name,
+                marker = %marker_path,
+                phase,
+                "container pty cleanup exec failed"
+            );
+            false
+        }
+    }
+}
+
+async fn terminate_host_pty_child(
+    killer: Arc<Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
+    child_pid: Option<u32>,
+) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        #[cfg(unix)]
+        if let Some(child_pid) = child_pid {
+            terminate_process_group(child_pid);
+        }
+        killer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pty child killer lock poisoned"))?
+            .kill()
+            .map_err(anyhow::Error::from)
+    })
+    .await
+    .context("join pty child terminate task")?
+}
+
+impl Drop for ContainerPtySession {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(child_pid) = self.child_pid {
+            terminate_process_group_nonblocking(child_pid);
+        }
+        match self.killer.lock() {
+            Ok(mut killer) => {
+                if let Err(err) = killer.kill() {
+                    tracing::debug!(error = %err, "pty child terminate on drop failed");
+                }
+            }
+            Err(_) => {
+                tracing::debug!("pty child killer lock poisoned during drop");
+            }
+        }
+    }
+}
+
+static NEXT_PTY_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(unix)]
+fn terminate_process_group(child_pid: u32) {
+    terminate_process_group_nonblocking(child_pid);
+    std::thread::sleep(Duration::from_millis(100));
+    signal_process_group(child_pid, libc::SIGKILL);
+    signal_process(child_pid, libc::SIGKILL);
+}
+
+#[cfg(unix)]
+fn terminate_process_group_nonblocking(child_pid: u32) {
+    signal_process_group(child_pid, libc::SIGHUP);
+    signal_process_group(child_pid, libc::SIGTERM);
+    signal_process(child_pid, libc::SIGHUP);
+    signal_process(child_pid, libc::SIGTERM);
+}
+
+#[cfg(unix)]
+fn signal_process_group(child_pid: u32, signal: libc::c_int) {
+    let pid = child_pid as libc::pid_t;
+    if pid > 1 {
+        unsafe {
+            libc::kill(-pid, signal);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn signal_process(child_pid: u32, signal: libc::c_int) {
+    let pid = child_pid as libc::pid_t;
+    if pid > 1 {
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+}
+
+fn run_pty_master_pump(
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    output_tx: mpsc::Sender<Vec<u8>>,
+    mut resize_rx: mpsc::Receiver<ContainerPtySize>,
+) {
+    #[cfg(unix)]
+    {
+        run_unix_pty_master_pump(master, output_tx, &mut resize_rx);
+    }
+    #[cfg(not(unix))]
+    {
+        let mut reader = match master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(err) => {
+                tracing::warn!(error = %err, "pty reader clone failed");
+                return;
+            }
+        };
+        let mut buffer = [0_u8; 8192];
+        loop {
+            while let Ok(size) = resize_rx.try_recv() {
+                if let Err(err) = master.resize(pty_size(size)) {
+                    tracing::warn!(error = %err, "pty resize failed");
+                }
+            }
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if output_tx.blocking_send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_unix_pty_master_pump(
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    output_tx: mpsc::Sender<Vec<u8>>,
+    resize_rx: &mut mpsc::Receiver<ContainerPtySize>,
+) {
+    use std::io;
+    use std::os::fd::RawFd;
+
+    const POLL_TIMEOUT_MS: libc::c_int = 100;
+
+    let Some(fd) = master.as_raw_fd() else {
+        tracing::warn!("pty master does not expose a unix fd");
+        return;
+    };
+    let mut buffer = [0_u8; 8192];
+    loop {
+        if !drain_pty_resize_requests(&*master, resize_rx) {
+            break;
+        }
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+            revents: 0,
+        };
+        let poll_result = unsafe { libc::poll(&mut poll_fd, 1, POLL_TIMEOUT_MS) };
+        if poll_result < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            tracing::warn!(error = %err, "pty poll failed");
+            break;
+        }
+        if poll_result == 0 {
+            continue;
+        }
+        if poll_fd.revents & (libc::POLLERR | libc::POLLHUP) != 0
+            && poll_fd.revents & libc::POLLIN == 0
+        {
+            break;
+        }
+        if poll_fd.revents & libc::POLLIN == 0 {
+            continue;
+        }
+        let bytes_read = unsafe {
+            libc::read(
+                fd as RawFd,
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer.len(),
+            )
+        };
+        if bytes_read == 0 {
+            break;
+        }
+        if bytes_read < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            tracing::warn!(error = %err, "pty read failed");
+            break;
+        }
+        let bytes_read = bytes_read as usize;
+        if output_tx
+            .blocking_send(buffer[..bytes_read].to_vec())
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn drain_pty_resize_requests(
+    master: &dyn portable_pty::MasterPty,
+    resize_rx: &mut mpsc::Receiver<ContainerPtySize>,
+) -> bool {
+    loop {
+        match resize_rx.try_recv() {
+            Ok(size) => {
+                if let Err(err) = master.resize(pty_size(size)) {
+                    tracing::warn!(error = %err, "pty resize failed");
+                }
+            }
+            Err(mpsc::error::TryRecvError::Empty) => return true,
+            Err(mpsc::error::TryRecvError::Disconnected) => return false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +605,14 @@ impl ContainerRuntime {
     }
 
     pub async fn exec_discard(&self, spec: &ContainerExecSpec) -> anyhow::Result<i32> {
+        self.exec_discard_with_timeout(spec, None).await
+    }
+
+    pub async fn exec_discard_with_timeout(
+        &self,
+        spec: &ContainerExecSpec,
+        timeout_duration: Option<Duration>,
+    ) -> anyhow::Result<i32> {
         let mut command = self.command();
         command
             .arg("exec")
@@ -274,10 +621,84 @@ impl ContainerRuntime {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let status = command.status().await.with_context(|| {
-            format!("run {} exec {}", self.runtime_label(), spec.container_name)
-        })?;
+        let status = match timeout_duration {
+            Some(timeout_duration) => tokio::time::timeout(timeout_duration, command.status())
+                .await
+                .with_context(|| {
+                    format!(
+                        "{} exec {} timed out after {:?}",
+                        self.runtime_label(),
+                        spec.container_name,
+                        timeout_duration
+                    )
+                })?,
+            None => command.status().await,
+        }
+        .with_context(|| format!("run {} exec {}", self.runtime_label(), spec.container_name))?;
         Ok(exit_code(status))
+    }
+
+    pub fn exec_pty(
+        &self,
+        spec: &ContainerExecSpec,
+        size: ContainerPtySize,
+    ) -> anyhow::Result<ContainerPtySession> {
+        const PTY_OUTPUT_BUFFER: usize = 64;
+        const PTY_INPUT_BUFFER: usize = 64;
+        const PTY_RESIZE_BUFFER: usize = 16;
+
+        let mut pty_spec = spec.clone();
+        pty_spec.stdin_tty = true;
+        pty_spec.stdout_tty = true;
+        let marker = next_pty_marker()?;
+        pty_spec.command = wrap_pty_command(&spec.command, &marker);
+        let cleanup_spec = pty_cleanup_spec(spec, &marker);
+
+        let pty_system = portable_pty::native_pty_system();
+        let pair = pty_system.openpty(pty_size(size))?;
+        let mut command = portable_pty::CommandBuilder::new(&self.program);
+        command.arg("exec");
+        command.args(self.exec_args(&pty_spec));
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+
+        let mut writer = pair.master.take_writer()?;
+        let mut child = pair.slave.spawn_command(command)?;
+        drop(pair.slave);
+        let child_pid = child.process_id();
+        let killer = Arc::new(Mutex::new(child.clone_killer()));
+
+        let (output_tx, output) = mpsc::channel(PTY_OUTPUT_BUFFER);
+        let (input, mut input_rx) = mpsc::channel::<Vec<u8>>(PTY_INPUT_BUFFER);
+        let (resize, resize_rx) = mpsc::channel::<ContainerPtySize>(PTY_RESIZE_BUFFER);
+
+        std::thread::spawn(move || run_pty_master_pump(pair.master, output_tx, resize_rx));
+
+        std::thread::spawn(move || {
+            while let Some(bytes) = input_rx.blocking_recv() {
+                if writer.write_all(&bytes).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let exit = tokio::task::spawn_blocking(move || {
+            let status = child.wait()?;
+            Ok(status.exit_code() as i32)
+        });
+
+        Ok(ContainerPtySession {
+            output,
+            input,
+            resize,
+            exit,
+            killer,
+            child_pid,
+            cleanup_runtime: self.clone(),
+            cleanup_spec,
+            cleanup_marker_path: marker.path,
+        })
     }
 
     pub async fn exec_quiet<I, S>(&self, name: &str, args: I) -> anyhow::Result<i32>
@@ -523,6 +944,100 @@ impl ContainerRuntime {
             ContainerRuntimeType::Colima => "colima/docker",
         }
     }
+}
+
+fn pty_size(size: ContainerPtySize) -> portable_pty::PtySize {
+    portable_pty::PtySize {
+        rows: size.rows,
+        cols: size.cols,
+        pixel_width: size.pixel_width,
+        pixel_height: size.pixel_height,
+    }
+}
+
+struct PtyMarker {
+    path: String,
+    token: String,
+}
+
+fn next_pty_marker() -> anyhow::Result<PtyMarker> {
+    let id = NEXT_PTY_ID.fetch_add(1, Ordering::Relaxed);
+    Ok(PtyMarker {
+        path: format!("/tmp/aw-gateway-pty-{}-{id}.pid", std::process::id()),
+        token: random_pty_marker_token()?,
+    })
+}
+
+fn random_pty_marker_token() -> anyhow::Result<String> {
+    let mut bytes = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .context("open /dev/urandom")?
+        .read_exact(&mut bytes)
+        .context("read /dev/urandom")?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn wrap_pty_command(command: &[String], marker: &PtyMarker) -> Vec<String> {
+    let mut wrapped = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        r#"printf "%s %s\n" "$$" "$2" > "$1"; shift 2; exec "$@""#.to_string(),
+        "aw-gateway-pty".to_string(),
+        marker.path.clone(),
+        marker.token.clone(),
+    ];
+    wrapped.extend(command.iter().cloned());
+    wrapped
+}
+
+fn pty_cleanup_spec(spec: &ContainerExecSpec, marker: &PtyMarker) -> ContainerExecSpec {
+    let mut cleanup = spec.clone();
+    cleanup.stdin_tty = false;
+    cleanup.stdout_tty = false;
+    cleanup.command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        r#"read pid token < "$1" 2>/dev/null || exit 0
+[ "$token" = "$2" ] || exit 0
+case "$pid" in ""|*[!0-9]*|0|1) exit 0 ;; esac
+descendants=$(ps -e -o pid= -o ppid= 2>/dev/null | awk -v root="$pid" '
+  {
+    children[$2] = children[$2] " " $1
+  }
+  END {
+    frontier = root
+    while (frontier != "") {
+      next_frontier = ""
+      count = split(frontier, parents, /[[:space:]]+/)
+      for (i = 1; i <= count; i++) {
+        if (parents[i] == "") {
+          continue
+        }
+        count_children = split(children[parents[i]], ids, /[[:space:]]+/)
+        for (j = 1; j <= count_children; j++) {
+          if (ids[j] == "") {
+            continue
+          }
+          print ids[j]
+          next_frontier = next_frontier " " ids[j]
+        }
+      }
+      frontier = next_frontier
+    }
+  }')
+kill -HUP "-$pid" 2>/dev/null || kill -HUP "$pid" 2>/dev/null || true
+kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+[ -z "$descendants" ] || kill -TERM $descendants 2>/dev/null || true
+sleep 0.2
+kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+[ -z "$descendants" ] || kill -KILL $descendants 2>/dev/null || true
+rm -f "$1""#
+            .to_string(),
+        "aw-gateway-pty-cleanup".to_string(),
+        marker.path.clone(),
+        marker.token.clone(),
+    ];
+    cleanup
 }
 
 fn render_runtime_value(value: &str, user: &str, home: &Path) -> anyhow::Result<String> {
@@ -776,6 +1291,50 @@ mod tests {
         assert_eq!(exec_stdio_arg(true, false), Some("-i"));
         assert_eq!(exec_stdio_arg(false, true), None);
         assert_eq!(exec_stdio_arg(false, false), None);
+    }
+
+    #[test]
+    fn pty_wrapper_and_cleanup_commands_are_stable() {
+        let marker = PtyMarker {
+            path: "/tmp/aw-gateway-pty-test.pid".into(),
+            token: "test-token".into(),
+        };
+        let command = vec!["/bin/bash".into(), "-lc".into(), "echo ok".into()];
+
+        let wrapped = wrap_pty_command(&command, &marker);
+        assert_eq!(wrapped[0], "/bin/sh");
+        assert_eq!(wrapped[1], "-c");
+        assert_eq!(wrapped[3], "aw-gateway-pty");
+        assert_eq!(wrapped[4], marker.path.as_str());
+        assert_eq!(wrapped[5], marker.token.as_str());
+        assert_eq!(&wrapped[6..], command.as_slice());
+
+        let spec = ContainerExecSpec {
+            stdin_tty: true,
+            stdout_tty: true,
+            user: "2450:100".into(),
+            cwd: Some(PathBuf::from("/home/alice/project")),
+            env: BTreeMap::new(),
+            container_name: "ubuntu-dev".into(),
+            command,
+        };
+        let cleanup = pty_cleanup_spec(&spec, &marker);
+        assert!(!cleanup.stdin_tty);
+        assert!(!cleanup.stdout_tty);
+        assert_eq!(cleanup.command[0], "/bin/sh");
+        assert_eq!(cleanup.command[1], "-c");
+
+        let script = &cleanup.command[2];
+        let kill_pos = script.rfind("kill -KILL").expect("kill command");
+        let rm_pos = script.rfind("rm -f \"$1\"").expect("marker removal");
+        assert!(rm_pos > kill_pos);
+        assert!(script.contains("ps -e -o pid= -o ppid="));
+
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", script])
+            .status()
+            .expect("run shell syntax check");
+        assert!(status.success());
     }
 
     #[cfg(unix)]

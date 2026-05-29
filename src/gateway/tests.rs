@@ -2188,6 +2188,70 @@ exit 0
 }
 
 #[tokio::test]
+async fn prepared_execution_failure_runs_post_session_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<JSON
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":false,"Pid":0}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  start)
+    exit 7
+    ;;
+  stop)
+    ;;
+  unshare)
+    rm -rf "$5"
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+        ),
+    );
+    let mut runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        cfg.target_defaults.lifecycle_steps.clear();
+        cfg.target_defaults.host_steps.clear();
+    });
+    let home = dir.path().join("home");
+    let workspace = home.join(".cache/aw-gateway/workspaces/default-abc");
+    configure_workspace_cleanup_runtime(
+        &mut runtime,
+        WorkspaceCleanup::Always,
+        workspace.clone(),
+        home,
+        "abc",
+    );
+
+    let result = OperationRunner::run_command(
+        runtime,
+        OperationExecutionOptions::STREAM,
+        None,
+        vec!["echo".into()],
+    )
+    .prepare()
+    .await;
+    let err = match result {
+        Ok(_) => panic!("prepare should fail"),
+        Err(err) => err,
+    };
+
+    assert!(err.to_string().contains("start"));
+    assert!(
+        !workspace.exists(),
+        "prepare failure should apply post-session workspace cleanup"
+    );
+}
+
+#[tokio::test]
 async fn ensure_ready_create_missing_removes_stale_control_socket_files_before_run() {
     let dir = tempfile::tempdir().unwrap();
     let fake_runtime = dir.path().join("runtime");

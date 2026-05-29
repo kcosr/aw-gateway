@@ -1089,8 +1089,10 @@ list configured launches.
 `name`, `target`, optional `description`, and a `vars` object keyed by variable
 name with `type`, `required`, optional `default`, optional enum `values`, and
 optional `description`. `launch show --json` emits one detail object with the
-same variable metadata plus `steps`, optional final `cwd`, optional final
-`env`, and final `command`.
+same variable metadata plus resolved target mode, fixed-target container name,
+`steps`, optional final `cwd`, optional final `env`, and final `command`.
+Ephemeral launch detail omits the concrete container name because it is not
+known until a session id is selected.
 
 Launch execution order is:
 
@@ -1395,6 +1397,33 @@ There is no query-later result endpoint for detached operations. Detached
 operations run in the background through the same gateway operation layer and
 are observable only through existing lifecycle/status side effects.
 
+PTY-mode command and launch requests prepare an interactive session and return
+HTTP 201 with a short-lived single-use attach lease:
+
+```json
+{
+  "ok": true,
+  "mode": "pty",
+  "status": "prepared",
+  "pty_id": "pty_abc123",
+  "attach_token": "awpt_secret",
+  "session_id": "abc123def456",
+  "attach_url": "/api/v1/pty/pty_abc123"
+}
+```
+
+For fixed targets, `session_id` is `null`.
+
+The POST is the authorized `run` or `launch` action and may block while the
+target becomes ready and launch steps run. The client then opens the WebSocket
+attach URL and sends the first text frame as `{"type":"auth","token":"..."}`.
+The attach token is a one-time lease-scoped capability; bearer headers are not
+used on the WebSocket route so browser-native clients can attach. After auth,
+binary WebSocket frames carry terminal bytes, text `resize` frames update the
+PTY size, and closing the WebSocket cancels the foreground PTY exec while normal
+idle/workspace cleanup policy decides whether the container remains available.
+Gateway shutdown also cancels active PTY execs and expires prepared leases.
+
 Errors use a stable envelope:
 
 ```json
@@ -1413,6 +1442,7 @@ Errors use a stable envelope:
 | `GET` | `/api/v1/launches/{name}` | `launch` | `GatewayOperation::LaunchShow` |
 | `POST` | `/api/v1/launches/{name}/run` | `launch` | `GatewayOperation::Launch` |
 | `POST` | `/api/v1/run` | `run` | `GatewayOperation::Run` |
+| `GET` | `/api/v1/pty/{pty_id}` | lease token | WebSocket PTY attach |
 
 Lifecycle POST bodies accept optional `target` and `session_id` fields. Fixed
 targets reject `session_id`; ephemeral targets require it for `stop` and
@@ -1420,11 +1450,12 @@ targets reject `session_id`; ephemeral targets require it for `stop` and
 
 Command-like POST bodies also accept optional `mode`, `output`, and
 `output_format` fields.
-`mode` defaults to `wait` and can be `wait` or `detach`; HTTP does not expose
-stream mode. `output` defaults to `["stdout", "stderr"]`, accepts only
-`stdout` and `stderr`, and applies only to wait responses. `output_format`
-accepts `text` or `json` for selected streams and defaults to `text`.
-`output` and `output_format` are rejected for detach requests.
+`mode` defaults to `wait` and can be `wait`, `detach`, or `pty`; HTTP does not
+expose inherited-stdio stream mode. `output` defaults to
+`["stdout", "stderr"]`, accepts only `stdout` and `stderr`, and applies only to
+wait responses. `output_format` accepts `text` or `json` for selected streams
+and defaults to `text`. `output` and `output_format` are rejected for detach and
+PTY requests.
 
 ```json
 {
@@ -1460,10 +1491,24 @@ and non-finite numbers are rejected as `invalid_launch_var`.
 }
 ```
 
-The initial HTTP API intentionally does not implement streaming, SSE/NDJSON,
-persistent jobs, TTY sessions, SSH key management, generated client config or
-bundles, proxy/tunnel helpers, default-target management, route aliases, or
-retired config-shape compatibility.
+PTY requests must include an initial terminal size. Pixel dimensions are
+optional:
+
+```json
+{
+  "command": ["bash", "-lc", "exec bash"],
+  "mode": "pty",
+  "terminal": {
+    "cols": 120,
+    "rows": 34,
+    "cell_width_px": 9,
+    "cell_height_px": 18
+  }
+}
+```
+
+PTY attach leases are single-use. A PTY session cannot be replayed or attached
+by multiple clients.
 
 ## Assets
 
