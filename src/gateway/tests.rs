@@ -36,6 +36,11 @@ case "$1" in
 JSON
     ;;
   exec)
+    case "$*" in
+      *aw-gateway-marker-list*|*aw-gateway-marker-sweep*)
+        exit 0
+        ;;
+    esac
     exit {exit_code}
     ;;
 esac
@@ -93,6 +98,11 @@ case "$1" in
 JSON
     ;;
   exec)
+    case "$*" in
+      *aw-gateway-marker-list*|*aw-gateway-marker-sweep*)
+        exit 0
+        ;;
+    esac
     echo started > "{log}"
     sleep 0.2
     echo done >> "{log}"
@@ -1286,6 +1296,11 @@ case "$1" in
 JSON
     ;;
   exec)
+    case "$*" in
+      *aw-gateway-marker-list*|*aw-gateway-marker-sweep*)
+        exit 0
+        ;;
+    esac
     echo "captured stdout"
     echo "captured stderr" >&2
     exit 23
@@ -1420,6 +1435,11 @@ case "$1" in
 JSON
     ;;
   exec)
+    case "$*" in
+      *aw-gateway-marker-list*|*aw-gateway-marker-sweep*)
+        exit 0
+        ;;
+    esac
     echo "$@" >> "{runtime_log}"
     exit 0
     ;;

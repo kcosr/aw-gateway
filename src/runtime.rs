@@ -111,6 +111,10 @@ const CANCEL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const CANCEL_HOST_TERMINATE_DELAY: Duration = Duration::from_millis(100);
 const CANCEL_INITIAL_CLEANUP_JOIN_TIMEOUT: Duration = Duration::from_millis(2500);
 const CANCEL_HOST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const CANCEL_MARKER_LIST_ARGV0: &str = "aw-gateway-marker-list";
+const CANCEL_MARKER_SWEEP_ARGV0: &str = "aw-gateway-marker-sweep";
+const CANCEL_MARKER_PATH_PREFIX: &str = "/tmp/aw-gateway-";
+const CANCEL_MARKER_PATH_SUFFIX: &str = ".pid";
 
 impl ContainerPtySession {
     pub async fn terminate(&self) -> anyhow::Result<()> {
@@ -372,12 +376,22 @@ async fn cancel_container_exec_child(
     }
 }
 
+#[cfg(unix)]
 async fn terminate_host_exec_child(child_pid: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(child_pid) = child_pid {
-        terminate_process_group(child_pid);
+    if let Some(child_pid) = child_pid
+        && let Err(err) =
+            tokio::task::spawn_blocking(move || terminate_process_group(child_pid)).await
+    {
+        tracing::warn!(
+            error = %err,
+            child_pid,
+            "host runtime exec process-group terminate task failed"
+        );
     }
 }
+
+#[cfg(not(unix))]
+async fn terminate_host_exec_child(_child_pid: Option<u32>) {}
 
 impl Drop for ContainerPtySession {
     fn drop(&mut self) {
@@ -636,6 +650,47 @@ impl ContainerRuntime {
 
     pub fn env(&self) -> &BTreeMap<String, String> {
         &self.env
+    }
+
+    pub async fn sweep_stale_cancel_markers(
+        &self,
+        container_name: &str,
+        user: &str,
+    ) -> anyhow::Result<usize> {
+        let spec = cancel_marker_list_spec(container_name, user);
+        let output = self
+            .exec_capture_with_timeout(&spec, Some(CANCEL_CLEANUP_TIMEOUT))
+            .await?;
+        if output.exit_code != 0 {
+            anyhow::bail!(
+                "{} exec {} stale cancel marker list exited with status {}",
+                self.runtime_label(),
+                container_name,
+                output.exit_code
+            );
+        }
+
+        let listed = String::from_utf8_lossy(&output.stdout);
+        let stale = stale_cancel_marker_paths(listed.lines(), host_process_is_active);
+        if stale.is_empty() {
+            return Ok(0);
+        }
+
+        for chunk in stale.chunks(100) {
+            let spec = cancel_marker_sweep_spec(container_name, user, chunk);
+            let exit_code = self
+                .exec_discard_with_timeout(&spec, Some(CANCEL_CLEANUP_TIMEOUT))
+                .await?;
+            if exit_code != 0 {
+                anyhow::bail!(
+                    "{} exec {} stale cancel marker sweep exited with status {}",
+                    self.runtime_label(),
+                    container_name,
+                    exit_code
+                );
+            }
+        }
+        Ok(stale.len())
     }
 
     pub async fn inspect(&self, name: &str) -> anyhow::Result<Option<ContainerInspect>> {
@@ -1362,6 +1417,101 @@ rm -f "$1""#
     cleanup
 }
 
+fn cancel_marker_list_spec(container_name: &str, user: &str) -> ContainerExecSpec {
+    ContainerExecSpec {
+        stdin_tty: false,
+        stdout_tty: false,
+        user: user.to_string(),
+        cwd: None,
+        env: BTreeMap::new(),
+        container_name: container_name.to_string(),
+        command: vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            r#"for path in /tmp/aw-gateway-*-*.pid; do
+  [ -e "$path" ] || continue
+  printf '%s\n' "$path"
+done"#
+                .to_string(),
+            CANCEL_MARKER_LIST_ARGV0.to_string(),
+        ],
+    }
+}
+
+fn cancel_marker_sweep_spec(
+    container_name: &str,
+    user: &str,
+    marker_paths: &[String],
+) -> ContainerExecSpec {
+    let mut command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        r#"for path do
+  case "$path" in
+    /tmp/aw-gateway-*-*.pid) rm -f -- "$path" ;;
+  esac
+done"#
+            .to_string(),
+        CANCEL_MARKER_SWEEP_ARGV0.to_string(),
+    ];
+    command.extend(marker_paths.iter().cloned());
+    ContainerExecSpec {
+        stdin_tty: false,
+        stdout_tty: false,
+        user: user.to_string(),
+        cwd: None,
+        env: BTreeMap::new(),
+        container_name: container_name.to_string(),
+        command,
+    }
+}
+
+fn stale_cancel_marker_paths<'a, I, F>(paths: I, host_process_is_active: F) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+    F: Fn(u32) -> bool,
+{
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let pid = parse_cancel_marker_host_pid(path)?;
+            (!host_process_is_active(pid)).then(|| path.to_string())
+        })
+        .collect()
+}
+
+fn parse_cancel_marker_host_pid(path: &str) -> Option<u32> {
+    let rest = path.strip_prefix(CANCEL_MARKER_PATH_PREFIX)?;
+    let rest = rest.strip_suffix(CANCEL_MARKER_PATH_SUFFIX)?;
+    let (kind_and_pid, id) = rest.rsplit_once('-')?;
+    if id.is_empty() || !id.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let (kind, pid) = kind_and_pid.rsplit_once('-')?;
+    if kind.is_empty() {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+#[cfg(unix)]
+fn host_process_is_active(pid: u32) -> bool {
+    let pid = pid as libc::pid_t;
+    if pid <= 0 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn host_process_is_active(pid: u32) -> bool {
+    pid == std::process::id()
+}
+
 fn render_runtime_value(value: &str, user: &str, home: &Path) -> anyhow::Result<String> {
     let mut vars = Vars::new();
     vars.insert("user".into(), user.to_string());
@@ -1686,6 +1836,60 @@ mod tests {
             .status()
             .expect("run shell syntax check");
         assert!(status.success());
+    }
+
+    #[test]
+    fn stale_cancel_marker_paths_keep_active_and_malformed_markers() {
+        let paths = [
+            "/tmp/aw-gateway-exec-111-1.pid",
+            "/tmp/aw-gateway-pty-222-2.pid",
+            "/tmp/aw-gateway-exec-333.pid",
+            "/tmp/aw-gateway-exec-444-nope.pid",
+            "/tmp/not-aw-gateway-exec-555-5.pid",
+        ];
+
+        let stale = stale_cancel_marker_paths(paths, |pid| pid == 222);
+
+        assert_eq!(stale, vec!["/tmp/aw-gateway-exec-111-1.pid"]);
+    }
+
+    #[test]
+    fn stale_cancel_marker_sweep_command_is_rm_only() {
+        let test_pid = std::process::id();
+        let paths = vec![
+            format!("/tmp/aw-gateway-exec-{test_pid}-1001.pid"),
+            format!("/tmp/aw-gateway-pty-{test_pid}-1002.pid"),
+        ];
+        let spec = cancel_marker_sweep_spec("ubuntu-dev", "2450:100", &paths);
+
+        assert_eq!(spec.command[0], "/bin/sh");
+        assert_eq!(spec.command[3], CANCEL_MARKER_SWEEP_ARGV0);
+        assert_eq!(&spec.command[4..], paths.as_slice());
+        let script = &spec.command[2];
+        assert!(script.contains("rm -f -- \"$path\""));
+        assert!(!script.contains("kill "));
+        assert!(!script.contains("ps -e"));
+
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", script])
+            .status()
+            .expect("run shell syntax check");
+        assert!(status.success());
+
+        for path in &paths {
+            std::fs::write(path, "").unwrap();
+        }
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .arg(CANCEL_MARKER_SWEEP_ARGV0)
+            .args(&paths)
+            .status()
+            .expect("run marker sweep script");
+        assert!(status.success());
+        for path in &paths {
+            assert!(!Path::new(path).exists(), "{path} was not removed");
+        }
     }
 
     #[cfg(unix)]

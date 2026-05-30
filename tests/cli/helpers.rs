@@ -201,6 +201,11 @@ case "$1" in
 JSON
     ;;
   exec)
+    case "$*" in
+      *aw-gateway-marker-list*|*aw-gateway-marker-sweep*)
+        exit 0
+        ;;
+    esac
     echo "exec $*" >> "{log}"
     case "$*" in
       *aw-gateway-exec-cleanup*|*aw-gateway-exec-rm*)

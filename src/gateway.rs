@@ -1577,6 +1577,7 @@ impl Runtime {
                 .ensure_container_for_readiness_plan(plan, &mut failed_start_cleanup)
                 .await?;
             self.validate_labels(&inspect)?;
+            self.sweep_stale_cancel_markers().await;
             let container_pid = inspect.state.pid.to_string();
             self.run_lifecycle_phase(LifecyclePhase::PostStartHost, Some(&container_pid))
                 .await?;

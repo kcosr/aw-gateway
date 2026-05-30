@@ -102,6 +102,30 @@ impl Runtime {
         self.stop_managed_container().await
     }
 
+    pub(super) async fn sweep_stale_cancel_markers(&self) {
+        match self
+            .container_runtime
+            .sweep_stale_cancel_markers(&self.identity.container_name, &self.exec_identity())
+            .await
+        {
+            Ok(0) => {}
+            Ok(count) => {
+                tracing::debug!(
+                    container = self.identity.container_name,
+                    count,
+                    "removed stale container cancel markers"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    container = self.identity.container_name,
+                    error = %err,
+                    "stale container cancel marker sweep failed"
+                );
+            }
+        }
+    }
+
     async fn stop_managed_container(&self) -> anyhow::Result<()> {
         let Some(inspect) = self
             .container_runtime

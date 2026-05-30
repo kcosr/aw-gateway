@@ -54,6 +54,11 @@ JSON
 JSON
     ;;
   exec)
+    case "$*" in
+      *aw-gateway-marker-list*|*aw-gateway-marker-sweep*)
+        exit 0
+        ;;
+    esac
     echo "$@" >> "{log}"
     case "$*" in
       *invalid-json-output*)
@@ -108,6 +113,11 @@ JSON
 JSON
     ;;
   exec)
+    case "$*" in
+      *aw-gateway-marker-list*|*aw-gateway-marker-sweep*)
+        exit 0
+        ;;
+    esac
     echo "$@" >> "{log}"
     case "$*" in
       *aw-gateway-pty-cleanup*)
@@ -155,6 +165,11 @@ JSON
 JSON
     ;;
   exec)
+    case "$*" in
+      *aw-gateway-marker-list*|*aw-gateway-marker-sweep*)
+        exit 0
+        ;;
+    esac
     echo "$@" >> "{log}"
     case "$*" in
       *aw-gateway-exec-cleanup*)
@@ -1003,6 +1018,27 @@ async fn run_wait_completion_preserves_status_codes_after_spawn() {
     let (status, body) = post_json(app, "/api/v1/launches/missing/run", r#"{"mode":"wait"}"#).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn wait_shutdown_cancels_active_waits_after_grace() {
+    let shutdown = WaitShutdown::default();
+    let (token, active) = shutdown.register();
+
+    let shutdown_task = tokio::spawn(async move {
+        shutdown
+            .cancel_active_after_grace(Duration::from_millis(10), Duration::from_millis(500))
+            .await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), token.cancelled())
+        .await
+        .expect("shutdown did not cancel active wait token");
+    drop(active);
+    tokio::time::timeout(Duration::from_secs(1), shutdown_task)
+        .await
+        .expect("shutdown wait did not finish")
+        .expect("shutdown task failed");
 }
 
 #[tokio::test]
