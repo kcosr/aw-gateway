@@ -1565,6 +1565,8 @@ by multiple clients.
 
 The `assets/` directory contains deployable helpers and image files:
 
+- `assets/acl-proxy.example.toml`: starter `acl-proxy` allowlist for common
+  coding-agent egress. Review and adapt before deploying.
 - `assets/aw-iptables`: applies, checks, and reports namespace-local proxy
   firewall rules for a running container PID.
 - `assets/ensure-storage-conf`: creates a rootless Podman storage config for

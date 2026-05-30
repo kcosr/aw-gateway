@@ -12,6 +12,9 @@
 - Added opt-in launch passthrough args with `allow_args = true`, CLI/SSH
   `launch ... -- <args...>`, and HTTP launch-run `args`
   ([#50](https://github.com/kcosr/aw-gateway/pull/50)).
+- Added `assets/acl-proxy.example.toml` as a starter allowlist for common
+  coding-agent proxy egress
+  ([#51](https://github.com/kcosr/aw-gateway/pull/51)).
 
 ### Changed
 
