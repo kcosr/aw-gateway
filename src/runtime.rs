@@ -133,12 +133,14 @@ impl ContainerPtySession {
         let initial_cleanup_marker_path = cleanup_marker_path.clone();
         let initial_cleanup_container_name = cleanup_container_name.clone();
         let mut cleanup = tokio::spawn(async move {
-            run_container_cancel_cleanup(
+            run_container_cancel_exec(
                 initial_cleanup_runtime,
                 initial_cleanup_spec,
                 initial_cleanup_marker_path,
                 initial_cleanup_container_name,
                 "initial",
+                "cleanup",
+                ContainerCancelExecLog::Info,
             )
             .await
         });
@@ -173,12 +175,14 @@ impl ContainerPtySession {
                 }
             };
         if !initial_cleanup_finished {
-            run_container_cancel_cleanup(
+            run_container_cancel_exec(
                 cleanup_runtime,
                 cleanup_spec,
                 cleanup_marker_path,
                 cleanup_container_name,
                 "post-host-terminate",
+                "cleanup",
+                ContainerCancelExecLog::Info,
             )
             .await;
         }
@@ -186,59 +190,48 @@ impl ContainerPtySession {
     }
 }
 
-async fn run_container_cancel_cleanup(
-    runtime: ContainerRuntime,
-    spec: ContainerExecSpec,
-    marker_path: String,
-    container_name: String,
-    phase: &'static str,
-) -> bool {
-    match runtime
-        .exec_discard_with_timeout(&spec, Some(CANCEL_CLEANUP_TIMEOUT))
-        .await
-    {
-        Ok(exit_code) => {
-            tracing::info!(
-                container = %container_name,
-                marker = %marker_path,
-                phase,
-                exit_code,
-                "container cancel cleanup exec finished"
-            );
-            true
-        }
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                container = %container_name,
-                marker = %marker_path,
-                phase,
-                "container cancel cleanup exec failed"
-            );
-            false
-        }
-    }
+#[derive(Debug, Clone, Copy)]
+enum ContainerCancelExecLog {
+    Info,
+    Debug,
 }
 
-async fn run_container_marker_remove(
+async fn run_container_cancel_exec(
     runtime: ContainerRuntime,
     spec: ContainerExecSpec,
     marker_path: String,
     container_name: String,
     phase: &'static str,
+    action: &'static str,
+    success_log: ContainerCancelExecLog,
 ) -> bool {
     match runtime
         .exec_discard_with_timeout(&spec, Some(CANCEL_CLEANUP_TIMEOUT))
         .await
     {
         Ok(exit_code) => {
-            tracing::debug!(
-                container = %container_name,
-                marker = %marker_path,
-                phase,
-                exit_code,
-                "container cancel marker remove exec finished"
-            );
+            match success_log {
+                ContainerCancelExecLog::Info => {
+                    tracing::info!(
+                        container = %container_name,
+                        marker = %marker_path,
+                        phase,
+                        action,
+                        exit_code,
+                        "container cancel exec finished"
+                    );
+                }
+                ContainerCancelExecLog::Debug => {
+                    tracing::debug!(
+                        container = %container_name,
+                        marker = %marker_path,
+                        phase,
+                        action,
+                        exit_code,
+                        "container cancel exec finished"
+                    );
+                }
+            }
             true
         }
         Err(err) => {
@@ -247,7 +240,8 @@ async fn run_container_marker_remove(
                 container = %container_name,
                 marker = %marker_path,
                 phase,
-                "container cancel marker remove exec failed"
+                action,
+                "container cancel exec failed"
             );
             false
         }
@@ -301,12 +295,14 @@ async fn cancel_container_exec_child(
     let initial_marker_path = marker_path.clone();
     let initial_container_name = container_name.clone();
     let mut cleanup = tokio::spawn(async move {
-        run_container_cancel_cleanup(
+        run_container_cancel_exec(
             initial_cleanup_runtime,
             initial_cleanup_spec,
             initial_marker_path,
             initial_container_name,
             "initial",
+            "cleanup",
+            ContainerCancelExecLog::Info,
         )
         .await
     });
@@ -337,12 +333,14 @@ async fn cancel_container_exec_child(
             }
         };
     if !initial_cleanup_finished {
-        run_container_cancel_cleanup(
+        run_container_cancel_exec(
             runtime,
             cleanup_spec,
             marker_path.clone(),
             container_name.clone(),
             "post-host-terminate",
+            "cleanup",
+            ContainerCancelExecLog::Info,
         )
         .await;
     }
@@ -895,12 +893,14 @@ impl ContainerRuntime {
                     stdout,
                     stderr,
                 };
-                run_container_marker_remove(
+                run_container_cancel_exec(
                     self.clone(),
                     remove_spec,
                     marker.path.clone(),
                     spec.container_name.clone(),
                     "normal-completion",
+                    "marker-remove",
+                    ContainerCancelExecLog::Debug,
                 )
                 .await;
                 Ok(ContainerExecCaptureResult::Completed(output))
@@ -952,12 +952,14 @@ impl ContainerRuntime {
             status = &mut wait_task => {
                 let status = status.context("join container exec wait task")?
                     .with_context(|| format!("run {} exec {}", self.runtime_label(), spec.container_name))?;
-                run_container_marker_remove(
+                run_container_cancel_exec(
                     self.clone(),
                     remove_spec,
                     marker.path.clone(),
                     spec.container_name.clone(),
                     "normal-completion",
+                    "marker-remove",
+                    ContainerCancelExecLog::Debug,
                 )
                 .await;
                 Ok(ContainerExecStatusResult::Completed(exit_code(status)))
