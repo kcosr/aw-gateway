@@ -2,7 +2,7 @@ use crate::config::{ContainerRuntimeType, RuntimeConfig};
 use crate::template::{self, Vars};
 use anyhow::Context;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Read;
@@ -12,7 +12,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -413,6 +413,7 @@ impl Drop for ContainerPtySession {
 }
 
 static NEXT_CANCEL_MARKER_ID: AtomicU64 = AtomicU64::new(1);
+static CANCEL_MARKER_SWEEP_KEYS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 
 #[cfg(unix)]
 fn terminate_process_group(child_pid: u32) {
@@ -691,6 +692,32 @@ impl ContainerRuntime {
             }
         }
         Ok(stale.len())
+    }
+
+    pub async fn sweep_stale_cancel_markers_once(
+        &self,
+        container_name: &str,
+        user: &str,
+    ) -> anyhow::Result<Option<usize>> {
+        let key = self.cancel_marker_sweep_key(container_name, user);
+        let sweep_keys = CANCEL_MARKER_SWEEP_KEYS.get_or_init(|| Mutex::new(BTreeSet::new()));
+        let should_sweep = sweep_keys
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cancel marker sweep key lock poisoned"))?
+            .insert(key);
+        if !should_sweep {
+            return Ok(None);
+        }
+        self.sweep_stale_cancel_markers(container_name, user)
+            .await
+            .map(Some)
+    }
+
+    fn cancel_marker_sweep_key(&self, container_name: &str, user: &str) -> String {
+        format!(
+            "{:?}\0{}\0{:?}\0{}\0{}",
+            self.kind, self.program, self.env, container_name, user
+        )
     }
 
     pub async fn inspect(&self, name: &str) -> anyhow::Result<Option<ContainerInspect>> {
@@ -1448,7 +1475,7 @@ fn cancel_marker_sweep_spec(
         "-c".to_string(),
         r#"for path do
   case "$path" in
-    /tmp/aw-gateway-*-*.pid) rm -f -- "$path" ;;
+    /tmp/aw-gateway-*-*.pid) rm -f -- "$path" 2>/dev/null || true ;;
   esac
 done"#
             .to_string(),
@@ -1867,6 +1894,7 @@ mod tests {
         assert_eq!(&spec.command[4..], paths.as_slice());
         let script = &spec.command[2];
         assert!(script.contains("rm -f -- \"$path\""));
+        assert!(script.contains("|| true"));
         assert!(!script.contains("kill "));
         assert!(!script.contains("ps -e"));
 
@@ -1890,6 +1918,51 @@ mod tests {
         for path in &paths {
             assert!(!Path::new(path).exists(), "{path} was not removed");
         }
+    }
+
+    #[tokio::test]
+    async fn stale_cancel_marker_sweep_once_skips_repeated_runtime_container_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-runtime");
+        let log = dir.path().join("runtime.log");
+        std::fs::write(
+            &runtime_program,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = exec ]; then
+  echo "$*" >> "{log}"
+fi
+exit 0
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::Podman,
+            program: runtime_program.display().to_string(),
+            env: BTreeMap::new(),
+        };
+        let container_name = format!("ubuntu-dev-{}", std::process::id());
+
+        assert_eq!(
+            runtime
+                .sweep_stale_cancel_markers_once(&container_name, "2450:100")
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            runtime
+                .sweep_stale_cancel_markers_once(&container_name, "2450:100")
+                .await
+                .unwrap(),
+            None
+        );
+
+        let log = std::fs::read_to_string(log).unwrap();
+        assert_eq!(log.matches(CANCEL_MARKER_LIST_ARGV0).count(), 1, "{log}");
     }
 
     #[cfg(unix)]

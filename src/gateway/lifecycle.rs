@@ -105,11 +105,11 @@ impl Runtime {
     pub(super) async fn sweep_stale_cancel_markers(&self) {
         match self
             .container_runtime
-            .sweep_stale_cancel_markers(&self.identity.container_name, &self.exec_identity())
+            .sweep_stale_cancel_markers_once(&self.identity.container_name, &self.exec_identity())
             .await
         {
-            Ok(0) => {}
-            Ok(count) => {
+            Ok(None | Some(0)) => {}
+            Ok(Some(count)) => {
                 tracing::debug!(
                     container = self.identity.container_name,
                     count,

@@ -33,7 +33,8 @@
   command to outlive the request
   ([#51](https://github.com/kcosr/aw-gateway/pull/51)).
 - Gateway readiness now best-effort sweeps stale in-container cancellation
-  marker files left by crashed or killed gateway processes
+  marker files left by crashed or killed gateway processes once per
+  runtime/container/user tuple
   ([#51](https://github.com/kcosr/aw-gateway/pull/51)).
 - HTTP PTY close and WebSocket disconnect now terminate the in-container
   attached process tree instead of relying only on the host-side runtime client
