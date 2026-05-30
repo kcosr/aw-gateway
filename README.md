@@ -1085,6 +1085,11 @@ Callers pass launch args after `--`. Empty passthrough args are equivalent to
 no args; non-empty args are rejected unless the effective launch has
 `allow_args = true`.
 
+When a launch is reachable through SSH dispatch, `allow_args = true` exposes the
+configured program's CLI surface to authorized launch callers. Omit `launch`
+from `ssh_dispatch.enabled_actions` if callers should not be able to supply
+program arguments.
+
 Launch commands:
 
 ```bash

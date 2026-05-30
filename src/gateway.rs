@@ -9,7 +9,7 @@ use crate::config::{
     LocalSshMode, LocalSshReadiness, TargetConfig, TargetMode, validate_name,
     validate_passwd_scalar,
 };
-use crate::launch_args::{LaunchRunArgRole, parse_launch_run_args_from};
+use crate::launch_args::{LaunchRunArgRole, LaunchRunArgs, parse_launch_run_args_from};
 use crate::paths::{self, UserContext};
 use crate::runtime::{ContainerExecSpec, ContainerRuntime};
 use crate::ssh_dispatch::{self, Dispatch, GatewayAction};
@@ -24,7 +24,6 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_GATEWAY_CONFIG: &str = include_str!("../aw-gateway.sample.toml");
 const MAX_SSH_ORIGINAL_COMMAND_BYTES: usize = 64 * 1024;
-type ParsedLaunchRunArgs = (String, Option<String>, Vec<String>, Vec<String>);
 
 #[cfg(target_os = "linux")]
 const UNIX_SOCKET_PATH_MAX_BYTES: usize = 107;
@@ -760,23 +759,29 @@ async fn launch(config_path: Option<PathBuf>, command: LaunchCommand) -> anyhow:
     match command {
         LaunchCommand::Show(args) => launch_show(config_path, args).await,
         LaunchCommand::Run(raw) => {
-            let (name, session_id, vars, args) = parse_launch_run_args(raw)?;
-            launch_execute(config_path, &name, session_id, vars, args).await
+            let parsed = parse_launch_run_args(raw)?;
+            launch_execute(
+                config_path,
+                &parsed.name,
+                parsed.session_id,
+                parsed.vars,
+                parsed.args,
+            )
+            .await
         }
     }
 }
 
-fn parse_launch_run_args(raw: Vec<std::ffi::OsString>) -> anyhow::Result<ParsedLaunchRunArgs> {
+fn parse_launch_run_args(raw: Vec<std::ffi::OsString>) -> anyhow::Result<LaunchRunArgs> {
     let mut args = raw.into_iter();
-    let parsed = parse_launch_run_args_from(|role| {
+    parse_launch_run_args_from(|role| {
         let Some(arg) = args.next() else {
             return Ok(None);
         };
         arg.into_string()
             .map(Some)
             .map_err(|_| anyhow::anyhow!(launch_arg_utf8_error(role)))
-    })?;
-    Ok((parsed.name, parsed.session_id, parsed.vars, parsed.args))
+    })
 }
 
 fn launch_arg_utf8_error(role: LaunchRunArgRole) -> &'static str {

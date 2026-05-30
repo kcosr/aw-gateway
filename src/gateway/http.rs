@@ -829,7 +829,7 @@ fn parse_body<T: for<'de> Deserialize<'de>>(
     semantic_code: ErrorCode,
 ) -> Result<T, HttpError> {
     serde_json::from_slice(body).map_err(|err| {
-        if is_launch_args_error(&err) {
+        if semantic_code == ErrorCode::InvalidLaunchVar && is_launch_args_error(&err) {
             return HttpError::new(
                 StatusCode::BAD_REQUEST,
                 ErrorCode::InvalidLaunchArgs,

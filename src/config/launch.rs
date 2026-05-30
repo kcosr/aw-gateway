@@ -271,18 +271,22 @@ fn validate_launch_command_templates_with_policy(
         validate_template_with_policy(field, arg, allowed, policy)?;
     }
 
-    if effective {
-        return validate_effective_launch_args_sentinel(
-            launch_name,
-            field,
-            allow_args.unwrap_or(false),
-            &sentinel_positions,
-        );
-    }
+    validate_launch_args_sentinel(
+        launch_name,
+        field,
+        allow_args,
+        effective,
+        &sentinel_positions,
+    )
+}
 
-    if allow_args == Some(false) && !sentinel_positions.is_empty() {
-        anyhow::bail!("launch {launch_name:?} {field} uses {{args}} but allow_args is false");
-    }
+fn validate_launch_args_sentinel(
+    launch_name: &str,
+    field: &str,
+    allow_args: Option<bool>,
+    effective: bool,
+    sentinel_positions: &[usize],
+) -> anyhow::Result<()> {
     if sentinel_positions
         .first()
         .is_some_and(|position| *position == 0)
@@ -294,31 +298,23 @@ fn validate_launch_command_templates_with_policy(
             "launch {launch_name:?} {field} must not contain duplicate {{args}} argv elements"
         );
     }
-    Ok(())
-}
 
-fn validate_effective_launch_args_sentinel(
-    launch_name: &str,
-    field: &str,
-    allow_args: bool,
-    sentinel_positions: &[usize],
-) -> anyhow::Result<()> {
-    match (allow_args, sentinel_positions) {
-        (true, [position]) if *position != 0 => Ok(()),
-        (true, [0]) => {
-            anyhow::bail!("launch {launch_name:?} {field} must not place {{args}} at argv[0]")
-        }
-        (true, []) => anyhow::bail!(
+    if effective && allow_args.unwrap_or(false) && sentinel_positions.is_empty() {
+        anyhow::bail!(
             "launch {launch_name:?} allow_args = true requires exactly one {{args}} argv element"
-        ),
-        (true, _) => anyhow::bail!(
-            "launch {launch_name:?} allow_args = true requires exactly one {{args}} argv element"
-        ),
-        (false, []) => Ok(()),
-        (false, _) => {
-            anyhow::bail!("launch {launch_name:?} {field} uses {{args}} but allow_args is false")
-        }
+        );
     }
+
+    let allow_args_is_false = if effective {
+        !allow_args.unwrap_or(false)
+    } else {
+        allow_args == Some(false)
+    };
+    if allow_args_is_false && !sentinel_positions.is_empty() {
+        anyhow::bail!("launch {launch_name:?} {field} uses {{args}} but allow_args is false");
+    }
+
+    Ok(())
 }
 
 fn allowed_template_vars(vars: &BTreeMap<String, LaunchVarConfig>) -> Vec<String> {

@@ -570,3 +570,62 @@ impl Runtime {
         self.finish_post_session(marker, result, outcome).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_launch_command_splices_passthrough_args_verbatim() {
+        let vars = BTreeMap::from([("var.mode".into(), "safe".into())]);
+        let args = LaunchPassthroughArgs::from_strings(vec![
+            "{var.mode}".into(),
+            "{args}".into(),
+            "--literal".into(),
+        ])
+        .unwrap();
+
+        let rendered = render_launch_command(
+            &[
+                "agent-pack".into(),
+                "run".into(),
+                "{var.mode}".into(),
+                "{args}".into(),
+                "--after".into(),
+            ],
+            &vars,
+            &args,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rendered,
+            [
+                "agent-pack",
+                "run",
+                "safe",
+                "{var.mode}",
+                "{args}",
+                "--literal",
+                "--after"
+            ]
+        );
+    }
+
+    #[test]
+    fn render_launch_command_removes_sentinel_for_empty_passthrough_args() {
+        let rendered = render_launch_command(
+            &[
+                "agent-pack".into(),
+                "run".into(),
+                "{args}".into(),
+                "--after".into(),
+            ],
+            &BTreeMap::new(),
+            &LaunchPassthroughArgs::default(),
+        )
+        .unwrap();
+
+        assert_eq!(rendered, ["agent-pack", "run", "--after"]);
+    }
+}
