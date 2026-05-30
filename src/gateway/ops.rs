@@ -20,8 +20,9 @@ mod types;
 
 pub(super) use ssh::{SshGatewayOperation, SshRenderOptions};
 pub(super) use types::{
-    CanonicalLaunchVarValue, ExecutionOutcome, OperationError, OperationExecutionOptions,
-    OperationMode, OperationResult, OutputSelection, RemoveResult, StopResult, SuppliedLaunchVars,
+    CanonicalLaunchVarValue, ExecutionOutcome, LaunchPassthroughArgs, OperationError,
+    OperationExecutionOptions, OperationMode, OperationResult, OutputSelection, RemoveResult,
+    StopResult, SuppliedLaunchVars,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +52,7 @@ pub(super) enum GatewayOperation {
         name: String,
         session_id: Option<String>,
         vars: SuppliedLaunchVars,
+        args: LaunchPassthroughArgs,
         options: OperationExecutionOptions,
     },
     Stop {
@@ -144,11 +146,13 @@ impl GatewayOperation {
         name: String,
         session_id: Option<String>,
         vars: SuppliedLaunchVars,
+        args: LaunchPassthroughArgs,
     ) -> Self {
         Self::Launch {
             name,
             session_id,
             vars,
+            args,
             options: OperationExecutionOptions::STREAM,
         }
     }
@@ -227,11 +231,12 @@ pub(super) async fn execute_gateway_operation(
             name,
             session_id,
             vars,
+            args,
             options,
         } => {
             let cfg = load_config(config_path)?;
             Ok(GatewayOperationResult::Launch(
-                launch_execute_with_config(cfg, &name, session_id, vars, options).await?,
+                launch_execute_with_config(cfg, &name, session_id, vars, args, options).await?,
             ))
         }
         GatewayOperation::Stop { target, session_id } => Ok(GatewayOperationResult::Stop(

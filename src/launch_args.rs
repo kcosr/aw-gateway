@@ -5,6 +5,7 @@ pub(crate) struct LaunchRunArgs {
     pub(crate) name: String,
     pub(crate) session_id: Option<String>,
     pub(crate) vars: Vec<String>,
+    pub(crate) args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +14,7 @@ pub(crate) enum LaunchRunArgRole {
     Argument,
     SessionId,
     Variable,
+    Passthrough,
 }
 
 pub(crate) fn parse_launch_run_strings(
@@ -30,8 +32,15 @@ pub(crate) fn parse_launch_run_args_from(
     };
 
     let mut vars = Vec::new();
+    let mut passthrough_args = Vec::new();
     let mut session_id = None;
     while let Some(arg) = next_arg(LaunchRunArgRole::Argument)? {
+        if arg == "--" {
+            while let Some(value) = next_arg(LaunchRunArgRole::Passthrough)? {
+                passthrough_args.push(value);
+            }
+            break;
+        }
         if arg == "--json" {
             anyhow::bail!("launch execution does not support --json");
         }
@@ -66,6 +75,7 @@ pub(crate) fn parse_launch_run_args_from(
         name,
         session_id,
         vars,
+        args: passthrough_args,
     })
 }
 
@@ -107,6 +117,45 @@ mod tests {
                     "repo=https://example.test/repo.git".into(),
                     "branch=main".into()
                 ],
+                args: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_launch_passthrough_args_after_separator() {
+        let parsed = parse_launch_run_strings([
+            "repo-shell".into(),
+            "--var=branch=main".into(),
+            "--".into(),
+            "--skill".into(),
+            "fresh-eyes".into(),
+            "review this".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            parsed,
+            LaunchRunArgs {
+                name: "repo-shell".into(),
+                session_id: None,
+                vars: vec!["branch=main".into()],
+                args: vec!["--skill".into(), "fresh-eyes".into(), "review this".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_trailing_separator_as_empty_passthrough_args() {
+        let parsed = parse_launch_run_strings(["repo-shell".into(), "--".into()]).unwrap();
+
+        assert_eq!(
+            parsed,
+            LaunchRunArgs {
+                name: "repo-shell".into(),
+                session_id: None,
+                vars: Vec::new(),
+                args: Vec::new(),
             }
         );
     }

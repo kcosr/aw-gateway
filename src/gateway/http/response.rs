@@ -65,6 +65,11 @@ pub(super) fn operation_error_response(err: OperationError) -> Response {
             ErrorCode::InvalidLaunchVar,
             message,
         ),
+        OperationError::InvalidLaunchArgs { .. } => HttpError::new(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidLaunchArgs,
+            message,
+        ),
         OperationError::AgentNotReady { .. }
         | OperationError::ContainerNotFound { .. }
         | OperationError::ContainerLabelMismatch { .. }
@@ -82,6 +87,7 @@ pub(super) enum ErrorCode {
     InvalidMode,
     InvalidOutput,
     InvalidLaunchVar,
+    InvalidLaunchArgs,
     OperationFailed,
 }
 
@@ -95,6 +101,7 @@ impl ErrorCode {
             Self::InvalidMode => "invalid_mode",
             Self::InvalidOutput => "invalid_output",
             Self::InvalidLaunchVar => "invalid_launch_var",
+            Self::InvalidLaunchArgs => "invalid_launch_args",
             Self::OperationFailed => "operation_failed",
         }
     }

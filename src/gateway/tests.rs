@@ -375,6 +375,16 @@ fn assert_invalid_launch_variable(err: OperationError, expected: &str) {
     );
 }
 
+fn assert_invalid_launch_args(err: OperationError, expected: &str) {
+    let OperationError::InvalidLaunchArgs { message } = err else {
+        panic!("expected invalid launch args error, got {err:?}");
+    };
+    assert!(
+        message.contains(expected),
+        "expected {expected:?} in {message:?}"
+    );
+}
+
 fn assert_invalid_session(err: OperationError, expected: &str) {
     let OperationError::InvalidSession { message } = err else {
         panic!("expected invalid session error, got {err:?}");
@@ -1384,12 +1394,87 @@ async fn launch_operation_core_returns_nonzero_exit_without_exiting_process() {
         "returns-nonzero",
         None,
         SuppliedLaunchVars::default(),
+        LaunchPassthroughArgs::default(),
         OperationExecutionOptions::STREAM,
     )
     .await
     .unwrap();
 
     assert_eq!(outcome, ExecutionOutcome::new(42));
+}
+
+#[tokio::test]
+async fn launch_operation_splices_passthrough_args_at_sentinel() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let runtime_log = dir.path().join("runtime.log");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  exec)
+    echo "$@" >> "{runtime_log}"
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+            runtime_log = runtime_log.display(),
+        ),
+    );
+    let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    cfg.runtime.program = Some(fake_runtime.display().to_string());
+    disable_default_container_agent(&mut cfg);
+    cfg.target_defaults.host_steps.clear();
+    cfg.target_defaults.workspace = Some(crate::config::WorkspaceConfigInput {
+        path: Some(dir.path().join("workspace").display().to_string()),
+        state_dir: Some(".aw-gateway".into()),
+        cleanup: None,
+    });
+    cfg.targets.get_mut("default").unwrap().stop_when_idle = Some(false);
+    cfg.launches.insert(
+        "agent".into(),
+        crate::config::LaunchConfigInput {
+            target: Some("default".into()),
+            allow_args: Some(true),
+            command: Some(vec![
+                "agent-pack".into(),
+                "run".into(),
+                "--fixed".into(),
+                "{args}".into(),
+                "--after".into(),
+            ]),
+            ..Default::default()
+        },
+    );
+    cfg.validate().unwrap();
+
+    let outcome = launch_execute_with_config(
+        cfg,
+        "agent",
+        None,
+        SuppliedLaunchVars::default(),
+        LaunchPassthroughArgs::from_strings(vec!["--skill".into(), "fresh-eyes".into()]).unwrap(),
+        OperationExecutionOptions::STREAM,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome, ExecutionOutcome::new(0));
+    let log = std::fs::read_to_string(runtime_log).unwrap();
+    assert!(
+        log.contains("ubuntu-dev agent-pack run --fixed --skill fresh-eyes --after"),
+        "{log}"
+    );
 }
 
 #[tokio::test]
@@ -1420,6 +1505,7 @@ async fn detached_launch_keeps_launch_marker_until_background_finishes() {
         "detached-launch",
         None,
         SuppliedLaunchVars::default(),
+        LaunchPassthroughArgs::default(),
         OperationExecutionOptions::DETACH,
     )
     .await
@@ -1749,6 +1835,7 @@ async fn operation_boundary_classifies_launch_variable_errors() {
         name: "agent".into(),
         session_id: None,
         vars: vec!["repo=a".into(), "repo=b".into()],
+        args: Vec::new(),
     })
     .unwrap_err();
     assert_invalid_launch_variable(duplicate, "duplicate launch variable");
@@ -1765,6 +1852,7 @@ async fn operation_boundary_classifies_launch_variable_errors() {
         "agent",
         None,
         unknown,
+        LaunchPassthroughArgs::default(),
         OperationExecutionOptions::STREAM,
     )
     .await
@@ -1776,6 +1864,7 @@ async fn operation_boundary_classifies_launch_variable_errors() {
         "agent",
         None,
         SuppliedLaunchVars::default(),
+        LaunchPassthroughArgs::default(),
         OperationExecutionOptions::STREAM,
     )
     .await
@@ -1792,6 +1881,7 @@ async fn operation_boundary_classifies_launch_variable_errors() {
         "agent",
         None,
         invalid_enum,
+        LaunchPassthroughArgs::default(),
         OperationExecutionOptions::STREAM,
     )
     .await
@@ -1808,6 +1898,7 @@ async fn operation_boundary_classifies_launch_variable_errors() {
         "agent",
         None,
         invalid_number,
+        LaunchPassthroughArgs::default(),
         OperationExecutionOptions::STREAM,
     )
     .await
@@ -1823,11 +1914,44 @@ async fn operation_boundary_classifies_launch_variable_errors() {
         "agent",
         None,
         invalid_type,
+        LaunchPassthroughArgs::default(),
         OperationExecutionOptions::STREAM,
     )
     .await
     .unwrap_err();
     assert_invalid_launch_variable(err, "invalid string launch variable");
+}
+
+#[tokio::test]
+async fn operation_boundary_rejects_disallowed_launch_args_before_runtime_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let runtime_log = dir.path().join("runtime.log");
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+echo "$@" >> "{runtime_log}"
+exit 1
+"#,
+            runtime_log = runtime_log.display(),
+        ),
+    );
+    let cfg = launch_test_config(&dir, &fake_runtime, "agent", vec!["agent-pack".into()]);
+
+    let err = launch_execute_with_config(
+        cfg,
+        "agent",
+        None,
+        SuppliedLaunchVars::default(),
+        LaunchPassthroughArgs::from_strings(vec!["--skill".into(), "fresh-eyes".into()]).unwrap(),
+        OperationExecutionOptions::STREAM,
+    )
+    .await
+    .unwrap_err();
+
+    assert_invalid_launch_args(err, "does not allow passthrough args");
+    assert!(!runtime_log.exists());
 }
 
 #[tokio::test]
@@ -1838,6 +1962,7 @@ async fn operation_boundary_classifies_unknown_launch_and_session_errors() {
         "missing",
         None,
         SuppliedLaunchVars::default(),
+        LaunchPassthroughArgs::default(),
         OperationExecutionOptions::STREAM,
     )
     .await

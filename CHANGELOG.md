@@ -9,6 +9,9 @@
   ([#49](https://github.com/kcosr/aw-gateway/pull/49)).
 - Added resolved target metadata to launch detail responses
   ([#49](https://github.com/kcosr/aw-gateway/pull/49)).
+- Added opt-in launch passthrough args with `allow_args = true`, CLI/SSH
+  `launch ... -- <args...>`, and HTTP launch-run `args`
+  ([#50](https://github.com/kcosr/aw-gateway/pull/50)).
 
 ### Changed
 

@@ -6,7 +6,8 @@ use super::{
 use crate::config::LaunchConfig;
 use crate::gateway::model::ReadyStatus;
 use crate::gateway::ops::{
-    ExecutionOutcome, OperationExecutionOptions, OperationMode, OutputSelection,
+    ExecutionOutcome, LaunchPassthroughArgs, OperationExecutionOptions, OperationMode,
+    OutputSelection,
 };
 use crate::paths;
 use crate::runtime::{ContainerExecSpec, ContainerPtySession, ContainerPtySize};
@@ -79,6 +80,7 @@ impl OperationRunner {
         options: OperationExecutionOptions,
         launch: LaunchConfig,
         resolved_vars: BTreeMap<String, String>,
+        args: LaunchPassthroughArgs,
     ) -> Self {
         debug_assert!(
             runtime.identity.launch_name.is_some(),
@@ -91,6 +93,7 @@ impl OperationRunner {
             body: OperationBody::Launch {
                 launch,
                 resolved_vars,
+                args,
             },
         }
     }
@@ -413,6 +416,7 @@ enum OperationBody {
     Launch {
         launch: LaunchConfig,
         resolved_vars: BTreeMap<String, String>,
+        args: LaunchPassthroughArgs,
     },
 }
 
@@ -434,6 +438,7 @@ impl OperationBody {
             Self::Launch {
                 launch,
                 resolved_vars,
+                args,
             } => {
                 let container_pid = ready.container_pid.to_string();
                 let vars = launch_template_vars(runtime, &resolved_vars, Some(&container_pid));
@@ -445,12 +450,28 @@ impl OperationBody {
                     &vars,
                     runtime.identity.container_home.as_path(),
                 )?;
-                let command = template::render_argv(&launch.command, &vars)?;
+                let command = render_launch_command(&launch.command, &vars, &args)?;
                 let exec_spec = final_container_exec_spec(runtime, command, cwd, env);
                 Ok(PreparedCommand { ready, exec_spec })
             }
         }
     }
+}
+
+fn render_launch_command(
+    command: &[String],
+    vars: &template::Vars,
+    args: &LaunchPassthroughArgs,
+) -> anyhow::Result<Vec<String>> {
+    let mut rendered = Vec::new();
+    for arg in command {
+        if arg == "{args}" {
+            rendered.extend(args.as_slice().iter().cloned());
+        } else {
+            rendered.push(template::render(arg, vars)?);
+        }
+    }
+    Ok(rendered)
 }
 
 pub(super) struct PreparedExecution {
@@ -547,5 +568,64 @@ impl Runtime {
             .take()
             .expect("operation session marker must be present");
         self.finish_post_session(marker, result, outcome).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_launch_command_splices_passthrough_args_verbatim() {
+        let vars = BTreeMap::from([("var.mode".into(), "safe".into())]);
+        let args = LaunchPassthroughArgs::from_strings(vec![
+            "{var.mode}".into(),
+            "{args}".into(),
+            "--literal".into(),
+        ])
+        .unwrap();
+
+        let rendered = render_launch_command(
+            &[
+                "agent-pack".into(),
+                "run".into(),
+                "{var.mode}".into(),
+                "{args}".into(),
+                "--after".into(),
+            ],
+            &vars,
+            &args,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rendered,
+            [
+                "agent-pack",
+                "run",
+                "safe",
+                "{var.mode}",
+                "{args}",
+                "--literal",
+                "--after"
+            ]
+        );
+    }
+
+    #[test]
+    fn render_launch_command_removes_sentinel_for_empty_passthrough_args() {
+        let rendered = render_launch_command(
+            &[
+                "agent-pack".into(),
+                "run".into(),
+                "{args}".into(),
+                "--after".into(),
+            ],
+            &BTreeMap::new(),
+            &LaunchPassthroughArgs::default(),
+        )
+        .unwrap();
+
+        assert_eq!(rendered, ["agent-pack", "run", "--after"]);
     }
 }

@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct LaunchConfig {
     pub target: String,
     pub description: Option<String>,
+    #[serde(default)]
+    pub allow_args: bool,
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -28,6 +30,7 @@ impl LaunchConfig {
             launch_name,
             LaunchShape {
                 target: Some(&self.target),
+                allow_args: Some(self.allow_args),
                 cwd: self.cwd.as_deref(),
                 env: &self.env,
                 command: Some(&self.command),
@@ -46,6 +49,7 @@ pub struct LaunchConfigInput {
     pub use_templates: Vec<String>,
     pub target: Option<String>,
     pub description: Option<String>,
+    pub allow_args: Option<bool>,
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
@@ -65,6 +69,7 @@ impl LaunchConfigInput {
             launch_name,
             LaunchShape {
                 target: self.target.as_deref(),
+                allow_args: self.allow_args,
                 cwd: self.cwd.as_deref(),
                 env: &self.env,
                 command: self.command.as_deref(),
@@ -81,6 +86,9 @@ impl LaunchConfigInput {
         }
         if let Some(description) = &later.description {
             self.description = Some(description.clone());
+        }
+        if let Some(allow_args) = later.allow_args {
+            self.allow_args = Some(allow_args);
         }
         if let Some(cwd) = &later.cwd {
             self.cwd = Some(cwd.clone());
@@ -100,6 +108,7 @@ impl LaunchConfigInput {
                 anyhow::anyhow!("launch {launch_name:?} target is required after defaults")
             })?,
             description: self.description,
+            allow_args: self.allow_args.unwrap_or(false),
             cwd: self.cwd,
             env: self.env,
             command: self.command.ok_or_else(|| {
@@ -141,6 +150,7 @@ impl<'a> LaunchValidationPolicy<'a> {
 
 struct LaunchShape<'a> {
     target: Option<&'a str>,
+    allow_args: Option<bool>,
     cwd: Option<&'a str>,
     env: &'a BTreeMap<String, String>,
     command: Option<&'a [String]>,
@@ -189,11 +199,14 @@ fn validate_launch_shape(
         if !policy.validate_command_before_vars {
             validate_command("launch.command", command)?;
         }
-        validate_command_templates_with_policy(
+        validate_launch_command_templates_with_policy(
+            launch_name,
             "launch.command",
             command,
             &allowed_refs,
             policy.template_policy,
+            shape.allow_args,
+            policy.collect_references,
         )?;
     }
 
@@ -232,6 +245,75 @@ fn validate_launch_shape(
             );
         }
     }
+    Ok(())
+}
+
+fn validate_launch_command_templates_with_policy(
+    launch_name: &str,
+    field: &str,
+    command: &[String],
+    allowed: &[&str],
+    policy: TemplatePolicy,
+    allow_args: Option<bool>,
+    effective: bool,
+) -> anyhow::Result<()> {
+    let mut sentinel_positions = Vec::new();
+    for (index, arg) in command.iter().enumerate() {
+        if arg == "{args}" {
+            sentinel_positions.push(index);
+            continue;
+        }
+        if arg.contains("{args}") {
+            anyhow::bail!(
+                "launch {launch_name:?} {field} must use {{args}} only as a whole argv element"
+            );
+        }
+        validate_template_with_policy(field, arg, allowed, policy)?;
+    }
+
+    validate_launch_args_sentinel(
+        launch_name,
+        field,
+        allow_args,
+        effective,
+        &sentinel_positions,
+    )
+}
+
+fn validate_launch_args_sentinel(
+    launch_name: &str,
+    field: &str,
+    allow_args: Option<bool>,
+    effective: bool,
+    sentinel_positions: &[usize],
+) -> anyhow::Result<()> {
+    if sentinel_positions
+        .first()
+        .is_some_and(|position| *position == 0)
+    {
+        anyhow::bail!("launch {launch_name:?} {field} must not place {{args}} at argv[0]");
+    }
+    if sentinel_positions.len() > 1 {
+        anyhow::bail!(
+            "launch {launch_name:?} {field} must not contain duplicate {{args}} argv elements"
+        );
+    }
+
+    if effective && allow_args.unwrap_or(false) && sentinel_positions.is_empty() {
+        anyhow::bail!(
+            "launch {launch_name:?} allow_args = true requires exactly one {{args}} argv element"
+        );
+    }
+
+    let allow_args_is_false = if effective {
+        !allow_args.unwrap_or(false)
+    } else {
+        allow_args == Some(false)
+    };
+    if allow_args_is_false && !sentinel_positions.is_empty() {
+        anyhow::bail!("launch {launch_name:?} {field} uses {{args}} but allow_args is false");
+    }
+
     Ok(())
 }
 

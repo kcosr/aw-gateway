@@ -1,4 +1,4 @@
-use super::{GatewayOperation, OperationResult, SuppliedLaunchVars};
+use super::{GatewayOperation, LaunchPassthroughArgs, OperationResult, SuppliedLaunchVars};
 use crate::ssh_dispatch::{GatewayAction, RunAction, StatusAction};
 use std::path::PathBuf;
 
@@ -39,10 +39,17 @@ impl SshGatewayOperation {
                 name,
                 session_id,
                 vars,
+                args,
             } => {
                 let vars = SuppliedLaunchVars::from_cli_pairs(vars.clone())?;
+                let args = LaunchPassthroughArgs::from_strings(args.clone())?;
                 Some(Self {
-                    operation: GatewayOperation::launch_run(name.clone(), session_id.clone(), vars),
+                    operation: GatewayOperation::launch_run(
+                        name.clone(),
+                        session_id.clone(),
+                        vars,
+                        args,
+                    ),
                     render: SshRenderOptions::default(),
                 })
             }

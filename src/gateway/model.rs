@@ -87,6 +87,7 @@ pub(super) struct TargetEntry {
 pub(super) struct LaunchSummary {
     pub(super) name: String,
     pub(super) target: String,
+    pub(super) allow_args: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) description: Option<String>,
     pub(super) vars: BTreeMap<String, LaunchVarMetadata>,
@@ -97,6 +98,7 @@ pub(super) struct LaunchDetail {
     pub(super) name: String,
     pub(super) target: String,
     pub(super) target_mode: String,
+    pub(super) allow_args: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) target_container: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

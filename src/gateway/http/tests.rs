@@ -165,6 +165,11 @@ stop_when_idle = false
 target = "default"
 command = ["launch-command"]
 
+[launches.args]
+target = "default"
+allow_args = true
+command = ["launch-command", "before", "{{args}}", "after"]
+
 [launches.typed]
 target = "default"
 cwd = "/repo-{{var.repo}}-{{var.count}}"
@@ -475,6 +480,29 @@ fn launch_vars_parse_typed_values_and_reject_duplicates_and_structured_values() 
         .unwrap_err()
         .to_string();
     assert!(object.contains("invalid launch variable"), "{object}");
+}
+
+#[test]
+fn launch_args_parse_string_arrays_and_reject_invalid_values() {
+    let parsed: LaunchRunRequest =
+        serde_json::from_str(r#"{"args":["--skill","fresh-eyes","review this"]}"#).unwrap();
+    assert_eq!(
+        parsed.args.unwrap().as_slice(),
+        ["--skill", "fresh-eyes", "review this"]
+    );
+
+    let number = serde_json::from_str::<LaunchRunRequest>(r#"{"args":[1]}"#)
+        .unwrap_err()
+        .to_string();
+    assert!(number.contains("invalid launch args"), "{number}");
+
+    let empty = serde_json::from_str::<LaunchRunRequest>(r#"{"args":[""]}"#)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        empty.contains("launch args must not contain empty strings"),
+        "{empty}"
+    );
 }
 
 #[tokio::test]
@@ -1278,6 +1306,56 @@ async fn launch_route_renders_typed_json_vars_into_steps_and_final_exec() {
 }
 
 #[tokio::test]
+async fn launch_route_splices_passthrough_args() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    write_fake_runtime(&fake_runtime, &fake_running_runtime_script(&log));
+    let app = app_for_config(http_operation_config(&dir, &fake_runtime));
+
+    let (status, body) = post_json(
+        app,
+        "/api/v1/launches/args/run",
+        r#"{"args":["--skill","fresh-eyes","review this"],"mode":"wait"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], true);
+
+    let log = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        log.contains("ubuntu-dev launch-command before --skill fresh-eyes review this after"),
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn launch_route_rejects_disallowed_args_with_typed_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    write_fake_runtime(&fake_runtime, &fake_running_runtime_script(&log));
+    let app = app_for_config(http_operation_config(&dir, &fake_runtime));
+
+    let (status, body) = post_json(
+        app,
+        "/api/v1/launches/echo/run",
+        r#"{"args":["--skill","fresh-eyes"],"mode":"wait"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_launch_args");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not allow passthrough args"),
+        "{body}"
+    );
+    assert!(!log.exists());
+}
+
+#[tokio::test]
 async fn metadata_routes_return_data_envelopes() {
     let dir = tempfile::tempdir().unwrap();
     let fake_runtime = dir.path().join("runtime");
@@ -1308,7 +1386,17 @@ async fn metadata_routes_return_data_envelopes() {
     let (status, body) = get_json(app.clone(), "/api/v1/launches").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ok"], true);
-    assert_eq!(body["data"][0]["name"], "echo");
+    let launches = body["data"].as_array().unwrap();
+    assert!(
+        launches
+            .iter()
+            .any(|entry| { entry["name"] == "args" && entry["allow_args"] == true })
+    );
+    assert!(
+        launches
+            .iter()
+            .any(|entry| { entry["name"] == "echo" && entry["allow_args"] == false })
+    );
 
     let (status, body) = get_json(app, "/api/v1/launches/echo").await;
     assert_eq!(status, StatusCode::OK);
@@ -1316,6 +1404,7 @@ async fn metadata_routes_return_data_envelopes() {
     assert_eq!(body["data"]["name"], "echo");
     assert_eq!(body["data"]["target_mode"], "fixed");
     assert_eq!(body["data"]["target_container"], "ubuntu-dev");
+    assert_eq!(body["data"]["allow_args"], false);
     assert_eq!(body["data"]["command"][0], "launch-command");
 }
 

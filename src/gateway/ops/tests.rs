@@ -392,6 +392,7 @@ fn constructs_launch_run_request() {
             Some("abc123".into()),
             SuppliedLaunchVars::from_cli_pairs(vec!["repo=https://example.test/repo.git".into()])
                 .unwrap(),
+            LaunchPassthroughArgs::default(),
         ),
         GatewayOperation::Launch {
             name: "repo-shell".into(),
@@ -400,6 +401,7 @@ fn constructs_launch_run_request() {
                 "repo=https://example.test/repo.git".into()
             ])
             .unwrap(),
+            args: LaunchPassthroughArgs::default(),
             options: OperationExecutionOptions::STREAM,
         }
     );
@@ -447,11 +449,14 @@ fn constructs_operation_requests_from_ssh_actions() {
             name: "repo-shell".into(),
             session_id: Some("abc123".into()),
             vars: vec!["repo=https://example.test/repo.git".into()],
+            args: vec!["--skill".into(), "fresh-eyes".into()],
         },
         GatewayOperation::launch_run(
             "repo-shell".into(),
             Some("abc123".into()),
             SuppliedLaunchVars::from_cli_pairs(vec!["repo=https://example.test/repo.git".into()])
+                .unwrap(),
+            LaunchPassthroughArgs::from_strings(vec!["--skill".into(), "fresh-eyes".into()])
                 .unwrap(),
         ),
         SshRenderOptions::default(),
@@ -619,6 +624,7 @@ fn ssh_launch_var_conversion_errors_remain_typed() {
         name: "repo-shell".into(),
         session_id: None,
         vars: vec!["repo=a".into(), "repo=b".into()],
+        args: Vec::new(),
     })
     .unwrap_err();
     assert!(matches!(err, OperationError::InvalidLaunchVariable { .. }));
@@ -631,6 +637,7 @@ fn launch_var_conversion_uses_existing_cli_pair_validation() {
         name: "repo-shell".into(),
         session_id: None,
         vars: vec!["repo".into()],
+        args: Vec::new(),
     })
     .unwrap_err();
     assert!(matches!(err, OperationError::InvalidLaunchVariable { .. }));
