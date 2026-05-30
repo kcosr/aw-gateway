@@ -1,7 +1,7 @@
 use super::{
-    OperationSessionGuard, Runtime, SessionOutcome, exec_container_command_with_options,
-    final_container_exec_spec, launch_final_env, launch_template_vars, render_launch_cwd,
-    render_template_map, run_launch_steps,
+    OperationSessionGuard, Runtime, SessionOutcome, exec_container_command_with_cancel,
+    exec_container_command_with_options, final_container_exec_spec, launch_final_env,
+    launch_template_vars, render_launch_cwd, render_template_map, run_launch_steps,
 };
 use crate::config::LaunchConfig;
 use crate::gateway::model::ReadyStatus;
@@ -14,6 +14,7 @@ use crate::runtime::{ContainerExecSpec, ContainerPtySession, ContainerPtySize};
 use crate::template;
 use anyhow::Context;
 use std::collections::BTreeMap;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum OperationSessionSpec {
@@ -111,6 +112,25 @@ impl OperationRunner {
         let session = runtime
             .begin_operation_session(session_spec.kind(), session_spec.uses_launch_marker())?;
         run_operation_session(runtime, session_spec, session, body, options).await
+    }
+
+    pub(super) async fn run_cancelable(
+        self,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<ExecutionOutcome> {
+        if self.options.mode == OperationMode::Detach {
+            return self.spawn_detached().await;
+        }
+        let Self {
+            runtime,
+            options,
+            session_spec,
+            body,
+        } = self;
+        let session = runtime
+            .begin_operation_session(session_spec.kind(), session_spec.uses_launch_marker())?;
+        run_operation_session_cancelable(runtime, session_spec, session, body, options, cancel)
+            .await
     }
 
     pub(super) async fn prepare(self) -> anyhow::Result<PreparedExecution> {
@@ -229,6 +249,29 @@ async fn run_operation_session(
         .await
 }
 
+async fn run_operation_session_cancelable(
+    runtime: Runtime,
+    session_spec: OperationSessionSpec,
+    mut session: OperationSessionGuard,
+    body: OperationBody,
+    options: OperationExecutionOptions,
+    cancel: CancellationToken,
+) -> anyhow::Result<ExecutionOutcome> {
+    let result = execute_operation_session_body_cancelable(
+        &runtime,
+        session_spec,
+        &mut session,
+        body,
+        options,
+        cancel,
+    )
+    .await;
+    let outcome = SessionOutcome::from_execution_result(&result);
+    runtime
+        .finish_operation_session(session, result, outcome)
+        .await
+}
+
 async fn run_foreground_operation_session(
     runtime: &Runtime,
     session_spec: OperationSessionSpec,
@@ -236,7 +279,15 @@ async fn run_foreground_operation_session(
     body: OperationBody,
     options: OperationExecutionOptions,
 ) -> anyhow::Result<ForegroundOperationResult> {
-    let operation = execute_operation_session_body(runtime, session_spec, session, body, options);
+    let cancel = CancellationToken::new();
+    let operation = execute_operation_session_body_cancelable(
+        runtime,
+        session_spec,
+        session,
+        body,
+        options,
+        cancel.clone(),
+    );
     tokio::pin!(operation);
     let mut signals = match ForegroundSignalListener::new() {
         Ok(signals) => signals,
@@ -270,8 +321,21 @@ async fn run_foreground_operation_session(
                 exit_code = signal.exit_code(),
                 "foreground operation canceled"
             );
+            cancel.cancel();
+            let result = tokio::select! {
+                biased;
+                result = &mut operation => result.map(|_| ExecutionOutcome::new(signal.exit_code())),
+                second = signals.recv() => {
+                    tracing::warn!(
+                        signal = second.name,
+                        exit_code = second.exit_code(),
+                        "foreground cleanup interrupted by a second signal"
+                    );
+                    std::process::exit(second.exit_code());
+                }
+            };
             Ok(ForegroundOperationResult {
-                result: Ok(ExecutionOutcome::new(signal.exit_code())),
+                result,
                 outcome: SessionOutcome::Canceled,
                 cleanup_signals: Some(signals),
             })
@@ -317,6 +381,24 @@ async fn execute_operation_session_body(
 ) -> anyhow::Result<ExecutionOutcome> {
     let prepared = prepare_operation_session_body(runtime, session_spec, session, body).await?;
     exec_container_command_with_options(runtime, &prepared.exec_spec, options).await
+}
+
+async fn execute_operation_session_body_cancelable(
+    runtime: &Runtime,
+    session_spec: OperationSessionSpec,
+    session: &mut OperationSessionGuard,
+    body: OperationBody,
+    options: OperationExecutionOptions,
+    cancel: CancellationToken,
+) -> anyhow::Result<ExecutionOutcome> {
+    if cancel.is_cancelled() {
+        return Ok(ExecutionOutcome::canceled(None));
+    }
+    let prepared = prepare_operation_session_body(runtime, session_spec, session, body).await?;
+    if cancel.is_cancelled() {
+        return Ok(ExecutionOutcome::canceled(None));
+    }
+    exec_container_command_with_cancel(runtime, &prepared.exec_spec, options, Some(cancel)).await
 }
 
 async fn prepare_operation_session_body(

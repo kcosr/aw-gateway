@@ -255,6 +255,11 @@ case "$1" in
 JSON
     ;;
   exec)
+    case "$*" in
+      *aw-gateway-marker-list*|*aw-gateway-marker-sweep*)
+        exit 0
+        ;;
+    esac
     echo "$@" >> "{runtime_log}"
     exit 0
     ;;
@@ -310,10 +315,12 @@ command = ["launch-command", "before", "{{args}}", "after"]
         .success();
 
     let log = std::fs::read_to_string(runtime_log).unwrap();
+    assert!(log.contains("aw-gateway-exec"), "{log}");
     assert!(
-        log.contains("ubuntu-dev launch-command before --skill fresh-eyes review this after"),
+        log.contains("launch-command before --skill fresh-eyes review this after"),
         "{log}"
     );
+    assert!(log.contains("aw-gateway-exec-rm"), "{log}");
 }
 
 #[test]

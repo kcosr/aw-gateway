@@ -12,6 +12,9 @@
 - Added opt-in launch passthrough args with `allow_args = true`, CLI/SSH
   `launch ... -- <args...>`, and HTTP launch-run `args`
   ([#50](https://github.com/kcosr/aw-gateway/pull/50)).
+- Added `assets/acl-proxy.example.toml` as a starter allowlist for common
+  coding-agent proxy egress
+  ([#51](https://github.com/kcosr/aw-gateway/pull/51)).
 
 ### Changed
 
@@ -19,12 +22,23 @@
   by canceling the active session and routing through normal idle/workspace
   cleanup; a second handled signal during cleanup aborts immediately
   ([#46](https://github.com/kcosr/aw-gateway/pull/46)).
+- Foreground `run` and `launch` signal cancellation now terminates the marked
+  in-container process tree for the final command
+  ([#51](https://github.com/kcosr/aw-gateway/pull/51)).
 - HTTP wait-mode `run` and `launch` responses can now project selected captured
   streams as JSON with `output_format`
   ([#47](https://github.com/kcosr/aw-gateway/pull/47)).
 
 ### Fixed
 
+- HTTP wait-mode client disconnects now cancel the operation and run bounded
+  in-container process cleanup for the final command instead of leaving the
+  command to outlive the request
+  ([#51](https://github.com/kcosr/aw-gateway/pull/51)).
+- Gateway readiness now best-effort sweeps stale in-container cancellation
+  marker files left by crashed or killed gateway processes once per
+  runtime/container/user tuple
+  ([#51](https://github.com/kcosr/aw-gateway/pull/51)).
 - HTTP PTY close and WebSocket disconnect now terminate the in-container
   attached process tree instead of relying only on the host-side runtime client
   ([#49](https://github.com/kcosr/aw-gateway/pull/49)).

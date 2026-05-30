@@ -36,6 +36,11 @@ case "$1" in
 JSON
     ;;
   exec)
+    case "$*" in
+      *aw-gateway-marker-list*|*aw-gateway-marker-sweep*)
+        exit 0
+        ;;
+    esac
     exit {exit_code}
     ;;
 esac
@@ -93,6 +98,11 @@ case "$1" in
 JSON
     ;;
   exec)
+    case "$*" in
+      *aw-gateway-marker-list*|*aw-gateway-marker-sweep*)
+        exit 0
+        ;;
+    esac
     echo started > "{log}"
     sleep 0.2
     echo done >> "{log}"
@@ -1286,6 +1296,11 @@ case "$1" in
 JSON
     ;;
   exec)
+    case "$*" in
+      *aw-gateway-marker-list*|*aw-gateway-marker-sweep*)
+        exit 0
+        ;;
+    esac
     echo "captured stdout"
     echo "captured stderr" >&2
     exit 23
@@ -1420,6 +1435,11 @@ case "$1" in
 JSON
     ;;
   exec)
+    case "$*" in
+      *aw-gateway-marker-list*|*aw-gateway-marker-sweep*)
+        exit 0
+        ;;
+    esac
     echo "$@" >> "{runtime_log}"
     exit 0
     ;;
@@ -1471,10 +1491,12 @@ exit 0
 
     assert_eq!(outcome, ExecutionOutcome::new(0));
     let log = std::fs::read_to_string(runtime_log).unwrap();
+    assert!(log.contains("aw-gateway-exec"), "{log}");
     assert!(
-        log.contains("ubuntu-dev agent-pack run --fixed --skill fresh-eyes --after"),
+        log.contains("agent-pack run --fixed --skill fresh-eyes --after"),
         "{log}"
     );
+    assert!(log.contains("aw-gateway-exec-rm"), "{log}");
 }
 
 #[tokio::test]

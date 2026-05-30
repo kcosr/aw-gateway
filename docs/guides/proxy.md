@@ -125,7 +125,7 @@ restart = "always"
 [target_defaults.container_agent.services.health_check]
 type = "tcp"
 host = "127.0.0.1"
-port = 8881
+port = 8080
 interval = "2s"
 timeout = "1s"
 ```
@@ -146,8 +146,8 @@ For tools that honor proxy variables, set session env:
 
 ```toml
 [targets.default.session_env]
-HTTP_PROXY = "http://127.0.0.1:8881"
-HTTPS_PROXY = "http://127.0.0.1:8881"
+HTTP_PROXY = "http://127.0.0.1:8080"
+HTTPS_PROXY = "http://127.0.0.1:8080"
 NO_PROXY = "127.0.0.1,localhost"
 ```
 
@@ -156,8 +156,8 @@ them in `container_env` instead or in addition:
 
 ```toml
 [targets.default.container_env]
-HTTP_PROXY = "http://127.0.0.1:8881"
-HTTPS_PROXY = "http://127.0.0.1:8881"
+HTTP_PROXY = "http://127.0.0.1:8080"
+HTTPS_PROXY = "http://127.0.0.1:8080"
 NO_PROXY = "127.0.0.1,localhost"
 ```
 
@@ -211,3 +211,11 @@ One possible proxy implementation is
 [acl-proxy](https://github.com/kcosr/acl-proxy). `aw-gateway` does not require
 that project; any proxy with a stable command, config file, health check, CA
 bundle, and firewall policy can use the same integration pattern.
+
+The repository includes `assets/acl-proxy.example.toml` as a small starter
+policy for common coding-agent egress: broad GitHub access, optional GitHub
+sentinel Authorization replacement, and common LLM provider endpoints. Treat it
+as an example, not a production allowlist. Review domains, certificate paths,
+log paths, capture settings, and credential handling before deploying. The
+sentinel rule must appear before the broad GitHub allow rule so the rewrite
+happens before the terminal allow match.

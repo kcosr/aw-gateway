@@ -14,9 +14,9 @@
 set -euo pipefail
 
 PROXY_IP="169.254.1.2"    # host.containers.internal for podman
-PROXY_PORT=8881
-LOCAL_HTTP_PORT=8881      # local proxy HTTP port (handles HTTP + CONNECT)
-LOCAL_HTTPS_PORT=8889     # local proxy HTTPS intercept port
+PROXY_PORT=8080
+LOCAL_HTTP_PORT=8080      # local proxy HTTP port (handles HTTP + CONNECT)
+LOCAL_HTTPS_PORT=8443     # local proxy HTTPS intercept port
 
 NAT_CHAIN="AW_OUT_NAT"
 FILTER_CHAIN="AW_OUT_FILTER"

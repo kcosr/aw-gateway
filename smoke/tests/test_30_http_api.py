@@ -180,6 +180,41 @@ def test_http_run_detach(host: Host) -> None:
         assert response.body["operation_id"]
 
 
+def test_http_run_wait_disconnect_terminates_container_process(host: Host) -> None:
+    pidfile = f"/tmp/aw-gateway-wait-close-{host.name}.pid"
+    child_pidfile = f"/tmp/aw-gateway-wait-close-{host.name}.child.pid"
+
+    daemon = HttpDaemon(host)
+    with daemon as http:
+        with _start_raw_wait_request(
+            daemon,
+            host,
+            {
+                "target": host.target,
+                "mode": "wait",
+                "command": [
+                    "/bin/bash",
+                    "-lc",
+                    _long_running_process_command(pidfile, child_pidfile),
+                ],
+            },
+        ) as sock:
+            _wait_for_http_command(http, host, f"test -s {pidfile}")
+            _wait_for_http_command(http, host, f"test -s {child_pidfile}")
+            sock.shutdown(socket.SHUT_RDWR)
+
+        _wait_for_http_command(
+            http,
+            host,
+            f"pid=$(cat {pidfile}) && ! kill -0 \"$pid\" 2>/dev/null",
+        )
+        _wait_for_http_command(
+            http,
+            host,
+            f"pid=$(cat {child_pidfile}) && ! kill -0 \"$pid\" 2>/dev/null",
+        )
+
+
 def test_http_run_pty_close_terminates_container_process(host: Host) -> None:
     pidfile = f"/tmp/aw-gateway-pty-close-{host.name}.pid"
     child_pidfile = f"/tmp/aw-gateway-pty-close-{host.name}.child.pid"
@@ -483,20 +518,12 @@ def _start_long_running_pty(
     pidfile: str,
     child_pidfile: str,
 ) -> object:
-    command = (
-        f"rm -f {pidfile} {child_pidfile}; "
-        "trap '' HUP INT TERM; "
-        f"/bin/bash -lc 'trap \"\" HUP INT TERM; printf \"%s\" $$ > {child_pidfile}; "
-        "while :; do sleep 1; done' & "
-        f"printf '%s' $$ > {pidfile}; "
-        "wait"
-    )
     response = http.post(
         "/api/v1/run",
         {
             "target": host.target,
             "mode": "pty",
-            "command": ["/bin/bash", "-lc", command],
+            "command": ["/bin/bash", "-lc", _long_running_process_command(pidfile, child_pidfile)],
             "terminal": {"cols": 80, "rows": 24},
         },
     )
@@ -504,3 +531,44 @@ def _start_long_running_pty(
     assert response.body["ok"] is True
     assert response.body["mode"] == "pty"
     return response
+
+
+def _long_running_process_command(pidfile: str, child_pidfile: str) -> str:
+    return (
+        f"rm -f {pidfile} {child_pidfile}; "
+        "trap '' HUP INT TERM; "
+        f"/bin/bash -lc 'trap \"\" HUP INT TERM; printf \"%s\" $$ > {child_pidfile}; "
+        "while :; do sleep 1; done' & "
+        f"printf '%s' $$ > {pidfile}; "
+        "wait"
+    )
+
+
+class _RawHttpWait:
+    def __init__(self, daemon: HttpDaemon, body: dict) -> None:
+        self.daemon = daemon
+        self.body = body
+        self.sock: socket.socket | None = None
+
+    def __enter__(self) -> socket.socket:
+        payload = json.dumps(self.body).encode("utf-8")
+        request = (
+            b"POST /api/v1/run HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            + f"Authorization: Bearer {self.daemon.host.http_token}\r\n".encode("ascii")
+            + b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
+            + payload
+        )
+        self.sock = socket.create_connection(("127.0.0.1", self.daemon.local_port), timeout=10)
+        self.sock.sendall(request)
+        return self.sock
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self.sock is not None:
+            self.sock.close()
+
+
+def _start_raw_wait_request(daemon: HttpDaemon, host: Host, body: dict) -> _RawHttpWait:
+    assert body["target"] == host.target
+    return _RawHttpWait(daemon, body)

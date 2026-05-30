@@ -1221,7 +1221,8 @@ Gateway command behavior:
   reuse a target and run one command inside the container. A command is
   required; use `up` to start or hold a target without running a command.
   Foreground runs interrupted by `SIGINT`, `SIGTERM`, or `SIGHUP` are canceled
-  and then routed through normal session cleanup.
+  with in-container process cleanup and then routed through normal session
+  cleanup.
 - `launches [--json]`: list configured launches.
 - `launch show <name> [--json]`: show one configured launch's variables, steps,
   and final command.
@@ -1230,7 +1231,8 @@ Gateway command behavior:
   command. Args after `--` are accepted only for launches with
   `allow_args = true` and are spliced at the configured `{args}` argv element.
   Foreground launches interrupted by `SIGINT`, `SIGTERM`, or `SIGHUP` are
-  canceled and then routed through normal session cleanup.
+  canceled with in-container process cleanup and then routed through normal
+  session cleanup.
 - `stop [target] [--session-id ID]`: stop a target, or a specific ephemeral
   session target.
 - `remove [target] [--session-id ID]`: stop a fixed target if needed, then
@@ -1494,6 +1496,14 @@ wait responses. `output_format` accepts `text` or `json` for selected streams
 and defaults to `text`. `output` and `output_format` are rejected for detach and
 PTY requests.
 
+In wait mode, aw-gateway owns the operation until the response completes. If a
+direct HTTP client connection closes or resets before completion, the gateway
+cancels the operation, runs the same session cleanup path used by interrupted
+foreground commands, and attempts bounded in-container process-tree cleanup for
+the final command. Silently dead peers that do not deliver FIN/RST are limited
+by TCP/proxy behavior; use detach mode for operations that must survive client
+network loss.
+
 ```json
 {
   "target": "default",
@@ -1555,6 +1565,8 @@ by multiple clients.
 
 The `assets/` directory contains deployable helpers and image files:
 
+- `assets/acl-proxy.example.toml`: starter `acl-proxy` allowlist for common
+  coding-agent egress. Review and adapt before deploying.
 - `assets/aw-iptables`: applies, checks, and reports namespace-local proxy
   firewall rules for a running container PID.
 - `assets/ensure-storage-conf`: creates a rootless Podman storage config for
@@ -1727,7 +1739,8 @@ sequenceDiagram
     O->>R: Resolve target and ensure container readiness
     R->>A: Wait for configured services/control readiness
     alt wait mode
-        O->>R: Execute command and capture stdout/stderr
+        G->>G: Spawn operation task and hold disconnect cancel guard
+        O->>R: Execute cancelable command and capture stdout/stderr
         G-->>C: 200 JSON with exit_code/stdout/stderr
     else detach mode
         O->>R: Start background operation with session guard

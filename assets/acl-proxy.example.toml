@@ -1,0 +1,139 @@
+# Example acl-proxy policy for common coding-agent egress.
+#
+# This is a starter allowlist, not a complete site policy. Review provider
+# domains, ports, log paths, capture settings, and certificate paths before
+# deploying. This example allows GitHub broadly and optionally replaces a
+# sentinel GitHub Authorization header with a proxy-managed credential.
+
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+https_bind_address = "127.0.0.1"
+https_port = 8443
+request_timeout_ms = 1800000
+internal_base_path = "/_acl-proxy"
+
+[certificates]
+certs_dir = "/var/lib/acl-proxy/certs"
+
+[tls]
+verify_upstream = true
+enable_http2_upstream = false
+
+[logging]
+level = "info"
+directory = "/var/log/acl-proxy"
+max_bytes = 104857600
+max_files = 5
+console = true
+
+[logging.policy_decisions]
+log_allows = false
+log_denies = true
+level_allows = "info"
+level_denies = "warn"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "/var/lib/acl-proxy/captures"
+max_body_bytes = 65536
+
+[loop_protection]
+enabled = true
+add_header = true
+header_name = "x-acl-proxy-request-id"
+
+[policy]
+default = "deny"
+
+# GitHub with sentinel Authorization replacement
+#
+# This rule must appear before the broad GitHub allow rule. It matches only
+# the sentinel Authorization values below, then replaces the whole outbound
+# Authorization header with ACL_PROXY_GITHUB_AUTHORIZATION. Set that environment
+# variable to the complete header value to send upstream, for example:
+#
+#   export ACL_PROXY_GITHUB_AUTHORIZATION='Bearer github_pat_...'
+#   export ACL_PROXY_GITHUB_AUTHORIZATION='token ghp_...'
+#
+[[policy.rules]]
+action = "allow"
+patterns = [
+    "https://github.com/**",
+    "https://api.github.com/**",
+    "https://uploads.github.com/**",
+    "https://raw.githubusercontent.com/**",
+    "https://objects.githubusercontent.com/**",
+    "https://codeload.github.com/**",
+    "https://release-assets.githubusercontent.com/**",
+]
+headers_match = { "authorization" = [
+    "Bearer __ACL_PROXY_GITHUB_TOKEN__",
+    "token __ACL_PROXY_GITHUB_TOKEN__",
+] }
+description = "GitHub with sentinel Authorization replaced by proxy-managed credential"
+
+  [[policy.rules.header_actions]]
+  direction = "request"
+  action = "set"
+  name = "authorization"
+  value = "${ACL_PROXY_GITHUB_AUTHORIZATION}"
+  when = "always"
+
+# GitHub access
+#
+# This broad rule allows GitHub traffic regardless of whether the client sends
+# Authorization. If the Authorization header is one of the sentinel values
+# above, the previous rule matches first and substitutes the proxy-managed
+# credential.
+[[policy.rules]]
+action = "allow"
+patterns = [
+    "https://github.com/**",
+    "https://api.github.com/**",
+    "https://uploads.github.com/**",
+    "https://raw.githubusercontent.com/**",
+    "https://objects.githubusercontent.com/**",
+    "https://codeload.github.com/**",
+    "https://release-assets.githubusercontent.com/**",
+]
+description = "GitHub access"
+
+# Anthropic / Claude
+[[policy.rules]]
+action = "allow"
+patterns = [
+    "https://api.anthropic.com/**",
+    "https://console.anthropic.com/**",
+    "https://platform.claude.com/**",
+    "https://claude.ai/**",
+    "https://statsig.anthropic.com/**",
+]
+description = "Anthropic and Claude services"
+
+# OpenAI / ChatGPT / Codex
+[[policy.rules]]
+action = "allow"
+patterns = [
+    "https://api.openai.com/**",
+    "https://chatgpt.com/**",
+    "https://**.chatgpt.com/**",
+    "https://auth.openai.com/**",
+    "https://developers.openai.com/**",
+    "https://files.openai.com/content?**",
+]
+description = "OpenAI, ChatGPT, and Codex services"
+
+# Cursor
+[[policy.rules]]
+action = "allow"
+patterns = [
+    "https://cursor.com/**",
+    "https://*.cursor.sh/**",
+]
+description = "Cursor services"

@@ -1,7 +1,7 @@
 use super::ops::{
     CanonicalLaunchVarValue, GatewayOperation, GatewayOperationResult, LaunchPassthroughArgs,
     OperationExecutionOptions, OperationMode, OutputSelection, SuppliedLaunchVars,
-    execute_gateway_operation,
+    execute_gateway_operation, execute_gateway_operation_cancelable,
 };
 use super::{
     PreparedExecution, SessionOutcome, prepare_launch_execution_with_config,
@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Mutex, watch};
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 mod auth;
 mod output_projection;
@@ -48,6 +49,8 @@ const MAX_WS_TEXT_BYTES: usize = 64 * 1024;
 const MAX_WS_BINARY_BYTES: usize = 256 * 1024;
 const PTY_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const PTY_SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const WAIT_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const WAIT_SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub(super) struct AppState {
@@ -55,6 +58,7 @@ pub(super) struct AppState {
     config: Arc<GatewayConfig>,
     pty_leases: Arc<PtyLeaseManager>,
     pty_shutdown: PtyShutdown,
+    wait_shutdown: WaitShutdown,
 }
 
 pub(super) async fn serve(config_path: Option<PathBuf>) -> anyhow::Result<()> {
@@ -65,11 +69,13 @@ pub(super) async fn serve(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     let addr = cfg.http.listen_addr()?;
     let pty_leases = Arc::new(PtyLeaseManager::default());
     let pty_shutdown = PtyShutdown::default();
+    let wait_shutdown = WaitShutdown::default();
     let app = router(AppState {
         config_path,
         config: Arc::new(cfg),
         pty_leases: pty_leases.clone(),
         pty_shutdown: pty_shutdown.clone(),
+        wait_shutdown: wait_shutdown.clone(),
     });
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(listen = %addr, "http listener started");
@@ -77,6 +83,10 @@ pub(super) async fn serve(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
+            tracing::info!("http shutdown signal received; giving active wait operations grace");
+            wait_shutdown
+                .cancel_active_after_grace(WAIT_SHUTDOWN_GRACE, WAIT_SHUTDOWN_WAIT_TIMEOUT)
+                .await;
             tracing::info!("http shutdown signal received; canceling active pty sessions");
             pty_shutdown
                 .cancel_active_and_wait(PTY_SHUTDOWN_WAIT_TIMEOUT)
@@ -192,6 +202,83 @@ struct ActivePtySession {
 impl Drop for ActivePtySession {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+struct WaitShutdown {
+    token: CancellationToken,
+    active: Arc<AtomicUsize>,
+}
+
+impl Default for WaitShutdown {
+    fn default() -> Self {
+        Self {
+            token: CancellationToken::new(),
+            active: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl WaitShutdown {
+    fn register(&self) -> (CancellationToken, ActiveWaitOperation) {
+        self.active.fetch_add(1, Ordering::Relaxed);
+        (
+            self.token.child_token(),
+            ActiveWaitOperation {
+                active: self.active.clone(),
+            },
+        )
+    }
+
+    async fn cancel_active_after_grace(&self, grace: Duration, wait_timeout: Duration) {
+        let grace_deadline = tokio::time::Instant::now() + grace;
+        while self.active.load(Ordering::Relaxed) > 0 {
+            if tokio::time::Instant::now() >= grace_deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if self.active.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+
+        tracing::info!(
+            active = self.active.load(Ordering::Relaxed),
+            "canceling active http wait operations after shutdown grace"
+        );
+        self.token.cancel();
+        let wait_deadline = tokio::time::Instant::now() + wait_timeout;
+        while self.active.load(Ordering::Relaxed) > 0 {
+            if tokio::time::Instant::now() >= wait_deadline {
+                tracing::warn!(
+                    active = self.active.load(Ordering::Relaxed),
+                    "timed out waiting for active http wait operations to finish"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+struct ActiveWaitOperation {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveWaitOperation {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct OperationCancelGuard {
+    token: CancellationToken,
+}
+
+impl Drop for OperationCancelGuard {
+    fn drop(&mut self) {
+        self.token.cancel();
     }
 }
 
@@ -393,7 +480,13 @@ async fn launch_run(
         args: request.args.unwrap_or_default(),
         options: execution.options,
     };
-    execute_http_execution(state.config_path, operation, execution.output_formats).await
+    execute_http_execution(
+        state,
+        operation,
+        execution.output_formats,
+        execution.options.mode,
+    )
+    .await
 }
 
 async fn run(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -425,7 +518,13 @@ async fn run(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> 
         command: request.command,
         options: execution.options,
     };
-    execute_http_execution(state.config_path, operation, execution.output_formats).await
+    execute_http_execution(
+        state,
+        operation,
+        execution.output_formats,
+        execution.options.mode,
+    )
+    .await
 }
 
 async fn pty_attach(
@@ -770,11 +869,71 @@ async fn prepare_pty_launch(state: AppState, name: String, request: LaunchRunReq
 }
 
 async fn execute_http_execution(
+    state: AppState,
+    operation: GatewayOperation,
+    output_formats: OutputFormats,
+    mode: OperationMode,
+) -> Response {
+    if mode == OperationMode::Wait {
+        return execute_http_wait(state, operation, output_formats).await;
+    }
+    execute_http_execution_direct(state.config_path, operation, output_formats).await
+}
+
+async fn execute_http_wait(
+    state: AppState,
+    operation: GatewayOperation,
+    output_formats: OutputFormats,
+) -> Response {
+    let (cancel, active) = state.wait_shutdown.register();
+    let guard = OperationCancelGuard {
+        token: cancel.clone(),
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _active = active;
+        let response = execute_http_execution_direct_cancelable(
+            state.config_path,
+            operation,
+            output_formats,
+            cancel,
+        )
+        .await;
+        let _ = tx.send(response);
+    });
+    let response = match rx.await {
+        Ok(response) => response,
+        Err(_) => {
+            HttpError::operation_failed("operation task ended without a response").into_response()
+        }
+    };
+    drop(guard);
+    response
+}
+
+async fn execute_http_execution_direct(
     config_path: Option<PathBuf>,
     operation: GatewayOperation,
     output_formats: OutputFormats,
 ) -> Response {
     match execute_gateway_operation(config_path, operation).await {
+        Ok(GatewayOperationResult::Run(outcome)) | Ok(GatewayOperationResult::Launch(outcome)) => {
+            execution_response(outcome, output_formats)
+        }
+        Ok(_) => {
+            HttpError::operation_failed("operation returned an unexpected result").into_response()
+        }
+        Err(err) => operation_error_response(err),
+    }
+}
+
+async fn execute_http_execution_direct_cancelable(
+    config_path: Option<PathBuf>,
+    operation: GatewayOperation,
+    output_formats: OutputFormats,
+    cancel: CancellationToken,
+) -> Response {
+    match execute_gateway_operation_cancelable(config_path, operation, cancel).await {
         Ok(GatewayOperationResult::Run(outcome)) | Ok(GatewayOperationResult::Launch(outcome)) => {
             execution_response(outcome, output_formats)
         }

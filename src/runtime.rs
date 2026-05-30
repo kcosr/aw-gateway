@@ -2,7 +2,7 @@ use crate::config::{ContainerRuntimeType, RuntimeConfig};
 use crate::template::{self, Vars};
 use anyhow::Context;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::Read;
@@ -12,11 +12,13 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 mod parse;
 
@@ -93,9 +95,26 @@ pub struct ContainerPtySession {
     cleanup_marker_path: String,
 }
 
-const PTY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
-const PTY_HOST_TERMINATE_DELAY: Duration = Duration::from_millis(100);
-const PTY_INITIAL_CLEANUP_JOIN_TIMEOUT: Duration = Duration::from_millis(2500);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContainerExecCaptureResult {
+    Completed(ContainerExecOutput),
+    Canceled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerExecStatusResult {
+    Completed(i32),
+    Canceled,
+}
+
+const CANCEL_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const CANCEL_HOST_TERMINATE_DELAY: Duration = Duration::from_millis(100);
+const CANCEL_INITIAL_CLEANUP_JOIN_TIMEOUT: Duration = Duration::from_millis(2500);
+const CANCEL_HOST_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const CANCEL_MARKER_LIST_ARGV0: &str = "aw-gateway-marker-list";
+const CANCEL_MARKER_SWEEP_ARGV0: &str = "aw-gateway-marker-sweep";
+const CANCEL_MARKER_PATH_PREFIX: &str = "/tmp/aw-gateway-";
+const CANCEL_MARKER_PATH_SUFFIX: &str = ".pid";
 
 impl ContainerPtySession {
     pub async fn terminate(&self) -> anyhow::Result<()> {
@@ -114,25 +133,27 @@ impl ContainerPtySession {
         let initial_cleanup_marker_path = cleanup_marker_path.clone();
         let initial_cleanup_container_name = cleanup_container_name.clone();
         let mut cleanup = tokio::spawn(async move {
-            run_container_pty_cleanup(
+            run_container_cancel_exec(
                 initial_cleanup_runtime,
                 initial_cleanup_spec,
                 initial_cleanup_marker_path,
                 initial_cleanup_container_name,
                 "initial",
+                "cleanup",
+                ContainerCancelExecLog::Info,
             )
             .await
         });
         let killer = self.killer.clone();
         let child_pid = self.child_pid;
         let host_terminate = async move {
-            tokio::time::sleep(PTY_HOST_TERMINATE_DELAY).await;
+            tokio::time::sleep(CANCEL_HOST_TERMINATE_DELAY).await;
             terminate_host_pty_child(killer, child_pid).await
         };
 
         let host_result = host_terminate.await;
         let initial_cleanup_finished =
-            match tokio::time::timeout(PTY_INITIAL_CLEANUP_JOIN_TIMEOUT, &mut cleanup).await {
+            match tokio::time::timeout(CANCEL_INITIAL_CLEANUP_JOIN_TIMEOUT, &mut cleanup).await {
                 Ok(Ok(ok)) => ok,
                 Ok(Err(err)) => {
                     tracing::warn!(
@@ -154,12 +175,14 @@ impl ContainerPtySession {
                 }
             };
         if !initial_cleanup_finished {
-            run_container_pty_cleanup(
+            run_container_cancel_exec(
                 cleanup_runtime,
                 cleanup_spec,
                 cleanup_marker_path,
                 cleanup_container_name,
                 "post-host-terminate",
+                "cleanup",
+                ContainerCancelExecLog::Info,
             )
             .await;
         }
@@ -167,25 +190,48 @@ impl ContainerPtySession {
     }
 }
 
-async fn run_container_pty_cleanup(
+#[derive(Debug, Clone, Copy)]
+enum ContainerCancelExecLog {
+    Info,
+    Debug,
+}
+
+async fn run_container_cancel_exec(
     runtime: ContainerRuntime,
     spec: ContainerExecSpec,
     marker_path: String,
     container_name: String,
     phase: &'static str,
+    action: &'static str,
+    success_log: ContainerCancelExecLog,
 ) -> bool {
     match runtime
-        .exec_discard_with_timeout(&spec, Some(PTY_CLEANUP_TIMEOUT))
+        .exec_discard_with_timeout(&spec, Some(CANCEL_CLEANUP_TIMEOUT))
         .await
     {
         Ok(exit_code) => {
-            tracing::info!(
-                container = %container_name,
-                marker = %marker_path,
-                phase,
-                exit_code,
-                "container pty cleanup exec finished"
-            );
+            match success_log {
+                ContainerCancelExecLog::Info => {
+                    tracing::info!(
+                        container = %container_name,
+                        marker = %marker_path,
+                        phase,
+                        action,
+                        exit_code,
+                        "container cancel exec finished"
+                    );
+                }
+                ContainerCancelExecLog::Debug => {
+                    tracing::debug!(
+                        container = %container_name,
+                        marker = %marker_path,
+                        phase,
+                        action,
+                        exit_code,
+                        "container cancel exec finished"
+                    );
+                }
+            }
             true
         }
         Err(err) => {
@@ -194,7 +240,8 @@ async fn run_container_pty_cleanup(
                 container = %container_name,
                 marker = %marker_path,
                 phase,
-                "container pty cleanup exec failed"
+                action,
+                "container cancel exec failed"
             );
             false
         }
@@ -220,6 +267,130 @@ async fn terminate_host_pty_child(
     .context("join pty child terminate task")?
 }
 
+async fn read_pipe_to_end<R>(mut reader: R) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+async fn cancel_container_exec_child(
+    runtime: ContainerRuntime,
+    cleanup_spec: ContainerExecSpec,
+    marker_path: String,
+    container_name: String,
+    child_pid: Option<u32>,
+    mut wait_task: JoinHandle<std::io::Result<ExitStatus>>,
+) {
+    tracing::info!(
+        container = %container_name,
+        marker = %marker_path,
+        child_pid = ?child_pid,
+        "canceling container exec"
+    );
+    let initial_cleanup_runtime = runtime.clone();
+    let initial_cleanup_spec = cleanup_spec.clone();
+    let initial_marker_path = marker_path.clone();
+    let initial_container_name = container_name.clone();
+    let mut cleanup = tokio::spawn(async move {
+        run_container_cancel_exec(
+            initial_cleanup_runtime,
+            initial_cleanup_spec,
+            initial_marker_path,
+            initial_container_name,
+            "initial",
+            "cleanup",
+            ContainerCancelExecLog::Info,
+        )
+        .await
+    });
+
+    tokio::time::sleep(CANCEL_HOST_TERMINATE_DELAY).await;
+    terminate_host_exec_child(child_pid).await;
+
+    let initial_cleanup_finished =
+        match tokio::time::timeout(CANCEL_INITIAL_CLEANUP_JOIN_TIMEOUT, &mut cleanup).await {
+            Ok(Ok(ok)) => ok,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    container = %container_name,
+                    marker = %marker_path,
+                    "initial container exec cleanup task failed"
+                );
+                false
+            }
+            Err(_) => {
+                cleanup.abort();
+                tracing::warn!(
+                    container = %container_name,
+                    marker = %marker_path,
+                    "initial container exec cleanup task timed out"
+                );
+                false
+            }
+        };
+    if !initial_cleanup_finished {
+        run_container_cancel_exec(
+            runtime,
+            cleanup_spec,
+            marker_path.clone(),
+            container_name.clone(),
+            "post-host-terminate",
+            "cleanup",
+            ContainerCancelExecLog::Info,
+        )
+        .await;
+    }
+
+    match tokio::time::timeout(CANCEL_HOST_WAIT_TIMEOUT, &mut wait_task).await {
+        Ok(Ok(Ok(_))) => {}
+        Ok(Ok(Err(err))) => {
+            tracing::warn!(
+                error = %err,
+                container = %container_name,
+                marker = %marker_path,
+                "host runtime exec wait failed after cancellation"
+            );
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(
+                error = %err,
+                container = %container_name,
+                marker = %marker_path,
+                "host runtime exec wait task failed after cancellation"
+            );
+        }
+        Err(_) => {
+            wait_task.abort();
+            tracing::warn!(
+                container = %container_name,
+                marker = %marker_path,
+                "host runtime exec did not exit after cancellation"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn terminate_host_exec_child(child_pid: Option<u32>) {
+    if let Some(child_pid) = child_pid
+        && let Err(err) =
+            tokio::task::spawn_blocking(move || terminate_process_group(child_pid)).await
+    {
+        tracing::warn!(
+            error = %err,
+            child_pid,
+            "host runtime exec process-group terminate task failed"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminate_host_exec_child(_child_pid: Option<u32>) {}
+
 impl Drop for ContainerPtySession {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -239,7 +410,8 @@ impl Drop for ContainerPtySession {
     }
 }
 
-static NEXT_PTY_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_CANCEL_MARKER_ID: AtomicU64 = AtomicU64::new(1);
+static CANCEL_MARKER_SWEEP_KEYS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 
 #[cfg(unix)]
 fn terminate_process_group(child_pid: u32) {
@@ -479,6 +651,73 @@ impl ContainerRuntime {
         &self.env
     }
 
+    pub async fn sweep_stale_cancel_markers(
+        &self,
+        container_name: &str,
+        user: &str,
+    ) -> anyhow::Result<usize> {
+        let spec = cancel_marker_list_spec(container_name, user);
+        let output = self
+            .exec_capture_with_timeout(&spec, Some(CANCEL_CLEANUP_TIMEOUT))
+            .await?;
+        if output.exit_code != 0 {
+            anyhow::bail!(
+                "{} exec {} stale cancel marker list exited with status {}",
+                self.runtime_label(),
+                container_name,
+                output.exit_code
+            );
+        }
+
+        let listed = String::from_utf8_lossy(&output.stdout);
+        let stale = stale_cancel_marker_paths(listed.lines(), host_process_is_active);
+        if stale.is_empty() {
+            return Ok(0);
+        }
+
+        for chunk in stale.chunks(100) {
+            let spec = cancel_marker_sweep_spec(container_name, user, chunk);
+            let exit_code = self
+                .exec_discard_with_timeout(&spec, Some(CANCEL_CLEANUP_TIMEOUT))
+                .await?;
+            if exit_code != 0 {
+                anyhow::bail!(
+                    "{} exec {} stale cancel marker sweep exited with status {}",
+                    self.runtime_label(),
+                    container_name,
+                    exit_code
+                );
+            }
+        }
+        Ok(stale.len())
+    }
+
+    pub async fn sweep_stale_cancel_markers_once(
+        &self,
+        container_name: &str,
+        user: &str,
+    ) -> anyhow::Result<Option<usize>> {
+        let key = self.cancel_marker_sweep_key(container_name, user);
+        let sweep_keys = CANCEL_MARKER_SWEEP_KEYS.get_or_init(|| Mutex::new(BTreeSet::new()));
+        let should_sweep = sweep_keys
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cancel marker sweep key lock poisoned"))?
+            .insert(key);
+        if !should_sweep {
+            return Ok(None);
+        }
+        self.sweep_stale_cancel_markers(container_name, user)
+            .await
+            .map(Some)
+    }
+
+    fn cancel_marker_sweep_key(&self, container_name: &str, user: &str) -> String {
+        format!(
+            "{:?}\0{}\0{:?}\0{}\0{}",
+            self.kind, self.program, self.env, container_name, user
+        )
+    }
+
     pub async fn inspect(&self, name: &str) -> anyhow::Result<Option<ContainerInspect>> {
         let output = self
             .command()
@@ -604,6 +843,142 @@ impl ContainerRuntime {
         })
     }
 
+    pub async fn exec_capture_cancelable(
+        &self,
+        spec: &ContainerExecSpec,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<ContainerExecCaptureResult> {
+        let marker = next_cancel_marker("exec")?;
+        let mut exec_spec = spec.clone();
+        exec_spec.command = wrap_cancelable_command(&spec.command, &marker, "aw-gateway-exec");
+        let cleanup_spec = cancel_cleanup_spec(spec, &marker, "aw-gateway-exec-cleanup");
+        let remove_spec = cancel_marker_remove_spec(spec, &marker, "aw-gateway-exec-rm");
+
+        let mut command = self.command();
+        command
+            .arg("exec")
+            .args(self.exec_args(&exec_spec))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "start {} exec {}",
+                self.runtime_label(),
+                spec.container_name
+            )
+        })?;
+        let child_pid = child.id();
+        let stdout = child
+            .stdout
+            .take()
+            .context("container exec stdout pipe was not captured")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("container exec stderr pipe was not captured")?;
+        let mut wait_task = tokio::spawn(async move { child.wait().await });
+        let stdout_task = tokio::spawn(read_pipe_to_end(stdout));
+        let stderr_task = tokio::spawn(read_pipe_to_end(stderr));
+
+        tokio::select! {
+            status = &mut wait_task => {
+                let status = status.context("join container exec wait task")?
+                    .with_context(|| format!("run {} exec {}", self.runtime_label(), spec.container_name))?;
+                let stdout = stdout_task.await.context("join stdout drain task")??;
+                let stderr = stderr_task.await.context("join stderr drain task")??;
+                let output = ContainerExecOutput {
+                    exit_code: exit_code(status),
+                    stdout,
+                    stderr,
+                };
+                run_container_cancel_exec(
+                    self.clone(),
+                    remove_spec,
+                    marker.path.clone(),
+                    spec.container_name.clone(),
+                    "normal-completion",
+                    "marker-remove",
+                    ContainerCancelExecLog::Debug,
+                )
+                .await;
+                Ok(ContainerExecCaptureResult::Completed(output))
+            }
+            _ = cancel.cancelled() => {
+                cancel_container_exec_child(
+                    self.clone(),
+                    cleanup_spec,
+                    marker.path,
+                    spec.container_name.clone(),
+                    child_pid,
+                    wait_task,
+                )
+                .await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                Ok(ContainerExecCaptureResult::Canceled)
+            }
+        }
+    }
+
+    pub async fn exec_cancelable(
+        &self,
+        spec: &ContainerExecSpec,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<ContainerExecStatusResult> {
+        let marker = next_cancel_marker("exec")?;
+        let mut exec_spec = spec.clone();
+        exec_spec.command = wrap_cancelable_command(&spec.command, &marker, "aw-gateway-exec");
+        let cleanup_spec = cancel_cleanup_spec(spec, &marker, "aw-gateway-exec-cleanup");
+        let remove_spec = cancel_marker_remove_spec(spec, &marker, "aw-gateway-exec-rm");
+
+        let mut command = self.command();
+        command
+            .arg("exec")
+            .args(self.exec_args(&exec_spec))
+            .kill_on_drop(true);
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "start {} exec {}",
+                self.runtime_label(),
+                spec.container_name
+            )
+        })?;
+        let child_pid = child.id();
+        let mut wait_task = tokio::spawn(async move { child.wait().await });
+
+        tokio::select! {
+            status = &mut wait_task => {
+                let status = status.context("join container exec wait task")?
+                    .with_context(|| format!("run {} exec {}", self.runtime_label(), spec.container_name))?;
+                run_container_cancel_exec(
+                    self.clone(),
+                    remove_spec,
+                    marker.path.clone(),
+                    spec.container_name.clone(),
+                    "normal-completion",
+                    "marker-remove",
+                    ContainerCancelExecLog::Debug,
+                )
+                .await;
+                Ok(ContainerExecStatusResult::Completed(exit_code(status)))
+            }
+            _ = cancel.cancelled() => {
+                cancel_container_exec_child(
+                    self.clone(),
+                    cleanup_spec,
+                    marker.path,
+                    spec.container_name.clone(),
+                    child_pid,
+                    wait_task,
+                )
+                .await;
+                Ok(ContainerExecStatusResult::Canceled)
+            }
+        }
+    }
+
     pub async fn exec_discard(&self, spec: &ContainerExecSpec) -> anyhow::Result<i32> {
         self.exec_discard_with_timeout(spec, None).await
     }
@@ -650,9 +1025,9 @@ impl ContainerRuntime {
         let mut pty_spec = spec.clone();
         pty_spec.stdin_tty = true;
         pty_spec.stdout_tty = true;
-        let marker = next_pty_marker()?;
-        pty_spec.command = wrap_pty_command(&spec.command, &marker);
-        let cleanup_spec = pty_cleanup_spec(spec, &marker);
+        let marker = next_cancel_marker("pty")?;
+        pty_spec.command = wrap_cancelable_command(&spec.command, &marker, "aw-gateway-pty");
+        let cleanup_spec = cancel_cleanup_spec(spec, &marker, "aw-gateway-pty-cleanup");
 
         let pty_system = portable_pty::native_pty_system();
         let pair = pty_system.openpty(pty_size(size))?;
@@ -955,20 +1330,21 @@ fn pty_size(size: ContainerPtySize) -> portable_pty::PtySize {
     }
 }
 
-struct PtyMarker {
+#[derive(Debug, Clone)]
+struct ContainerCancelMarker {
     path: String,
     token: String,
 }
 
-fn next_pty_marker() -> anyhow::Result<PtyMarker> {
-    let id = NEXT_PTY_ID.fetch_add(1, Ordering::Relaxed);
-    Ok(PtyMarker {
-        path: format!("/tmp/aw-gateway-pty-{}-{id}.pid", std::process::id()),
-        token: random_pty_marker_token()?,
+fn next_cancel_marker(kind: &str) -> anyhow::Result<ContainerCancelMarker> {
+    let id = NEXT_CANCEL_MARKER_ID.fetch_add(1, Ordering::Relaxed);
+    Ok(ContainerCancelMarker {
+        path: format!("/tmp/aw-gateway-{kind}-{}-{id}.pid", std::process::id()),
+        token: random_cancel_marker_token()?,
     })
 }
 
-fn random_pty_marker_token() -> anyhow::Result<String> {
+fn random_cancel_marker_token() -> anyhow::Result<String> {
     let mut bytes = [0_u8; 32];
     std::fs::File::open("/dev/urandom")
         .context("open /dev/urandom")?
@@ -977,12 +1353,16 @@ fn random_pty_marker_token() -> anyhow::Result<String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn wrap_pty_command(command: &[String], marker: &PtyMarker) -> Vec<String> {
+fn wrap_cancelable_command(
+    command: &[String],
+    marker: &ContainerCancelMarker,
+    argv0: &'static str,
+) -> Vec<String> {
     let mut wrapped = vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
         r#"printf "%s %s\n" "$$" "$2" > "$1"; shift 2; exec "$@""#.to_string(),
-        "aw-gateway-pty".to_string(),
+        argv0.to_string(),
         marker.path.clone(),
         marker.token.clone(),
     ];
@@ -990,7 +1370,11 @@ fn wrap_pty_command(command: &[String], marker: &PtyMarker) -> Vec<String> {
     wrapped
 }
 
-fn pty_cleanup_spec(spec: &ContainerExecSpec, marker: &PtyMarker) -> ContainerExecSpec {
+fn cancel_cleanup_spec(
+    spec: &ContainerExecSpec,
+    marker: &ContainerCancelMarker,
+    argv0: &'static str,
+) -> ContainerExecSpec {
     let mut cleanup = spec.clone();
     cleanup.stdin_tty = false;
     cleanup.stdout_tty = false;
@@ -1033,11 +1417,128 @@ kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
 [ -z "$descendants" ] || kill -KILL $descendants 2>/dev/null || true
 rm -f "$1""#
             .to_string(),
-        "aw-gateway-pty-cleanup".to_string(),
+        argv0.to_string(),
         marker.path.clone(),
         marker.token.clone(),
     ];
     cleanup
+}
+
+fn cancel_marker_remove_spec(
+    spec: &ContainerExecSpec,
+    marker: &ContainerCancelMarker,
+    argv0: &'static str,
+) -> ContainerExecSpec {
+    let mut cleanup = spec.clone();
+    cleanup.stdin_tty = false;
+    cleanup.stdout_tty = false;
+    cleanup.command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        r#"read pid token < "$1" 2>/dev/null || exit 0
+[ "$token" = "$2" ] || exit 0
+rm -f "$1""#
+            .to_string(),
+        argv0.to_string(),
+        marker.path.clone(),
+        marker.token.clone(),
+    ];
+    cleanup
+}
+
+fn cancel_marker_list_spec(container_name: &str, user: &str) -> ContainerExecSpec {
+    ContainerExecSpec {
+        stdin_tty: false,
+        stdout_tty: false,
+        user: user.to_string(),
+        cwd: None,
+        env: BTreeMap::new(),
+        container_name: container_name.to_string(),
+        command: vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            r#"for path in /tmp/aw-gateway-*-*.pid; do
+  [ -e "$path" ] || continue
+  printf '%s\n' "$path"
+done"#
+                .to_string(),
+            CANCEL_MARKER_LIST_ARGV0.to_string(),
+        ],
+    }
+}
+
+fn cancel_marker_sweep_spec(
+    container_name: &str,
+    user: &str,
+    marker_paths: &[String],
+) -> ContainerExecSpec {
+    let mut command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        r#"for path do
+  case "$path" in
+    /tmp/aw-gateway-*-*.pid) rm -f -- "$path" 2>/dev/null || true ;;
+  esac
+done"#
+            .to_string(),
+        CANCEL_MARKER_SWEEP_ARGV0.to_string(),
+    ];
+    command.extend(marker_paths.iter().cloned());
+    ContainerExecSpec {
+        stdin_tty: false,
+        stdout_tty: false,
+        user: user.to_string(),
+        cwd: None,
+        env: BTreeMap::new(),
+        container_name: container_name.to_string(),
+        command,
+    }
+}
+
+fn stale_cancel_marker_paths<'a, I, F>(paths: I, host_process_is_active: F) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+    F: Fn(u32) -> bool,
+{
+    paths
+        .into_iter()
+        .filter_map(|path| {
+            let pid = parse_cancel_marker_host_pid(path)?;
+            (!host_process_is_active(pid)).then(|| path.to_string())
+        })
+        .collect()
+}
+
+fn parse_cancel_marker_host_pid(path: &str) -> Option<u32> {
+    let rest = path.strip_prefix(CANCEL_MARKER_PATH_PREFIX)?;
+    let rest = rest.strip_suffix(CANCEL_MARKER_PATH_SUFFIX)?;
+    let (kind_and_pid, id) = rest.rsplit_once('-')?;
+    if id.is_empty() || !id.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let (kind, pid) = kind_and_pid.rsplit_once('-')?;
+    if kind.is_empty() {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+#[cfg(unix)]
+fn host_process_is_active(pid: u32) -> bool {
+    let pid = pid as libc::pid_t;
+    if pid <= 0 {
+        return false;
+    }
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn host_process_is_active(pid: u32) -> bool {
+    pid == std::process::id()
 }
 
 fn render_runtime_value(value: &str, user: &str, home: &Path) -> anyhow::Result<String> {
@@ -1295,13 +1796,13 @@ mod tests {
 
     #[test]
     fn pty_wrapper_and_cleanup_commands_are_stable() {
-        let marker = PtyMarker {
+        let marker = ContainerCancelMarker {
             path: "/tmp/aw-gateway-pty-test.pid".into(),
             token: "test-token".into(),
         };
         let command = vec!["/bin/bash".into(), "-lc".into(), "echo ok".into()];
 
-        let wrapped = wrap_pty_command(&command, &marker);
+        let wrapped = wrap_cancelable_command(&command, &marker, "aw-gateway-pty");
         assert_eq!(wrapped[0], "/bin/sh");
         assert_eq!(wrapped[1], "-c");
         assert_eq!(wrapped[3], "aw-gateway-pty");
@@ -1318,7 +1819,7 @@ mod tests {
             container_name: "ubuntu-dev".into(),
             command,
         };
-        let cleanup = pty_cleanup_spec(&spec, &marker);
+        let cleanup = cancel_cleanup_spec(&spec, &marker, "aw-gateway-pty-cleanup");
         assert!(!cleanup.stdin_tty);
         assert!(!cleanup.stdout_tty);
         assert_eq!(cleanup.command[0], "/bin/sh");
@@ -1335,6 +1836,135 @@ mod tests {
             .status()
             .expect("run shell syntax check");
         assert!(status.success());
+    }
+
+    #[test]
+    fn success_marker_remove_command_is_rm_only() {
+        let marker = ContainerCancelMarker {
+            path: "/tmp/aw-gateway-exec-test.pid".into(),
+            token: "test-token".into(),
+        };
+        let spec = ContainerExecSpec {
+            stdin_tty: false,
+            stdout_tty: false,
+            user: "2450:100".into(),
+            cwd: None,
+            env: BTreeMap::new(),
+            container_name: "ubuntu-dev".into(),
+            command: vec!["true".into()],
+        };
+
+        let cleanup = cancel_marker_remove_spec(&spec, &marker, "aw-gateway-exec-rm");
+        let script = &cleanup.command[2];
+        assert!(script.contains("rm -f \"$1\""));
+        assert!(!script.contains("kill "));
+        assert!(!script.contains("ps -e"));
+
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", script])
+            .status()
+            .expect("run shell syntax check");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn stale_cancel_marker_paths_keep_active_and_malformed_markers() {
+        let paths = [
+            "/tmp/aw-gateway-exec-111-1.pid",
+            "/tmp/aw-gateway-pty-222-2.pid",
+            "/tmp/aw-gateway-exec-333.pid",
+            "/tmp/aw-gateway-exec-444-nope.pid",
+            "/tmp/not-aw-gateway-exec-555-5.pid",
+        ];
+
+        let stale = stale_cancel_marker_paths(paths, |pid| pid == 222);
+
+        assert_eq!(stale, vec!["/tmp/aw-gateway-exec-111-1.pid"]);
+    }
+
+    #[test]
+    fn stale_cancel_marker_sweep_command_is_rm_only() {
+        let test_pid = std::process::id();
+        let paths = vec![
+            format!("/tmp/aw-gateway-exec-{test_pid}-1001.pid"),
+            format!("/tmp/aw-gateway-pty-{test_pid}-1002.pid"),
+        ];
+        let spec = cancel_marker_sweep_spec("ubuntu-dev", "2450:100", &paths);
+
+        assert_eq!(spec.command[0], "/bin/sh");
+        assert_eq!(spec.command[3], CANCEL_MARKER_SWEEP_ARGV0);
+        assert_eq!(&spec.command[4..], paths.as_slice());
+        let script = &spec.command[2];
+        assert!(script.contains("rm -f -- \"$path\""));
+        assert!(script.contains("|| true"));
+        assert!(!script.contains("kill "));
+        assert!(!script.contains("ps -e"));
+
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", script])
+            .status()
+            .expect("run shell syntax check");
+        assert!(status.success());
+
+        for path in &paths {
+            std::fs::write(path, "").unwrap();
+        }
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .arg(CANCEL_MARKER_SWEEP_ARGV0)
+            .args(&paths)
+            .status()
+            .expect("run marker sweep script");
+        assert!(status.success());
+        for path in &paths {
+            assert!(!Path::new(path).exists(), "{path} was not removed");
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_cancel_marker_sweep_once_skips_repeated_runtime_container_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-runtime");
+        let log = dir.path().join("runtime.log");
+        std::fs::write(
+            &runtime_program,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = exec ]; then
+  echo "$*" >> "{log}"
+fi
+exit 0
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::Podman,
+            program: runtime_program.display().to_string(),
+            env: BTreeMap::new(),
+        };
+        let container_name = format!("ubuntu-dev-{}", std::process::id());
+
+        assert_eq!(
+            runtime
+                .sweep_stale_cancel_markers_once(&container_name, "2450:100")
+                .await
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            runtime
+                .sweep_stale_cancel_markers_once(&container_name, "2450:100")
+                .await
+                .unwrap(),
+            None
+        );
+
+        let log = std::fs::read_to_string(log).unwrap();
+        assert_eq!(log.matches(CANCEL_MARKER_LIST_ARGV0).count(), 1, "{log}");
     }
 
     #[cfg(unix)]

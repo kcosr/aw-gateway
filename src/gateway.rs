@@ -11,7 +11,9 @@ use crate::config::{
 };
 use crate::launch_args::{LaunchRunArgRole, LaunchRunArgs, parse_launch_run_args_from};
 use crate::paths::{self, UserContext};
-use crate::runtime::{ContainerExecSpec, ContainerRuntime};
+use crate::runtime::{
+    ContainerExecCaptureResult, ContainerExecSpec, ContainerExecStatusResult, ContainerRuntime,
+};
 use crate::ssh_dispatch::{self, Dispatch, GatewayAction};
 use crate::ssh_filter::{
     is_sftp_server_command, legacy_scp_mode_allows, legacy_scp_server_direction,
@@ -21,6 +23,7 @@ use anyhow::Context;
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_GATEWAY_CONFIG: &str = include_str!("../aw-gateway.sample.toml");
 const MAX_SSH_ORIGINAL_COMMAND_BYTES: usize = 64 * 1024;
@@ -639,12 +642,48 @@ async fn exec_container_command_with_options(
     exec_spec: &ContainerExecSpec,
     options: OperationExecutionOptions,
 ) -> anyhow::Result<ExecutionOutcome> {
+    exec_container_command_with_cancel(runtime, exec_spec, options, None).await
+}
+
+async fn exec_container_command_with_cancel(
+    runtime: &Runtime,
+    exec_spec: &ContainerExecSpec,
+    options: OperationExecutionOptions,
+    cancel: Option<CancellationToken>,
+) -> anyhow::Result<ExecutionOutcome> {
     match options.mode {
-        OperationMode::Stream => Ok(ExecutionOutcome::new(
-            runtime.container_runtime.exec(exec_spec).await?,
-        )),
+        OperationMode::Stream => {
+            if let Some(cancel) = cancel {
+                return match runtime
+                    .container_runtime
+                    .exec_cancelable(exec_spec, cancel)
+                    .await?
+                {
+                    ContainerExecStatusResult::Completed(exit_code) => {
+                        Ok(ExecutionOutcome::new(exit_code))
+                    }
+                    ContainerExecStatusResult::Canceled => Ok(ExecutionOutcome::canceled(None)),
+                };
+            }
+            Ok(ExecutionOutcome::new(
+                runtime.container_runtime.exec(exec_spec).await?,
+            ))
+        }
         OperationMode::Wait => {
-            let output = runtime.container_runtime.exec_capture(exec_spec).await?;
+            let output = if let Some(cancel) = cancel {
+                match runtime
+                    .container_runtime
+                    .exec_capture_cancelable(exec_spec, cancel)
+                    .await?
+                {
+                    ContainerExecCaptureResult::Completed(output) => output,
+                    ContainerExecCaptureResult::Canceled => {
+                        return Ok(ExecutionOutcome::canceled(None));
+                    }
+                }
+            } else {
+                runtime.container_runtime.exec_capture(exec_spec).await?
+            };
             Ok(ExecutionOutcome::captured(
                 output.exit_code,
                 options.output.stdout.then_some(output.stdout),
@@ -843,6 +882,27 @@ async fn launch_execute_with_config(
         Runtime::from_config(cfg, Some(&target), session_id, true, Some(name.to_string())).await?;
     OperationRunner::launch(runtime, options, launch, resolved_vars, args)
         .run()
+        .await
+        .map_err(OperationError::operation_failed)
+}
+
+async fn launch_execute_with_config_cancelable(
+    cfg: GatewayConfig,
+    name: &str,
+    session_id: Option<String>,
+    supplied: SuppliedLaunchVars,
+    args: LaunchPassthroughArgs,
+    options: OperationExecutionOptions,
+    cancel: CancellationToken,
+) -> OperationResult<ExecutionOutcome> {
+    let launch = lookup_launch(&cfg, name)?;
+    let resolved_vars = resolve_launch_vars(name, &launch, &supplied)?;
+    validate_launch_passthrough_args(name, &launch, &args)?;
+    let target = launch.target.clone();
+    let runtime =
+        Runtime::from_config(cfg, Some(&target), session_id, true, Some(name.to_string())).await?;
+    OperationRunner::launch(runtime, options, launch, resolved_vars, args)
+        .run_cancelable(cancel)
         .await
         .map_err(OperationError::operation_failed)
 }
@@ -1255,6 +1315,7 @@ impl SessionOutcome {
 
     fn from_execution_result(result: &anyhow::Result<ExecutionOutcome>) -> Self {
         match result {
+            Ok(outcome) if outcome.is_canceled() => Self::Canceled,
             Ok(outcome) => outcome
                 .exit_code()
                 .map(|code| {
@@ -1516,6 +1577,7 @@ impl Runtime {
                 .ensure_container_for_readiness_plan(plan, &mut failed_start_cleanup)
                 .await?;
             self.validate_labels(&inspect)?;
+            self.sweep_stale_cancel_markers().await;
             let container_pid = inspect.state.pid.to_string();
             self.run_lifecycle_phase(LifecyclePhase::PostStartHost, Some(&container_pid))
                 .await?;

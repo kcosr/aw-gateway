@@ -49,6 +49,9 @@ pub(super) fn execution_response(outcome: ExecutionOutcome, formats: OutputForma
             HttpError::operation_failed("http operations must use wait or detach mode")
                 .into_response()
         }
+        ExecutionOutcome::Canceled { .. } => {
+            HttpError::operation_failed("operation canceled").into_response()
+        }
     }
 }
 
