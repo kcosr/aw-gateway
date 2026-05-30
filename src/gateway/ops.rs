@@ -2,7 +2,8 @@ use super::model::{
     AllStatusEntry, GatewayStatus, LaunchDetail, LaunchSummary, ReadyStatus, TargetEntry,
 };
 use super::{
-    Runtime, client, launch_detail, launch_execute_with_config, launch_summaries, load_config,
+    OperationRunner, Runtime, client, launch_detail, launch_execute_with_config,
+    launch_execute_with_config_cancelable, launch_summaries, load_config,
     run_container_command_with_runtime, status_all_entries, target_entries,
 };
 use crate::cli::{
@@ -14,6 +15,7 @@ use crate::paths::{self, UserContext};
 use crate::runtime::ContainerRuntime;
 use anyhow::Context;
 use std::path::PathBuf;
+use tokio_util::sync::CancellationToken;
 
 mod ssh;
 mod types;
@@ -270,6 +272,49 @@ pub(super) async fn execute_gateway_operation(
     }
 }
 
+pub(super) async fn execute_gateway_operation_cancelable(
+    config_path: Option<PathBuf>,
+    operation: GatewayOperation,
+    cancel: CancellationToken,
+) -> OperationResult<GatewayOperationResult> {
+    match operation {
+        GatewayOperation::Run {
+            target,
+            session_id,
+            cwd,
+            command,
+            options,
+        } => Ok(GatewayOperationResult::Run(
+            operation_run_cancelable(
+                config_path,
+                target,
+                session_id,
+                cwd,
+                command,
+                options,
+                cancel,
+            )
+            .await?,
+        )),
+        GatewayOperation::Launch {
+            name,
+            session_id,
+            vars,
+            args,
+            options,
+        } => {
+            let cfg = load_config(config_path)?;
+            Ok(GatewayOperationResult::Launch(
+                launch_execute_with_config_cancelable(
+                    cfg, &name, session_id, vars, args, options, cancel,
+                )
+                .await?,
+            ))
+        }
+        operation => execute_gateway_operation(config_path, operation).await,
+    }
+}
+
 async fn operation_run(
     config_path: Option<PathBuf>,
     target: Option<String>,
@@ -280,6 +325,22 @@ async fn operation_run(
 ) -> OperationResult<ExecutionOutcome> {
     let runtime = Runtime::load(config_path, target.as_deref(), session_id, true).await?;
     run_container_command_with_runtime(runtime, cwd, command, options)
+        .await
+        .map_err(OperationError::operation_failed)
+}
+
+async fn operation_run_cancelable(
+    config_path: Option<PathBuf>,
+    target: Option<String>,
+    session_id: Option<String>,
+    cwd: Option<String>,
+    command: Vec<String>,
+    options: OperationExecutionOptions,
+    cancel: CancellationToken,
+) -> OperationResult<ExecutionOutcome> {
+    let runtime = Runtime::load(config_path, target.as_deref(), session_id, true).await?;
+    OperationRunner::run_command(runtime, options, cwd, command)
+        .run_cancelable(cancel)
         .await
         .map_err(OperationError::operation_failed)
 }

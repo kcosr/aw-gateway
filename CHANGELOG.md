@@ -16,8 +16,9 @@
 ### Changed
 
 - Foreground `run` and `launch` now handle `SIGINT`, `SIGTERM`, and `SIGHUP`
-  by canceling the active session and routing through normal idle/workspace
-  cleanup; a second handled signal during cleanup aborts immediately
+  by canceling the active session, terminating the marked in-container process
+  tree, and routing through normal idle/workspace cleanup; a second handled
+  signal during cleanup aborts immediately
   ([#46](https://github.com/kcosr/aw-gateway/pull/46)).
 - HTTP wait-mode `run` and `launch` responses can now project selected captured
   streams as JSON with `output_format`
@@ -25,6 +26,9 @@
 
 ### Fixed
 
+- HTTP wait-mode client disconnects now cancel the operation and run bounded
+  in-container process cleanup for the final command instead of leaving the
+  command to outlive the request.
 - HTTP PTY close and WebSocket disconnect now terminate the in-container
   attached process tree instead of relying only on the host-side runtime client
   ([#49](https://github.com/kcosr/aw-gateway/pull/49)).

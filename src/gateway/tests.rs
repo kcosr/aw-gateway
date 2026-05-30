@@ -1471,10 +1471,12 @@ exit 0
 
     assert_eq!(outcome, ExecutionOutcome::new(0));
     let log = std::fs::read_to_string(runtime_log).unwrap();
+    assert!(log.contains("aw-gateway-exec"), "{log}");
     assert!(
-        log.contains("ubuntu-dev agent-pack run --fixed --skill fresh-eyes --after"),
+        log.contains("agent-pack run --fixed --skill fresh-eyes --after"),
         "{log}"
     );
+    assert!(log.contains("aw-gateway-exec-rm"), "{log}");
 }
 
 #[tokio::test]

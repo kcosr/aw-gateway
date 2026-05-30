@@ -12,6 +12,10 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::{Request, StatusCode};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::BTreeMap;
+use std::io::Write;
+use std::net::{Shutdown, TcpStream};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use tokio::time::{Duration, sleep};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tower::ServiceExt;
@@ -130,6 +134,57 @@ exit 0
     )
 }
 
+fn fake_long_running_wait_runtime_script(
+    log: &std::path::Path,
+    parent_pid: &std::path::Path,
+    child_pid: &std::path::Path,
+    cleanup_done: &std::path::Path,
+) -> String {
+    let user = UserContext::current().unwrap();
+    format!(
+        r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  ps)
+    cat <<'JSON'
+[{{"Names":["ubuntu-dev"],"Image":"ubuntu/dev","State":"running","Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev","io.aw-gateway.image":"ubuntu/dev"}}}}]
+JSON
+    ;;
+  exec)
+    echo "$@" >> "{log}"
+    case "$*" in
+      *aw-gateway-exec-cleanup*)
+        pid="$(cat "{child_pid}" 2>/dev/null || true)"
+        if [ -n "$pid" ]; then
+          kill -KILL "$pid" 2>/dev/null || true
+        fi
+        echo done > "{cleanup_done}"
+        exit 0
+        ;;
+      *aw-gateway-exec-rm*)
+        exit 0
+        ;;
+    esac
+    echo "$$" > "{parent_pid}"
+    sh -c 'trap "" HUP TERM; echo "$$" > "$1"; while :; do sleep 1; done' sh "{child_pid}" &
+    wait "$!"
+    ;;
+esac
+exit 0
+"#,
+        user = user.user,
+        uid = user.uid,
+        log = log.display(),
+        parent_pid = parent_pid.display(),
+        child_pid = child_pid.display(),
+        cleanup_done = cleanup_done.display(),
+    )
+}
+
 fn http_operation_config(dir: &tempfile::TempDir, fake_runtime: &std::path::Path) -> PathBuf {
     let config = dir.path().join("gateway.toml");
     std::fs::write(
@@ -207,6 +262,7 @@ fn app_for_config(config: PathBuf) -> Router {
         config: Arc::new(cfg),
         pty_leases: Arc::new(PtyLeaseManager::default()),
         pty_shutdown: PtyShutdown::default(),
+        wait_shutdown: WaitShutdown::default(),
     })
 }
 
@@ -255,6 +311,15 @@ async fn serve_live_app(app: Router) -> (String, tokio::task::JoinHandle<()>) {
     (format!("ws://{addr}"), handle)
 }
 
+async fn serve_live_http_app(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, handle)
+}
+
 async fn wait_for_path(path: &std::path::Path) {
     for _ in 0..50 {
         if path.exists() {
@@ -275,6 +340,101 @@ fn read_pid(path: &std::path::Path) -> libc::pid_t {
 
 fn process_is_alive(pid: libc::pid_t) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[derive(Clone)]
+struct DropProbe {
+    events: tokio::sync::mpsc::UnboundedSender<&'static str>,
+}
+
+struct DropProbeGuard {
+    events: tokio::sync::mpsc::UnboundedSender<&'static str>,
+}
+
+impl Drop for DropProbeGuard {
+    fn drop(&mut self) {
+        let _ = self.events.send("dropped");
+    }
+}
+
+async fn phase0_disconnect_probe(State(probe): State<DropProbe>, _body: Bytes) -> Response {
+    let _guard = DropProbeGuard {
+        events: probe.events.clone(),
+    };
+    let _ = probe.events.send("entered");
+    std::future::pending::<Response>().await
+}
+
+async fn serve_drop_probe() -> (
+    std::net::SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (events, rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = Router::new()
+        .route("/probe", post(phase0_disconnect_probe))
+        .with_state(DropProbe { events });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, rx, handle)
+}
+
+fn write_probe_request(stream: &mut TcpStream) {
+    stream
+        .write_all(
+            b"POST /probe HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .unwrap();
+    stream.flush().unwrap();
+}
+
+#[cfg(unix)]
+fn enable_abortive_close(stream: &TcpStream) {
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    let result = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const libc::linger as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(result, 0, "setsockopt SO_LINGER failed");
+}
+
+async fn assert_probe_drop_after_disconnect(abortive: bool) {
+    let (addr, mut events, server) = serve_drop_probe().await;
+    let mut stream = TcpStream::connect(addr).unwrap();
+    write_probe_request(&mut stream);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap(),
+        Some("entered")
+    );
+
+    if abortive {
+        #[cfg(unix)]
+        enable_abortive_close(&stream);
+    } else {
+        stream.shutdown(Shutdown::Both).unwrap();
+    }
+    drop(stream);
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap(),
+        Some("dropped")
+    );
+    server.abort();
 }
 
 async fn wait_for_process_exit(pid: libc::pid_t, marker: &std::path::Path) {
@@ -298,7 +458,19 @@ fn test_state(http: HttpConfig) -> AppState {
         config: Arc::new(cfg),
         pty_leases: Arc::new(PtyLeaseManager::default()),
         pty_shutdown: PtyShutdown::default(),
+        wait_shutdown: WaitShutdown::default(),
     }
+}
+
+#[tokio::test]
+async fn real_tcp_handler_future_drops_on_fin_disconnect() {
+    assert_probe_drop_after_disconnect(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn real_tcp_handler_future_drops_on_rst_disconnect() {
+    assert_probe_drop_after_disconnect(true).await;
 }
 
 #[tokio::test]
@@ -774,6 +946,63 @@ async fn run_wait_and_detach_routes_use_shared_operations() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "invalid_request");
+}
+
+#[tokio::test]
+async fn run_wait_disconnect_cancels_operation_and_runs_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    let parent_pid = dir.path().join("parent.pid");
+    let child_pid = dir.path().join("child.pid");
+    let cleanup_done = dir.path().join("cleanup.done");
+    write_fake_runtime(
+        &fake_runtime,
+        &fake_long_running_wait_runtime_script(&log, &parent_pid, &child_pid, &cleanup_done),
+    );
+    let app = app_for_config(http_operation_config(&dir, &fake_runtime));
+    let (addr, server) = serve_live_http_app(app).await;
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    let body = r#"{"command":["long-running"],"mode":"wait"}"#;
+    write!(
+        stream,
+        "POST /api/v1/run HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body,
+    )
+    .unwrap();
+    stream.flush().unwrap();
+
+    wait_for_path(&parent_pid).await;
+    drop(stream);
+    wait_for_path(&cleanup_done).await;
+
+    let log = std::fs::read_to_string(log).unwrap();
+    assert!(log.contains("aw-gateway-exec-cleanup"), "{log}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn run_wait_completion_preserves_status_codes_after_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    write_fake_runtime(&fake_runtime, &fake_running_runtime_script(&log));
+    let app = app_for_config(http_operation_config(&dir, &fake_runtime));
+
+    let (status, body) = post_json(
+        app.clone(),
+        "/api/v1/run",
+        r#"{"command":["run-wait"],"mode":"wait","output":["stdout"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["exit_code"], 23);
+
+    let (status, body) = post_json(app, "/api/v1/launches/missing/run", r#"{"mode":"wait"}"#).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "not_found");
 }
 
 #[tokio::test]
@@ -1283,10 +1512,12 @@ async fn launch_route_renders_typed_json_vars_into_steps_and_final_exec() {
     assert!(log.contains("--env MODE=safe"), "{log}");
     assert!(log.contains("--env RATIO=1.5"), "{log}");
     assert!(log.contains("--env REPO=alpha"), "{log}");
+    assert!(log.contains("aw-gateway-exec"), "{log}");
     assert!(
-        log.contains("ubuntu-dev launch-command alpha safe true 3 1.5"),
+        log.contains("launch-command alpha safe true 3 1.5"),
         "{log}"
     );
+    assert!(log.contains("aw-gateway-exec-rm"), "{log}");
 
     let (status, body) = post_json(
         app,
@@ -1323,10 +1554,12 @@ async fn launch_route_splices_passthrough_args() {
     assert_eq!(body["ok"], true);
 
     let log = std::fs::read_to_string(&log).unwrap();
+    assert!(log.contains("aw-gateway-exec"), "{log}");
     assert!(
-        log.contains("ubuntu-dev launch-command before --skill fresh-eyes review this after"),
+        log.contains("launch-command before --skill fresh-eyes review this after"),
         "{log}"
     );
+    assert!(log.contains("aw-gateway-exec-rm"), "{log}");
 }
 
 #[tokio::test]

@@ -310,10 +310,12 @@ command = ["launch-command", "before", "{{args}}", "after"]
         .success();
 
     let log = std::fs::read_to_string(runtime_log).unwrap();
+    assert!(log.contains("aw-gateway-exec"), "{log}");
     assert!(
-        log.contains("ubuntu-dev launch-command before --skill fresh-eyes review this after"),
+        log.contains("launch-command before --skill fresh-eyes review this after"),
         "{log}"
     );
+    assert!(log.contains("aw-gateway-exec-rm"), "{log}");
 }
 
 #[test]

@@ -178,6 +178,9 @@ pub(in crate::gateway) enum ExecutionOutcome {
     Detached {
         operation_id: String,
     },
+    Canceled {
+        exit_code: Option<i32>,
+    },
 }
 
 impl ExecutionOutcome {
@@ -201,9 +204,18 @@ impl ExecutionOutcome {
         Self::Detached { operation_id }
     }
 
+    pub(in crate::gateway) fn canceled(exit_code: Option<i32>) -> Self {
+        Self::Canceled { exit_code }
+    }
+
+    pub(in crate::gateway) fn is_canceled(&self) -> bool {
+        matches!(self, Self::Canceled { .. })
+    }
+
     pub(in crate::gateway) fn exit_code(&self) -> Option<i32> {
         match self {
             Self::Streamed { exit_code } | Self::Captured { exit_code, .. } => Some(*exit_code),
+            Self::Canceled { exit_code } => *exit_code,
             Self::Detached { .. } => None,
         }
     }

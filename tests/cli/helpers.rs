@@ -202,6 +202,11 @@ JSON
     ;;
   exec)
     echo "exec $*" >> "{log}"
+    case "$*" in
+      *aw-gateway-exec-cleanup*|*aw-gateway-exec-rm*)
+        exit 0
+        ;;
+    esac
     echo started > "{started}"
     sleep 30
     ;;
