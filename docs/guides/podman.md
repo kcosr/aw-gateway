@@ -14,8 +14,8 @@ trust, command-policy wrappers, or proxy services. Those are site policy
 add-ons. See [Firewall Policy](firewall.md) and
 [Proxy And CA Policy](proxy.md) for reusable optional layers.
 
-Run commands from the cloned repository root unless a section says otherwise.
-Podman must be installed and available on `PATH`; rootless Podman is
+Run commands from the extracted release archive unless a section says
+otherwise. Podman must be installed and available on `PATH`; rootless Podman is
 recommended for managed-host deployments.
 
 ## What This Provides
@@ -80,23 +80,25 @@ a private user path such as `$HOME/aw-gateway` and replace every
 Install the host-side gateway:
 
 ```bash
+RELEASE_ROOT=/path/to/aw-gateway-VERSION-linux-x86_64
 sudo install -d -m 0755 /opt/aw-gateway/bin
-sudo install -m 0755 target/release/aw-gateway /opt/aw-gateway/bin/aw-gateway
+sudo install -m 0755 "$RELEASE_ROOT/bin/aw-gateway" /opt/aw-gateway/bin/aw-gateway
 ```
 
 Install the container-side runtime files:
 
 ```bash
+RELEASE_ROOT=/path/to/aw-gateway-VERSION-linux-x86_64
 sudo install -d -m 0755 /opt/aw-gateway/runtime/linux
-sudo install -m 0755 target/release/aw-container-agent \
+sudo install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-container-agent" \
   /opt/aw-gateway/runtime/linux/aw-container-agent
-sudo install -m 0755 target/release/aw-container-bootstrap \
+sudo install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-container-bootstrap" \
   /opt/aw-gateway/runtime/linux/aw-container-bootstrap
-sudo install -m 0755 target/release/aw-ssh-command-filter \
+sudo install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-ssh-command-filter" \
   /opt/aw-gateway/runtime/linux/aw-ssh-command-filter
-sudo install -m 0755 examples/podman/start-container-sshd \
+sudo install -m 0755 "$RELEASE_ROOT/examples/podman/start-container-sshd" \
   /opt/aw-gateway/runtime/linux/start-container-sshd
-sudo install -m 0644 examples/podman/sshd_config_agent \
+sudo install -m 0644 "$RELEASE_ROOT/examples/podman/sshd_config_agent" \
   /opt/aw-gateway/runtime/linux/sshd_config_agent
 ```
 

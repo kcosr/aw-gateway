@@ -12,6 +12,15 @@ fn asset(name: &str) -> String {
         .to_string()
 }
 
+fn example_asset(runtime: &str, name: &str) -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples")
+        .join(runtime)
+        .join(name)
+        .display()
+        .to_string()
+}
+
 #[test]
 fn asset_scripts_are_shell_syntax_valid() {
     for script in [
@@ -140,6 +149,22 @@ fn sshd_config_agent_keeps_inner_ssh_policy_container_scoped() {
     ] {
         assert!(!config.contains(forbidden), "forbidden {forbidden:?}");
     }
+}
+
+#[test]
+fn example_sshd_configs_match_documented_runtime_networking_and_ubuntu_sftp_path() {
+    for runtime in ["docker", "podman"] {
+        let config = std::fs::read_to_string(example_asset(runtime, "sshd_config_agent")).unwrap();
+        assert!(config.contains("ListenAddress 127.0.0.1"));
+        assert!(config.contains("Subsystem sftp /usr/lib/openssh/sftp-server"));
+        assert!(!config.contains("/usr/libexec/openssh/sftp-server"));
+    }
+
+    let colima_config =
+        std::fs::read_to_string(example_asset("colima", "sshd_config_agent")).unwrap();
+    assert!(colima_config.contains("ListenAddress 0.0.0.0"));
+    assert!(colima_config.contains("Subsystem sftp /usr/lib/openssh/sftp-server"));
+    assert!(!colima_config.contains("/usr/libexec/openssh/sftp-server"));
 }
 
 #[test]

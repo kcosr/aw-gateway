@@ -14,8 +14,8 @@ trust, command-policy wrappers, or proxy services. Those are site policy
 add-ons. See [Firewall Policy](firewall.md) and
 [Proxy And CA Policy](proxy.md) for reusable optional layers.
 
-Run commands from the cloned repository root unless a section says otherwise.
-Docker must be installed and available on `PATH`.
+Run commands from the extracted release archive unless a section says
+otherwise. Docker must be installed and available on `PATH`.
 
 Use the Colima guide instead of this guide for macOS Colima. Colima uses Docker
 inside a Linux VM and needs a different SSH endpoint mode.
@@ -56,13 +56,20 @@ Use one deployment root:
 Install the host-side gateway and Linux container runtime files:
 
 ```bash
+RELEASE_ROOT=/path/to/aw-gateway-VERSION-linux-x86_64
 sudo install -d -m 0755 /opt/aw-gateway/bin /opt/aw-gateway/runtime/linux
-sudo install -m 0755 target/release/aw-gateway /opt/aw-gateway/bin/aw-gateway
-sudo install -m 0755 target/release/aw-container-agent /opt/aw-gateway/runtime/linux/aw-container-agent
-sudo install -m 0755 target/release/aw-container-bootstrap /opt/aw-gateway/runtime/linux/aw-container-bootstrap
-sudo install -m 0755 target/release/aw-ssh-command-filter /opt/aw-gateway/runtime/linux/aw-ssh-command-filter
-sudo install -m 0755 examples/docker/start-container-sshd /opt/aw-gateway/runtime/linux/start-container-sshd
-sudo install -m 0644 examples/docker/sshd_config_agent /opt/aw-gateway/runtime/linux/sshd_config_agent
+sudo install -m 0755 "$RELEASE_ROOT/bin/aw-gateway" \
+  /opt/aw-gateway/bin/aw-gateway
+sudo install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-container-agent" \
+  /opt/aw-gateway/runtime/linux/aw-container-agent
+sudo install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-container-bootstrap" \
+  /opt/aw-gateway/runtime/linux/aw-container-bootstrap
+sudo install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-ssh-command-filter" \
+  /opt/aw-gateway/runtime/linux/aw-ssh-command-filter
+sudo install -m 0755 "$RELEASE_ROOT/examples/docker/start-container-sshd" \
+  /opt/aw-gateway/runtime/linux/start-container-sshd
+sudo install -m 0644 "$RELEASE_ROOT/examples/docker/sshd_config_agent" \
+  /opt/aw-gateway/runtime/linux/sshd_config_agent
 ```
 
 `/opt/aw-gateway` is the recommended production layout. For local evaluation

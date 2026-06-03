@@ -15,6 +15,7 @@ access behind explicit gateway paths and policy hooks.
 
 - [Why It Exists](#why-it-exists)
 - [Features](#features)
+- [Install](#install)
 - [Quickstart](#quickstart)
 - [Core Concepts](#core-concepts)
 - [Binaries](#binaries)
@@ -86,15 +87,41 @@ gateway binary.
 - Protocol-safe logging for proxy modes and rotating JSON logs for
   diagnostics.
 
+## Install
+
+Download the latest archive for your platform from GitHub Releases:
+
+```text
+https://github.com/kcosr/aw-gateway/releases
+```
+
+Supported release platforms are currently:
+
+- `linux-x86_64`
+- `macos-arm64`
+
+Extract the archive on the host that will run `aw-gateway`. Each archive
+contains `bin/aw-gateway` for the host platform and `runtime/linux/` files for
+the managed container or Linux VM. Install those files using the deployment
+guide for your runtime:
+
+- [Podman](docs/guides/podman.md)
+- [Docker](docs/guides/docker.md)
+- [Colima](docs/guides/colima.md)
+
+For unsupported platforms or local development, build from source in the
+[Build](#build) section.
+
 ## Quickstart
 
 For a working end-to-end deployment, pick the runtime guide that matches your
 host and follow it before using the README as a reference:
 
-1. Build the release binaries with `cargo build --release`.
+1. Download and extract the latest release archive for your platform.
 2. Pick a deployment guide: [Podman](docs/guides/podman.md),
    [Docker](docs/guides/docker.md), or [Colima](docs/guides/colima.md).
-3. Install the host and container-side binaries using that guide's layout.
+3. Install the host and container-side runtime files using that guide's
+   layout.
 4. Copy or adapt the guide's gateway config and validate it.
 5. Start a target with `aw-gateway --config <path> up <target> --json`.
 6. Generate client config and connect with OpenSSH, SCP, SFTP, or VS Code.
@@ -168,10 +195,11 @@ flowchart LR
 
 ## Build
 
-Run build and install commands from the cloned repository root. Building
-requires a Rust toolchain with edition 2024 support, which means rustc 1.85 or
-newer. Container-side binaries must be built for the Linux architecture used by
-the target container.
+Use source builds for local development or unsupported release platforms. Run
+build commands from the cloned repository root. Building requires a Rust
+toolchain with edition 2024 support, which means rustc 1.85 or newer.
+Container-side binaries must be built for the Linux architecture used by the
+target container.
 
 ```bash
 cargo build --release
@@ -244,8 +272,7 @@ cp aw-gateway.sample.toml ./gateway.toml
 aw-container-agent config init ./container-agent.toml
 ```
 
-Once installed on `PATH` or invoked through `./target/release/...`, validate
-the configs:
+Once installed on `PATH`, validate the configs:
 
 ```bash
 aw-gateway --config ./gateway.toml config validate
@@ -1845,19 +1872,11 @@ cargo build --release
 ## Release
 
 Releases are driven from `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`.
-`0.1.0` is the first release version for this repository.
-
-For the first release, after the `Unreleased` changelog section is complete and
-`main` is clean:
+Use `current` when `Cargo.toml` already has the intended release version, or
+use `patch`, `minor`, `major`, or an explicit semantic version:
 
 ```bash
 node scripts/release.mjs current
-```
-
-For later releases, use `patch`, `minor`, `major`, or an explicit semantic
-version:
-
-```bash
 node scripts/release.mjs patch
 node scripts/release.mjs minor
 node scripts/release.mjs major
@@ -1865,8 +1884,83 @@ node scripts/release.mjs 0.2.3
 ```
 
 The script stamps the changelog, commits `Release vX.Y.Z`, creates and pushes a
-matching git tag, creates a GitHub prerelease with notes from the changelog,
+matching git tag, creates a GitHub release with notes from the changelog,
 then commits a fresh `Unreleased` section for the next cycle.
+
+If GitHub release creation fails after the commit and tag are pushed, recover
+by creating the release manually for the existing tag instead of rerunning the
+script.
+
+Release binaries are packaged separately after the platform binaries have been
+provided or built by the release operator. Supported release platforms currently
+use archive names like:
+
+```text
+aw-gateway-VERSION-linux-x86_64.tar.gz
+aw-gateway-VERSION-macos-arm64.tar.gz
+```
+
+Each archive should contain one top-level directory named
+`aw-gateway-VERSION-PLATFORM` with:
+
+- `bin/aw-gateway` - host executable for that platform.
+- `runtime/linux/aw-container-bootstrap` - Linux container-side bootstrap.
+- `runtime/linux/aw-container-agent` - Linux container-side supervisor.
+- `runtime/linux/aw-ssh-command-filter` - Linux container-side SSH command
+  filter.
+- `examples/` - runtime-specific deployment configs, including the SSHD
+  startup helper and SSHD config used by each guide.
+- `README.md`
+- `LICENSE`
+- `CHANGELOG.md`
+- `aw-gateway.sample.toml`
+- `container-agent.sample.toml`
+- `docs/`
+- `assets/`
+
+The host `aw-gateway` binary is built for the archive platform. The
+container-side runtime binaries are always Linux binaries and must match the
+container or VM architecture. For example, `linux-x86_64` uses Linux x86_64
+for both host and runtime binaries, while `macos-arm64` uses a macOS arm64
+host binary plus Linux arm64 runtime binaries for a native Apple Silicon
+Colima profile.
+
+Example packaging flow for one platform:
+
+```bash
+VERSION=0.6.0
+PLATFORM=linux-x86_64
+HOST_BINARY=/path/to/aw-gateway
+RUNTIME_BIN_DIR=/path/to/linux-runtime-binaries
+
+STAGE="$(mktemp -d)"
+ROOT="aw-gateway-${VERSION}-${PLATFORM}"
+mkdir -p "$STAGE/$ROOT/bin" "$STAGE/$ROOT/runtime/linux"
+install -m 755 "$HOST_BINARY" "$STAGE/$ROOT/bin/aw-gateway"
+install -m 755 "$RUNTIME_BIN_DIR/aw-container-bootstrap" \
+  "$STAGE/$ROOT/runtime/linux/aw-container-bootstrap"
+install -m 755 "$RUNTIME_BIN_DIR/aw-container-agent" \
+  "$STAGE/$ROOT/runtime/linux/aw-container-agent"
+install -m 755 "$RUNTIME_BIN_DIR/aw-ssh-command-filter" \
+  "$STAGE/$ROOT/runtime/linux/aw-ssh-command-filter"
+cp README.md LICENSE CHANGELOG.md aw-gateway.sample.toml \
+  container-agent.sample.toml "$STAGE/$ROOT/"
+cp -R docs examples assets "$STAGE/$ROOT/"
+tar -C "$STAGE" -czf "${ROOT}.tar.gz" "$ROOT"
+rm -rf "$STAGE"
+```
+
+Repeat that staging step for each platform, for example `linux-x86_64` and
+`macos-arm64`, using the correct host binary, Linux runtime binaries, and
+runtime-specific example configs for each target. After the GitHub Release
+exists, upload the archives:
+
+```bash
+RELEASE_TAG="v${VERSION}"
+gh release upload "$RELEASE_TAG" \
+  "aw-gateway-${VERSION}-linux-x86_64.tar.gz" \
+  "aw-gateway-${VERSION}-macos-arm64.tar.gz"
+```
 
 ## Project Structure
 
