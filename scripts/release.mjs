@@ -15,7 +15,7 @@
  * 3. Update CHANGELOG.md: [Unreleased] -> [version] - date
  * 4. Commit and tag
  * 5. Push commit and tag to origin
- * 6. Create GitHub prerelease with notes from CHANGELOG.md
+ * 6. Create GitHub release with notes from CHANGELOG.md
  * 7. Add a new [Unreleased] section
  * 8. Commit and push the next-cycle changelog
  */
@@ -282,12 +282,12 @@ run(`git push origin ${RELEASE_BRANCH}`);
 run(`git push origin v${version}`);
 console.log();
 
-console.log("Creating GitHub prerelease...");
+console.log("Creating GitHub release...");
 const releaseNotes = extractReleaseNotes(version);
 const notesFile = join(ROOT, ".release-notes-tmp.md");
 writeFileSync(notesFile, releaseNotes);
 run(
-	`gh release create v${version} --repo ${REPO} --prerelease --title "v${version}" --notes-file "${notesFile}"`
+	`gh release create v${version} --repo ${REPO} --title "v${version}" --notes-file "${notesFile}"`
 );
 unlinkSync(notesFile);
 console.log();

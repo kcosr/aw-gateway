@@ -76,14 +76,7 @@ Use these sections under `## [Unreleased]`:
 
 ## Releasing
 
-The first release version is `0.1.0`, matching `Cargo.toml`. Since the crate is
-already set to that version, release it with:
-
-```bash
-node scripts/release.mjs current
-```
-
-For later releases:
+Use `patch`, `minor`, `major`, or an explicit semantic version:
 
 ```bash
 node scripts/release.mjs patch    # Bug fixes, e.g. 0.1.0 -> 0.1.1
@@ -94,5 +87,12 @@ node scripts/release.mjs 0.2.3    # Explicit version
 
 The release script verifies a clean `main` branch, optionally bumps
 `Cargo.toml` and `Cargo.lock`, stamps `CHANGELOG.md`, commits and tags the
-release, pushes to origin, creates a GitHub prerelease from the changelog
+release, pushes to origin, creates a GitHub release from the changelog
 notes, then opens a new `## [Unreleased]` section for the next cycle.
+
+Release archives are packaged separately after the GitHub release exists. Use
+the README release section as the source of truth for archive names, contents,
+and platform handling. The host `aw-gateway` binary is platform-specific, while
+container-side runtime binaries are Linux binaries and must match the container
+or VM architecture, including Linux arm64 runtime binaries for native
+Apple Silicon Colima profiles.

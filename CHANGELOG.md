@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Changed
+
+- Release automation now creates normal GitHub releases.
+- Documented release download/install guidance and archive packaging for Linux
+  x86_64 and macOS arm64, including Linux container-side runtime binaries.
 
 ## [0.5.0] - 2026-05-30
 
