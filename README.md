@@ -1872,9 +1872,11 @@ cargo build --release
 ## Release
 
 Releases are driven from `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`.
-Use `patch`, `minor`, `major`, or an explicit semantic version:
+Use `current` when `Cargo.toml` already has the intended release version, or
+use `patch`, `minor`, `major`, or an explicit semantic version:
 
 ```bash
+node scripts/release.mjs current
 node scripts/release.mjs patch
 node scripts/release.mjs minor
 node scripts/release.mjs major
@@ -1884,6 +1886,10 @@ node scripts/release.mjs 0.2.3
 The script stamps the changelog, commits `Release vX.Y.Z`, creates and pushes a
 matching git tag, creates a GitHub release with notes from the changelog,
 then commits a fresh `Unreleased` section for the next cycle.
+
+If GitHub release creation fails after the commit and tag are pushed, recover
+by creating the release manually for the existing tag instead of rerunning the
+script.
 
 Release binaries are packaged separately after the platform binaries have been
 provided or built by the release operator. Supported release platforms currently
@@ -1902,15 +1908,14 @@ Each archive should contain one top-level directory named
 - `runtime/linux/aw-container-agent` - Linux container-side supervisor.
 - `runtime/linux/aw-ssh-command-filter` - Linux container-side SSH command
   filter.
-- `runtime/linux/start-container-sshd` - runtime SSHD startup helper.
-- `runtime/linux/sshd_config_agent` - runtime SSHD config.
+- `examples/` - runtime-specific deployment configs, including the SSHD
+  startup helper and SSHD config used by each guide.
 - `README.md`
 - `LICENSE`
 - `CHANGELOG.md`
 - `aw-gateway.sample.toml`
 - `container-agent.sample.toml`
 - `docs/`
-- `examples/`
 - `assets/`
 
 The host `aw-gateway` binary is built for the archive platform. The
@@ -1938,10 +1943,6 @@ install -m 755 "$RUNTIME_BIN_DIR/aw-container-agent" \
   "$STAGE/$ROOT/runtime/linux/aw-container-agent"
 install -m 755 "$RUNTIME_BIN_DIR/aw-ssh-command-filter" \
   "$STAGE/$ROOT/runtime/linux/aw-ssh-command-filter"
-install -m 755 assets/start-container-sshd \
-  "$STAGE/$ROOT/runtime/linux/start-container-sshd"
-install -m 644 assets/sshd_config_agent \
-  "$STAGE/$ROOT/runtime/linux/sshd_config_agent"
 cp README.md LICENSE CHANGELOG.md aw-gateway.sample.toml \
   container-agent.sample.toml "$STAGE/$ROOT/"
 cp -R docs examples assets "$STAGE/$ROOT/"
@@ -1950,8 +1951,9 @@ rm -rf "$STAGE"
 ```
 
 Repeat that staging step for each platform, for example `linux-x86_64` and
-`macos-arm64`, using the correct host binary and Linux runtime binaries for
-each target. After the GitHub Release exists, upload the archives:
+`macos-arm64`, using the correct host binary, Linux runtime binaries, and
+runtime-specific example configs for each target. After the GitHub Release
+exists, upload the archives:
 
 ```bash
 RELEASE_TAG="v${VERSION}"

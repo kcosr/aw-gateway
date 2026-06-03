@@ -66,9 +66,9 @@ sudo install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-container-bootstrap" \
   /opt/aw-gateway/runtime/linux/aw-container-bootstrap
 sudo install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-ssh-command-filter" \
   /opt/aw-gateway/runtime/linux/aw-ssh-command-filter
-sudo install -m 0755 "$RELEASE_ROOT/runtime/linux/start-container-sshd" \
+sudo install -m 0755 "$RELEASE_ROOT/examples/docker/start-container-sshd" \
   /opt/aw-gateway/runtime/linux/start-container-sshd
-sudo install -m 0644 "$RELEASE_ROOT/runtime/linux/sshd_config_agent" \
+sudo install -m 0644 "$RELEASE_ROOT/examples/docker/sshd_config_agent" \
   /opt/aw-gateway/runtime/linux/sshd_config_agent
 ```
 

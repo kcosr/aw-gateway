@@ -147,9 +147,9 @@ install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-container-bootstrap" \
   ~/aw-gateway/runtime/linux/aw-container-bootstrap
 install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-ssh-command-filter" \
   ~/aw-gateway/runtime/linux/aw-ssh-command-filter
-install -m 0755 "$RELEASE_ROOT/runtime/linux/start-container-sshd" \
+install -m 0755 "$RELEASE_ROOT/examples/colima/start-container-sshd" \
   ~/aw-gateway/runtime/linux/start-container-sshd
-install -m 0644 "$RELEASE_ROOT/runtime/linux/sshd_config_agent" \
+install -m 0644 "$RELEASE_ROOT/examples/colima/sshd_config_agent" \
   ~/aw-gateway/runtime/linux/sshd_config_agent
 ```
 

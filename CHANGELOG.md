@@ -6,7 +6,8 @@
 
 - Release automation now creates normal GitHub releases.
 - Documented release download/install guidance and archive packaging for Linux
-  x86_64 and macOS arm64, including Linux container-side runtime binaries.
+  x86_64 and macOS arm64, including Linux container-side runtime binaries and
+  runtime-specific SSHD helper/config files.
 
 ## [0.5.0] - 2026-05-30
 

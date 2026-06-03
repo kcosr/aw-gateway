@@ -76,9 +76,11 @@ Use these sections under `## [Unreleased]`:
 
 ## Releasing
 
-Use `patch`, `minor`, `major`, or an explicit semantic version:
+Use `current` when `Cargo.toml` already has the intended release version, or
+use `patch`, `minor`, `major`, or an explicit semantic version:
 
 ```bash
+node scripts/release.mjs current  # Release current Cargo.toml version
 node scripts/release.mjs patch    # Bug fixes, e.g. 0.1.0 -> 0.1.1
 node scripts/release.mjs minor    # New features, e.g. 0.1.1 -> 0.2.0
 node scripts/release.mjs major    # Breaking changes, e.g. 0.2.0 -> 1.0.0
@@ -90,9 +92,15 @@ The release script verifies a clean `main` branch, optionally bumps
 release, pushes to origin, creates a GitHub release from the changelog
 notes, then opens a new `## [Unreleased]` section for the next cycle.
 
+If GitHub release creation fails after the commit and tag are pushed, create
+the GitHub release manually for the existing tag instead of rerunning the
+script.
+
 Release archives are packaged separately after the GitHub release exists. Use
 the README release section as the source of truth for archive names, contents,
 and platform handling. The host `aw-gateway` binary is platform-specific, while
 container-side runtime binaries are Linux binaries and must match the container
 or VM architecture, including Linux arm64 runtime binaries for native
-Apple Silicon Colima profiles.
+Apple Silicon Colima profiles. SSHD helper/config files are runtime-specific;
+deployment guides install them from `examples/<runtime>/` in the extracted
+release archive.
