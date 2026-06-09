@@ -11,6 +11,9 @@
 
 ### Fixed
 
+- Hardened container-agent shutdown so repeated shutdown triggers are
+  idempotent and stalled service shutdown cannot leave the agent alive
+  indefinitely.
 - Final streamed `run` and `launch` container execs now keep stdin attached
   even when `aw-gateway` is spawned with non-interactive stdin, while
   wait/detach execution keeps stdin detached for noninteractive capture paths

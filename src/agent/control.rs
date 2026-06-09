@@ -13,7 +13,9 @@ use tokio::net::UnixStream;
 use tokio::time::{Duration, sleep};
 
 use super::idle::reap_processes;
-use super::lifecycle::{exit_pid1_agent_process_success, shutdown_agent};
+use super::lifecycle::{
+    exit_pid1_agent_process_success, schedule_forced_exit_after, shutdown_agent,
+};
 use super::socket::{bind_private_unix_socket, validate_control_peer};
 use super::state::AgentState;
 use super::status::status_payload;
@@ -28,6 +30,7 @@ pub(super) async fn run_control_socket(state: Arc<AgentState>, path: &Path) -> a
         tokio::select! {
             result = &mut shutdown => {
                 result?;
+                schedule_forced_exit_after(Duration::from_secs(30), "control-signal");
                 shutdown_agent(state).await;
                 return Ok(());
             }
@@ -46,6 +49,7 @@ pub(super) async fn run_control_socket(state: Arc<AgentState>, path: &Path) -> a
 
 pub(super) async fn wait_for_shutdown_signal(state: Arc<AgentState>) -> anyhow::Result<()> {
     shutdown_signal().await?;
+    schedule_forced_exit_after(Duration::from_secs(30), "signal");
     shutdown_agent(state).await;
     Ok(())
 }
@@ -131,6 +135,7 @@ async fn handle_control_connection(
             return Ok(());
         }
         ControlRequest::Shutdown(_) => {
+            schedule_forced_exit_after(Duration::from_secs(30), "control-request");
             shutdown_agent(state.clone()).await;
             let response = ControlSuccess::new(
                 id,

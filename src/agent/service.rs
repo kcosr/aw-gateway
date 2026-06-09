@@ -112,8 +112,11 @@ impl ManagedService {
 
     pub(super) async fn stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
+        tracing::info!(service = self.config.name, "stopping service");
         if let Some(child) = self.child.lock().await.take() {
             stop_child_gracefully(self, child).await;
+        } else {
+            tracing::debug!(service = self.config.name, "service already stopped");
         }
     }
 }
@@ -165,7 +168,14 @@ pub(super) async fn service_supervisor(
             break;
         }
 
-        service.restart_count.fetch_add(1, Ordering::SeqCst);
+        let restart_count = service.restart_count.fetch_add(1, Ordering::SeqCst) + 1;
+        tracing::warn!(
+            service = service.config.name,
+            restart_count,
+            backoff_ms = current_backoff.as_millis(),
+            exit_success,
+            "service restart scheduled"
+        );
         sleep(current_backoff).await;
         current_backoff = std::cmp::min(current_backoff.saturating_mul(2), max_backoff);
     }
@@ -197,13 +207,26 @@ async fn wait_for_service_exit_or_unhealthy(service: &ManagedService) -> bool {
             Some(Ok(success)) => {
                 if success {
                     *service.last_error.lock().await = None;
+                    tracing::info!(
+                        service = service.config.name,
+                        "service process exited successfully"
+                    );
                 } else {
                     *service.last_error.lock().await = Some("service exited unsuccessfully".into());
+                    tracing::warn!(
+                        service = service.config.name,
+                        "service process exited unsuccessfully"
+                    );
                 }
                 return success;
             }
             Some(Err(err)) => {
                 *service.last_error.lock().await = Some(err.to_string());
+                tracing::warn!(
+                    service = service.config.name,
+                    error = %err,
+                    "failed to observe service exit status"
+                );
                 return false;
             }
             None => {
@@ -213,6 +236,11 @@ async fn wait_for_service_exit_or_unhealthy(service: &ManagedService) -> bool {
                 {
                     *service.last_error.lock().await =
                         Some("required service health check failed".into());
+                    tracing::warn!(
+                        service = service.config.name,
+                        startup_timeout_ms = health_grace.as_millis(),
+                        "required service health check failed"
+                    );
                     if let Some(child) = service.child.lock().await.take() {
                         stop_child_gracefully(service, child).await;
                     }
@@ -331,7 +359,7 @@ async fn start_service(service: &ManagedService) -> anyhow::Result<()> {
     let log_path = logs.join(format!("{}.log", service.config.name));
     let service_log = Arc::new(Mutex::new(
         RotatingServiceLog::new(
-            log_path,
+            log_path.clone(),
             service.logging.max_bytes.unwrap_or(100 * 1024 * 1024),
             service.logging.max_files.unwrap_or(5),
         )
@@ -373,9 +401,17 @@ async fn start_service(service: &ManagedService) -> anyhow::Result<()> {
     }
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    tracing::info!(
+        service = service.config.name,
+        user = service.config.user,
+        log = %log_path.display(),
+        "starting service"
+    );
     let mut child = command
         .spawn()
         .with_context(|| format!("spawn service {:?}", service.config.name))?;
+    let pid = child.id();
+    tracing::info!(service = service.config.name, pid, "service started");
     if let Some(stdout) = child.stdout.take() {
         tokio::spawn(copy_service_output(
             service.config.name.clone(),
@@ -578,6 +614,12 @@ async fn stop_child_gracefully(service: &ManagedService, mut child: Child) {
         .and_then(|value| parse_duration(value).ok())
         .unwrap_or(Duration::from_secs(10));
     if let Some(pid) = child.id() {
+        tracing::info!(
+            service = service.config.name,
+            pid,
+            timeout_ms = timeout.as_millis(),
+            "sending SIGTERM to service"
+        );
         let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();

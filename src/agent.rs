@@ -467,10 +467,24 @@ mod tests {
         ));
         state.accepting_bridge.store(true, Ordering::SeqCst);
 
-        shutdown_agent(state.clone()).await;
+        assert!(shutdown_agent(state.clone()).await);
 
         assert!(state.shutting_down.load(Ordering::SeqCst));
         assert!(!state.accepting_bridge.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn shutdown_agent_is_idempotent() {
+        let state = Arc::new(AgentState::new(
+            PathBuf::from("/tmp"),
+            None,
+            true,
+            None,
+            None,
+        ));
+
+        assert!(shutdown_agent(state.clone()).await);
+        assert!(!shutdown_agent(state.clone()).await);
     }
 
     #[tokio::test]
