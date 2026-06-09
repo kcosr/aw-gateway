@@ -90,11 +90,11 @@ Install the container-side runtime files:
 ```bash
 RELEASE_ROOT=/path/to/aw-gateway-VERSION-linux-x86_64
 sudo install -d -m 0755 /opt/aw-gateway/runtime/linux
-sudo install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-container-agent" \
+sudo install -m 0755 "$RELEASE_ROOT/bin/aw-container-agent" \
   /opt/aw-gateway/runtime/linux/aw-container-agent
-sudo install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-container-bootstrap" \
+sudo install -m 0755 "$RELEASE_ROOT/bin/aw-container-bootstrap" \
   /opt/aw-gateway/runtime/linux/aw-container-bootstrap
-sudo install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-ssh-command-filter" \
+sudo install -m 0755 "$RELEASE_ROOT/bin/aw-ssh-command-filter" \
   /opt/aw-gateway/runtime/linux/aw-ssh-command-filter
 sudo install -m 0755 "$RELEASE_ROOT/examples/podman/start-container-sshd" \
   /opt/aw-gateway/runtime/linux/start-container-sshd

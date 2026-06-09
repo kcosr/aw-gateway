@@ -97,7 +97,7 @@ colima start \
 
 Use `--arch x86_64` if you are staging Linux x86_64 container-side binaries.
 On Apple Silicon, a native arm64 profile requires Linux arm64 runtime binaries
-from the `macos-arm64` release archive.
+from the `linux-arm64` release archive.
 
 Set Docker to use that profile:
 
@@ -134,22 +134,23 @@ real setup replace that with your path, for example `$HOME/aw-gateway`.
   workspace/
 ```
 
-Install the macOS host binary and Linux container-side runtime files from the
-extracted release archive:
+Install the macOS host binary from the macOS archive and Linux container-side
+runtime files from the Linux archive matching the Colima VM architecture:
 
 ```bash
-RELEASE_ROOT=/path/to/aw-gateway-VERSION-macos-arm64
+HOST_RELEASE_ROOT=/path/to/aw-gateway-VERSION-macos-arm64
+LINUX_RELEASE_ROOT=/path/to/aw-gateway-VERSION-linux-arm64
 install -d -m 0755 ~/aw-gateway/bin ~/aw-gateway/runtime/linux
-install -m 0755 "$RELEASE_ROOT/bin/aw-gateway" ~/aw-gateway/bin/aw-gateway
-install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-container-agent" \
+install -m 0755 "$HOST_RELEASE_ROOT/bin/aw-gateway" ~/aw-gateway/bin/aw-gateway
+install -m 0755 "$LINUX_RELEASE_ROOT/bin/aw-container-agent" \
   ~/aw-gateway/runtime/linux/aw-container-agent
-install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-container-bootstrap" \
+install -m 0755 "$LINUX_RELEASE_ROOT/bin/aw-container-bootstrap" \
   ~/aw-gateway/runtime/linux/aw-container-bootstrap
-install -m 0755 "$RELEASE_ROOT/runtime/linux/aw-ssh-command-filter" \
+install -m 0755 "$LINUX_RELEASE_ROOT/bin/aw-ssh-command-filter" \
   ~/aw-gateway/runtime/linux/aw-ssh-command-filter
-install -m 0755 "$RELEASE_ROOT/examples/colima/start-container-sshd" \
+install -m 0755 "$LINUX_RELEASE_ROOT/examples/colima/start-container-sshd" \
   ~/aw-gateway/runtime/linux/start-container-sshd
-install -m 0644 "$RELEASE_ROOT/examples/colima/sshd_config_agent" \
+install -m 0644 "$LINUX_RELEASE_ROOT/examples/colima/sshd_config_agent" \
   ~/aw-gateway/runtime/linux/sshd_config_agent
 ```
 

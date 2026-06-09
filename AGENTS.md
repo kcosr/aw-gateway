@@ -98,9 +98,9 @@ script.
 
 Release archives are packaged separately after the GitHub release exists. Use
 the README release section as the source of truth for archive names, contents,
-and platform handling. The host `aw-gateway` binary is platform-specific, while
-container-side runtime binaries are Linux binaries and must match the container
-or VM architecture, including Linux arm64 runtime binaries for native
-Apple Silicon Colima profiles. SSHD helper/config files are runtime-specific;
-deployment guides install them from `examples/<runtime>/` in the extracted
-release archive.
+and platform handling. Each archive is a single-platform build output; do not
+bundle Linux runtime binaries into macOS archives. Mixed host/container
+deployments, such as a macOS arm64 host with a Linux arm64 Colima VM, are
+assembled from multiple platform archives. SSHD helper/config files are
+runtime-specific; deployment guides install them from `examples/<runtime>/` in
+the extracted release archive.

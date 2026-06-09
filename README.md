@@ -98,12 +98,16 @@ https://github.com/kcosr/aw-gateway/releases
 Supported release platforms are currently:
 
 - `linux-x86_64`
+- `linux-arm64`
 - `macos-arm64`
 
-Extract the archive on the host that will run `aw-gateway`. Each archive
-contains `bin/aw-gateway` for the host platform and `runtime/linux/` files for
-the managed container or Linux VM. Install those files using the deployment
-guide for your runtime:
+Each archive contains binaries for one platform only. Extract the archive that
+matches the host that will run `aw-gateway`; if the managed container or VM
+runs a different Linux platform, also extract the Linux archive that matches
+that container or VM. For example, a macOS arm64 host with a native Apple
+Silicon Colima profile uses the macOS arm64 archive for `bin/aw-gateway` and
+the Linux arm64 archive for the container-side runtime binaries. Install those
+files using the deployment guide for your runtime:
 
 - [Podman](docs/guides/podman.md)
 - [Docker](docs/guides/docker.md)
@@ -117,7 +121,8 @@ For unsupported platforms or local development, build from source in the
 For a working end-to-end deployment, pick the runtime guide that matches your
 host and follow it before using the README as a reference:
 
-1. Download and extract the latest release archive for your platform.
+1. Download and extract the latest release archive for your host platform and,
+   when needed, the Linux archive for your container or VM platform.
 2. Pick a deployment guide: [Podman](docs/guides/podman.md),
    [Docker](docs/guides/docker.md), or [Colima](docs/guides/colima.md).
 3. Install the host and container-side runtime files using that guide's
@@ -219,9 +224,8 @@ Container-side binaries can either be installed in the target image or mounted
 read-only through the bootstrap-mount mode.
 See [Podman](docs/guides/podman.md), [Docker](docs/guides/docker.md), or
 [Colima](docs/guides/colima.md) for the host and container install layout for
-your deployment. macOS readers should also follow the Colima guide's
-cross-build notes so container-side binaries match the Linux architecture used
-inside the VM.
+your deployment. macOS readers should use a Linux release archive or source
+build whose architecture matches the Linux architecture used inside the VM.
 
 ## Deployment Guides
 
@@ -1927,17 +1931,19 @@ use archive names like:
 
 ```text
 aw-gateway-VERSION-linux-x86_64.tar.gz
+aw-gateway-VERSION-linux-arm64.tar.gz
 aw-gateway-VERSION-macos-arm64.tar.gz
 ```
 
 Each archive should contain one top-level directory named
 `aw-gateway-VERSION-PLATFORM` with:
 
-- `bin/aw-gateway` - host executable for that platform.
-- `runtime/linux/aw-container-bootstrap` - Linux container-side bootstrap.
-- `runtime/linux/aw-container-agent` - Linux container-side supervisor.
-- `runtime/linux/aw-ssh-command-filter` - Linux container-side SSH command
-  filter.
+- `bin/aw-gateway` - gateway executable for that platform.
+- `bin/aw-container-bootstrap` - container bootstrap executable for that
+  platform.
+- `bin/aw-container-agent` - container supervisor executable for that platform.
+- `bin/aw-ssh-command-filter` - SSH command filter executable for that
+  platform.
 - `examples/` - runtime-specific deployment configs, including the SSHD
   startup helper and SSHD config used by each guide.
 - `README.md`
@@ -1948,31 +1954,29 @@ Each archive should contain one top-level directory named
 - `docs/`
 - `assets/`
 
-The host `aw-gateway` binary is built for the archive platform. The
-container-side runtime binaries are always Linux binaries and must match the
-container or VM architecture. For example, `linux-x86_64` uses Linux x86_64
-for both host and runtime binaries, while `macos-arm64` uses a macOS arm64
-host binary plus Linux arm64 runtime binaries for a native Apple Silicon
-Colima profile.
+Archives are single-platform build outputs. Do not put Linux runtime binaries
+inside a macOS archive. Mixed host/container deployments are assembled by
+installing files from multiple archives. For example, a macOS arm64 host with a
+native Apple Silicon Colima profile uses `bin/aw-gateway` from the macOS arm64
+archive and the container-side binaries from the Linux arm64 archive.
 
 Example packaging flow for one platform:
 
 ```bash
 VERSION=0.6.0
 PLATFORM=linux-x86_64
-HOST_BINARY=/path/to/aw-gateway
-RUNTIME_BIN_DIR=/path/to/linux-runtime-binaries
+BIN_DIR=/path/to/platform-binaries
 
 STAGE="$(mktemp -d)"
 ROOT="aw-gateway-${VERSION}-${PLATFORM}"
-mkdir -p "$STAGE/$ROOT/bin" "$STAGE/$ROOT/runtime/linux"
-install -m 755 "$HOST_BINARY" "$STAGE/$ROOT/bin/aw-gateway"
-install -m 755 "$RUNTIME_BIN_DIR/aw-container-bootstrap" \
-  "$STAGE/$ROOT/runtime/linux/aw-container-bootstrap"
-install -m 755 "$RUNTIME_BIN_DIR/aw-container-agent" \
-  "$STAGE/$ROOT/runtime/linux/aw-container-agent"
-install -m 755 "$RUNTIME_BIN_DIR/aw-ssh-command-filter" \
-  "$STAGE/$ROOT/runtime/linux/aw-ssh-command-filter"
+mkdir -p "$STAGE/$ROOT/bin"
+install -m 755 "$BIN_DIR/aw-gateway" "$STAGE/$ROOT/bin/aw-gateway"
+install -m 755 "$BIN_DIR/aw-container-bootstrap" \
+  "$STAGE/$ROOT/bin/aw-container-bootstrap"
+install -m 755 "$BIN_DIR/aw-container-agent" \
+  "$STAGE/$ROOT/bin/aw-container-agent"
+install -m 755 "$BIN_DIR/aw-ssh-command-filter" \
+  "$STAGE/$ROOT/bin/aw-ssh-command-filter"
 cp README.md LICENSE CHANGELOG.md aw-gateway.sample.toml \
   container-agent.sample.toml "$STAGE/$ROOT/"
 cp -R docs examples assets "$STAGE/$ROOT/"
@@ -1981,14 +1985,14 @@ rm -rf "$STAGE"
 ```
 
 Repeat that staging step for each platform, for example `linux-x86_64` and
-`macos-arm64`, using the correct host binary, Linux runtime binaries, and
-runtime-specific example configs for each target. After the GitHub Release
-exists, upload the archives:
+`macos-arm64`, using binaries built for that archive platform. After the
+GitHub Release exists, upload the archives:
 
 ```bash
 RELEASE_TAG="v${VERSION}"
 gh release upload "$RELEASE_TAG" \
   "aw-gateway-${VERSION}-linux-x86_64.tar.gz" \
+  "aw-gateway-${VERSION}-linux-arm64.tar.gz" \
   "aw-gateway-${VERSION}-macos-arm64.tar.gz"
 ```
 
