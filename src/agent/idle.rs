@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::time::{Duration, Instant, sleep};
 
-use super::lifecycle::{exit_pid1_agent_process_success, shutdown_agent};
+use super::lifecycle::{
+    exit_pid1_agent_process_success, schedule_forced_exit_after, shutdown_agent,
+    shutdown_watchdog_delay,
+};
 use super::process::{
     ProcInfo, current_uid, read_process_table, signal_matching_processes, signal_number,
     signal_processes,
@@ -36,6 +39,18 @@ pub(super) async fn run_idle_cleanup(state: Arc<AgentState>) {
         match transition {
             IdleTransition::None => {}
             IdleTransition::ShutdownContainer => {
+                let minimum = config
+                    .shutdown_timeout
+                    .as_deref()
+                    .and_then(|value| parse_duration(value).ok())
+                    .unwrap_or_else(|| Duration::from_secs(20))
+                    + Duration::from_secs(5);
+                let force_after = shutdown_watchdog_delay(&state, minimum).await;
+                tracing::info!(
+                    force_after_ms = force_after.as_millis(),
+                    "idle cleanup is shutting down container"
+                );
+                schedule_forced_exit_after(force_after, "idle-cleanup");
                 shutdown_agent(state.clone()).await;
                 exit_pid1_agent_process_success();
             }

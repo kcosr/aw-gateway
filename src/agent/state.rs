@@ -3,7 +3,7 @@ use crate::config::{IdleCleanupAction, IdleCleanupConfig, IdleCleanupOwner};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
 
 use super::service::ManagedService;
@@ -20,6 +20,8 @@ pub(super) struct AgentState {
     pub(super) active_sessions: AtomicUsize,
     pub(super) accepting_bridge: AtomicBool,
     pub(super) shutting_down: AtomicBool,
+    pub(super) shutdown_complete: AtomicBool,
+    pub(super) shutdown_complete_notify: Notify,
     pub(super) control_token: Option<String>,
     pub(super) socket_owner: Option<SocketOwner>,
 }
@@ -46,6 +48,8 @@ impl AgentState {
             active_sessions: AtomicUsize::new(0),
             accepting_bridge: AtomicBool::new(true),
             shutting_down: AtomicBool::new(false),
+            shutdown_complete: AtomicBool::new(false),
+            shutdown_complete_notify: Notify::new(),
             control_token,
             socket_owner,
         }

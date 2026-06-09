@@ -143,7 +143,7 @@ mod tests {
     use super::*;
     use crate::agent::control::unauthorized_if_needed;
     use crate::agent::idle::build_reap_plan;
-    use crate::agent::lifecycle::shutdown_agent;
+    use crate::agent::lifecycle::{shutdown_agent, shutdown_watchdog_delay};
     use crate::agent::process::{ProcInfo, current_uid, process_exists};
     use crate::agent::service::{
         RotatingServiceLog, health_check_interval, health_check_timeout, resolve_service_user,
@@ -467,10 +467,94 @@ mod tests {
         ));
         state.accepting_bridge.store(true, Ordering::SeqCst);
 
-        shutdown_agent(state.clone()).await;
+        assert!(shutdown_agent(state.clone()).await);
 
         assert!(state.shutting_down.load(Ordering::SeqCst));
         assert!(!state.accepting_bridge.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn shutdown_agent_is_idempotent() {
+        let state = Arc::new(AgentState::new(
+            PathBuf::from("/tmp"),
+            None,
+            true,
+            None,
+            None,
+        ));
+
+        assert!(shutdown_agent(state.clone()).await);
+        assert!(!shutdown_agent(state.clone()).await);
+    }
+
+    #[tokio::test]
+    async fn repeated_shutdown_waits_for_in_flight_service_stop() {
+        let state = Arc::new(AgentState::new(
+            PathBuf::from("/tmp"),
+            None,
+            true,
+            None,
+            None,
+        ));
+        state.shutting_down.store(true, Ordering::SeqCst);
+        let completing = state.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            completing.shutdown_complete.store(true, Ordering::SeqCst);
+            completing.shutdown_complete_notify.notify_waiters();
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), shutdown_agent(state.clone()))
+                .await
+                .is_err()
+        );
+
+        assert!(
+            !tokio::time::timeout(Duration::from_millis(200), shutdown_agent(state.clone()))
+                .await
+                .unwrap()
+        );
+        assert!(state.shutdown_complete.load(Ordering::SeqCst));
+        assert!(!shutdown_agent(state.clone()).await);
+    }
+
+    #[tokio::test]
+    async fn shutdown_watchdog_delay_covers_sequential_service_timeouts() {
+        let state = Arc::new(AgentState::new(
+            PathBuf::from("/tmp"),
+            None,
+            true,
+            None,
+            None,
+        ));
+        *state.services.lock().await = vec![
+            Arc::new(ManagedService::new(
+                ServiceConfig {
+                    shutdown_timeout: Some("40ms".into()),
+                    ..test_service("one", Vec::new())
+                },
+                PathBuf::from("/tmp"),
+                LoggingConfig::default(),
+            )),
+            Arc::new(ManagedService::new(
+                ServiceConfig {
+                    shutdown_timeout: Some("20ms".into()),
+                    ..test_service("two", Vec::new())
+                },
+                PathBuf::from("/tmp"),
+                LoggingConfig::default(),
+            )),
+        ];
+
+        assert_eq!(
+            shutdown_watchdog_delay(&state, Duration::from_millis(30)).await,
+            Duration::from_millis(5060)
+        );
+        assert_eq!(
+            shutdown_watchdog_delay(&state, Duration::from_secs(6)).await,
+            Duration::from_secs(6)
+        );
     }
 
     #[tokio::test]
