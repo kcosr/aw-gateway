@@ -12,7 +12,8 @@
 ### Fixed
 
 - Final streamed `run` and `launch` container execs now keep stdin attached
-  even when `aw-gateway` is spawned with non-interactive stdin
+  even when `aw-gateway` is spawned with non-interactive stdin, while
+  wait/detach execution keeps stdin detached for noninteractive capture paths
   ([#55](https://github.com/kcosr/aw-gateway/pull/55)).
 
 ## [0.5.1] - 2026-06-03
