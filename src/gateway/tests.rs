@@ -33,6 +33,15 @@ fn assert_stdin_attached(argv: &str) {
     );
 }
 
+fn assert_stdin_detached(argv: &str) {
+    assert!(
+        !argv
+            .split_whitespace()
+            .any(|arg| arg == "-i" || arg == "-it"),
+        "expected runtime exec args to leave stdin detached; got:\n{argv}"
+    );
+}
+
 fn fake_running_runtime_script(exit_code: i32) -> String {
     let user = UserContext::current().unwrap();
     format!(
@@ -1297,6 +1306,44 @@ exit 0
     assert_eq!(outcome, ExecutionOutcome::new(0));
     let argv = std::fs::read_to_string(log).unwrap();
     assert_stdin_attached(&argv);
+}
+
+#[tokio::test]
+async fn wait_final_container_command_leaves_stdin_detached() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$@" > '{}'
+if [ "$1" = "exec" ]; then
+  exit 0
+fi
+exit 0
+"#,
+            log.display()
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |_| {});
+
+    let outcome = exec_final_container_command_with_options(
+        &runtime,
+        vec!["/bin/capture".into()],
+        None,
+        BTreeMap::new(),
+        OperationExecutionOptions::WAIT,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        ExecutionOutcome::captured(0, Some(Vec::new()), Some(Vec::new()))
+    );
+    let argv = std::fs::read_to_string(log).unwrap();
+    assert_stdin_detached(&argv);
 }
 
 #[tokio::test]

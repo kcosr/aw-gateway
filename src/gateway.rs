@@ -616,7 +616,7 @@ async fn exec_final_container_command_with_options(
     env: BTreeMap<String, String>,
     options: OperationExecutionOptions,
 ) -> anyhow::Result<ExecutionOutcome> {
-    let exec_spec = final_container_exec_spec(runtime, command, cwd, env);
+    let exec_spec = final_container_exec_spec(runtime, command, cwd, env, options.mode);
     exec_container_command_with_options(runtime, &exec_spec, options).await
 }
 
@@ -625,9 +625,10 @@ fn final_container_exec_spec(
     command: Vec<String>,
     cwd: Option<PathBuf>,
     env: BTreeMap<String, String>,
+    mode: OperationMode,
 ) -> ContainerExecSpec {
     ContainerExecSpec {
-        stdin_tty: true,
+        stdin_tty: mode == OperationMode::Stream,
         stdout_tty: std::io::stdout().is_terminal(),
         user: runtime.exec_identity(),
         cwd,

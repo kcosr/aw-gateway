@@ -138,7 +138,7 @@ impl OperationRunner {
             runtime,
             session_spec,
             body,
-            options: _,
+            options,
         } = self;
         let mut session = runtime
             .begin_operation_session(session_spec.kind(), session_spec.uses_launch_marker())?;
@@ -147,6 +147,7 @@ impl OperationRunner {
             session_spec,
             &mut session,
             body,
+            options.mode,
         )
         .await
         {
@@ -379,7 +380,8 @@ async fn execute_operation_session_body(
     body: OperationBody,
     options: OperationExecutionOptions,
 ) -> anyhow::Result<ExecutionOutcome> {
-    let prepared = prepare_operation_session_body(runtime, session_spec, session, body).await?;
+    let prepared =
+        prepare_operation_session_body(runtime, session_spec, session, body, options.mode).await?;
     exec_container_command_with_options(runtime, &prepared.exec_spec, options).await
 }
 
@@ -394,7 +396,8 @@ async fn execute_operation_session_body_cancelable(
     if cancel.is_cancelled() {
         return Ok(ExecutionOutcome::canceled(None));
     }
-    let prepared = prepare_operation_session_body(runtime, session_spec, session, body).await?;
+    let prepared =
+        prepare_operation_session_body(runtime, session_spec, session, body, options.mode).await?;
     if cancel.is_cancelled() {
         return Ok(ExecutionOutcome::canceled(None));
     }
@@ -406,12 +409,13 @@ async fn prepare_operation_session_body(
     session_spec: OperationSessionSpec,
     session: &mut OperationSessionGuard,
     body: OperationBody,
+    mode: OperationMode,
 ) -> anyhow::Result<PreparedCommand> {
     let ready = runtime.ensure_ready().await?;
     runtime
         .hold_operation_agent_session(session, session_spec.kind())
         .await?;
-    body.prepare(runtime, ready).await
+    body.prepare(runtime, ready, mode).await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -507,6 +511,7 @@ impl OperationBody {
         self,
         runtime: &Runtime,
         ready: ReadyStatus,
+        mode: OperationMode,
     ) -> anyhow::Result<PreparedCommand> {
         match self {
             Self::Run { cwd, command } => {
@@ -514,7 +519,7 @@ impl OperationBody {
                     .as_deref()
                     .map(|cwd| paths::expand_home(&runtime.identity.container_home, cwd));
                 let exec_spec =
-                    final_container_exec_spec(runtime, command, cwd, runtime.session_env()?);
+                    final_container_exec_spec(runtime, command, cwd, runtime.session_env()?, mode);
                 Ok(PreparedCommand { ready, exec_spec })
             }
             Self::Launch {
@@ -533,7 +538,7 @@ impl OperationBody {
                     runtime.identity.container_home.as_path(),
                 )?;
                 let command = render_launch_command(&launch.command, &vars, &args)?;
-                let exec_spec = final_container_exec_spec(runtime, command, cwd, env);
+                let exec_spec = final_container_exec_spec(runtime, command, cwd, env, mode);
                 Ok(PreparedCommand { ready, exec_spec })
             }
         }
