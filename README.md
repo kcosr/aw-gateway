@@ -754,6 +754,9 @@ container_dir = "/run/aw-gateway"
 Target-specific runtime and environment knobs are explicit:
 
 ```toml
+[targets.default]
+session_env_inherit = ["GIT_ASKPASS", "GIT_TERMINAL_PROMPT"]
+
 [targets.default.runtime]
 extra_run_args = ["--cap-add", "SYS_ADMIN"]
 
@@ -768,6 +771,32 @@ CODEX_HOME = "/var/lib/codex"
 `session_env` is used for gateway-managed command execution and is rendered
 into the generated SSHD session environment snippet consumed by the example
 container SSH helper.
+
+`session_env_inherit` is an allow-list of environment variable names copied
+from the `aw-gateway` process into gateway-managed command execution when the
+named variable is present. Inherited values are not passed when the long-lived
+container is created and are not written into the generated SSHD session
+environment snippet. Effective command env is layered as built-in `SHELL` and
+`PATH`, then present inherited values, then explicit `session_env`, then launch
+`env`, and finally per-step launch `env` for that step. Repeating the same
+`session_env_inherit` key through target defaults, templates, and the concrete
+target is a validation error; unlike `container_env` and `session_env`, inherited
+env names do not override by key.
+
+Inherited names are read from the running gateway process at command execution
+time. This is useful when a caller starts a fresh `aw-gateway` process with
+per-launch non-secret routing or helper values. A long-running shared HTTP
+gateway has one process environment, so inherited values are static for that
+daemon rather than per principal. Avoid inheriting `SHELL` or `PATH` unless you
+intentionally want host-process values to override the container-oriented
+defaults. Inherited values must be valid UTF-8; values that are present but not
+valid UTF-8 are skipped with a warning.
+
+Runtime exec env is passed to Podman, Docker, or Colima as runtime arguments,
+so inherited values can be visible in host process listings on standard Linux
+systems. Do not use `session_env_inherit` as the normal transport for personal
+access tokens, bearer tokens, identity tokens, or other high-value secrets until
+a non-argv secret transport is available.
 
 Container SSH transfer policy is independent for SFTP and legacy SCP:
 
@@ -1648,6 +1677,7 @@ merging, and references are deterministic.
 | `target.container_home` | Gateway identity resolution | `{user}`, `{uid}`, `{gid}`, `{home}` |
 | `target.workspace.path` | Gateway target resolution | `{user}`, `{uid}`, `{gid}`, `{home}`, `{target}`, `{image}`, `{image_slug}`, `{session_id}` |
 | `target.workspace.state_dir`, `target.container_env`, `target.session_env`, `target.container_mounts.*`, `target.runtime.extra_run_args`, `target.container_bootstrap.*`, `target.container_bootstrap_steps.*` | Gateway runtime resolution | Gateway vars except `{container_pid}` |
+| `target.session_env_inherit` | Gateway runtime resolution | Env key names only; no template interpolation |
 | `target.lifecycle_steps[].command` | Gateway lifecycle execution | Pre-start supports gateway vars except `{container_pid}`; later phases support all gateway vars |
 | `target.host_steps[].command` and HTTP health-check URLs | Gateway host-step execution | All gateway vars, including `{container_pid}` |
 | `container_agent.services[].user` in gateway config | Gateway-managed agent config render | `{container_user}` |

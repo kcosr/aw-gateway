@@ -627,7 +627,7 @@ fn final_container_exec_spec(
     env: BTreeMap<String, String>,
 ) -> ContainerExecSpec {
     ContainerExecSpec {
-        stdin_tty: std::io::stdin().is_terminal(),
+        stdin_tty: true,
         stdout_tty: std::io::stdout().is_terminal(),
         user: runtime.exec_identity(),
         cwd,

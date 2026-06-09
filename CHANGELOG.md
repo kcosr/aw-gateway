@@ -2,7 +2,16 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Added target `session_env_inherit` allow-lists for copying selected
+  non-secret gateway process environment variables into gateway-managed session
+  command environments.
+
+### Fixed
+
+- Final streamed `run` and `launch` container execs now keep stdin attached
+  even when `aw-gateway` is spawned with non-interactive stdin.
 
 ## [0.5.1] - 2026-06-03
 

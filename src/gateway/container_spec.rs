@@ -309,6 +309,23 @@ impl Runtime {
     }
 
     pub(super) fn session_env(&self) -> anyhow::Result<BTreeMap<String, String>> {
+        self.session_env_with_lookup(|key| match std::env::var(key) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                tracing::warn!(
+                    key,
+                    "inherited session environment variable is not valid UTF-8"
+                );
+                None
+            }
+        })
+    }
+
+    pub(super) fn session_env_with_lookup(
+        &self,
+        mut lookup: impl FnMut(&str) -> Option<String>,
+    ) -> anyhow::Result<BTreeMap<String, String>> {
         let mut env = BTreeMap::from([
             ("SHELL".into(), DEFAULT_SESSION_SHELL_ENV.to_string()),
             (
@@ -316,6 +333,11 @@ impl Runtime {
                 "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
             ),
         ]);
+        for key in &self.target.session_env_inherit {
+            if let Some(value) = lookup(key) {
+                env.insert(key.clone(), value);
+            }
+        }
         env.extend(self.render_env_map(&self.target.session_env)?);
         Ok(env)
     }

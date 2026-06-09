@@ -6,7 +6,7 @@ use super::validation::*;
 use super::{ContainerAgentConfig, ContainerAgentConfigInput};
 use crate::template;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 mod container_ssh;
@@ -160,6 +160,8 @@ pub struct TargetConfigInput {
     #[serde(default)]
     pub session_env: BTreeMap<String, String>,
     #[serde(default)]
+    pub session_env_inherit: Vec<String>,
+    #[serde(default)]
     pub container_mounts: Vec<ContainerMountConfig>,
     pub stop_when_idle: Option<bool>,
     pub remove_on_stop: Option<bool>,
@@ -247,6 +249,8 @@ impl TargetConfigInput {
         }
         self.container_env.extend(later.container_env.clone());
         self.session_env.extend(later.session_env.clone());
+        self.session_env_inherit
+            .extend(later.session_env_inherit.clone());
         self.container_mounts.extend(later.container_mounts.clone());
         if let Some(stop_when_idle) = later.stop_when_idle {
             self.stop_when_idle = Some(stop_when_idle);
@@ -386,6 +390,9 @@ impl TargetConfigInput {
         }
         validate_env_map("target.container_env", &self.container_env)?;
         validate_env_map("target.session_env", &self.session_env)?;
+        for key in &self.session_env_inherit {
+            validate_env_key(key)?;
+        }
         for mount in &self.container_mounts {
             mount.validate()?;
         }
@@ -460,6 +467,7 @@ impl TargetConfigInput {
             container_home: self.container_home,
             container_env: self.container_env,
             session_env: self.session_env,
+            session_env_inherit: self.session_env_inherit,
             container_mounts: self.container_mounts,
             stop_when_idle: self.stop_when_idle.unwrap_or(false),
             remove_on_stop: self.remove_on_stop.unwrap_or(false),
@@ -501,6 +509,8 @@ pub struct TargetConfig {
     pub container_env: BTreeMap<String, String>,
     #[serde(default)]
     pub session_env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub session_env_inherit: Vec<String>,
     #[serde(default)]
     pub container_mounts: Vec<ContainerMountConfig>,
     pub stop_when_idle: bool,
@@ -549,6 +559,13 @@ impl TargetConfig {
         self.runtime.validate(target_name)?;
         validate_env_map("target.container_env", &self.container_env)?;
         validate_env_map("target.session_env", &self.session_env)?;
+        let mut inherited_session_env = BTreeSet::new();
+        for key in &self.session_env_inherit {
+            validate_env_key(key)?;
+            if !inherited_session_env.insert(key) {
+                anyhow::bail!("target.session_env_inherit contains duplicate key {key:?}");
+            }
+        }
         for mount in &self.container_mounts {
             mount.validate()?;
         }
