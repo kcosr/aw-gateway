@@ -25,6 +25,23 @@ fn assert_file_mode(path: &Path, expected: u32) {
 #[cfg(not(unix))]
 fn assert_file_mode(_path: &Path, _expected: u32) {}
 
+fn assert_stdin_attached(argv: &str) {
+    assert!(
+        argv.split_whitespace()
+            .any(|arg| arg == "-i" || arg == "-it"),
+        "expected runtime exec args to attach stdin; got:\n{argv}"
+    );
+}
+
+fn assert_stdin_detached(argv: &str) {
+    assert!(
+        !argv
+            .split_whitespace()
+            .any(|arg| arg == "-i" || arg == "-it"),
+        "expected runtime exec args to leave stdin detached; got:\n{argv}"
+    );
+}
+
 fn fake_running_runtime_script(exit_code: i32) -> String {
     let user = UserContext::current().unwrap();
     format!(
@@ -1181,6 +1198,55 @@ fn launch_env_precedence_is_session_then_launch_then_step() {
     assert_eq!(final_env["STEP"], "session");
 }
 
+#[test]
+fn launch_metadata_does_not_include_inherited_session_env() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+session_env_inherit = ["AW_GATEWAY_TEST_METADATA_ENV"]
+
+[launches.metadata]
+target = "default"
+env = { LAUNCH_ONLY = "launch" }
+command = ["/bin/true"]
+
+[[launches.metadata.steps]]
+phase = "post_ready"
+location = "container"
+name = "step"
+env = { STEP_ONLY = "step" }
+command = ["/bin/true"]
+"#,
+    )
+    .unwrap();
+    cfg.validate().unwrap();
+
+    let summaries = launch_summaries(&cfg).unwrap();
+    assert_eq!(summaries[0].name, "metadata");
+
+    let launch = cfg.effective_launch("metadata").unwrap();
+    let detail = launch_detail(&cfg, "metadata", &launch).unwrap();
+    assert!(!detail.env.contains_key("AW_GATEWAY_TEST_METADATA_ENV"));
+    assert_eq!(
+        detail.env.get("LAUNCH_ONLY").map(String::as_str),
+        Some("launch")
+    );
+    assert!(
+        !detail.steps[0]
+            .env
+            .contains_key("AW_GATEWAY_TEST_METADATA_ENV")
+    );
+    assert_eq!(
+        detail.steps[0].env.get("STEP_ONLY").map(String::as_str),
+        Some("step")
+    );
+}
+
 #[tokio::test]
 async fn final_container_command_returns_runtime_exit_status() {
     let dir = tempfile::tempdir().unwrap();
@@ -1206,6 +1272,78 @@ exit 0
     .unwrap();
 
     assert_eq!(outcome, ExecutionOutcome::new(37));
+}
+
+#[tokio::test]
+async fn final_container_command_keeps_stdin_attached_for_streaming() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$@" > '{}'
+if [ "$1" = "exec" ]; then
+  exit 0
+fi
+exit 0
+"#,
+            log.display()
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |_| {});
+
+    let outcome = exec_final_container_command(
+        &runtime,
+        vec!["/bin/launch-final".into()],
+        None,
+        BTreeMap::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome, ExecutionOutcome::new(0));
+    let argv = std::fs::read_to_string(log).unwrap();
+    assert_stdin_attached(&argv);
+}
+
+#[tokio::test]
+async fn wait_final_container_command_leaves_stdin_detached() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$@" > '{}'
+if [ "$1" = "exec" ]; then
+  exit 0
+fi
+exit 0
+"#,
+            log.display()
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |_| {});
+
+    let outcome = exec_final_container_command_with_options(
+        &runtime,
+        vec!["/bin/capture".into()],
+        None,
+        BTreeMap::new(),
+        OperationExecutionOptions::WAIT,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        outcome,
+        ExecutionOutcome::captured(0, Some(Vec::new()), Some(Vec::new()))
+    );
+    let argv = std::fs::read_to_string(log).unwrap();
+    assert_stdin_detached(&argv);
 }
 
 #[tokio::test]
@@ -1361,6 +1499,58 @@ async fn run_operation_core_returns_nonzero_exit_without_exiting_process() {
 }
 
 #[tokio::test]
+async fn run_operation_keeps_stdin_attached_for_streaming() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let runtime_log = dir.path().join("runtime.log");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  exec)
+    case "$*" in
+      *aw-gateway-marker-list*|*aw-gateway-marker-sweep*)
+        exit 0
+        ;;
+    esac
+    printf '%s\n' "$@" >> "{runtime_log}"
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+            runtime_log = runtime_log.display(),
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        cfg.target_defaults.host_steps.clear();
+        cfg.targets.get_mut("default").unwrap().stop_when_idle = Some(false);
+    });
+
+    let outcome = run_container_command_with_runtime(
+        runtime,
+        None,
+        vec!["/bin/streaming-run".into()],
+        OperationExecutionOptions::STREAM,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome, ExecutionOutcome::new(0));
+    let argv = std::fs::read_to_string(runtime_log).unwrap();
+    assert_stdin_attached(&argv);
+}
+
+#[tokio::test]
 async fn detached_run_keeps_session_marker_until_background_finishes() {
     let dir = tempfile::tempdir().unwrap();
     let fake_runtime = dir.path().join("runtime");
@@ -1496,6 +1686,7 @@ exit 0
         log.contains("agent-pack run --fixed --skill fresh-eyes --after"),
         "{log}"
     );
+    assert_stdin_attached(&log);
     assert!(log.contains("aw-gateway-exec-rm"), "{log}");
 }
 
@@ -3412,6 +3603,19 @@ fn container_run_env_does_not_include_target_session_env() {
         .unwrap()
         .session_env
         .insert("SESSION_ONLY".into(), "session".into());
+    cfg.targets.get_mut("default").unwrap().session_env.insert(
+        "AW_GATEWAY_TEST_SESSION_OVERRIDE_ENV".into(),
+        "explicit".into(),
+    );
+    cfg.targets
+        .get_mut("default")
+        .unwrap()
+        .session_env_inherit
+        .extend([
+            "AW_GATEWAY_TEST_INHERITED_SESSION_ENV".into(),
+            "AW_GATEWAY_TEST_SESSION_OVERRIDE_ENV".into(),
+            "AW_GATEWAY_TEST_MISSING_SESSION_ENV".into(),
+        ]);
     let target = cfg.effective_target("default").unwrap();
     let container_runtime =
         ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
@@ -3422,19 +3626,72 @@ fn container_run_env_does_not_include_target_session_env() {
     let spec = runtime.container_run_spec(None, None).unwrap();
     assert_eq!(spec.env.get("START_ONLY"), Some(&"start".to_string()));
     assert!(!spec.env.contains_key("SESSION_ONLY"));
+    assert!(
+        !spec
+            .env
+            .contains_key("AW_GATEWAY_TEST_INHERITED_SESSION_ENV")
+    );
+    assert!(
+        !spec
+            .env
+            .contains_key("AW_GATEWAY_TEST_SESSION_OVERRIDE_ENV")
+    );
 
-    let exec_env = runtime.session_env().unwrap();
+    let exec_env = runtime
+        .session_env_with_lookup(|key| match key {
+            "AW_GATEWAY_TEST_INHERITED_SESSION_ENV" => Some("inherited-session".into()),
+            "AW_GATEWAY_TEST_SESSION_OVERRIDE_ENV" => Some("inherited-value".into()),
+            _ => None,
+        })
+        .unwrap();
     assert_eq!(
         exec_env.get("SHELL").map(String::as_str),
         Some(DEFAULT_SESSION_SHELL_ENV)
     );
     assert_eq!(exec_env.get("SESSION_ONLY"), Some(&"session".to_string()));
+    assert_eq!(
+        exec_env
+            .get("AW_GATEWAY_TEST_INHERITED_SESSION_ENV")
+            .map(String::as_str),
+        Some("inherited-session")
+    );
+    assert_eq!(
+        exec_env
+            .get("AW_GATEWAY_TEST_SESSION_OVERRIDE_ENV")
+            .map(String::as_str),
+        Some("explicit")
+    );
+    assert!(!exec_env.contains_key("AW_GATEWAY_TEST_MISSING_SESSION_ENV"));
+
+    let mut vars = Vars::new();
+    vars.insert("var.step".into(), "step".into());
+    let launch_env = BTreeMap::from([("LAUNCH_ONLY".into(), "launch".into())]);
+    let step_env = BTreeMap::from([("STEP_ONLY".into(), "{var.step}".into())]);
+    let step_exec_env =
+        launch_container_step_env(&exec_env, &launch_env, &step_env, &vars).unwrap();
+    assert_eq!(
+        step_exec_env
+            .get("AW_GATEWAY_TEST_INHERITED_SESSION_ENV")
+            .map(String::as_str),
+        Some("inherited-session")
+    );
+    assert_eq!(
+        step_exec_env.get("LAUNCH_ONLY").map(String::as_str),
+        Some("launch")
+    );
+    assert_eq!(
+        step_exec_env.get("STEP_ONLY").map(String::as_str),
+        Some("step")
+    );
 
     std::fs::create_dir_all(&runtime.paths.container_state_dir).unwrap();
     let env_path = runtime.write_sshd_session_env_config().unwrap();
     assert_file_mode(&env_path, 0o600);
     let env_config = std::fs::read_to_string(env_path).unwrap();
     assert!(env_config.contains("SESSION_ONLY=session"));
+    assert!(!env_config.contains("AW_GATEWAY_TEST_INHERITED_SESSION_ENV"));
+    assert!(env_config.contains("AW_GATEWAY_TEST_SESSION_OVERRIDE_ENV=explicit"));
+    assert!(!env_config.contains("inherited-value"));
 }
 
 #[test]

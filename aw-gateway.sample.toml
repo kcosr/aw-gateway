@@ -30,3 +30,7 @@ cleanup = "never"
 image = "ubuntu/dev"
 mode = "fixed"
 name = "{image_slug}"
+# Optional allow-list of non-secret aw-gateway process environment variables
+# copied into gateway-managed command execution. Do not use this for tokens or
+# other high-value secrets while runtime exec env is argv-backed.
+# session_env_inherit = ["GIT_ASKPASS", "GIT_TERMINAL_PROMPT"]

@@ -1126,6 +1126,125 @@ CODEX_HOME = "/var/lib/codex"
 }
 
 #[test]
+fn target_session_env_inherit_composes_and_validates() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[target_defaults]
+session_env_inherit = ["DEFAULT_ENV"]
+
+[target_templates.runtime]
+session_env_inherit = ["RUNTIME_ENV"]
+
+[target_templates.policy]
+session_env_inherit = ["POLICY_ENV"]
+
+[targets.default]
+use = ["runtime", "policy"]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+session_env_inherit = ["TARGET_ENV"]
+"#,
+    )
+    .unwrap();
+    cfg.validate().unwrap();
+
+    let target = cfg.effective_target("default").unwrap();
+    assert_eq!(
+        target.session_env_inherit,
+        ["DEFAULT_ENV", "RUNTIME_ENV", "POLICY_ENV", "TARGET_ENV"]
+    );
+
+    for config in [
+        r#"
+schema_version = "1"
+
+[target_defaults]
+session_env_inherit = ["bad-name"]
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        r#"
+schema_version = "1"
+
+[target_templates.unused]
+session_env_inherit = ["bad-name"]
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+session_env_inherit = ["bad-name"]
+"#,
+    ] {
+        let invalid: GatewayConfig = toml::from_str(config).unwrap();
+        let err = format!("{:#}", invalid.validate().unwrap_err());
+        assert!(err.contains("invalid environment key"), "{err}");
+        assert!(err.contains("bad-name"), "{err}");
+    }
+}
+
+#[test]
+fn target_session_env_inherit_rejects_duplicate_effective_keys() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[target_defaults]
+session_env_inherit = ["DUPLICATE_ENV"]
+
+[target_templates.runtime]
+session_env_inherit = ["RUNTIME_ENV"]
+
+[targets.default]
+use = ["runtime"]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+session_env_inherit = ["DUPLICATE_ENV"]
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(
+        err.contains("target.session_env_inherit contains duplicate key \"DUPLICATE_ENV\""),
+        "{err}"
+    );
+
+    let duplicate_in_layer: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+session_env_inherit = ["DUPLICATE_ENV", "DUPLICATE_ENV"]
+"#,
+    )
+    .unwrap();
+    let err = format!("{:#}", duplicate_in_layer.validate().unwrap_err());
+    assert!(
+        err.contains("target.session_env_inherit contains duplicate key \"DUPLICATE_ENV\""),
+        "{err}"
+    );
+}
+
+#[test]
 fn ssh_dispatch_defaults_include_launch_actions() {
     let cfg = SshDispatchConfig::default();
     assert!(

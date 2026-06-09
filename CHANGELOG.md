@@ -2,7 +2,19 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Added target `session_env_inherit` allow-lists for copying selected
+  non-secret gateway process environment variables into gateway-managed session
+  command environments
+  ([#55](https://github.com/kcosr/aw-gateway/pull/55)).
+
+### Fixed
+
+- Final streamed `run` and `launch` container execs now keep stdin attached
+  even when `aw-gateway` is spawned with non-interactive stdin, while
+  wait/detach execution keeps stdin detached for noninteractive capture paths
+  ([#55](https://github.com/kcosr/aw-gateway/pull/55)).
 
 ## [0.5.1] - 2026-06-03
 

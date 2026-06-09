@@ -50,6 +50,17 @@ Implemented in `tests/test_10_lifecycle.py`.
 | Status JSON reports the target after execution | all enabled hosts |
 | Stop succeeds and leaves the target in a stopped or absent state | all enabled hosts |
 
+## Session Environment And Streamed Stdin
+
+Implemented in `tests/test_12_session_env_and_stdin.py`.
+
+| Scenario | Hosts |
+| --- | --- |
+| `session_env_inherit` copies an allow-listed gateway process environment key into a session command | all enabled hosts |
+| The inherited session environment key is absent from a later command when the gateway process does not provide it | all enabled hosts |
+| `run` keeps piped stdin attached through the final container exec | all enabled hosts |
+| `launch` keeps piped stdin attached through the final container exec | all enabled hosts |
+
 ## Host-Local Container SSH
 
 Implemented in `tests/test_15_host_local_container_ssh.py`.
