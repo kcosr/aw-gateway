@@ -198,20 +198,32 @@ def test_http_run_wait_disconnect_terminates_container_process(host: Host) -> No
                     _long_running_process_command(pidfile, child_pidfile),
                 ],
             },
-        ) as sock:
-            _wait_for_http_command(http, host, f"test -s {pidfile}")
-            _wait_for_http_command(http, host, f"test -s {child_pidfile}")
-            sock.shutdown(socket.SHUT_RDWR)
+            ) as sock:
+                _wait_for_http_command(
+                    http,
+                    host,
+                    f"test -s {pidfile}",
+                    timeout=_close_termination_timeout(host),
+                )
+                _wait_for_http_command(
+                    http,
+                    host,
+                    f"test -s {child_pidfile}",
+                    timeout=_close_termination_timeout(host),
+                )
+                sock.shutdown(socket.SHUT_RDWR)
 
         _wait_for_http_command(
             http,
             host,
-            f"pid=$(cat {pidfile}) && ! kill -0 \"$pid\" 2>/dev/null",
+            _process_absent_or_reused_command(pidfile),
+            timeout=_close_termination_timeout(host),
         )
         _wait_for_http_command(
             http,
             host,
-            f"pid=$(cat {child_pidfile}) && ! kill -0 \"$pid\" 2>/dev/null",
+            _process_absent_or_reused_command(child_pidfile),
+            timeout=_close_termination_timeout(host),
         )
 
 
@@ -233,12 +245,14 @@ def test_http_run_pty_close_terminates_container_process(host: Host) -> None:
         _wait_for_http_command(
             http,
             host,
-            f"pid=$(cat {pidfile}) && ! kill -0 \"$pid\" 2>/dev/null",
+            _process_absent_or_reused_command(pidfile),
+            timeout=_close_termination_timeout(host),
         )
         _wait_for_http_command(
             http,
             host,
-            f"pid=$(cat {child_pidfile}) && ! kill -0 \"$pid\" 2>/dev/null",
+            _process_absent_or_reused_command(child_pidfile),
+            timeout=_close_termination_timeout(host),
         )
 
 
@@ -260,11 +274,11 @@ def test_http_shutdown_signal_terminates_active_pty_process(host: Host) -> None:
             daemon.wait_remote_stopped(timeout=20)
             _wait_for_gateway_command(
                 host,
-                f"pid=$(cat {pidfile}) && ! kill -0 \"$pid\" 2>/dev/null",
+                _process_absent_or_reused_command(pidfile),
             )
             _wait_for_gateway_command(
                 host,
-                f"pid=$(cat {child_pidfile}) && ! kill -0 \"$pid\" 2>/dev/null",
+                _process_absent_or_reused_command(child_pidfile),
             )
 
 
@@ -478,8 +492,14 @@ def _recv_exact(sock: socket.socket, count: int) -> bytes:
     return data
 
 
-def _wait_for_http_command(http: HttpClient, host: Host, command: str) -> None:
-    deadline = time.monotonic() + 20
+def _wait_for_http_command(
+    http: HttpClient,
+    host: Host,
+    command: str,
+    *,
+    timeout: float = 20,
+) -> None:
+    deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
         last = http.post(
@@ -495,6 +515,12 @@ def _wait_for_http_command(http: HttpClient, host: Host, command: str) -> None:
             return
         time.sleep(0.25)
     raise AssertionError(f"command did not succeed before timeout: {command!r}; last={last.body!r}")
+
+
+def _close_termination_timeout(host: Host) -> float:
+    if host.runtime == "colima":
+        return 90
+    return 20
 
 
 def _wait_for_gateway_command(host: Host, command: str) -> None:
@@ -541,6 +567,15 @@ def _long_running_process_command(pidfile: str, child_pidfile: str) -> str:
         "while :; do sleep 1; done' & "
         f"printf '%s' $$ > {pidfile}; "
         "wait"
+    )
+
+
+def _process_absent_or_reused_command(pidfile: str) -> str:
+    return (
+        f"pid=$(cat {pidfile}) && "
+        "{ [ ! -r \"/proc/$pid/cmdline\" ] || "
+        f"! tr '\\0' ' ' < \"/proc/$pid/cmdline\" | grep -F -- {json.dumps(pidfile)} >/dev/null; "
+        "}"
     )
 
 
