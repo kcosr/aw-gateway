@@ -6,6 +6,9 @@
 
 - Documented single-platform release archives and mixed host/container
   deployment installs assembled from separate host and Linux runtime archives.
+- Relaxed Colima HTTP close/disconnect smoke timing to account for delegated
+  runtime cancellation over SSH-forwarded API connections
+  ([#TBD](https://github.com/kcosr/aw-gateway/pull/TBD)).
 
 ## [0.5.2] - 2026-06-09
 
