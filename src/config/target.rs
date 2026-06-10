@@ -4,6 +4,7 @@ use super::steps::{
 };
 use super::validation::*;
 use super::{ContainerAgentConfig, ContainerAgentConfigInput};
+use crate::context::{ContextVarConfig, RuntimeContext};
 use crate::template;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -81,20 +82,46 @@ impl WorkspaceConfigInput {
             if path.trim().is_empty() {
                 anyhow::bail!("target {target_name:?} workspace.path must not be empty");
             }
-            validate_template(
+            validate_template_with_policy(
                 "target.workspace.path",
                 path,
                 TARGET_WORKSPACE_TEMPLATE_VARS,
+                TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
             )?;
         }
         if let Some(state_dir) = &self.state_dir {
             if state_dir.trim().is_empty() {
                 anyhow::bail!("target {target_name:?} workspace.state_dir must not be empty");
             }
-            validate_template(
+            validate_template_with_policy(
                 "target.workspace.state_dir",
                 state_dir,
                 GATEWAY_TEMPLATE_VARS_NO_PID,
+                TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_context_templates(
+        &self,
+        field: &str,
+        context_vars: &BTreeMap<String, ContextVarConfig>,
+    ) -> anyhow::Result<()> {
+        if let Some(path) = &self.path {
+            validate_template_with_context(
+                &format!("{field}.path"),
+                path,
+                TARGET_WORKSPACE_TEMPLATE_VARS,
+                context_vars.keys(),
+            )?;
+        }
+        if let Some(state_dir) = &self.state_dir {
+            validate_template_with_context(
+                &format!("{field}.state_dir"),
+                state_dir,
+                GATEWAY_TEMPLATE_VARS_NO_PID,
+                context_vars.keys(),
             )?;
         }
         Ok(())
@@ -127,17 +154,38 @@ impl ControlSocketsConfig {
         if self.container_dir.trim().is_empty() {
             anyhow::bail!("{field}.container_dir must not be empty");
         }
-        validate_template(
+        validate_template_with_policy(
             &format!("{field}.host_dir"),
             &self.host_dir,
             CONTROL_SOCKET_TEMPLATE_VARS,
+            TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
         )?;
-        validate_template(
+        validate_template_with_policy(
             &format!("{field}.container_dir"),
             &self.container_dir,
             CONTROL_SOCKET_TEMPLATE_VARS,
+            TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
         )?;
         Ok(())
+    }
+
+    pub(super) fn validate_context_templates(
+        &self,
+        field: &str,
+        context_vars: &BTreeMap<String, ContextVarConfig>,
+    ) -> anyhow::Result<()> {
+        validate_template_with_context(
+            &format!("{field}.host_dir"),
+            &self.host_dir,
+            CONTROL_SOCKET_TEMPLATE_VARS,
+            context_vars.keys(),
+        )?;
+        validate_template_with_context(
+            &format!("{field}.container_dir"),
+            &self.container_dir,
+            CONTROL_SOCKET_TEMPLATE_VARS,
+            context_vars.keys(),
+        )
     }
 }
 
@@ -364,13 +412,19 @@ impl TargetConfigInput {
             anyhow::bail!("target {target_name:?} image is required");
         }
         if let Some(name) = &self.name {
-            validate_template("target.name", name, &["image_slug"])?;
+            validate_template_with_policy(
+                "target.name",
+                name,
+                &["image_slug"],
+                TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
+            )?;
         }
         if let Some(ephemeral_name) = &self.ephemeral_name {
-            validate_template(
+            validate_template_with_policy(
                 "target.ephemeral_name",
                 ephemeral_name,
                 &["image_slug", "session_id"],
+                TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
             )?;
         }
         if let Some(workspace) = &self.workspace {
@@ -432,6 +486,37 @@ impl TargetConfigInput {
         }
         if let Some(container_agent) = &self.container_agent {
             container_agent.validate_partial()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_context_templates(
+        &self,
+        field: &str,
+        context_vars: &BTreeMap<String, ContextVarConfig>,
+    ) -> anyhow::Result<()> {
+        if let Some(name) = &self.name {
+            validate_template_with_context(
+                &format!("{field}.name"),
+                name,
+                &["image_slug"],
+                context_vars.keys(),
+            )?;
+        }
+        if let Some(ephemeral_name) = &self.ephemeral_name {
+            validate_template_with_context(
+                &format!("{field}.ephemeral_name"),
+                ephemeral_name,
+                &["image_slug", "session_id"],
+                context_vars.keys(),
+            )?;
+        }
+        if let Some(workspace) = &self.workspace {
+            workspace.validate_context_templates(&format!("{field}.workspace"), context_vars)?;
+        }
+        if let Some(control_sockets) = &self.control_sockets {
+            control_sockets
+                .validate_context_templates(&format!("{field}.control_sockets"), context_vars)?;
         }
         Ok(())
     }
@@ -543,18 +628,20 @@ impl TargetConfig {
         if self.workspace.path.trim().is_empty() {
             anyhow::bail!("target {target_name:?} workspace.path must not be empty");
         }
-        validate_template(
+        validate_template_with_policy(
             "target.workspace.path",
             &self.workspace.path,
             TARGET_WORKSPACE_TEMPLATE_VARS,
+            TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
         )?;
         if self.workspace.state_dir.trim().is_empty() {
             anyhow::bail!("target {target_name:?} workspace.state_dir must not be empty");
         }
-        validate_template(
+        validate_template_with_policy(
             "target.workspace.state_dir",
             &self.workspace.state_dir,
             GATEWAY_TEMPLATE_VARS_NO_PID,
+            TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
         )?;
         self.runtime.validate(target_name)?;
         validate_env_map("target.container_env", &self.container_env)?;
@@ -572,17 +659,23 @@ impl TargetConfig {
         match self.mode {
             TargetMode::Fixed => {
                 if let Some(name) = &self.name {
-                    validate_template("target.name", name, &["image_slug"])?;
+                    validate_template_with_policy(
+                        "target.name",
+                        name,
+                        &["image_slug"],
+                        TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
+                    )?;
                 } else {
                     anyhow::bail!("fixed target {target_name:?} requires name");
                 }
             }
             TargetMode::Ephemeral => {
                 if let Some(name) = &self.ephemeral_name {
-                    validate_template(
+                    validate_template_with_policy(
                         "target.ephemeral_name",
                         name,
                         &["image_slug", "session_id"],
+                        TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
                     )?;
                 } else {
                     anyhow::bail!("ephemeral target {target_name:?} requires ephemeral_name");
@@ -662,11 +755,20 @@ impl TargetConfig {
     }
 
     pub fn container_name(&self, session_id: Option<&str>) -> anyhow::Result<String> {
+        self.container_name_with_context(session_id, &RuntimeContext::empty())
+    }
+
+    pub fn container_name_with_context(
+        &self,
+        session_id: Option<&str>,
+        context: &RuntimeContext,
+    ) -> anyhow::Result<String> {
         let mut vars = BTreeMap::new();
         vars.insert("image_slug".into(), template::image_slug(&self.image));
         if let Some(session_id) = session_id {
             vars.insert("session_id".into(), session_id.to_string());
         }
+        context.insert_template_vars(&mut vars);
         let pattern = match self.mode {
             TargetMode::Fixed => self.name.as_deref().unwrap_or("{image_slug}"),
             TargetMode::Ephemeral => self
@@ -677,6 +779,45 @@ impl TargetConfig {
         let rendered = template::render(pattern, &vars)?;
         validate_container_name(&rendered)?;
         Ok(rendered)
+    }
+
+    pub(super) fn validate_context_templates(
+        &self,
+        target_name: &str,
+        context_vars: &BTreeMap<String, ContextVarConfig>,
+    ) -> anyhow::Result<()> {
+        let field = format!("target {target_name:?}");
+        if let Some(name) = &self.name {
+            validate_template_with_context(
+                &format!("{field}.name"),
+                name,
+                &["image_slug"],
+                context_vars.keys(),
+            )?;
+        }
+        if let Some(ephemeral_name) = &self.ephemeral_name {
+            validate_template_with_context(
+                &format!("{field}.ephemeral_name"),
+                ephemeral_name,
+                &["image_slug", "session_id"],
+                context_vars.keys(),
+            )?;
+        }
+        validate_template_with_context(
+            &format!("{field}.workspace.path"),
+            &self.workspace.path,
+            TARGET_WORKSPACE_TEMPLATE_VARS,
+            context_vars.keys(),
+        )?;
+        validate_template_with_context(
+            &format!("{field}.workspace.state_dir"),
+            &self.workspace.state_dir,
+            GATEWAY_TEMPLATE_VARS_NO_PID,
+            context_vars.keys(),
+        )?;
+        self.control_sockets
+            .validate_context_templates(&format!("{field}.control_sockets"), context_vars)?;
+        Ok(())
     }
 }
 
@@ -710,10 +851,11 @@ impl TargetControlSocketsConfig {
             if host_dir.trim().is_empty() {
                 anyhow::bail!("target {target_name:?} control_sockets.host_dir must not be empty");
             }
-            validate_template(
+            validate_template_with_policy(
                 "target.control_sockets.host_dir",
                 host_dir,
                 CONTROL_SOCKET_TEMPLATE_VARS,
+                TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
             )?;
         }
         if let Some(container_dir) = &self.container_dir {
@@ -722,10 +864,35 @@ impl TargetControlSocketsConfig {
                     "target {target_name:?} control_sockets.container_dir must not be empty"
                 );
             }
-            validate_template(
+            validate_template_with_policy(
                 "target.control_sockets.container_dir",
                 container_dir,
                 CONTROL_SOCKET_TEMPLATE_VARS,
+                TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_context_templates(
+        &self,
+        field: &str,
+        context_vars: &BTreeMap<String, ContextVarConfig>,
+    ) -> anyhow::Result<()> {
+        if let Some(host_dir) = &self.host_dir {
+            validate_template_with_context(
+                &format!("{field}.host_dir"),
+                host_dir,
+                CONTROL_SOCKET_TEMPLATE_VARS,
+                context_vars.keys(),
+            )?;
+        }
+        if let Some(container_dir) = &self.container_dir {
+            validate_template_with_context(
+                &format!("{field}.container_dir"),
+                container_dir,
+                CONTROL_SOCKET_TEMPLATE_VARS,
+                context_vars.keys(),
             )?;
         }
         Ok(())

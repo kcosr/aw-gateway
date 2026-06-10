@@ -604,6 +604,51 @@ create a per-session container and require `mode = "ephemeral"`,
 `ephemeral_name` with `{session_id}`, and `stop_when_idle = true` so idle
 cleanup can remove each session container.
 
+Delegated runtime context can further partition runtime identity for trusted
+control-plane callers. Declare allowed keys at the gateway root:
+
+```toml
+[context_vars.tenant]
+required = true
+format = "slug"
+
+[context_vars.workspace]
+required = true
+format = "slug"
+```
+
+Callers supply context with global flags before the subcommand:
+
+```bash
+aw-gateway --context tenant=acme --context workspace=web launch repo-shell -- --agent-arg
+aw-gateway --context-file /run/aw-gateway/context.json status --all --json
+aw-gateway --context tenant=acme --context workspace=web remove repo --session-id 018f...
+```
+
+Context files are JSON objects with string values. Duplicate keys across files
+and flags are rejected; missing required keys, unknown keys, malformed
+`key=value`, invalid slug values, unreadable or oversized files, and non-string
+JSON values fail before runtime operations. Context values are not secrets:
+they are persisted in AW Gateway session metadata and runtime labels, and may
+appear in status output for authorized callers.
+
+Context is runtime identity metadata, not launch input. AW Gateway does not
+copy context into launch variables, command argv, process environment,
+`container_env`, `session_env`, or passthrough args. If a context-scoped
+container or session exists, an invocation with no context does not act as a
+wildcard; list, status, attach/connect, resume, stop, remove, and cleanup paths
+fail closed or exclude the scoped container/session.
+
+Fixed targets with required context must include every required key in
+`target.name`, for example:
+
+```toml
+[targets.repo]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}-{context.tenant}-{context.workspace}"
+```
+
 Ephemeral targets can also opt into target workspace cleanup:
 
 ```toml
@@ -673,6 +718,9 @@ Gateway configs commonly include:
   whether interactive shell and container command passthrough are enabled.
 - `[http]`: optional JSON HTTP daemon listener, auth mode, and HTTP action
   allow list.
+- `[context_vars.<name>]`: allowed non-secret runtime context keys. Key names
+  and `format = "slug"` values use lowercase ASCII letters, numbers, and
+  hyphens only, with no leading, trailing, or consecutive hyphens.
 - `[client_config]`: generated SSH alias templates, host name, gateway path,
   and default identity directory.
 - `[targets.<name>]`: container image, naming mode, container user/home,
@@ -1299,8 +1347,10 @@ Gateway command behavior:
   remove its existing container so the next start recreates it from the current
   config, or remove one specific ephemeral session target. Explicit remove also
   attempts to clean the resolved session workspace when workspace cleanup is
-  not `never`; workspace cleanup failures are logged and the command result
-  still reports the container removal outcome.
+  not `never`; if the container is already absent, context-scoped cleanup
+  requires a matching session marker context. Workspace cleanup failures or
+  skipped context checks are logged, and the command result still reports the
+  container removal outcome.
 - `status [target] [--json] [--session-id ID]`: report one
   configured/default target's container state.
 - `status --all [--json]`: list existing `aw-gateway`-managed containers for
@@ -1440,6 +1490,27 @@ Every success response is JSON. Metadata endpoints return:
 
 ```json
 {"ok": true, "data": {}}
+```
+
+Runtime operations accept the same delegated context as the CLI. Body-based
+requests use a strict `context` object:
+
+```json
+{
+  "target": "repo",
+  "session_id": "018f...",
+  "context": {
+    "tenant": "acme",
+    "workspace": "web"
+  }
+}
+```
+
+Status endpoints carry context as flattened query parameters:
+
+```text
+GET /api/v1/status?target=repo&session_id=018f...&context.tenant=acme&context.workspace=web
+GET /api/v1/status/all?context.tenant=acme&context.workspace=web
 ```
 
 Wait-mode command and launch responses return HTTP 200 even when the command
@@ -1679,8 +1750,10 @@ merging, and references are deterministic.
 | --- | --- | --- |
 | `target.identity.*` | Gateway identity resolution | `{user}`, `{uid}`, `{gid}`, `{home}` |
 | `target.container_home` | Gateway identity resolution | `{user}`, `{uid}`, `{gid}`, `{home}` |
-| `target.workspace.path` | Gateway target resolution | `{user}`, `{uid}`, `{gid}`, `{home}`, `{target}`, `{image}`, `{image_slug}`, `{session_id}` |
-| `target.workspace.state_dir`, `target.container_env`, `target.session_env`, `target.container_mounts.*`, `target.runtime.extra_run_args`, `target.container_bootstrap.*`, `target.container_bootstrap_steps.*` | Gateway runtime resolution | Gateway vars except `{container_pid}` |
+| `target.name`, `target.ephemeral_name` | Gateway container identity | `{image_slug}`, `{session_id}` for ephemeral names, and declared `{context.<name>}` keys |
+| `target.workspace.path` | Gateway target resolution | `{user}`, `{uid}`, `{gid}`, `{home}`, `{target}`, `{image}`, `{image_slug}`, `{session_id}`, and declared `{context.<name>}` keys |
+| `target.workspace.state_dir` | Gateway runtime resolution | Gateway vars except `{container_pid}`, plus declared `{context.<name>}` keys |
+| `target.container_env`, `target.session_env`, `target.container_mounts.*`, `target.runtime.extra_run_args`, `target.container_bootstrap.*`, `target.container_bootstrap_steps.*` | Gateway runtime resolution | Gateway vars except `{container_pid}` |
 | `target.session_env_inherit` | Gateway runtime resolution | Env key names only; no template interpolation |
 | `target.lifecycle_steps[].command` | Gateway lifecycle execution | Pre-start supports gateway vars except `{container_pid}`; later phases support all gateway vars |
 | `target.host_steps[].command` and HTTP health-check URLs | Gateway host-step execution | All gateway vars, including `{container_pid}` |
@@ -1689,7 +1762,8 @@ merging, and references are deterministic.
 | `container_agent.control_socket` and `ssh_bridge.socket` in standalone agent config | Container-agent startup | `{container_state_dir}` |
 | `launch.cwd`, `launch.command`, `launch.env`, and `launch.steps[]` command/cwd/env | Launch execution | Launch built-ins plus `{var.<name>}` |
 | `client_config.inner_alias_template`, `container_host_template`, `default_identity_dir` | Client config generation | `{user}`, `{uid}`, `{gid}`, `{home}`, `{container_user}`, `{container_home}`, `{workspace}`, `{state}`, `{state_dir}`, `{target}`, `{image}`, `{image_slug}`, `{container_name}`, `{container_state_dir}`, `{container_state_dir_in_container}`, `{session_id}`, `{host}` |
-| `logging.directory` | Gateway logging startup | `{user}`, `{uid}`, `{gid}`, `{home}`, `{workspace}`, `{state}`, `{state_dir}` |
+| `target.control_sockets.host_dir`, `target.control_sockets.container_dir` | Gateway runtime socket resolution | `{user}`, `{uid}`, `{gid}`, `{home}`, `{target}`, `{image}`, `{image_slug}`, `{container_name}`, `{session_id}`, `{runtime_id}`, and declared `{context.<name>}` keys |
+| `logging.directory` | Gateway logging startup | `{user}`, `{uid}`, `{gid}`, `{home}`, `{workspace}`, `{state}`, `{state_dir}`, and declared `{context.<name>}` keys |
 | Container-agent `logging.directory` | Container-agent logging startup | `{container_state_dir}` |
 | `runtime.docker_host` | Runtime initialization | `{user}`, `{home}` |
 

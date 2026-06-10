@@ -1,20 +1,21 @@
 use super::ops::{
     CanonicalLaunchVarValue, GatewayOperation, GatewayOperationResult, LaunchPassthroughArgs,
     OperationExecutionOptions, OperationMode, OutputSelection, SuppliedLaunchVars,
-    execute_gateway_operation, execute_gateway_operation_cancelable,
+    execute_gateway_operation_cancelable_with_context, execute_gateway_operation_with_context,
 };
 use super::{
     PreparedExecution, SessionOutcome, prepare_launch_execution_with_config,
     prepare_run_execution_with_config,
 };
 use crate::config::GatewayConfig;
+use crate::context::{RuntimeContext, deserialize_context_object};
 use crate::gateway::ops::ExecutionOutcome;
 use crate::runtime::{ContainerPtySession, ContainerPtySize};
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -378,33 +379,55 @@ async fn finish_pty_lease(
 async fn status(
     State(state): State<AppState>,
     headers: HeaderMap,
-    query: Result<Query<StatusQuery>, axum::extract::rejection::QueryRejection>,
+    RawQuery(query): RawQuery,
 ) -> Response {
     handle_metadata(state, headers, "status", || {
-        let query = query.map_err(|_| HttpError::invalid_request("invalid status query"))?;
-        Ok(GatewayOperation::Status {
-            target: query.target.clone(),
-            session_id: query.session_id.clone(),
-        })
+        let query = parse_status_query(query.as_deref())?;
+        Ok((
+            GatewayOperation::Status {
+                target: query.target,
+                session_id: query.session_id,
+            },
+            query.context,
+        ))
     })
     .await
 }
 
-async fn status_all(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    handle_metadata(state, headers, "status", || Ok(GatewayOperation::StatusAll)).await
+async fn status_all(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    handle_metadata(state, headers, "status", || {
+        let query = parse_status_query(query.as_deref())?;
+        if query.target.is_some() || query.session_id.is_some() {
+            return Err(HttpError::invalid_request(
+                "status/all query only accepts context.<key> parameters",
+            ));
+        }
+        Ok((GatewayOperation::StatusAll, query.context))
+    })
+    .await
 }
 
 async fn targets(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    handle_metadata(state, headers, "targets", || Ok(GatewayOperation::Targets)).await
+    handle_metadata(state, headers, "targets", || {
+        Ok((GatewayOperation::Targets, RuntimeContext::empty()))
+    })
+    .await
 }
 
 async fn up(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     handle_metadata(state, headers, "up", || {
         let request: UpRequest = parse_body(&body, ErrorCode::InvalidRequest)?;
-        Ok(GatewayOperation::Up {
-            target: request.target,
-            session_id: request.session_id,
-        })
+        Ok((
+            GatewayOperation::Up {
+                target: request.target,
+                session_id: request.session_id,
+            },
+            request.context.unwrap_or_default(),
+        ))
     })
     .await
 }
@@ -412,10 +435,13 @@ async fn up(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> R
 async fn stop(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     handle_metadata(state, headers, "stop", || {
         let request: LifecycleRequest = parse_body(&body, ErrorCode::InvalidRequest)?;
-        Ok(GatewayOperation::Stop {
-            target: request.target,
-            session_id: request.session_id,
-        })
+        Ok((
+            GatewayOperation::Stop {
+                target: request.target,
+                session_id: request.session_id,
+            },
+            request.context.unwrap_or_default(),
+        ))
     })
     .await
 }
@@ -423,17 +449,20 @@ async fn stop(State(state): State<AppState>, headers: HeaderMap, body: Bytes) ->
 async fn remove(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     handle_metadata(state, headers, "remove", || {
         let request: LifecycleRequest = parse_body(&body, ErrorCode::InvalidRequest)?;
-        Ok(GatewayOperation::Remove {
-            target: request.target,
-            session_id: request.session_id,
-        })
+        Ok((
+            GatewayOperation::Remove {
+                target: request.target,
+                session_id: request.session_id,
+            },
+            request.context.unwrap_or_default(),
+        ))
     })
     .await
 }
 
 async fn launches(State(state): State<AppState>, headers: HeaderMap) -> Response {
     handle_metadata(state, headers, "launches", || {
-        Ok(GatewayOperation::Launches)
+        Ok((GatewayOperation::Launches, RuntimeContext::empty()))
     })
     .await
 }
@@ -444,7 +473,10 @@ async fn launch_show(
     Path(name): Path<String>,
 ) -> Response {
     handle_metadata(state, headers, "launch", || {
-        Ok(GatewayOperation::LaunchShow { name })
+        Ok((
+            GatewayOperation::LaunchShow { name },
+            RuntimeContext::empty(),
+        ))
     })
     .await
 }
@@ -462,6 +494,7 @@ async fn launch_run(
         },
         Err(err) => return err.into_response(),
     };
+    let context = request.context.clone().unwrap_or_default();
     if is_pty_mode(request.mode.as_deref()) {
         return prepare_pty_launch(state, name, request).await;
     }
@@ -485,6 +518,7 @@ async fn launch_run(
         operation,
         execution.output_formats,
         execution.options.mode,
+        context,
     )
     .await
 }
@@ -500,6 +534,7 @@ async fn run(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> 
     if let Err(err) = validate_run_command(&request.command) {
         return err.into_response();
     }
+    let context = request.context.clone().unwrap_or_default();
     if is_pty_mode(request.mode.as_deref()) {
         return prepare_pty_run(state, request).await;
     }
@@ -523,6 +558,7 @@ async fn run(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> 
         operation,
         execution.output_formats,
         execution.options.mode,
+        context,
     )
     .await
 }
@@ -830,6 +866,7 @@ async fn prepare_pty_run(state: AppState, request: RunRequest) -> Response {
         request.session_id,
         request.cwd,
         request.command,
+        request.context.unwrap_or_default(),
     )
     .await
     {
@@ -856,6 +893,7 @@ async fn prepare_pty_launch(state: AppState, name: String, request: LaunchRunReq
         request.session_id,
         request.vars.unwrap_or_default(),
         request.args.unwrap_or_default(),
+        request.context.unwrap_or_default(),
     )
     .await
     {
@@ -873,17 +911,19 @@ async fn execute_http_execution(
     operation: GatewayOperation,
     output_formats: OutputFormats,
     mode: OperationMode,
+    context: RuntimeContext,
 ) -> Response {
     if mode == OperationMode::Wait {
-        return execute_http_wait(state, operation, output_formats).await;
+        return execute_http_wait(state, operation, output_formats, context).await;
     }
-    execute_http_execution_direct(state.config_path, operation, output_formats).await
+    execute_http_execution_direct(state.config_path, operation, output_formats, context).await
 }
 
 async fn execute_http_wait(
     state: AppState,
     operation: GatewayOperation,
     output_formats: OutputFormats,
+    context: RuntimeContext,
 ) -> Response {
     let (cancel, active) = state.wait_shutdown.register();
     let guard = OperationCancelGuard {
@@ -897,6 +937,7 @@ async fn execute_http_wait(
             operation,
             output_formats,
             cancel,
+            context,
         )
         .await;
         let _ = tx.send(response);
@@ -915,8 +956,9 @@ async fn execute_http_execution_direct(
     config_path: Option<PathBuf>,
     operation: GatewayOperation,
     output_formats: OutputFormats,
+    context: RuntimeContext,
 ) -> Response {
-    match execute_gateway_operation(config_path, operation).await {
+    match execute_gateway_operation_with_context(config_path, operation, context).await {
         Ok(GatewayOperationResult::Run(outcome)) | Ok(GatewayOperationResult::Launch(outcome)) => {
             execution_response(outcome, output_formats)
         }
@@ -932,8 +974,11 @@ async fn execute_http_execution_direct_cancelable(
     operation: GatewayOperation,
     output_formats: OutputFormats,
     cancel: CancellationToken,
+    context: RuntimeContext,
 ) -> Response {
-    match execute_gateway_operation_cancelable(config_path, operation, cancel).await {
+    match execute_gateway_operation_cancelable_with_context(config_path, operation, cancel, context)
+        .await
+    {
         Ok(GatewayOperationResult::Run(outcome)) | Ok(GatewayOperationResult::Launch(outcome)) => {
             execution_response(outcome, output_formats)
         }
@@ -962,16 +1007,16 @@ async fn handle_metadata(
     state: AppState,
     headers: HeaderMap,
     action: &'static str,
-    operation: impl FnOnce() -> Result<GatewayOperation, HttpError>,
+    operation: impl FnOnce() -> Result<(GatewayOperation, RuntimeContext), HttpError>,
 ) -> Response {
-    let operation = match authorize_action(&state, &headers, action).await {
+    let (operation, context) = match authorize_action(&state, &headers, action).await {
         Ok(()) => match operation() {
             Ok(operation) => operation,
             Err(err) => return err.into_response(),
         },
         Err(err) => return err.into_response(),
     };
-    match execute_gateway_operation(state.config_path, operation).await {
+    match execute_gateway_operation_with_context(state.config_path, operation, context).await {
         Ok(result) => metadata_result_response(result),
         Err(err) => operation_error_response(err),
     }
@@ -1005,6 +1050,107 @@ fn parse_body<T: for<'de> Deserialize<'de>>(
             HttpError::invalid_request(err.to_string())
         }
     })
+}
+
+#[derive(Debug, Default)]
+struct ParsedStatusQuery {
+    target: Option<String>,
+    session_id: Option<String>,
+    context: RuntimeContext,
+}
+
+fn parse_status_query(raw: Option<&str>) -> Result<ParsedStatusQuery, HttpError> {
+    let mut query = ParsedStatusQuery::default();
+    let mut context = BTreeMap::new();
+    let mut seen_context = BTreeSet::new();
+    let mut saw_target = false;
+    let mut saw_session_id = false;
+    for (key, value) in form_urlencoded::parse(raw.unwrap_or_default().as_bytes()) {
+        let key = key.into_owned();
+        let value = value.into_owned();
+        match key.as_str() {
+            "target" => {
+                if saw_target {
+                    return Err(HttpError::invalid_request(
+                        "duplicate status query parameter \"target\"",
+                    ));
+                }
+                saw_target = true;
+                query.target = Some(value);
+            }
+            "session_id" => {
+                if saw_session_id {
+                    return Err(HttpError::invalid_request(
+                        "duplicate status query parameter \"session_id\"",
+                    ));
+                }
+                saw_session_id = true;
+                query.session_id = Some(value);
+            }
+            _ => {
+                let Some(context_key) = key.strip_prefix("context.") else {
+                    return Err(HttpError::invalid_request(format!(
+                        "unknown status query parameter {key:?}"
+                    )));
+                };
+                if context_key.is_empty() {
+                    return Err(HttpError::invalid_request(
+                        "context query parameters must use context.<key>=value",
+                    ));
+                }
+                if !seen_context.insert(context_key.to_string()) {
+                    return Err(HttpError::invalid_request(format!(
+                        "duplicate context key {context_key:?}"
+                    )));
+                }
+                context.insert(context_key.to_string(), value);
+            }
+        }
+    }
+    query.context = RuntimeContext::from_map(context);
+    Ok(query)
+}
+
+fn deserialize_optional_runtime_context<'de, D>(
+    deserializer: D,
+) -> Result<Option<RuntimeContext>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_option(OptionalRuntimeContextVisitor)
+}
+
+struct OptionalRuntimeContextVisitor;
+
+impl<'de> Visitor<'de> for OptionalRuntimeContextVisitor {
+    type Value = Option<RuntimeContext>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("null or a JSON object with string values")
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_context_object(deserializer)
+            .map(RuntimeContext::from_map)
+            .map(Some)
+    }
 }
 
 fn is_launch_args_error(err: &serde_json::Error) -> bool {
@@ -1252,16 +1398,11 @@ async fn send_ws_error(
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StatusQuery {
-    target: Option<String>,
-    session_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct UpRequest {
     target: Option<String>,
     session_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_runtime_context")]
+    context: Option<RuntimeContext>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1269,6 +1410,8 @@ struct UpRequest {
 struct LifecycleRequest {
     target: Option<String>,
     session_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_runtime_context")]
+    context: Option<RuntimeContext>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1276,6 +1419,8 @@ struct LifecycleRequest {
 struct RunRequest {
     target: Option<String>,
     session_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_runtime_context")]
+    context: Option<RuntimeContext>,
     cwd: Option<String>,
     command: Vec<String>,
     mode: Option<String>,
@@ -1288,6 +1433,8 @@ struct RunRequest {
 #[serde(deny_unknown_fields)]
 struct LaunchRunRequest {
     session_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_runtime_context")]
+    context: Option<RuntimeContext>,
     #[serde(default, deserialize_with = "deserialize_launch_vars")]
     vars: Option<SuppliedLaunchVars>,
     #[serde(default, deserialize_with = "deserialize_launch_args")]

@@ -4,6 +4,7 @@ use crate::config::{
     ControlSocketConfig, ControlSocketsConfig, IdleCleanupAction, IdleCleanupOwner, LoggingConfig,
     RenderedContainerBootstrapStep, TargetConfig, validate_name,
 };
+use crate::context::RuntimeContext;
 use crate::fileutil::{AtomicWritePolicy, atomic_write_toml, write_private_file};
 use crate::paths::{self, UserContext};
 use crate::runtime;
@@ -543,6 +544,7 @@ pub(super) fn resolve_container_path(home: &Path, configured: &str, suffix: [&st
     path
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_control_socket_paths(
     cfg: &ControlSocketsConfig,
     target: &TargetConfig,
@@ -551,6 +553,7 @@ pub(super) fn render_control_socket_paths(
     session_id: Option<&str>,
     runtime_id: &str,
     user: &UserContext,
+    context: &RuntimeContext,
 ) -> anyhow::Result<ControlSocketPaths> {
     validate_name("control_sockets runtime_id", runtime_id)?;
     let mut vars = Vars::new();
@@ -566,6 +569,7 @@ pub(super) fn render_control_socket_paths(
     if let Some(session_id) = session_id {
         vars.insert("session_id".into(), session_id.to_string());
     }
+    context.insert_template_vars(&mut vars);
 
     let host_dir = PathBuf::from(template::render(&cfg.host_dir, &vars)?);
     if !host_dir.is_absolute() {

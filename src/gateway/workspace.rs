@@ -1,5 +1,6 @@
 use super::{Runtime, SessionOutcome, session};
 use crate::config::{TargetConfig, WorkspaceCleanup};
+use crate::context::RuntimeContext;
 use crate::paths::{self, UserContext};
 use crate::template::{self, Vars};
 use anyhow::Context;
@@ -88,6 +89,65 @@ impl Runtime {
                 "explicit remove workspace cleanup failed"
             );
         }
+    }
+
+    /// Caller must already hold this runtime's lifecycle lock. For an absent
+    /// container, labels cannot be inspected, so marker context is the only
+    /// available context proof for cleanup.
+    pub(super) fn should_cleanup_absent_container_workspace(&self) -> bool {
+        if self.target.workspace.cleanup == WorkspaceCleanup::Never {
+            return false;
+        }
+        if self.identity.session_id.is_none() {
+            return false;
+        }
+        let dir = self.session_marker_dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return self.context.is_empty();
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target = %self.identity.target_name,
+                    workspace = %self.paths.workspace.display(),
+                    error = %err,
+                    "absent-container workspace cleanup skipped because session markers could not be read"
+                );
+                return false;
+            }
+        };
+        let mut saw_marker = false;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            match session::read_session_marker(&path) {
+                Ok(marker) => {
+                    saw_marker = true;
+                    if self.context.matches_stored(&marker.context) {
+                        return true;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "failed to read session marker for absent-container workspace cleanup"
+                    );
+                }
+            }
+        }
+        if !saw_marker && self.context.is_empty() {
+            return true;
+        }
+        tracing::warn!(
+            target = %self.identity.target_name,
+            workspace = %self.paths.workspace.display(),
+            "absent-container workspace cleanup skipped because no matching session marker context was found"
+        );
+        false
     }
 
     pub(super) async fn validate_workspace_cleanup_path(&self) -> anyhow::Result<()> {
@@ -218,6 +278,7 @@ pub(super) fn resolve_target_workspace(
     target_name: &str,
     user: &UserContext,
     session_id: Option<&str>,
+    context: &RuntimeContext,
 ) -> anyhow::Result<PathBuf> {
     let mut vars = Vars::new();
     vars.insert("user".into(), user.user.clone());
@@ -230,6 +291,7 @@ pub(super) fn resolve_target_workspace(
     if let Some(session_id) = session_id {
         vars.insert("session_id".into(), session_id.to_string());
     }
+    context.insert_template_vars(&mut vars);
     let rendered = template::render(&target.workspace.path, &vars)?;
     Ok(paths::resolve_workspace(&user.home, &rendered))
 }

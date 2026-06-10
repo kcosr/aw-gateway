@@ -1,4 +1,5 @@
 use crate::config;
+use crate::context::ContextValidationError;
 use crate::gateway::failures::{AgentNotReady, ContainerNotFound};
 use crate::runtime::GatewayLabelError;
 use serde::Serialize;
@@ -58,6 +59,11 @@ impl OperationError {
     }
 
     pub(in crate::gateway) fn operation_failed(source: anyhow::Error) -> Self {
+        if source.chain().any(|err| err.is::<ContextValidationError>()) {
+            return Self::InvalidRequest {
+                message: source.to_string(),
+            };
+        }
         if source.chain().any(|err| err.is::<AgentNotReady>()) {
             return Self::AgentNotReady { source };
         }

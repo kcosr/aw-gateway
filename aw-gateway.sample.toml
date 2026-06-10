@@ -8,6 +8,19 @@ type = "podman"
 level = "info"
 console = true
 
+# Optional delegated runtime context declarations. Trusted callers can supply
+# values with global --context key=value or --context-file JSON before runtime
+# operations. Values are non-secret metadata and may appear in labels/status.
+#
+# [context_vars.tenant]
+# required = true
+# format = "slug"
+# description = "Delegated tenant namespace."
+#
+# [context_vars.workspace]
+# required = true
+# format = "slug"
+
 # Optional JSON HTTP API daemon. Keep the listener on loopback or behind an
 # external authentication boundary. Use bearer auth unless another boundary is
 # already enforcing access.
