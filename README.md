@@ -896,10 +896,11 @@ Container-side `aw-ssh-command-filter` implements the SFTP exec-form and legacy
 SCP checks. When either transfer mode is restrictive, commands containing raw
 shell-control bytes (`;`, `|`, `&`, `<`, `>`, `(`, `)`, `` ` ``, `$`, LF, or
 CR), shell assignment prefixes such as `NAME=value command`, or wrapper
-commands such as `command`, `env`, or `exec` are rejected before the shell runs
-them. Quoting does not exempt those bytes because the check runs before shell
-evaluation. Install or mount the binary alongside the agent whenever transfer
-policy may deny or direction-limit file transfer.
+commands such as `command`, `env`, `exec`, `nice`, `nohup`, `time`, `timeout`,
+`setsid`, `stdbuf`, or shell re-entry through `sh -c` / `bash -c` are rejected
+before the shell runs them. Quoting does not exempt those bytes because the
+check runs before shell evaluation. Install or mount the binary alongside the
+agent whenever transfer policy may deny or direction-limit file transfer.
 
 `target_defaults.container_ssh.transfer` only applies to traffic that
 traverses the container SSHD. Gateway actions such as `run` execute through the
@@ -1114,9 +1115,9 @@ must not contain NUL, LF, or CR characters.
 
 Treat `{var.*}` values as untrusted caller input when rendering host-side launch
 step `command`, `cwd`, or `env` fields. Avoid mapping caller strings into
-host-sensitive environment keys such as `PATH`, `LD_PRELOAD`, shell startup
-variables, or language loader paths unless the variable is constrained to a
-small configured enum.
+host-sensitive environment keys such as `HOME`, `XDG_CONFIG_HOME`, `PATH`,
+`LD_PRELOAD`, runtime client settings, shell startup variables, or language
+loader paths unless the variable is constrained to a small configured enum.
 
 ```toml
 [launches.repo-shell]

@@ -6,6 +6,8 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+#[cfg(not(unix))]
+use std::io::Read;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -1483,6 +1485,7 @@ fn runtime_client_sensitive_env_key(key: &str) -> bool {
             | "LD_DEBUG"
             | "DYLD_INSERT_LIBRARIES"
             | "DYLD_LIBRARY_PATH"
+            | "HOME"
             | "BASH_ENV"
             | "ENV"
             | "IFS"
@@ -1490,9 +1493,12 @@ fn runtime_client_sensitive_env_key(key: &str) -> bool {
             | "TMP"
             | "TEMP"
             | "XDG_RUNTIME_DIR"
+            | "XDG_CONFIG_HOME"
             | "DOCKER_HOST"
             | "DOCKER_CONTEXT"
             | "DOCKER_CONFIG"
+            | "DOCKER_TLS_VERIFY"
+            | "DOCKER_CERT_PATH"
             | "CONTAINER_HOST"
             | "CONTAINERS_CONF"
             | "CONTAINERS_REGISTRIES_CONF"
@@ -2513,8 +2519,12 @@ exit 0
             env: BTreeMap::from([
                 ("AW_SAFE".into(), "secret".into()),
                 ("PATH".into(), "/tmp/attacker".into()),
+                ("HOME".into(), "/tmp/home".into()),
+                ("XDG_CONFIG_HOME".into(), "/tmp/config".into()),
                 ("LD_PRELOAD".into(), "/tmp/libhook.so".into()),
                 ("DOCKER_HOST".into(), "tcp://example.test:2375".into()),
+                ("DOCKER_TLS_VERIFY".into(), "0".into()),
+                ("DOCKER_CERT_PATH".into(), "/tmp/certs".into()),
             ]),
             container_name: "ubuntu-dev".into(),
             command: vec!["true".into()],
@@ -2531,17 +2541,43 @@ exit 0
         );
         assert!(
             args.windows(2)
+                .any(|pair| pair[0] == "--env" && pair[1] == "HOME=/tmp/home")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--env" && pair[1] == "XDG_CONFIG_HOME=/tmp/config")
+        );
+        assert!(
+            args.windows(2)
                 .any(|pair| pair[0] == "--env" && pair[1] == "LD_PRELOAD=/tmp/libhook.so")
         );
         assert!(
             args.windows(2)
                 .any(|pair| pair[0] == "--env" && pair[1] == "DOCKER_HOST=tcp://example.test:2375")
         );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--env" && pair[1] == "DOCKER_TLS_VERIFY=0")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--env" && pair[1] == "DOCKER_CERT_PATH=/tmp/certs")
+        );
 
         assert!(runtime_env_can_passthrough_client_process("AW_SAFE"));
         assert!(!runtime_env_can_passthrough_client_process("PATH"));
+        assert!(!runtime_env_can_passthrough_client_process("HOME"));
+        assert!(!runtime_env_can_passthrough_client_process(
+            "XDG_CONFIG_HOME"
+        ));
         assert!(!runtime_env_can_passthrough_client_process("LD_PRELOAD"));
         assert!(!runtime_env_can_passthrough_client_process("DOCKER_HOST"));
+        assert!(!runtime_env_can_passthrough_client_process(
+            "DOCKER_TLS_VERIFY"
+        ));
+        assert!(!runtime_env_can_passthrough_client_process(
+            "DOCKER_CERT_PATH"
+        ));
     }
 
     #[tokio::test]

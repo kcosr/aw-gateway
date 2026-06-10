@@ -92,7 +92,22 @@ fn uses_shell_prefix_or_wrapper(command: &str) -> bool {
     is_assignment_prefix(first)
         || matches!(
             path_basename(first),
-            "command" | "env" | "exec" | "nohup" | "time"
+            "bash"
+                | "command"
+                | "dash"
+                | "env"
+                | "eval"
+                | "exec"
+                | "fish"
+                | "ksh"
+                | "nice"
+                | "nohup"
+                | "setsid"
+                | "sh"
+                | "stdbuf"
+                | "time"
+                | "timeout"
+                | "zsh"
         )
 }
 
@@ -358,6 +373,13 @@ mod tests {
                 "command scp -t /tmp/file",
                 "exec scp -t /tmp/file",
                 "env /usr/libexec/openssh/sftp-server",
+                "nice scp -t /tmp/file",
+                "eval scp -t /tmp/file",
+                "sh -c 'scp -t /tmp/file'",
+                "bash -c 'scp -t /tmp/file'",
+                "timeout 60 scp -t /tmp/file",
+                "setsid scp -t /tmp/file",
+                "stdbuf -oL scp -t /tmp/file",
             ] {
                 assert_eq!(
                     decide_command(&policy, Some(command)),
