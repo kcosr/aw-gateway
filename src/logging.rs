@@ -10,7 +10,7 @@ use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -186,19 +186,21 @@ struct SizeRotatingWriter {
     inner: Arc<Mutex<SizeRotatingFile>>,
 }
 
-impl Write for SizeRotatingWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+impl SizeRotatingWriter {
+    fn lock_inner(&self) -> MutexGuard<'_, SizeRotatingFile> {
         self.inner
             .lock()
-            .expect("log writer mutex poisoned")
-            .write(buf)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Write for SizeRotatingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.lock_inner().write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner
-            .lock()
-            .expect("log writer mutex poisoned")
-            .flush()
+        self.lock_inner().flush()
     }
 }
 
@@ -314,6 +316,26 @@ mod tests {
             assert_eq!(dir_mode, 0o700);
             assert_eq!(file_mode, 0o600);
         }
+    }
+
+    #[test]
+    fn size_rotating_writer_recovers_from_poisoned_mutex() {
+        let dir = tempdir().unwrap();
+        let make_writer =
+            SizeRotatingMakeWriter::new(dir.path().to_path_buf(), "test", 1024, 2).unwrap();
+        let inner = make_writer.inner.clone();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = inner.lock().unwrap();
+            panic!("poison log writer");
+        });
+        assert!(make_writer.inner.lock().is_err());
+
+        let mut writer = make_writer.make_writer();
+        writer.write_all(b"after poison\n").unwrap();
+        writer.flush().unwrap();
+
+        let text = std::fs::read_to_string(dir.path().join("test.log")).unwrap();
+        assert!(text.contains("after poison"));
     }
 
     #[test]

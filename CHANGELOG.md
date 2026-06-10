@@ -26,6 +26,8 @@
 - File logging now creates private log directories/files, rejects
   `logging.max_files` above `1024`, and redacts HTTP bearer tokens from Debug
   output.
+- File logging now recovers from a poisoned writer mutex instead of panicking on
+  subsequent log writes.
 - Private file writes now use atomic replace semantics, and existing control
   token files must have private permissions before they are trusted.
 - Runtime-provided container and exec environment values are now passed through
