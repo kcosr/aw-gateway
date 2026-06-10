@@ -567,9 +567,9 @@ async fn connect(
     )
     .await?;
     runtime.ensure_ssh_endpoint_configured()?;
-    let session = runtime.create_session_marker("connect")?;
+    let (session, ready_result) = runtime.begin_ready_session("connect", false).await?;
     let proxy_result = async {
-        let ready = runtime.ensure_ready().await?;
+        let ready = ready_result?;
         listener::proxy_ready_to_stdio(&ready).await
     }
     .await;
@@ -596,9 +596,9 @@ async fn up(
         && local_ssh.mode == LocalSshMode::Listen
     {
         runtime.ensure_ssh_endpoint_configured()?;
-        let session = runtime.create_session_marker("local-listen")?;
+        let (session, ready_result) = runtime.begin_ready_session("local-listen", false).await?;
         let up_result = async {
-            let mut ready = runtime.ensure_ready().await?;
+            let mut ready = ready_result?;
             let bound = listener::bind_local_ssh(&runtime).await?;
             ready.local_ssh = Some(bound.ready.clone());
             let config = runtime.render_client_config(None)?;
@@ -1723,6 +1723,25 @@ impl Runtime {
 
     async fn ensure_ready(&self) -> anyhow::Result<ReadyStatus> {
         let _lock = self.acquire_lifecycle_lock().await?;
+        self.ensure_ready_locked().await
+    }
+
+    async fn begin_ready_session(
+        &self,
+        kind: &str,
+        launch_marker: bool,
+    ) -> anyhow::Result<(session::SessionGuard, anyhow::Result<ReadyStatus>)> {
+        let _lock = self.acquire_lifecycle_lock().await?;
+        let session = if launch_marker {
+            self.create_launch_session_marker(kind)?
+        } else {
+            self.create_session_marker(kind)?
+        };
+        let ready = self.ensure_ready_locked().await;
+        Ok((session, ready))
+    }
+
+    async fn ensure_ready_locked(&self) -> anyhow::Result<ReadyStatus> {
         let mut failed_start_cleanup = FailedStartCleanup::default();
         let result = async {
             self.prepare_container_state_dir()?;

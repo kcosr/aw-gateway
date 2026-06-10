@@ -159,6 +159,16 @@ async fn wait_for_background_marker_clear(log: &Path, marker_dir: &Path, panic_m
     panic!("{panic_message}");
 }
 
+async fn wait_for_session_marker_count(marker_dir: &Path, expected: usize, panic_message: &str) {
+    for _ in 0..20 {
+        if session_marker_count(marker_dir) == expected {
+            return;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{panic_message}");
+}
+
 fn test_control_socket_paths(base: &Path) -> ControlSocketPaths {
     let host_dir = base.join("runtime-sockets");
     let container_dir = PathBuf::from("/run/aw-gateway");
@@ -1669,7 +1679,12 @@ async fn detached_run_keeps_session_marker_until_background_finishes() {
     .unwrap();
 
     assert!(matches!(outcome, ExecutionOutcome::Detached { .. }));
-    assert_eq!(session_marker_count(&marker_dir), 1);
+    wait_for_session_marker_count(
+        &marker_dir,
+        1,
+        "detached background operation did not create marker",
+    )
+    .await;
 
     wait_for_background_marker_clear(
         &log,
@@ -1826,7 +1841,7 @@ async fn detached_launch_keeps_launch_marker_until_background_finishes() {
     .unwrap();
 
     assert!(matches!(outcome, ExecutionOutcome::Detached { .. }));
-    assert_eq!(session_marker_count(&marker_dir), 1);
+    wait_for_session_marker_count(&marker_dir, 1, "detached launch did not create marker").await;
     let sessions = marker_runtime.active_session_markers().unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].kind, "launch");
@@ -1942,6 +1957,39 @@ exit 0
     assert!(!log.exists());
     assert_eq!(session_marker_count(&runtime.session_marker_dir()), 1);
     drop(session);
+}
+
+#[tokio::test]
+async fn begin_ready_session_writes_marker_under_lifecycle_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    write_fake_runtime(&fake_runtime, &fake_running_runtime_script(0));
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        cfg.target_defaults.host_steps.clear();
+    });
+
+    let lock = runtime.acquire_lifecycle_lock().await.unwrap();
+    let ready_session = runtime.begin_ready_session("run-command", false);
+    tokio::pin!(ready_session);
+
+    let blocked = tokio::time::timeout(Duration::from_millis(50), &mut ready_session).await;
+    assert!(
+        blocked.is_err(),
+        "ready session should wait for lifecycle lock"
+    );
+    assert_eq!(session_marker_count(&runtime.session_marker_dir()), 0);
+
+    drop(lock);
+    let (session, ready_result) = tokio::time::timeout(Duration::from_secs(2), ready_session)
+        .await
+        .unwrap()
+        .unwrap();
+    let ready = ready_result.unwrap();
+
+    assert_eq!(ready.target, "default");
+    assert_eq!(session_marker_count(&runtime.session_marker_dir()), 1);
+    drop(session);
+    assert_eq!(session_marker_count(&runtime.session_marker_dir()), 0);
 }
 
 #[test]
