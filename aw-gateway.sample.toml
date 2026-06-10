@@ -21,9 +21,8 @@ console = true
 # required = true
 # format = "slug"
 
-# Optional JSON HTTP API daemon. Keep the listener on loopback or behind an
-# external authentication boundary. Use bearer auth unless another boundary is
-# already enforcing access.
+# Optional JSON HTTP API daemon. Unauthenticated listeners must stay on
+# loopback; non-loopback listeners require bearer auth.
 #
 # [http]
 # enabled = true

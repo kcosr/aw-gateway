@@ -10,6 +10,8 @@
 - HTTP wait-mode command output, container-agent control responses, and HTTP
   health-probe responses are now size bounded; truncated wait streams are
   reported with `output_truncated`.
+- Enabled HTTP listeners now require bearer auth when `http.listen` is
+  non-loopback.
 
 ## [0.6.0] - 2026-06-10
 

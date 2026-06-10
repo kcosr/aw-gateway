@@ -32,11 +32,17 @@ impl Default for HttpConfig {
 
 impl HttpConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
-        self.listen
+        let listen = self
+            .listen
             .parse::<SocketAddr>()
             .with_context(|| format!("parse http.listen {:?}", self.listen))?;
         if self.enabled && self.enabled_actions.is_empty() {
             anyhow::bail!("http.enabled_actions must not be empty when http.enabled = true");
+        }
+        if self.enabled && !listen.ip().is_loopback() && self.auth.auth_type == HttpAuthType::None {
+            anyhow::bail!(
+                "http.auth.type = \"bearer\" is required when http.listen is non-loopback"
+            );
         }
         for enabled_action in &self.enabled_actions {
             if !action::is_http_action_name(enabled_action) {

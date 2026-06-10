@@ -1472,11 +1472,12 @@ enabled_actions = ["status", "targets", "launches", "launch", "up", "run", "stop
 type = "none"
 ```
 
-When `auth.type = "none"`, no `Authorization` header is required. Bind to
-loopback or put the daemon behind an external auth boundary. Bearer auth reads
-the configured token and requires `Authorization: Bearer <token>` on every
-`/api/v1/*` route. The HTTP listener does not terminate TLS; use loopback or a
-TLS-terminating reverse proxy for bearer auth.
+When `auth.type = "none"`, no `Authorization` header is required and
+`http.listen` must be loopback. Non-loopback HTTP listeners require bearer auth.
+Bearer auth reads the configured token and requires
+`Authorization: Bearer <token>` on every `/api/v1/*` route. The HTTP listener
+does not terminate TLS; use loopback or a TLS-terminating reverse proxy for
+bearer auth.
 
 ```toml
 [http.auth]

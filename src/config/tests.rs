@@ -317,6 +317,79 @@ name = "{image_slug}"
 }
 
 #[test]
+fn http_config_requires_bearer_auth_for_enabled_non_loopback_listen() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[http]
+enabled = true
+listen = "0.0.0.0:8080"
+enabled_actions = ["status"]
+
+[http.auth]
+type = "none"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(
+        err.contains("bearer") && err.contains("non-loopback"),
+        "{err}"
+    );
+
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[http]
+enabled = true
+listen = "0.0.0.0:8080"
+enabled_actions = ["status"]
+
+[http.auth]
+type = "bearer"
+token = "secret-token"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+    cfg.validate().unwrap();
+}
+
+#[test]
+fn http_config_non_loopback_none_auth_is_allowed_when_disabled() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[http]
+enabled = false
+listen = "0.0.0.0:8080"
+
+[http.auth]
+type = "none"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+    cfg.validate().unwrap();
+}
+
+#[test]
 fn http_config_rejects_non_socket_listen() {
     let cfg: GatewayConfig = toml::from_str(
         r#"
