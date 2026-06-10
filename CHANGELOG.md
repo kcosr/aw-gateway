@@ -23,6 +23,9 @@
   loops, and service shutdown no longer holds the child lock while waiting.
 - Container-agent SSH bridge and control socket accept loops now continue after
   transient accept errors and enforce fixed connection/session limits.
+- File logging now creates private log directories/files, rejects
+  `logging.max_files` above `1024`, and redacts HTTP bearer tokens from Debug
+  output.
 
 ## [0.6.0] - 2026-06-10
 

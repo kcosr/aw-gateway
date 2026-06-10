@@ -1819,7 +1819,9 @@ max_files = 5
 console = false
 ```
 
-`max_bytes` accepts a raw byte integer; `104857600` is 100 MB.
+`max_bytes` accepts a raw byte integer; `104857600` is 100 MB. `max_files`
+must not exceed `1024`. File logging creates log directories with mode `0700`
+and active log files with mode `0600`.
 `console = true` writes structured logs to stderr. `console = false` disables
 that console writer, so diagnostics go only to configured file logging and
 explicit stderr messages.

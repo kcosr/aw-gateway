@@ -159,6 +159,7 @@ impl GatewayConfig {
                 GATEWAY_LOGGING_TEMPLATE_VARS,
             )?;
         }
+        self.logging.validate_values("logging")?;
         self.http.validate()?;
         let effective_targets = self.effective_targets()?;
         self.validate_target_context_templates(&effective_targets)?;
@@ -450,6 +451,7 @@ impl ContainerAgentFile {
         }
         self.logging
             .validate_templates("logging", AGENT_TEMPLATE_VARS)?;
+        self.logging.validate_values("logging")?;
         self.container_agent.validate_agent_file()
     }
 }
@@ -465,6 +467,8 @@ pub struct LoggingConfig {
     #[serde(default = "default_true")]
     pub console: bool,
 }
+
+pub const MAX_LOG_ROTATION_FILES: usize = 1024;
 
 impl Default for LoggingConfig {
     fn default() -> Self {
@@ -482,6 +486,15 @@ impl LoggingConfig {
     fn validate_templates(&self, field: &str, allowed: &[&str]) -> anyhow::Result<()> {
         if let Some(directory) = &self.directory {
             validate_template(&format!("{field}.directory"), directory, allowed)?;
+        }
+        Ok(())
+    }
+
+    fn validate_values(&self, field: &str) -> anyhow::Result<()> {
+        if let Some(max_files) = self.max_files
+            && max_files > MAX_LOG_ROTATION_FILES
+        {
+            anyhow::bail!("{field}.max_files must not exceed {MAX_LOG_ROTATION_FILES}");
         }
         Ok(())
     }

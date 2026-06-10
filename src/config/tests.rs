@@ -1122,6 +1122,26 @@ name = "{image_slug}"
 }
 
 #[test]
+fn logging_max_files_is_bounded() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[logging]
+max_files = 1025
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+    let err = cfg.validate().unwrap_err();
+    assert!(err.to_string().contains("logging.max_files"), "{err:#}");
+}
+
+#[test]
 fn host_steps_reject_process_health_checks() {
     let cfg: GatewayConfig = toml::from_str(
         r#"

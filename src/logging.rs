@@ -1,11 +1,14 @@
 use crate::config::{ContainerAgentFile, GatewayConfig, LoggingConfig, WorkspaceConfig};
 use crate::context::{RuntimeContext, validate_supplied_context};
+use crate::fileutil::{ensure_private_dir, set_mode};
 use crate::paths::{self, UserContext};
 use crate::rotating_log::{RotationState, RotationStep};
 use crate::template::{self, Vars};
 use anyhow::Context;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing_subscriber::EnvFilter;
@@ -211,11 +214,11 @@ impl SizeRotatingFile {
         max_bytes: u64,
         max_files: usize,
     ) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(&directory)
+        ensure_private_dir(&directory)
             .with_context(|| format!("create log directory {}", directory.display()))?;
         let file_name = format!("{file_prefix}.log");
         let path = directory.join(&file_name);
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = open_log_file(&path, false)?;
         let bytes_written = file.metadata()?.len();
         Ok(Self {
             rotation: RotationState::new(path, max_bytes, max_files, bytes_written),
@@ -241,14 +244,27 @@ impl SizeRotatingFile {
                 }
             }
         }
-        self.file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(plan.active_path())?;
+        self.file = open_log_file(plan.active_path(), true)?;
         self.rotation.reset_after_rotation();
         Ok(())
     }
+}
+
+fn open_log_file(path: &Path, truncate: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true);
+    if truncate {
+        options.truncate(true);
+    } else {
+        options.append(true);
+    }
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    set_mode(path, 0o600).map_err(io::Error::other)?;
+    Ok(file)
 }
 
 impl Write for SizeRotatingFile {
@@ -278,6 +294,26 @@ mod tests {
         writer.flush().unwrap();
         assert!(dir.path().join("test.log").exists());
         assert!(dir.path().join("test.log.1").exists());
+    }
+
+    #[test]
+    fn size_rotating_writer_uses_private_directory_and_file_modes() {
+        let dir = tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        let _writer = SizeRotatingFile::new(log_dir.clone(), "test", 8, 2).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&log_dir).unwrap().permissions().mode() & 0o777;
+            let file_mode = std::fs::metadata(log_dir.join("test.log"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            assert_eq!(file_mode, 0o600);
+        }
     }
 
     #[test]
