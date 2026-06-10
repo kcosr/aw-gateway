@@ -139,7 +139,8 @@ impl Runtime {
         let path = self.local_listener_status_path();
         let status = LocalListenerStatus {
             gateway_pid: std::process::id(),
-            gateway_start_time: process_start_time(std::process::id()).unwrap_or_default(),
+            gateway_start_time: process_start_time(std::process::id())
+                .context("read current gateway process start time")?,
             host: host.to_string(),
             port,
             created_at_ms: unix_time_ms()?,

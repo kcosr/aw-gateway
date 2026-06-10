@@ -35,6 +35,9 @@
   created with owner-only permissions.
 - Session marker reads now tolerate pre-launch-field marker JSON, and marker
   liveness checks use the same self-process fast path as listener status.
+- Local SSH listener startup now serializes status-file checks and writes with
+  the lifecycle lock, and transient accept errors no longer terminate the
+  listener.
 
 ## [0.6.0] - 2026-06-10
 
