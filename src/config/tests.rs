@@ -4086,6 +4086,37 @@ includes = ["config.d/*.toml"]
 }
 
 #[test]
+fn includes_reject_patterns_that_match_no_files() {
+    for (case, include_pattern) in [
+        ("literal", "config.d/missing.toml"),
+        ("wildcard", "config.d/*.toml"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config.d")).unwrap();
+        let root = dir.path().join("gateway.toml");
+        std::fs::write(
+            &root,
+            format!(
+                r#"
+schema_version = "1"
+includes = ["{include_pattern}"]
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "default"
+"#
+            ),
+        )
+        .unwrap();
+
+        let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
+        assert!(err.contains("matched no files"), "{case}: {err}");
+        assert!(err.contains(include_pattern), "{case}: {err}");
+    }
+}
+
+#[test]
 fn included_templates_can_be_used_by_root_definitions() {
     let dir = tempfile::tempdir().unwrap();
     let config_dir = dir.path().join("config.d");

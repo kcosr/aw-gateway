@@ -747,8 +747,8 @@ Gateway configs commonly include:
   launches opt into with ordered `use = [...]`.
 - `includes`: strict include globs for splitting target templates, launch
   templates, targets, and launches into separate TOML files. Strict includes
-  are lexicographically ordered and reject unknown fields, duplicate
-  definitions, cycles, and partial object overrides.
+  must match at least one file, are lexicographically ordered, and reject
+  unknown fields, duplicate definitions, cycles, and partial object overrides.
 - `extends`: root config inheritance for layering a selected config over a
   managed base config.
 - `[[target_defaults.container_mounts]]` and `[[targets.<name>.container_mounts]]`: extra
@@ -999,10 +999,11 @@ Target and launch definitions can be split into strict include files:
 includes = ["/etc/aw-gateway/config.d/*.toml"]
 ```
 
-Include glob matches are sorted lexicographically before composition. Includes
-are resolved relative to the file that declares them, may be nested, and reject
-cycles, duplicate target/template or launch/template names, unknown fields, and
-partial object merge or override behavior. Include files may define nested
+Include glob matches are sorted lexicographically before composition. Each
+declared include pattern must match at least one file. Includes are resolved
+relative to the file that declares them, may be nested, and reject cycles,
+duplicate target/template or launch/template names, unknown fields, and partial
+object merge or override behavior. Include files may define nested
 `includes`, `[target_templates.<name>]`, `[launch_templates.<name>]`,
 `[targets.<name>]`, and `[launches.<name>]`.
 

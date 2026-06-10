@@ -181,8 +181,16 @@ fn expand_include_patterns(patterns: &[String], base_dir: &Path) -> anyhow::Resu
             base_dir.join(pattern_path)
         };
         let pattern_text = full_pattern.display().to_string();
+        let mut matched = false;
         for entry in glob(&pattern_text).with_context(|| format!("expand glob {pattern:?}"))? {
+            matched = true;
             paths.push(entry.with_context(|| format!("read glob entry for {pattern:?}"))?);
+        }
+        if !matched {
+            anyhow::bail!(
+                "include pattern {pattern:?} matched no files under {}",
+                base_dir.display()
+            );
         }
     }
     paths.sort();
