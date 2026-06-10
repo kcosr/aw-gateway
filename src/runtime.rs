@@ -2210,6 +2210,50 @@ exit 0
     }
 
     #[test]
+    fn parse_container_inspect_requires_zero_or_one_result() {
+        let empty = parse::parse_container_inspect(b"[]", "podman").unwrap();
+        assert!(empty.is_none());
+
+        let one = parse::parse_container_inspect(
+            br#"[{
+  "Id": "abc",
+  "Name": "/aw-default",
+  "State": {"Running": true, "Pid": 42},
+  "Config": {"Labels": {"io.aw-gateway.target": "default"}}
+}]"#,
+            "podman",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(one.id, "abc");
+        assert_eq!(one.name, "aw-default");
+        assert!(one.state.running);
+
+        let err = parse::parse_container_inspect(
+            br#"[
+  {
+    "Id": "abc",
+    "Name": "/aw-default",
+    "State": {"Running": true, "Pid": 42},
+    "Config": {"Labels": {}}
+  },
+  {
+    "Id": "def",
+    "Name": "/aw-other",
+    "State": {"Running": true, "Pid": 43},
+    "Config": {"Labels": {}}
+  }
+]"#,
+            "podman",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "podman inspect returned 2 containers; expected one"
+        );
+    }
+
+    #[test]
     fn managed_container_for_requires_matching_user_and_uid() {
         let raw = br#"
 [

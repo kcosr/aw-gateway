@@ -48,6 +48,8 @@
   separators, and mount targets must render to absolute paths.
 - Container startup now rejects read-write bind mounts whose resolved source is
   world-writable.
+- Container inspect results now fail closed when the runtime returns more than
+  one inspected container for a single-name inspect request.
 - Local SSH listener startup now serializes status-file checks and writes with
   the lifecycle lock, and transient accept errors no longer terminate the
   listener.
