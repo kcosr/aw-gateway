@@ -44,6 +44,8 @@
   now run on the blocking task pool instead of on async worker threads.
 - Container startup now resolves configured bind mounts once and reuses the
   checked mount set for safety warnings and the runtime run spec.
+- Rendered container bind mount sources and targets now reject `:` and `,`
+  separators, and mount targets must render to absolute paths.
 - Local SSH listener startup now serializes status-file checks and writes with
   the lifecycle lock, and transient accept errors no longer terminate the
   listener.

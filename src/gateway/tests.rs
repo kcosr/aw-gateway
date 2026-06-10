@@ -4172,6 +4172,59 @@ fn container_mounts_error_when_source_is_missing() {
 }
 
 #[test]
+fn container_mounts_reject_separator_paths_and_relative_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad_source = dir.path().join("bad:source");
+    std::fs::write(&bad_source, "").unwrap();
+    let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    cfg.target_defaults
+        .container_mounts
+        .push(crate::config::ContainerMountConfig {
+            source: bad_source.display().to_string(),
+            target: "/opt/good".into(),
+            mode: ContainerMountMode::Ro,
+        });
+    let target = cfg.effective_target("default").unwrap();
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+
+    let err = runtime.container_mounts().unwrap_err();
+    assert!(
+        err.to_string().contains("must not contain ':' or ','"),
+        "{err:#}"
+    );
+
+    let good_source = dir.path().join("good-source");
+    std::fs::write(&good_source, "").unwrap();
+    let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    cfg.target_defaults
+        .container_mounts
+        .push(crate::config::ContainerMountConfig {
+            source: good_source.display().to_string(),
+            target: "relative-target".into(),
+            mode: ContainerMountMode::Ro,
+        });
+    let target = cfg.effective_target("default").unwrap();
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+
+    let err = runtime.container_mounts().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("container mount target #0 must render to an absolute path"),
+        "{err:#}"
+    );
+}
+
+#[test]
 fn target_selection_accepts_configured_target_or_image() {
     let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
     assert_eq!(

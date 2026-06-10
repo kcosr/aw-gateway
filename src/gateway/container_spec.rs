@@ -358,9 +358,18 @@ fn render_container_mounts(
             let source = source
                 .canonicalize()
                 .with_context(|| format!("container mount source #{index} {}", source.display()))?;
+            validate_bind_mount_path(&format!("container mount source #{index}"), &source)?;
+            let target = PathBuf::from(template::render(&mount.target, &inputs.vars)?);
+            if !target.is_absolute() {
+                anyhow::bail!(
+                    "container mount target #{} must render to an absolute path",
+                    index
+                );
+            }
+            validate_bind_mount_path(&format!("container mount target #{index}"), &target)?;
             Ok(ContainerMountSpec {
                 source,
-                target: PathBuf::from(template::render(&mount.target, &inputs.vars)?),
+                target,
                 readonly: mount.mode == ContainerMountMode::Ro,
             })
         })
@@ -371,6 +380,14 @@ fn render_container_mounts(
         readonly: false,
     });
     Ok(mounts)
+}
+
+fn validate_bind_mount_path(label: &str, path: &std::path::Path) -> anyhow::Result<()> {
+    let value = path.as_os_str().to_string_lossy();
+    if value.contains(':') || value.contains(',') {
+        anyhow::bail!("{label} must not contain ':' or ','");
+    }
+    Ok(())
 }
 
 async fn warn_about_unsafe_container_mounts_async(
