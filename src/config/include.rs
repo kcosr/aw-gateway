@@ -1,7 +1,6 @@
 use anyhow::Context;
 use glob::glob;
-use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use toml::Value;
 
@@ -34,21 +33,6 @@ pub(super) fn compose_gateway_includes_value(
     Ok(())
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConfigIncludeFile {
-    #[serde(default)]
-    includes: Vec<String>,
-    #[serde(default, rename = "target_templates")]
-    _target_templates: BTreeMap<String, Value>,
-    #[serde(default, rename = "launch_templates")]
-    _launch_templates: BTreeMap<String, Value>,
-    #[serde(default, rename = "targets")]
-    _targets: BTreeMap<String, Value>,
-    #[serde(default, rename = "launches")]
-    _launches: BTreeMap<String, Value>,
-}
-
 struct ValueIncludeComposer<'a> {
     root: &'a mut toml::map::Map<String, Value>,
     seen: &'a mut BTreeSet<PathBuf>,
@@ -68,13 +52,13 @@ impl ValueIncludeComposer<'_> {
             self.stack.insert(canonical.clone());
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("read {}", path.display()))?;
-            reject_root_only_include_sections(&raw, &path)?;
-            let include: ConfigIncludeFile =
-                toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
             let mut include_value: Value =
                 toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+            reject_root_only_include_sections(&include_value, &path)?;
+            reject_unknown_include_fields(&include_value, &path)?;
+            let includes = include_patterns(&include_value, &path)?;
             let include_dir = path.parent().unwrap_or(base_dir);
-            self.compose(&include.includes, include_dir)?;
+            self.compose(&includes, include_dir)?;
             strip_include_loader_fields(&mut include_value);
             self.insert_definitions(include_value, &path)?;
             self.stack.remove(&canonical);
@@ -143,9 +127,34 @@ fn strip_include_loader_fields(value: &mut Value) {
     }
 }
 
-fn reject_root_only_include_sections(raw: &str, path: &Path) -> anyhow::Result<()> {
-    let value: toml::Value =
-        toml::from_str(raw).with_context(|| format!("parse {}", path.display()))?;
+fn include_patterns(value: &Value, path: &Path) -> anyhow::Result<Vec<String>> {
+    let Some(table) = value.as_table() else {
+        return Ok(Vec::new());
+    };
+    table
+        .get("includes")
+        .map(|value| value.clone().try_into())
+        .transpose()
+        .with_context(|| format!("parse includes from {}", path.display()))
+        .map(Option::unwrap_or_default)
+}
+
+fn reject_unknown_include_fields(value: &Value, path: &Path) -> anyhow::Result<()> {
+    let Some(table) = value.as_table() else {
+        return Ok(());
+    };
+    for key in table.keys() {
+        if !matches!(
+            key.as_str(),
+            "includes" | "target_templates" | "launch_templates" | "targets" | "launches"
+        ) {
+            anyhow::bail!("include {} contains unknown field {key:?}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn reject_root_only_include_sections(value: &Value, path: &Path) -> anyhow::Result<()> {
     let Some(table) = value.as_table() else {
         return Ok(());
     };
