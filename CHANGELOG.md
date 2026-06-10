@@ -26,6 +26,8 @@
 - File logging now creates private log directories/files, rejects
   `logging.max_files` above `1024`, and redacts HTTP bearer tokens from Debug
   output.
+- Private file writes now use atomic replace semantics, and existing control
+  token files must have private permissions before they are trusted.
 
 ## [0.6.0] - 2026-06-10
 

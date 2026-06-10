@@ -80,19 +80,7 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> anyhow::Result<()> {
 }
 
 pub(crate) fn write_private_file(path: &Path, contents: &[u8], mode: u32) -> anyhow::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(mode);
-    }
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    file.write_all(contents)
-        .with_context(|| format!("write {}", path.display()))?;
-    set_mode(path, mode)
+    atomic_write_file(path, contents, AtomicWritePolicy::fixed_no_fsync(mode))
 }
 
 pub(crate) fn atomic_write_file(
@@ -230,6 +218,28 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
         #[cfg(unix)]
         assert_eq!(file_mode(&path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_file_replaces_symlink_without_touching_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("secret");
+        std::fs::write(&target, "target contents").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        write_private_file(&link, b"new secret", 0o600).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "target contents");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "new secret");
+        assert_eq!(file_mode(&link), 0o600);
+        assert!(
+            !std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]

@@ -113,8 +113,8 @@ use client::{configured_default_display, normalize_image_selection};
 use execution::detach_discard_options;
 #[cfg(test)]
 use identity::{
-    ensure_identity_token_file, is_plausible_public_key, validate_identity_token_content,
-    validate_public_key_content,
+    ensure_identity_token_file, is_plausible_public_key, read_control_token_file,
+    validate_control_token_content, validate_identity_token_content, validate_public_key_content,
 };
 #[cfg(test)]
 use lifecycle::ContainerReadinessPlan;

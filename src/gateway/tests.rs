@@ -4240,6 +4240,35 @@ fn identity_token_validation_requires_single_non_empty_line() {
 }
 
 #[test]
+fn control_token_validation_requires_single_non_empty_line() {
+    let path = PathBuf::from("/tmp/control.token");
+    assert_eq!(
+        validate_control_token_content("abc\n", &path).unwrap(),
+        "abc"
+    );
+    assert!(validate_control_token_content("", &path).is_err());
+    assert!(validate_control_token_content("a\nb", &path).is_err());
+    assert!(validate_control_token_content(&"x".repeat(4097), &path).is_err());
+}
+
+#[test]
+fn control_token_file_rejects_unsafe_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control.token");
+    std::fs::write(&path, "abc\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_control_token_file(&path).is_err());
+    }
+    #[cfg(not(unix))]
+    {
+        assert_eq!(read_control_token_file(&path).unwrap(), "abc");
+    }
+}
+
+#[test]
 fn identity_token_is_generated_once_with_private_permissions() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config/identity-token");
