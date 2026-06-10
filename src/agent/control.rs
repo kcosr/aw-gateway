@@ -26,7 +26,14 @@ use super::status::status_payload;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONTROL_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_CONTROL_CONNECTIONS: usize = 256;
-const MAX_CONTROL_SESSION_HOLDS: usize = 256;
+// Each held session pins a connection permit for its whole lifetime, so the
+// session-hold cap must stay strictly below the connection cap. If they were
+// equal, held sessions could exhaust every connection permit and starve
+// transient control RPCs (status, gateway-issued shutdown), and the typed
+// `too_many_sessions` response below would be unreachable (holds would be
+// dropped at the connection limit first).
+const MAX_CONTROL_SESSION_HOLDS: usize = 64;
+const _: () = assert!(MAX_CONTROL_SESSION_HOLDS < MAX_CONTROL_CONNECTIONS);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 pub(super) async fn run_control_socket(state: Arc<AgentState>, path: &Path) -> anyhow::Result<()> {

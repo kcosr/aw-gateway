@@ -220,7 +220,7 @@ impl SizeRotatingFile {
             .with_context(|| format!("create log directory {}", directory.display()))?;
         let file_name = format!("{file_prefix}.log");
         let path = directory.join(&file_name);
-        let file = open_log_file(&path, false)?;
+        let file = open_log_file(&path)?;
         let bytes_written = file.metadata()?.len();
         Ok(Self {
             rotation: RotationState::new(path, max_bytes, max_files, bytes_written),
@@ -240,26 +240,45 @@ impl SizeRotatingFile {
                     let _ = std::fs::remove_file(path);
                 }
                 RotationStep::Rename { from, to } => {
-                    if from.exists() {
-                        std::fs::rename(from, to)?;
-                    }
+                    rename_if_exists(from, to)?;
                 }
             }
         }
-        self.file = open_log_file(plan.active_path(), true)?;
-        self.rotation.reset_after_rotation();
-        Ok(())
+        // Reopen the active path in append mode (not truncate): after the rename
+        // above the path is gone, so create+append yields a fresh file, and any
+        // file that unexpectedly survived the rename is appended to rather than
+        // destroyed. Reset the byte counter whether or not the reopen succeeds,
+        // so a failed reopen cannot leave the writer attached to the
+        // rotated-away inode while still counting toward the next rotation --
+        // which would otherwise re-rotate on every subsequent write.
+        match open_log_file(plan.active_path()) {
+            Ok(file) => {
+                self.file = file;
+                self.rotation.reset_after_rotation();
+                Ok(())
+            }
+            Err(err) => {
+                self.rotation.reset_after_rotation();
+                Err(err)
+            }
+        }
     }
 }
 
-fn open_log_file(path: &Path, truncate: bool) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.create(true).write(true);
-    if truncate {
-        options.truncate(true);
-    } else {
-        options.append(true);
+// Rename `from` to `to`, treating a missing source as success. Avoids the
+// exists()-then-rename TOCTOU and tolerates a generation file that another
+// rotation already moved.
+fn rename_if_exists(from: &Path, to: &Path) -> io::Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
     }
+}
+
+fn open_log_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
     #[cfg(unix)]
     {
         options.mode(0o600);
@@ -293,6 +312,38 @@ mod tests {
         let mut writer = SizeRotatingFile::new(dir.path().to_path_buf(), "test", 8, 2).unwrap();
         writer.write_all(b"12345678").unwrap();
         writer.write_all(b"abcdef").unwrap();
+        writer.flush().unwrap();
+        assert!(dir.path().join("test.log").exists());
+        assert!(dir.path().join("test.log.1").exists());
+    }
+
+    #[test]
+    fn rotation_preserves_previous_generation_and_continues_in_fresh_active() {
+        let dir = tempdir().unwrap();
+        let mut writer = SizeRotatingFile::new(dir.path().to_path_buf(), "test", 4, 3).unwrap();
+        writer.write_all(b"AAAA").unwrap();
+        writer.write_all(b"BBBB").unwrap();
+        writer.flush().unwrap();
+        // The previous generation must survive rotation (no truncation / loss),
+        // and writes after rotation land in a fresh active file.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("test.log.1")).unwrap(),
+            "AAAA"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("test.log")).unwrap(),
+            "BBBB"
+        );
+    }
+
+    #[test]
+    fn rotation_tolerates_missing_generation_files() {
+        let dir = tempdir().unwrap();
+        // max_files = 3 so the plan renames generations 1 and 2 that do not yet
+        // exist; rename_if_exists must treat the missing sources as success.
+        let mut writer = SizeRotatingFile::new(dir.path().to_path_buf(), "test", 4, 3).unwrap();
+        writer.write_all(b"AAAA").unwrap();
+        writer.write_all(b"BBBB").unwrap();
         writer.flush().unwrap();
         assert!(dir.path().join("test.log").exists());
         assert!(dir.path().join("test.log.1").exists());

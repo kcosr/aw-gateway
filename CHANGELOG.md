@@ -105,6 +105,18 @@
 - PTY lease tokens, cancel marker tokens, and temporary suffix generation now
   use `getrandom` directly instead of opening `/dev/urandom`.
 
+### Fixed
+
+- Size-based log rotation (gateway and container-agent) now reopens the rotated
+  file in append mode instead of truncating, tolerates already-moved generation
+  files, and always resets its byte counter after a rotation attempt, so a
+  failed reopen can no longer leave the writer attached to the rotated-away file
+  and re-rotating on every write.
+- The container-agent control socket now caps held sessions below the connection
+  limit, so a burst of session holds can no longer exhaust all control
+  connections and starve `status`/shutdown requests; the `too_many_sessions`
+  response is now reachable.
+
 ## [0.6.0] - 2026-06-10
 
 ### Added

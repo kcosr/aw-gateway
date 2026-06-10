@@ -545,21 +545,34 @@ impl RotatingServiceLog {
                     let _ = tokio::fs::remove_file(path).await;
                 }
                 RotationStep::Rename { from, to } => {
-                    if tokio::fs::try_exists(from).await? {
-                        tokio::fs::rename(from, to).await?;
-                    }
+                    rename_log_if_exists(from, to).await?;
                 }
             }
         }
-        self.file = tokio::fs::OpenOptions::new()
+        // Reopen in append mode (not truncate) and reset accounting whether or
+        // not the reopen succeeds, so a failed reopen cannot leave the writer on
+        // the rotated-away inode with a stale byte counter that re-rotates on
+        // every subsequent write.
+        let opened = tokio::fs::OpenOptions::new()
             .create(true)
-            .truncate(true)
-            .write(true)
+            .append(true)
             .open(plan.active_path())
             .await
-            .with_context(|| format!("open {}", plan.active_path().display()))?;
+            .with_context(|| format!("open {}", plan.active_path().display()));
         self.rotation.reset_after_rotation();
+        self.file = opened?;
         Ok(())
+    }
+}
+
+// Rename `from` to `to`, treating a missing source as success. Avoids the
+// try_exists()-then-rename TOCTOU and tolerates a generation file that another
+// rotation already moved.
+async fn rename_log_if_exists(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    match tokio::fs::rename(from, to).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
     }
 }
 
