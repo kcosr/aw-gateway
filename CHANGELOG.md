@@ -12,6 +12,8 @@
   reported with `output_truncated`.
 - Enabled HTTP listeners now require bearer auth when `http.listen` is
   non-loopback.
+- HTTP 500-class operation errors now return a generic client-facing message
+  while logging detailed internal error sources server-side.
 - Container-agent mutating control-socket methods now fail closed when no
   control token is configured, and control-token checks use shared
   constant-time comparison.

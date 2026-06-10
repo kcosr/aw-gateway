@@ -38,7 +38,8 @@ use crate::secret::constant_time_eq;
 use auth::{authorize, authorize_action};
 use output_projection::{OutputFormat, OutputFormats};
 use response::{
-    ErrorCode, HttpError, execution_response, metadata_result_response, operation_error_response,
+    ErrorCode, HttpError, execution_response, internal_operation_error_response,
+    metadata_result_response, operation_error_response,
 };
 
 const PTY_ATTACH_LEASE_TTL: Duration = Duration::from_secs(30);
@@ -876,7 +877,7 @@ async fn prepare_pty_run(state: AppState, request: RunRequest) -> Response {
     };
     match state.pty_leases.insert(prepared, terminal).await {
         Ok(created) => (StatusCode::CREATED, Json(created)).into_response(),
-        Err(err) => HttpError::operation_failed(err.to_string()).into_response(),
+        Err(err) => internal_operation_error_response(err, "PTY run lease creation failed"),
     }
 }
 
@@ -903,7 +904,7 @@ async fn prepare_pty_launch(state: AppState, name: String, request: LaunchRunReq
     };
     match state.pty_leases.insert(prepared, terminal).await {
         Ok(created) => (StatusCode::CREATED, Json(created)).into_response(),
-        Err(err) => HttpError::operation_failed(err.to_string()).into_response(),
+        Err(err) => internal_operation_error_response(err, "PTY launch lease creation failed"),
     }
 }
 

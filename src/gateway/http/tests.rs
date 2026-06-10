@@ -827,7 +827,7 @@ async fn operation_errors_map_all_typed_variants_to_http_codes() {
             OperationError::operation_failed(anyhow::anyhow!("runtime failed")),
             StatusCode::INTERNAL_SERVER_ERROR,
             "operation_failed",
-            "runtime failed",
+            "internal operation failed",
         ),
         (
             OperationError::operation_failed(anyhow::Error::new(
@@ -835,7 +835,7 @@ async fn operation_errors_map_all_typed_variants_to_http_codes() {
             )),
             StatusCode::INTERNAL_SERVER_ERROR,
             "operation_failed",
-            "container agent did not become ready",
+            "internal operation failed",
         ),
         (
             OperationError::operation_failed(anyhow::Error::new(
@@ -843,7 +843,7 @@ async fn operation_errors_map_all_typed_variants_to_http_codes() {
             )),
             StatusCode::INTERNAL_SERVER_ERROR,
             "operation_failed",
-            "container did not exist after start",
+            "internal operation failed",
         ),
         (
             OperationError::operation_failed(anyhow::Error::new(
@@ -853,7 +853,7 @@ async fn operation_errors_map_all_typed_variants_to_http_codes() {
             )),
             StatusCode::INTERNAL_SERVER_ERROR,
             "operation_failed",
-            "container missing required label \"io.aw-gateway.target\"",
+            "internal operation failed",
         ),
     ];
 

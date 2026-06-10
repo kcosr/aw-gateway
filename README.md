@@ -1629,6 +1629,10 @@ Errors use a stable envelope:
 {"ok": false, "error": {"code": "invalid_request", "message": "human-readable message"}}
 ```
 
+Validation and authorization errors include specific client-facing messages.
+Internal operation failures use a generic message and log the detailed source
+server-side.
+
 | Method | Path | Action | Operation |
 | --- | --- | --- | --- |
 | `GET` | `/api/v1/status?target=default&session_id=abc` | `status` | `GatewayOperation::Status` |
