@@ -348,6 +348,7 @@ impl ServiceConfig {
             validate_template("service.cwd", cwd, AGENT_TEMPLATE_VARS)?;
         }
         for value in self.env.values() {
+            value.validate()?;
             value.validate_templates(AGENT_TEMPLATE_VARS)?;
         }
         for value in [
@@ -405,11 +406,6 @@ pub struct EnvValue {
 impl EnvValue {
     pub fn resolve(&self, vars: &BTreeMap<String, String>) -> anyhow::Result<Option<String>> {
         self.validate()?;
-        let present =
-            self.value.is_some() as u8 + self.file.is_some() as u8 + self.inherit.is_some() as u8;
-        if present != 1 {
-            anyhow::bail!("environment value must specify exactly one of value, file, or inherit");
-        }
         let mut value = if let Some(value) = &self.value {
             Some(value.clone())
         } else if let Some(path) = &self.file {

@@ -1072,6 +1072,42 @@ fn env_value_requires_exactly_one_source() {
 }
 
 #[test]
+fn service_env_values_validate_sources_at_config_load() {
+    for env in [
+        r#"
+[targets.default.container_agent.services.env.BAD]
+"#,
+        r#"
+[targets.default.container_agent.services.env.BAD]
+value = "a"
+file = "/tmp/a"
+"#,
+    ] {
+        let cfg: GatewayConfig = toml::from_str(&format!(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+
+[[targets.default.container_agent.services]]
+name = "worker"
+command = ["/bin/true"]
+{env}
+"#
+        ))
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(
+            err.contains("environment value must specify exactly one"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
 fn env_value_renders_file_path_and_file_contents() {
     let dir = tempfile::tempdir().unwrap();
     let token_file = dir.path().join("token");
