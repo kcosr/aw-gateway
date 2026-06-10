@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Changed
+
+- Restrictive container SSH transfer policies now install the command filter
+  when either SFTP or legacy SCP is restricted, and reject shell-composed
+  commands before they can bypass denied SFTP/SCP server invocations.
 
 ## [0.6.0] - 2026-06-10
 

@@ -868,18 +868,22 @@ legacy_scp = "outbound"
 ```
 
 When `sftp = "deny"`, `start-container-sshd` removes the SFTP subsystem from
-the runtime SSHD config. Modern OpenSSH SCP uses SFTP, so that blocks both.
-When `legacy_scp` is not `"allow"`, the helper adds a container-side
-`ForceCommand` that runs `aw-ssh-command-filter`. Legacy SCP inbound means
-upload into the container (`scp -t`); outbound means download from the
-container (`scp -f`). SFTP has only allow/deny because the SFTP subsystem is a
+the runtime SSHD config. Modern OpenSSH SCP uses SFTP, so that blocks both. The
+helper also adds a container-side `ForceCommand` that runs
+`aw-ssh-command-filter` whenever either SFTP or legacy SCP policy is
+restrictive, so exec-form `sftp-server` and denied legacy SCP server commands
+are checked by the same policy boundary. Legacy SCP inbound means upload into
+the container (`scp -t`); outbound means download from the container
+(`scp -f`). SFTP has only allow/deny because the SFTP subsystem is a
 bidirectional protocol channel rather than separate upload/download server
 commands.
 
-Container-side `aw-ssh-command-filter` implements the legacy SCP checks. The
-`start-container-sshd` helper invokes it from the generated SSHD `ForceCommand`,
-so install or mount the binary alongside the agent when transfer policy uses
-legacy SCP restrictions.
+Container-side `aw-ssh-command-filter` implements the SFTP exec-form and legacy
+SCP checks. When either transfer mode is restrictive, commands containing shell
+control syntax such as `;`, `&&`, pipes, redirection, command substitution, or
+newlines are rejected before the shell runs them. Install or mount the binary
+alongside the agent whenever transfer policy may deny or direction-limit file
+transfer.
 
 `target_defaults.container_ssh.transfer` only applies to traffic that
 traverses the container SSHD. Gateway actions such as `run` execute through the

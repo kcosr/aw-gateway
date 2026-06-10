@@ -89,6 +89,22 @@ fn ssh_dispatch_rejects_host_side_transfer_commands_when_policy_disallows_them()
         .assert()
         .failure()
         .stderr(predicate::str::contains("sftp is not allowed"));
+
+    for original_command in [
+        "true; scp -t /tmp/file",
+        "true && scp -t /tmp/file",
+        "printf hi | scp -t /tmp/file",
+        "x=$(scp -t /tmp/file)",
+    ] {
+        Command::cargo_bin("aw-gateway")
+            .unwrap()
+            .arg("--config")
+            .arg(&config)
+            .env("SSH_ORIGINAL_COMMAND", original_command)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("shell composition is not allowed"));
+    }
 }
 
 #[test]

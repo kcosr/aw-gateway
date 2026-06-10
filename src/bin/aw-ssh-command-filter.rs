@@ -25,6 +25,12 @@ fn main() -> anyhow::Result<()> {
             eprintln!("blocked by policy: sftp is not allowed");
             std::process::exit(1);
         }
+        SshCommandDecision::RejectShellComposition => {
+            eprintln!(
+                "blocked by policy: shell composition is not allowed when transfer policy is restrictive"
+            );
+            std::process::exit(1);
+        }
     }
 }
 

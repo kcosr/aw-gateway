@@ -16,9 +16,7 @@ use crate::runtime::{
     ContainerExecCaptureResult, ContainerExecSpec, ContainerExecStatusResult, ContainerRuntime,
 };
 use crate::ssh_dispatch::{self, Dispatch, GatewayAction};
-use crate::ssh_filter::{
-    is_sftp_server_command, legacy_scp_mode_allows, legacy_scp_server_direction,
-};
+use crate::ssh_filter::{SshCommandDecision, SshCommandFilterPolicy, decide_command};
 use crate::template::{self, Vars};
 use anyhow::Context;
 use std::collections::BTreeMap;
@@ -289,13 +287,23 @@ async fn dispatch_from_ssh(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     }
     if let Some(command) = original.as_deref() {
         let transfer = cfg.effective_container_ssh_defaults()?.transfer;
-        if let Some(direction) = legacy_scp_server_direction(command)
-            && !legacy_scp_mode_allows(transfer.legacy_scp, direction)
-        {
-            anyhow::bail!("blocked by policy: legacy scp is not allowed");
-        }
-        if !transfer.sftp.allows() && is_sftp_server_command(command) {
-            anyhow::bail!("blocked by policy: sftp is not allowed");
+        let policy = SshCommandFilterPolicy {
+            sftp: transfer.sftp,
+            legacy_scp: transfer.legacy_scp,
+        };
+        match decide_command(&policy, Some(command)) {
+            SshCommandDecision::RejectLegacyScp => {
+                anyhow::bail!("blocked by policy: legacy scp is not allowed");
+            }
+            SshCommandDecision::RejectSftp => {
+                anyhow::bail!("blocked by policy: sftp is not allowed");
+            }
+            SshCommandDecision::RejectShellComposition => {
+                anyhow::bail!(
+                    "blocked by policy: shell composition is not allowed when transfer policy is restrictive"
+                );
+            }
+            SshCommandDecision::LoginShell | SshCommandDecision::RunCommand(_) => {}
         }
     }
     let has_pty = std::io::stdin().is_terminal();

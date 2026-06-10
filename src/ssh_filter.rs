@@ -28,6 +28,7 @@ pub enum SshCommandDecision {
     RunCommand(String),
     RejectLegacyScp,
     RejectSftp,
+    RejectShellComposition,
 }
 
 pub fn load_policy(path: &Path) -> anyhow::Result<SshCommandFilterPolicy> {
@@ -57,8 +58,24 @@ pub fn decide_command(
     if !policy.sftp.allows() && is_sftp_server_command(command) {
         return SshCommandDecision::RejectSftp;
     }
+    if policy_is_restrictive(policy) && contains_shell_control_syntax(command) {
+        return SshCommandDecision::RejectShellComposition;
+    }
 
     SshCommandDecision::RunCommand(command.to_string())
+}
+
+pub fn policy_is_restrictive(policy: &SshCommandFilterPolicy) -> bool {
+    !policy.sftp.allows() || policy.legacy_scp != LegacyScpTransferMode::Allow
+}
+
+fn contains_shell_control_syntax(command: &str) -> bool {
+    command.bytes().any(|byte| {
+        matches!(
+            byte,
+            b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b')' | b'`' | b'$' | b'\n' | b'\r'
+        )
+    })
 }
 
 pub fn is_legacy_scp_server_command(command: &str) -> bool {
@@ -286,6 +303,42 @@ mod tests {
                 Some("/usr/libexec/openssh/sftp-server"),
             ),
             SshCommandDecision::RunCommand("/usr/libexec/openssh/sftp-server".into())
+        );
+    }
+
+    #[test]
+    fn rejects_shell_composition_when_policy_is_restrictive() {
+        for policy in [
+            SshCommandFilterPolicy {
+                sftp: SftpTransferMode::Deny,
+                legacy_scp: LegacyScpTransferMode::Allow,
+            },
+            SshCommandFilterPolicy {
+                sftp: SftpTransferMode::Allow,
+                legacy_scp: LegacyScpTransferMode::Deny,
+            },
+        ] {
+            for command in [
+                "true; scp -t /tmp/file",
+                "true && scp -t /tmp/file",
+                "printf hi | scp -t /tmp/file",
+                "x=$(scp -t /tmp/file)",
+                "echo `scp -t /tmp/file`",
+            ] {
+                assert_eq!(
+                    decide_command(&policy, Some(command)),
+                    SshCommandDecision::RejectShellComposition,
+                    "command {command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn allows_shell_composition_when_policy_is_fully_allow() {
+        assert_eq!(
+            decide_command(&SshCommandFilterPolicy::default(), Some("true; echo ok")),
+            SshCommandDecision::RunCommand("true; echo ok".into())
         );
     }
 
