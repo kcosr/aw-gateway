@@ -4660,6 +4660,34 @@ fn extends_rejects_glob_paths() {
 }
 
 #[test]
+fn extends_rejects_deep_chains() {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..65 {
+        let path = dir.path().join(format!("config-{index}.toml"));
+        let next = dir.path().join(format!("config-{}.toml", index + 1));
+        std::fs::write(&path, format!("extends = \"{}\"\n", next.display())).unwrap();
+    }
+    std::fs::write(
+        dir.path().join("config-65.toml"),
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "default"
+"#,
+    )
+    .unwrap();
+
+    let err = format!(
+        "{:#}",
+        GatewayConfig::load(&dir.path().join("config-0.toml")).unwrap_err()
+    );
+    assert!(err.contains("maximum depth"), "{err}");
+}
+
+#[test]
 fn container_agent_rejects_service_dependency_cycles() {
     let cfg: ContainerAgentFile = toml::from_str(
         r#"

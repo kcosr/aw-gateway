@@ -61,6 +61,7 @@
   whitespace, empty path components, invalid tags, and invalid digests during
   config validation.
 - Include patterns now fail config loading when they match no files.
+- Root `extends` chains now fail config loading after 64 root config files.
 - `local_ssh.host` loopback validation now applies only when
   `local_ssh.mode = "listen"`, matching the effective config rules.
 - Local SSH listener startup now serializes status-file checks and writes with

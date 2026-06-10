@@ -750,7 +750,7 @@ Gateway configs commonly include:
   must match at least one file, are lexicographically ordered, and reject
   unknown fields, duplicate definitions, cycles, and partial object overrides.
 - `extends`: root config inheritance for layering a selected config over a
-  managed base config.
+  managed base config. Extends chains are limited to 64 root config files.
 - `[[target_defaults.container_mounts]]` and `[[targets.<name>.container_mounts]]`: extra
   host-to-container bind mounts, typically read-only bootstrap
   binaries/configs/certs. Each mount uses `source`, `target`, and `mode`
@@ -1061,9 +1061,10 @@ extends = "/etc/aw-gateway/gateway.toml"
 
 `extends` is honored only by the selected root config. Unlike include files, an
 extended root may define root-owned policy, defaults, templates, targets, and
-launches. Extends chains may have multiple levels. The loader composes each
-file's own `includes` relative to that file, strips loader-only `extends` and
-`includes`, then merges deepest base-to-child before normal validation.
+launches. Extends chains may have multiple levels, up to 64 root config files.
+The loader composes each file's own `includes` relative to that file, strips
+loader-only `extends` and `includes`, then merges deepest base-to-child before
+normal validation.
 
 Root inheritance uses these merge rules:
 
