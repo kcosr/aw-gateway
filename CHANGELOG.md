@@ -21,7 +21,12 @@
 - Restrictive container SSH transfer policies now install the command filter
   when either SFTP or legacy SCP is restricted, and reject shell-composed,
   assignment-prefixed, or known wrapper-command invocations before they can
-  bypass denied SFTP/SCP server invocations.
+  bypass denied SFTP/SCP server invocations. The shell-composition check rejects
+  only chaining, substitution, and subshell bytes (`;`, `|`, `&`, `(`, `)`,
+  `` ` ``, newlines); bare redirection (`<`, `>`) and variable expansion (`$`)
+  are now allowed so ordinary commands such as `echo "$HOME"` or `cmd > out` are
+  not blocked under restrictive transfer policy. Transfer policy is a best-effort
+  convenience control, not a security boundary.
 - HTTP wait-mode command output, container-agent control responses, and HTTP
   health-probe responses are now size bounded; truncated wait streams are
   reported with `output_truncated`.

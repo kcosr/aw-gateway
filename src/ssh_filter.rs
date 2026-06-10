@@ -73,15 +73,29 @@ fn contains_restricted_shell_invocation(command: &str) -> bool {
     contains_shell_control_syntax(command) || uses_shell_prefix_or_wrapper(command)
 }
 
+// Best-effort guard against composing a denied transfer command behind a
+// permitted one. We reject only the bytes that can chain, substitute, or
+// subshell another program: `;` `|` `&` `(` `)` backtick and newlines. Bare
+// redirection (`<`, `>`) and variable expansion (`$`) are intentionally allowed
+// -- they cannot by themselves invoke a transfer program, and rejecting them
+// blocked ordinary commands such as `echo "$HOME"` or `cmd > out`. Command and
+// process substitution (`` `...` ``, `$(...)`, `<(...)`) stay caught through the
+// backtick and paren bytes. This is a convenience nudge, not a security
+// boundary.
 fn contains_shell_control_syntax(command: &str) -> bool {
     command.bytes().any(|byte| {
         matches!(
             byte,
-            b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b')' | b'`' | b'$' | b'\n' | b'\r'
+            b';' | b'|' | b'&' | b'(' | b')' | b'`' | b'\n' | b'\r'
         )
     })
 }
 
+// Deliberately non-exhaustive best-effort denylist of leading shell builtins and
+// exec wrappers that would otherwise hide a denied `scp`/`sftp-server` behind a
+// permitted first word. A motivated user can still reach a transfer program
+// through an unlisted wrapper or interpreter; transfer policy is a convenience
+// control, so this list is intentionally not grown to chase every wrapper.
 fn uses_shell_prefix_or_wrapper(command: &str) -> bool {
     let Ok(words) = shell_words::split(command) else {
         return false;
@@ -368,6 +382,8 @@ mod tests {
                 "true && scp -t /tmp/file",
                 "printf hi | scp -t /tmp/file",
                 "x=$(scp -t /tmp/file)",
+                "(scp -t /tmp/file)",
+                "cat <(scp -f /tmp/file)",
                 "echo `scp -t /tmp/file`",
                 "x=1 scp -t /tmp/file",
                 "command scp -t /tmp/file",
@@ -414,5 +430,25 @@ mod tests {
             decide_command(&policy, Some("printf hello")),
             SshCommandDecision::RunCommand("printf hello".into())
         );
+    }
+
+    #[test]
+    fn allows_redirection_and_expansion_under_restrictive_policy() {
+        let policy = SshCommandFilterPolicy {
+            sftp: SftpTransferMode::Deny,
+            legacy_scp: LegacyScpTransferMode::Deny,
+        };
+        for command in [
+            "echo \"$HOME\"",
+            "printf '%s' $PATH",
+            "ls -la > /tmp/out",
+            "grep needle < /tmp/in",
+        ] {
+            assert_eq!(
+                decide_command(&policy, Some(command)),
+                SshCommandDecision::RunCommand(command.into()),
+                "command {command:?}"
+            );
+        }
     }
 }

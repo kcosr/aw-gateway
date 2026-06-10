@@ -893,15 +893,28 @@ bidirectional protocol channel rather than separate upload/download server
 commands.
 
 Container-side `aw-ssh-command-filter` implements the SFTP exec-form and legacy
-SCP checks. When either transfer mode is restrictive, commands containing raw
-shell-control bytes (`;`, `|`, `&`, `<`, `>`, `(`, `)`, `` ` ``, `$`, LF, or
-CR), shell assignment prefixes such as `NAME=value command`, or wrapper
-commands such as `command`, `env`, `eval`, `exec`, `nice`, `nohup`, `time`,
-`timeout`, `setsid`, `stdbuf`, or shell re-entry through `sh -c`, `bash -c`,
-`dash -c`, `fish -c`, `ksh -c`, or `zsh -c` are rejected before the shell runs
-them. Quoting does not exempt those bytes because the check runs before shell
-evaluation. Install or mount the binary alongside the agent whenever transfer
-policy may deny or direction-limit file transfer.
+SCP checks. When either transfer mode is restrictive, commands containing shell
+chaining or substitution bytes (`;`, `|`, `&`, `(`, `)`, `` ` ``, LF, or CR),
+shell assignment prefixes such as `NAME=value command`, or wrapper commands such
+as `command`, `env`, `eval`, `exec`, `nice`, `nohup`, `time`, `timeout`,
+`setsid`, `stdbuf`, or shell re-entry through `sh -c`, `bash -c`, `dash -c`,
+`fish -c`, `ksh -c`, or `zsh -c` are rejected before the shell runs them.
+Quoting does not exempt those bytes because the check runs before shell
+evaluation. Bare redirection (`<`, `>`) and variable expansion (`$VAR`) are not
+rejected, since they cannot by themselves invoke a transfer program; command and
+process substitution stay blocked through the `` ` `` and `(` / `)` bytes.
+Install or mount the binary alongside the agent whenever transfer policy may deny
+or direction-limit file transfer.
+
+This filter is a best-effort policy control to discourage casual `scp`/`sftp`
+use, **not a security boundary**. The wrapper list is a deliberately
+non-exhaustive denylist, and any user permitted to run commands over the
+container SSHD can still move data by other means — for example streaming a file
+over an ordinary command's stdin or stdout (`cat > file`, `cat file`). Use
+transfer policy to enforce a stated "do not transfer files" convention; do not
+rely on it to contain a motivated or compromised user. Removing arbitrary
+command execution (a transfer-only session) is the only way to make the
+direction limits an actual boundary.
 
 `target_defaults.container_ssh.transfer` only applies to traffic that
 traverses the container SSHD. Gateway actions such as `run` execute through the
