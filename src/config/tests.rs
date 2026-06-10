@@ -1324,6 +1324,45 @@ CODEX_HOME = "/var/lib/codex"
 }
 
 #[test]
+fn target_image_references_are_shape_validated() {
+    let valid: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ghcr.io/kcosr/aw-gateway@sha256:0123456789abcdef"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+    valid.validate().unwrap();
+
+    for image in [
+        "--privileged",
+        "ubuntu dev",
+        "ubuntu//dev",
+        "registry:port/ubuntu",
+        "ubuntu:",
+        "ubuntu@sha256:not-hex",
+    ] {
+        let cfg: GatewayConfig = toml::from_str(&format!(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "{image}"
+mode = "fixed"
+name = "{{image_slug}}"
+"#
+        ))
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("image reference"), "{image}: {err}");
+    }
+}
+
+#[test]
 fn target_session_env_inherit_composes_and_validates() {
     let cfg: GatewayConfig = toml::from_str(
         r#"
@@ -2754,6 +2793,27 @@ name = "{image_slug}"
         cfg.effective_target("default").unwrap().image,
         "ubuntu/default"
     );
+}
+
+#[test]
+fn target_defaults_validate_image_references_before_overlay() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+default_target = "default"
+
+[target_defaults]
+image = "--privileged"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("image reference"), "{err}");
 }
 
 #[test]

@@ -597,9 +597,11 @@ stop_when_idle = true
 remove_on_stop = false
 ```
 
-Replace `ubuntu/dev` with a real container image. The deployment guides build
-and use working runtime-specific images from the included example
-Containerfiles.
+Replace `ubuntu/dev` with a real container image. Image references must not
+contain whitespace or control characters, must not start with `-`, and must use
+normal slash-separated repository syntax with optional `:tag` or `@digest`
+suffixes. The deployment guides build and use working runtime-specific images
+from the included example Containerfiles.
 
 Fixed targets reuse one named container across connections. Ephemeral targets
 create a per-session container and require `mode = "ephemeral"`,

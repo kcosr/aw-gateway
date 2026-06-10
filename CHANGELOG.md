@@ -50,6 +50,9 @@
   world-writable.
 - Container inspect results now fail closed when the runtime returns more than
   one inspected container for a single-name inspect request.
+- Target image references now reject malformed values such as leading flags,
+  whitespace, empty path components, invalid tags, and invalid digests during
+  config validation.
 - Local SSH listener startup now serializes status-file checks and writes with
   the lifecycle lock, and transient accept errors no longer terminate the
   listener.

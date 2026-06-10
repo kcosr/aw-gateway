@@ -411,6 +411,9 @@ impl TargetConfigInput {
         {
             anyhow::bail!("target {target_name:?} image is required");
         }
+        if let Some(image) = &self.image {
+            validate_image_reference(&format!("target {target_name:?} image"), image)?;
+        }
         if let Some(name) = &self.name {
             validate_template_with_policy(
                 "target.name",
@@ -616,6 +619,7 @@ impl TargetConfig {
         if self.image.trim().is_empty() {
             anyhow::bail!("target {target_name:?} image is required");
         }
+        validate_image_reference(&format!("target {target_name:?} image"), &self.image)?;
         if let Some(container_user) = &self.container_user {
             validate_name("target.container_user", container_user)?;
         }
