@@ -4224,6 +4224,52 @@ fn container_mounts_reject_separator_paths_and_relative_targets() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn start_container_rejects_world_writable_read_write_mount_source() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    echo '[]'
+    ;;
+  run)
+    echo "$@" >> "{log}"
+    ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        ),
+    );
+    let mount_source = dir.path().join("shared");
+    std::fs::create_dir(&mount_source).unwrap();
+    std::fs::set_permissions(&mount_source, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        let target = cfg.targets.get_mut("default").unwrap();
+        target.container_mounts = vec![crate::config::ContainerMountConfig {
+            source: mount_source.display().to_string(),
+            target: "/mnt/shared".into(),
+            mode: ContainerMountMode::Rw,
+        }];
+    });
+
+    let err = runtime.ensure_ready().await.unwrap_err();
+
+    assert!(err.to_string().contains("world-writable"), "{err:#}");
+    assert!(
+        !log.exists(),
+        "runtime should not be invoked after unsafe mount rejection"
+    );
+}
+
 #[test]
 fn target_selection_accepts_configured_target_or_image() {
     let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();

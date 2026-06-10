@@ -412,6 +412,13 @@ fn warn_about_unsafe_container_mounts(mounts: &[ContainerMountSpec]) -> anyhow::
                 )
             })?;
             if metadata.permissions().mode() & 0o002 != 0 {
+                if !mount.readonly {
+                    anyhow::bail!(
+                        "container mount source #{} {} is world-writable; refusing read-write mount",
+                        index,
+                        mount.source.display()
+                    );
+                }
                 tracing::warn!(
                     mount = index,
                     source = %mount.source.display(),

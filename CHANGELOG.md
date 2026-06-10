@@ -46,6 +46,8 @@
   checked mount set for safety warnings and the runtime run spec.
 - Rendered container bind mount sources and targets now reject `:` and `,`
   separators, and mount targets must render to absolute paths.
+- Container startup now rejects read-write bind mounts whose resolved source is
+  world-writable.
 - Local SSH listener startup now serializes status-file checks and writes with
   the lifecycle lock, and transient accept errors no longer terminate the
   listener.
