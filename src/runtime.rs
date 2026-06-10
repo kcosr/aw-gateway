@@ -73,6 +73,8 @@ pub struct ContainerExecOutput {
     pub exit_code: i32,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +118,12 @@ const CANCEL_MARKER_LIST_ARGV0: &str = "aw-gateway-marker-list";
 const CANCEL_MARKER_SWEEP_ARGV0: &str = "aw-gateway-marker-sweep";
 const CANCEL_MARKER_PATH_PREFIX: &str = "/tmp/aw-gateway-";
 const CANCEL_MARKER_PATH_SUFFIX: &str = ".pid";
+pub const MAX_CAPTURED_STREAM_BYTES: usize = 4 * 1024 * 1024;
+
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
 
 impl ContainerPtySession {
     pub async fn terminate(&self) -> anyhow::Result<()> {
@@ -268,13 +276,18 @@ async fn terminate_host_pty_child(
     .context("join pty child terminate task")?
 }
 
-async fn read_pipe_to_end<R>(mut reader: R) -> std::io::Result<Vec<u8>>
+async fn read_pipe_to_end<R>(reader: R) -> std::io::Result<BoundedOutput>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).await?;
-    Ok(bytes)
+    let mut limited = reader.take((MAX_CAPTURED_STREAM_BYTES + 1) as u64);
+    limited.read_to_end(&mut bytes).await?;
+    let truncated = bytes.len() > MAX_CAPTURED_STREAM_BYTES;
+    if truncated {
+        bytes.truncate(MAX_CAPTURED_STREAM_BYTES);
+    }
+    Ok(BoundedOutput { bytes, truncated })
 }
 
 async fn cancel_container_exec_child(
@@ -822,25 +835,55 @@ impl ContainerRuntime {
             .arg("exec")
             .args(self.exec_args(spec))
             .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let output = match timeout_duration {
-            Some(timeout_duration) => tokio::time::timeout(timeout_duration, command.output())
-                .await
-                .with_context(|| {
-                    format!(
-                        "{} exec {} timed out after {:?}",
-                        self.runtime_label(),
-                        spec.container_name,
-                        timeout_duration
-                    )
-                })?,
-            None => command.output().await,
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "start {} exec {}",
+                self.runtime_label(),
+                spec.container_name
+            )
+        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("container exec stdout pipe was not captured")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("container exec stderr pipe was not captured")?;
+        let stdout_task = tokio::spawn(read_pipe_to_end(stdout));
+        let stderr_task = tokio::spawn(read_pipe_to_end(stderr));
+        let status = match timeout_duration {
+            Some(timeout_duration) => {
+                match tokio::time::timeout(timeout_duration, child.wait()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let _ = child.start_kill();
+                        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                        stdout_task.abort();
+                        stderr_task.abort();
+                        anyhow::bail!(
+                            "{} exec {} timed out after {:?}",
+                            self.runtime_label(),
+                            spec.container_name,
+                            timeout_duration
+                        );
+                    }
+                }
+            }
+            None => child.wait().await,
         }
         .with_context(|| format!("run {} exec {}", self.runtime_label(), spec.container_name))?;
+        let stdout = stdout_task.await.context("join stdout drain task")??;
+        let stderr = stderr_task.await.context("join stderr drain task")??;
         Ok(ContainerExecOutput {
-            exit_code: exit_code(output.status),
-            stdout: output.stdout,
-            stderr: output.stderr,
+            exit_code: exit_code(status),
+            stdout: stdout.bytes,
+            stderr: stderr.bytes,
+            stdout_truncated: stdout.truncated,
+            stderr_truncated: stderr.truncated,
         })
     }
 
@@ -891,8 +934,10 @@ impl ContainerRuntime {
                 let stderr = stderr_task.await.context("join stderr drain task")??;
                 let output = ContainerExecOutput {
                     exit_code: exit_code(status),
-                    stdout,
-                    stderr,
+                    stdout: stdout.bytes,
+                    stderr: stderr.bytes,
+                    stdout_truncated: stdout.truncated,
+                    stderr_truncated: stderr.truncated,
                 };
                 run_container_cancel_exec(
                     self.clone(),
@@ -2334,6 +2379,45 @@ exit 0
 
         assert_eq!(output.exit_code, 0);
         assert_eq!(output.stdout, b"done\n");
+        assert!(!output.stdout_truncated);
+        assert!(!output.stderr_truncated);
+    }
+
+    #[tokio::test]
+    async fn exec_capture_truncates_oversized_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-runtime");
+        std::fs::write(
+            &runtime_program,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = exec ]; then dd if=/dev/zero bs={} count=1 2>/dev/null; fi\n",
+                MAX_CAPTURED_STREAM_BYTES + 1
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::Podman,
+            program: runtime_program.display().to_string(),
+            env: BTreeMap::new(),
+        };
+        let spec = ContainerExecSpec {
+            stdin_tty: false,
+            stdout_tty: false,
+            user: "2450:100".into(),
+            cwd: None,
+            env: BTreeMap::new(),
+            container_name: "ubuntu-dev".into(),
+            command: vec!["large-output".into()],
+        };
+
+        let output = runtime.exec_capture(&spec).await.unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        assert_eq!(output.stdout.len(), MAX_CAPTURED_STREAM_BYTES);
+        assert!(output.stdout_truncated);
+        assert!(output.stderr.is_empty());
+        assert!(!output.stderr_truncated);
     }
 
     #[tokio::test]

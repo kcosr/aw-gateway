@@ -85,9 +85,9 @@ use model::{
     TargetEntry, TcpEndpoint, gateway_status_name,
 };
 use ops::{
-    CanonicalLaunchVarValue, ExecutionOutcome, GatewayOperation, GatewayOperationResult,
-    LaunchPassthroughArgs, OperationError, OperationExecutionOptions, OperationMode,
-    OperationResult, SshGatewayOperation, SshRenderOptions, SuppliedLaunchVars,
+    CanonicalLaunchVarValue, CapturedStream, ExecutionOutcome, GatewayOperation,
+    GatewayOperationResult, LaunchPassthroughArgs, OperationError, OperationExecutionOptions,
+    OperationMode, OperationResult, SshGatewayOperation, SshRenderOptions, SuppliedLaunchVars,
     execute_gateway_operation, execute_gateway_operation_with_context, lookup_launch,
     operation_up_with_runtime,
 };
@@ -733,10 +733,16 @@ async fn exec_container_command_with_cancel(
             } else {
                 runtime.container_runtime.exec_capture(exec_spec).await?
             };
-            Ok(ExecutionOutcome::captured(
+            Ok(ExecutionOutcome::captured_streams(
                 output.exit_code,
-                options.output.stdout.then_some(output.stdout),
-                options.output.stderr.then_some(output.stderr),
+                options
+                    .output
+                    .stdout
+                    .then(|| CapturedStream::new(output.stdout, output.stdout_truncated)),
+                options
+                    .output
+                    .stderr
+                    .then(|| CapturedStream::new(output.stderr, output.stderr_truncated)),
             ))
         }
         OperationMode::Detach => Ok(ExecutionOutcome::new(

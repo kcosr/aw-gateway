@@ -176,8 +176,8 @@ pub(in crate::gateway) enum ExecutionOutcome {
     // choose its own encoding policy instead of inheriting an accidental string conversion.
     Captured {
         exit_code: i32,
-        stdout: Option<Vec<u8>>,
-        stderr: Option<Vec<u8>>,
+        stdout: Option<CapturedStream>,
+        stderr: Option<CapturedStream>,
     },
     // The operation_id is intentionally not a registry key. Detached
     // background failures are logged and cannot be queried through the API.
@@ -189,15 +189,40 @@ pub(in crate::gateway) enum ExecutionOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::gateway) struct CapturedStream {
+    pub(in crate::gateway) bytes: Vec<u8>,
+    pub(in crate::gateway) truncated: bool,
+}
+
+impl CapturedStream {
+    pub(in crate::gateway) fn new(bytes: Vec<u8>, truncated: bool) -> Self {
+        Self { bytes, truncated }
+    }
+}
+
 impl ExecutionOutcome {
     pub(in crate::gateway) fn new(exit_code: i32) -> Self {
         Self::Streamed { exit_code }
     }
 
+    #[cfg(test)]
     pub(in crate::gateway) fn captured(
         exit_code: i32,
         stdout: Option<Vec<u8>>,
         stderr: Option<Vec<u8>>,
+    ) -> Self {
+        Self::captured_streams(
+            exit_code,
+            stdout.map(|bytes| CapturedStream::new(bytes, false)),
+            stderr.map(|bytes| CapturedStream::new(bytes, false)),
+        )
+    }
+
+    pub(in crate::gateway) fn captured_streams(
+        exit_code: i32,
+        stdout: Option<CapturedStream>,
+        stderr: Option<CapturedStream>,
     ) -> Self {
         Self::Captured {
             exit_code,

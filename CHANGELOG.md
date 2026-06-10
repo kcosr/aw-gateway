@@ -7,6 +7,9 @@
 - Restrictive container SSH transfer policies now install the command filter
   when either SFTP or legacy SCP is restricted, and reject shell-composed
   commands before they can bypass denied SFTP/SCP server invocations.
+- HTTP wait-mode command output, container-agent control responses, and HTTP
+  health-probe responses are now size bounded; truncated wait streams are
+  reported with `output_truncated`.
 
 ## [0.6.0] - 2026-06-10
 

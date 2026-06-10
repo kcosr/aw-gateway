@@ -1,5 +1,7 @@
 use serde_json::json;
 
+use crate::gateway::ops::CapturedStream;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OutputFormat {
     Text,
@@ -52,31 +54,44 @@ impl OutputProjectionErrorCode {
 
 pub(super) fn project_wait_payload(
     exit_code: i32,
-    stdout: Option<Vec<u8>>,
-    stderr: Option<Vec<u8>>,
+    stdout: Option<CapturedStream>,
+    stderr: Option<CapturedStream>,
     formats: OutputFormats,
 ) -> serde_json::Value {
     let mut payload = serde_json::Map::new();
     let mut output_errors = serde_json::Map::new();
+    let mut output_truncated = serde_json::Map::new();
     payload.insert("ok".into(), json!(true));
     payload.insert("mode".into(), json!("wait"));
     payload.insert("exit_code".into(), json!(exit_code));
     if let Some(stdout) = stdout {
+        if stdout.truncated {
+            output_truncated.insert("stdout".into(), json!(true));
+        }
         project_stream(
             &mut payload,
             &mut output_errors,
             "stdout",
-            stdout,
+            stdout.bytes,
             formats.stdout,
         );
     }
     if let Some(stderr) = stderr {
+        if stderr.truncated {
+            output_truncated.insert("stderr".into(), json!(true));
+        }
         project_stream(
             &mut payload,
             &mut output_errors,
             "stderr",
-            stderr,
+            stderr.bytes,
             formats.stderr,
+        );
+    }
+    if !output_truncated.is_empty() {
+        payload.insert(
+            "output_truncated".into(),
+            serde_json::Value::Object(output_truncated),
         );
     }
     if !output_errors.is_empty() {
@@ -148,12 +163,20 @@ fn insert_output_error(
 mod tests {
     use super::*;
 
+    fn captured(bytes: &[u8]) -> CapturedStream {
+        CapturedStream::new(bytes.to_vec(), false)
+    }
+
+    fn truncated(bytes: &[u8]) -> CapturedStream {
+        CapturedStream::new(bytes.to_vec(), true)
+    }
+
     #[test]
     fn projects_text_output_without_changing_fields() {
         let payload = project_wait_payload(
             7,
-            Some(b"out\n".to_vec()),
-            Some(b"err\n".to_vec()),
+            Some(captured(b"out\n")),
+            Some(captured(b"err\n")),
             OutputFormats::TEXT,
         );
 
@@ -170,7 +193,7 @@ mod tests {
     fn projects_json_output_to_json_fields() {
         let payload = project_wait_payload(
             0,
-            Some(br#"{"nested":{"value":42}}"#.to_vec()),
+            Some(captured(br#"{"nested":{"value":42}}"#)),
             None,
             OutputFormats {
                 stdout: OutputFormat::Json,
@@ -188,7 +211,7 @@ mod tests {
         let payload = project_wait_payload(
             0,
             None,
-            Some(br#"{"diagnostic":{"value":42}}"#.to_vec()),
+            Some(captured(br#"{"diagnostic":{"value":42}}"#)),
             OutputFormats {
                 stdout: OutputFormat::Text,
                 stderr: OutputFormat::Json,
@@ -204,8 +227,8 @@ mod tests {
     fn invalid_json_falls_back_to_text_with_output_error() {
         let payload = project_wait_payload(
             1,
-            Some(b"not-json".to_vec()),
-            Some(b"diagnostic".to_vec()),
+            Some(captured(b"not-json")),
+            Some(captured(b"diagnostic")),
             OutputFormats {
                 stdout: OutputFormat::Json,
                 stderr: OutputFormat::Text,
@@ -225,8 +248,8 @@ mod tests {
     fn invalid_utf8_omits_stream_with_output_error() {
         let payload = project_wait_payload(
             2,
-            Some(vec![0xff]),
-            Some(b"diagnostic".to_vec()),
+            Some(CapturedStream::new(vec![0xff], false)),
+            Some(captured(b"diagnostic")),
             OutputFormats::TEXT,
         );
 
@@ -243,7 +266,7 @@ mod tests {
         let payload = project_wait_payload(
             2,
             None,
-            Some(vec![0xff]),
+            Some(CapturedStream::new(vec![0xff], false)),
             OutputFormats {
                 stdout: OutputFormat::Text,
                 stderr: OutputFormat::Json,
@@ -256,5 +279,20 @@ mod tests {
         assert!(payload.get("stderr_json").is_none());
         assert_eq!(payload["output_errors"]["stderr"]["format"], "json");
         assert_eq!(payload["output_errors"]["stderr"]["code"], "invalid_utf8");
+    }
+
+    #[test]
+    fn truncated_streams_include_output_truncated_flags() {
+        let payload = project_wait_payload(
+            0,
+            Some(truncated(b"out")),
+            Some(captured(b"err")),
+            OutputFormats::TEXT,
+        );
+
+        assert_eq!(payload["stdout"], "out");
+        assert_eq!(payload["stderr"], "err");
+        assert_eq!(payload["output_truncated"]["stdout"], true);
+        assert!(payload["output_truncated"].get("stderr").is_none());
     }
 }
