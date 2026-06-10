@@ -570,6 +570,9 @@ async fn pty_attach(
     Path(pty_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    // PTY attach intentionally uses a short-lived single-use lease token as the
+    // WebSocket capability instead of bearer auth headers; browser clients send
+    // that token in the first frame after upgrade.
     if !state.pty_leases.contains(&pty_id).await {
         return HttpError::not_found("pty lease not found").into_response();
     }

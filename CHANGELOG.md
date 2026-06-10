@@ -7,12 +7,21 @@
 - Launch execution now requires `launch-run` in `ssh_dispatch.enabled_actions`
   or `http.enabled_actions`; `launch` only permits inspecting one launch
   definition.
+- Several unsafe or ambiguous configs now fail validation or startup instead of
+  being accepted: enabled non-loopback HTTP listeners require bearer auth,
+  include patterns must match files, include definition sections must be TOML
+  tables, config identifiers may not start with `.` or `-`, malformed image
+  references are rejected, `logging.max_files` is capped at `1024`, service env
+  entries must declare exactly one source at config load, rendered bind mount
+  paths may not contain `:` or `,`, read-write bind mount sources may not be
+  world-writable, and string launch var values may not contain NUL, LF, or CR.
 
 ### Changed
 
 - Restrictive container SSH transfer policies now install the command filter
-  when either SFTP or legacy SCP is restricted, and reject shell-composed
-  commands before they can bypass denied SFTP/SCP server invocations.
+  when either SFTP or legacy SCP is restricted, and reject shell-composed,
+  assignment-prefixed, or wrapper-command invocations before they can bypass
+  denied SFTP/SCP server invocations.
 - HTTP wait-mode command output, container-agent control responses, and HTTP
   health-probe responses are now size bounded; truncated wait streams are
   reported with `output_truncated`.
@@ -43,9 +52,14 @@
   subsequent log writes.
 - Private file writes now use atomic replace semantics, and existing control
   token files must have private permissions before they are trusted.
-- Runtime-provided container and exec environment values are now passed through
-  the spawned container-runtime process environment instead of embedding their
-  values in `podman`/`docker` argv.
+- Runtime-provided container and exec environment values are now normally passed
+  through the spawned container-runtime process environment instead of embedding
+  their values in `podman`/`docker` argv; host-runtime-sensitive names such as
+  `PATH`, `LD_PRELOAD`, and `DOCKER_HOST` still use explicit `KEY=value`
+  runtime arguments so they cannot alter the runtime client process itself.
+- Container-agent service user groups are now resolved before spawning the
+  child process, so the post-fork `pre_exec` path only performs setgroups,
+  setgid, and setuid.
 - Runtime process signaling now uses checked PID conversions to avoid
   out-of-range PID wraparound.
 - In-container cancel marker files for cancelable exec/PTY sessions are now
@@ -59,8 +73,9 @@
   now run on the blocking task pool instead of on async worker threads.
 - Container startup now resolves configured bind mounts once and reuses the
   checked mount set for safety warnings and the runtime run spec.
-- Rendered container bind mount sources and targets now reject `:` and `,`
-  separators, and mount targets must render to absolute paths.
+- Rendered container bind mount sources and targets, including generated
+  workspace and control-socket mounts, now reject `:` and `,` separators, and
+  configured mount targets must render to absolute paths.
 - Container startup now rejects read-write bind mounts whose resolved source is
   world-writable.
 - Container inspect results now fail closed when the runtime returns more than
@@ -68,7 +83,7 @@
 - Target image references now reject malformed values such as leading flags,
   whitespace, empty path components, invalid tags, and invalid digests during
   config validation.
-- String launch variable values now reject NUL and newline characters, and the
+- String launch variable values now reject NUL, LF, and CR characters, and the
   launch documentation now calls out `{var.*}` values as untrusted when used in
   host-side launch step environment values.
 - Include patterns now fail config loading when they match no files.
@@ -82,8 +97,8 @@
   listener.
 - Stale in-container cancel marker sweeping no longer treats inaccessible or
   out-of-range host PIDs as active.
-- Random token and temporary suffix generation now uses `getrandom` directly
-  instead of opening `/dev/urandom`.
+- PTY lease tokens, cancel marker tokens, and temporary suffix generation now
+  use `getrandom` directly instead of opening `/dev/urandom`.
 
 ## [0.6.0] - 2026-06-10
 

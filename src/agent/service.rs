@@ -423,9 +423,13 @@ async fn start_service(service: &ManagedService) -> anyhow::Result<()> {
         let identity = resolve_service_user(&service.config.user)?;
         let user = CString::new(service.config.user.clone())
             .with_context(|| format!("service user {:?} contains NUL", service.config.user))?;
+        let groups =
+            crate::unix_priv::resolve_user_groups(&user, identity.gid).with_context(|| {
+                format!("resolve groups for service user {:?}", service.config.user)
+            })?;
         unsafe {
             command.pre_exec(move || {
-                crate::unix_priv::drop_to_user_pre_exec(&user, identity.uid, identity.gid)
+                crate::unix_priv::drop_to_user_pre_exec(identity.uid, identity.gid, &groups)
             });
         }
     }

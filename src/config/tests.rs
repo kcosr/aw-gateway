@@ -3050,12 +3050,17 @@ fn launch_string_vars_reject_control_character_values() {
         (
             r#"repo = { type = "string", default = "line\nbreak" }
 mode = { type = "enum", values = ["fast", "safe"], default = "fast" }"#,
-            "launch \"agent\" variable \"repo\" string default must not contain NUL or newline",
+            "launch \"agent\" variable \"repo\" string default must not contain NUL, LF, or CR",
+        ),
+        (
+            r#"repo = { type = "string", default = "bad\u0000value" }
+mode = { type = "enum", values = ["fast", "safe"], default = "fast" }"#,
+            "launch \"agent\" variable \"repo\" string default must not contain NUL, LF, or CR",
         ),
         (
             r#"repo = { type = "string", default = "repo" }
 mode = { type = "enum", values = ["fast", "safe\r"], default = "fast" }"#,
-            "launch \"agent\" enum variable \"mode\" values must not contain NUL or newline",
+            "launch \"agent\" enum variable \"mode\" values must not contain NUL, LF, or CR",
         ),
     ] {
         let toml = [
@@ -4366,6 +4371,35 @@ name = "default"
         let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
         assert!(err.contains(expected), "{case}: {err}");
     }
+}
+
+#[test]
+fn includes_reject_non_table_definition_sections() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join("config.d");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("bad.toml"),
+        r#"
+targets = "config.d/target.toml"
+"#,
+    )
+    .unwrap();
+    let root = dir.path().join("gateway.toml");
+    std::fs::write(
+        &root,
+        r#"
+schema_version = "1"
+includes = ["config.d/bad.toml"]
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
+    assert!(
+        err.contains("field \"targets\" must be a TOML table"),
+        "{err}"
+    );
 }
 
 #[test]

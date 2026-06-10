@@ -148,7 +148,13 @@ fn canonical_launch_var_values_coerce_render_and_convert_defaults_for_config_typ
         "repo",
         launch_var_config(LaunchVarType::String, None),
         CanonicalLaunchVarValue::String("line\nbreak".into()),
-        "invalid launch variable \"repo\"; must not contain NUL or newline",
+        "invalid launch variable \"repo\"; must not contain NUL, LF, or CR",
+    );
+    assert_coercion_error(
+        "repo",
+        launch_var_config(LaunchVarType::String, None),
+        CanonicalLaunchVarValue::String("bad\0value".into()),
+        "invalid launch variable \"repo\"; must not contain NUL, LF, or CR",
     );
     assert_coercion_error(
         "mode",
@@ -160,7 +166,7 @@ fn canonical_launch_var_values_coerce_render_and_convert_defaults_for_config_typ
         "mode",
         launch_var_config(LaunchVarType::Enum, Some(vec!["fast", "safe"])),
         CanonicalLaunchVarValue::String("safe\r".into()),
-        "invalid launch variable \"mode\"; must not contain NUL or newline",
+        "invalid launch variable \"mode\"; must not contain NUL, LF, or CR",
     );
     assert_coercion_error(
         "count",

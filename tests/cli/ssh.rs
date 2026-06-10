@@ -95,6 +95,10 @@ fn ssh_dispatch_rejects_host_side_transfer_commands_when_policy_disallows_them()
         "true && scp -t /tmp/file",
         "printf hi | scp -t /tmp/file",
         "x=$(scp -t /tmp/file)",
+        "x=1 scp -t /tmp/file",
+        "command scp -t /tmp/file",
+        "exec scp -t /tmp/file",
+        "env /usr/libexec/openssh/sftp-server",
     ] {
         Command::cargo_bin("aw-gateway")
             .unwrap()

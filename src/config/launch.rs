@@ -436,7 +436,7 @@ impl LaunchVarConfig {
 
 pub(crate) fn validate_launch_var_string_value(value: &str) -> Result<(), &'static str> {
     if value.contains('\0') || value.contains('\n') || value.contains('\r') {
-        Err("must not contain NUL or newline")
+        Err("must not contain NUL, LF, or CR")
     } else {
         Ok(())
     }

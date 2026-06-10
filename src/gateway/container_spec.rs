@@ -120,6 +120,8 @@ impl Runtime {
             );
         }
         env.extend(self.render_env_map(&self.target.container_env)?);
+        validate_bind_mount_path("workspace path", &self.paths.workspace)?;
+        validate_bind_mount_path("container_home", &self.identity.container_home)?;
         let command = if self.agent_enabled() {
             if self.target.container_bootstrap.enabled {
                 vec![
@@ -374,6 +376,14 @@ fn render_container_mounts(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    validate_bind_mount_path(
+        "control socket host directory",
+        &inputs.control_socket_host_dir,
+    )?;
+    validate_bind_mount_path(
+        "control socket container directory",
+        &inputs.control_socket_container_dir,
+    )?;
     mounts.push(ContainerMountSpec {
         source: inputs.control_socket_host_dir,
         target: inputs.control_socket_container_dir,

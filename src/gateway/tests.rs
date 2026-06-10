@@ -2089,7 +2089,7 @@ mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("invalid launch variable \"repo\"; must not contain NUL or newline"),
+        err.contains("invalid launch variable \"repo\"; must not contain NUL, LF, or CR"),
         "{err}"
     );
 
@@ -4245,6 +4245,29 @@ fn container_mounts_reject_separator_paths_and_relative_targets() {
         .container_mounts
         .push(crate::config::ContainerMountConfig {
             source: good_source.display().to_string(),
+            target: "/opt/bad,target".into(),
+            mode: ContainerMountMode::Ro,
+        });
+    let target = cfg.effective_target("default").unwrap();
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+
+    let err = runtime.container_mounts().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("container mount target #0 must not contain ':' or ','"),
+        "{err:#}"
+    );
+
+    let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    cfg.target_defaults
+        .container_mounts
+        .push(crate::config::ContainerMountConfig {
+            source: good_source.display().to_string(),
             target: "relative-target".into(),
             mode: ContainerMountMode::Ro,
         });
@@ -4260,6 +4283,36 @@ fn container_mounts_reject_separator_paths_and_relative_targets() {
     assert!(
         err.to_string()
             .contains("container mount target #0 must render to an absolute path"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn generated_mounts_reject_separator_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let target = cfg.effective_target("default").unwrap();
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    let mut runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+
+    runtime.paths.control_sockets.container_dir = PathBuf::from("/run/aw-gateway/bad:image");
+    let err = runtime.container_mounts().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("control socket container directory must not contain ':' or ','"),
+        "{err:#}"
+    );
+
+    runtime.paths.control_sockets.container_dir = PathBuf::from("/run/aw-gateway");
+    runtime.paths.workspace = PathBuf::from("/tmp/bad:workspace");
+    let err = runtime.container_run_spec(None, None).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("workspace path must not contain ':' or ','"),
         "{err:#}"
     );
 }

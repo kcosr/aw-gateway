@@ -118,6 +118,7 @@ const CANCEL_MARKER_SWEEP_ARGV0: &str = "aw-gateway-marker-sweep";
 const CANCEL_MARKER_PATH_PREFIX: &str = "/tmp/aw-gateway-";
 const CANCEL_MARKER_PATH_SUFFIX: &str = ".pid";
 pub const MAX_CAPTURED_STREAM_BYTES: usize = 4 * 1024 * 1024;
+const EXEC_CAPTURE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 struct BoundedOutput {
     bytes: Vec<u8>,
@@ -485,10 +486,8 @@ fn run_pty_master_pump(
         };
         let mut buffer = [0_u8; 8192];
         loop {
-            while let Ok(size) = resize_rx.try_recv() {
-                if let Err(err) = master.resize(pty_size(size)) {
-                    tracing::warn!(error = %err, "pty resize failed");
-                }
+            if !drain_pty_resize_requests(master.as_ref(), &mut resize_rx) {
+                break;
             }
             match reader.read(&mut buffer) {
                 Ok(0) => break,
@@ -881,8 +880,14 @@ impl ContainerRuntime {
             None => child.wait().await,
         }
         .with_context(|| format!("run {} exec {}", self.runtime_label(), spec.container_name))?;
-        let stdout = stdout_task.await.context("join stdout drain task")??;
-        let stderr = stderr_task.await.context("join stderr drain task")??;
+        let (stdout, stderr) = drain_exec_capture_pipes(
+            stdout_task,
+            stderr_task,
+            timeout_duration.map(|_| EXEC_CAPTURE_DRAIN_TIMEOUT),
+            self.runtime_label(),
+            &spec.container_name,
+        )
+        .await?;
         Ok(ContainerExecOutput {
             exit_code: exit_code(status),
             stdout: stdout.bytes,
@@ -1239,9 +1244,9 @@ impl ContainerRuntime {
             args.push("--workdir".to_string());
             args.push(cwd.display().to_string());
         }
-        for key in spec.env.keys() {
+        for (key, value) in &spec.env {
             args.push("--env".to_string());
-            args.push(key.clone());
+            args.push(runtime_env_arg(key, value));
         }
         args.push(spec.container_name.clone());
         args.extend(spec.command.clone());
@@ -1344,9 +1349,9 @@ impl ContainerRuntime {
             args.push("-v".into());
             args.push("/etc/bashrc:/etc/bashrc:ro".into());
         }
-        for key in spec.env.keys() {
+        for (key, value) in &spec.env {
             args.push("-e".into());
-            args.push(key.clone());
+            args.push(runtime_env_arg(key, value));
         }
         for (key, value) in &spec.labels {
             args.push("--label".into());
@@ -1410,7 +1415,9 @@ impl ContainerRuntime {
 
 fn apply_command_env(command: &mut Command, env: &BTreeMap<String, String>) {
     for (key, value) in env {
-        command.env(key, value);
+        if runtime_env_can_passthrough_client_process(key) {
+            command.env(key, value);
+        }
     }
 }
 
@@ -1419,8 +1426,81 @@ fn apply_pty_command_env(
     env: &BTreeMap<String, String>,
 ) {
     for (key, value) in env {
-        command.env(key, value);
+        if runtime_env_can_passthrough_client_process(key) {
+            command.env(key, value);
+        }
     }
+}
+
+async fn drain_exec_capture_pipes(
+    stdout_task: JoinHandle<std::io::Result<BoundedOutput>>,
+    stderr_task: JoinHandle<std::io::Result<BoundedOutput>>,
+    timeout_duration: Option<Duration>,
+    runtime_label: &'static str,
+    container_name: &str,
+) -> anyhow::Result<(BoundedOutput, BoundedOutput)> {
+    let stdout_abort = stdout_task.abort_handle();
+    let stderr_abort = stderr_task.abort_handle();
+    let drain = async move {
+        let stdout = stdout_task.await.context("join stdout drain task")??;
+        let stderr = stderr_task.await.context("join stderr drain task")??;
+        anyhow::Ok((stdout, stderr))
+    };
+    match timeout_duration {
+        Some(timeout_duration) => match tokio::time::timeout(timeout_duration, drain).await {
+            Ok(result) => result,
+            Err(_) => {
+                stdout_abort.abort();
+                stderr_abort.abort();
+                anyhow::bail!(
+                    "{runtime_label} exec {container_name} timed out draining captured output after {timeout_duration:?}"
+                );
+            }
+        },
+        None => drain.await,
+    }
+}
+
+fn runtime_env_arg(key: &str, value: &str) -> String {
+    if runtime_env_can_passthrough_client_process(key) {
+        key.to_string()
+    } else {
+        format!("{key}={value}")
+    }
+}
+
+fn runtime_env_can_passthrough_client_process(key: &str) -> bool {
+    !runtime_client_sensitive_env_key(key)
+}
+
+fn runtime_client_sensitive_env_key(key: &str) -> bool {
+    matches!(
+        key,
+        "PATH"
+            | "LD_PRELOAD"
+            | "LD_LIBRARY_PATH"
+            | "LD_AUDIT"
+            | "LD_DEBUG"
+            | "DYLD_INSERT_LIBRARIES"
+            | "DYLD_LIBRARY_PATH"
+            | "BASH_ENV"
+            | "ENV"
+            | "IFS"
+            | "TMPDIR"
+            | "TMP"
+            | "TEMP"
+            | "XDG_RUNTIME_DIR"
+            | "DOCKER_HOST"
+            | "DOCKER_CONTEXT"
+            | "DOCKER_CONFIG"
+            | "CONTAINER_HOST"
+            | "CONTAINERS_CONF"
+            | "CONTAINERS_REGISTRIES_CONF"
+            | "CONTAINERS_STORAGE_CONF"
+            | "REGISTRY_AUTH_FILE"
+            | "SSL_CERT_FILE"
+            | "SSL_CERT_DIR"
+    )
 }
 
 fn pty_size(size: ContainerPtySize) -> portable_pty::PtySize {
@@ -2418,6 +2498,52 @@ exit 0
         );
     }
 
+    #[test]
+    fn runtime_sensitive_env_values_do_not_passthrough_client_process_env() {
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::Podman,
+            program: "podman".into(),
+            env: BTreeMap::new(),
+        };
+        let spec = ContainerExecSpec {
+            stdin_tty: false,
+            stdout_tty: false,
+            user: "2450:100".into(),
+            cwd: None,
+            env: BTreeMap::from([
+                ("AW_SAFE".into(), "secret".into()),
+                ("PATH".into(), "/tmp/attacker".into()),
+                ("LD_PRELOAD".into(), "/tmp/libhook.so".into()),
+                ("DOCKER_HOST".into(), "tcp://example.test:2375".into()),
+            ]),
+            container_name: "ubuntu-dev".into(),
+            command: vec!["true".into()],
+        };
+
+        let args = runtime.exec_args(&spec);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--env" && pair[1] == "AW_SAFE")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--env" && pair[1] == "PATH=/tmp/attacker")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--env" && pair[1] == "LD_PRELOAD=/tmp/libhook.so")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--env" && pair[1] == "DOCKER_HOST=tcp://example.test:2375")
+        );
+
+        assert!(runtime_env_can_passthrough_client_process("AW_SAFE"));
+        assert!(!runtime_env_can_passthrough_client_process("PATH"));
+        assert!(!runtime_env_can_passthrough_client_process("LD_PRELOAD"));
+        assert!(!runtime_env_can_passthrough_client_process("DOCKER_HOST"));
+    }
+
     #[tokio::test]
     async fn exec_with_timeout_reports_timeout() {
         let dir = tempfile::tempdir().unwrap();
@@ -2487,6 +2613,45 @@ exit 0
         assert_eq!(output.stdout, b"done\n");
         assert!(!output.stdout_truncated);
         assert!(!output.stderr_truncated);
+    }
+
+    #[tokio::test]
+    async fn exec_capture_with_timeout_bounds_pipe_drain_after_child_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-runtime");
+        std::fs::write(
+            &runtime_program,
+            "#!/bin/sh\nif [ \"$1\" = exec ]; then (sleep 5) & echo done; exit 0; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::Podman,
+            program: runtime_program.display().to_string(),
+            env: BTreeMap::new(),
+        };
+        let spec = ContainerExecSpec {
+            stdin_tty: false,
+            stdout_tty: false,
+            user: "2450:100".into(),
+            cwd: None,
+            env: BTreeMap::new(),
+            container_name: "ubuntu-dev".into(),
+            command: vec!["pipe-holder".into()],
+        };
+
+        let started = std::time::Instant::now();
+        let err = runtime
+            .exec_capture_with_timeout(&spec, Some(Duration::from_secs(5)))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("timed out draining captured output"),
+            "{err:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[tokio::test]

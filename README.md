@@ -757,7 +757,10 @@ Gateway configs commonly include:
 - `[[target_defaults.container_mounts]]` and `[[targets.<name>.container_mounts]]`: extra
   host-to-container bind mounts, typically read-only bootstrap
   binaries/configs/certs. Each mount uses `source`, `target`, and `mode`
-  (`"ro"` or `"rw"`).
+  (`"ro"` or `"rw"`). Rendered mount sources and targets must not contain `:`
+  or `,`, targets must be absolute paths, and read-write mount sources must not
+  resolve to world-writable paths. The generated workspace and control-socket
+  mounts use the same separator checks.
 - `[target_defaults.container_bootstrap]`: optional bootstrap entrypoint configuration and
   pre-agent container bootstrap steps. Targets may overlay
   `[targets.<name>.container_bootstrap]` field-by-field.
@@ -853,11 +856,13 @@ intentionally want host-process values to override the container-oriented
 defaults. Inherited values must be valid UTF-8; values that are present but not
 valid UTF-8 are skipped with a warning.
 
-Runtime exec env is passed to Podman, Docker, or Colima as runtime arguments,
-so inherited values can be visible in host process listings on standard Linux
-systems. Do not use `session_env_inherit` as the normal transport for personal
-access tokens, bearer tokens, identity tokens, or other high-value secrets until
-a non-argv secret transport is available.
+Runtime exec env values are normally supplied through the spawned Podman,
+Docker, or Colima process environment while only the env names appear on runtime
+argv. Env names that can alter the host-side runtime client itself, such as
+`PATH`, `LD_PRELOAD`, `DOCKER_HOST`, and related loader/runtime configuration
+keys, are passed as explicit `KEY=value` runtime arguments instead of being set
+on the client process environment. Avoid using those host-sensitive names for
+high-value secrets because their values can be visible in host process listings.
 
 Container SSH transfer policy is independent for SFTP and legacy SCP:
 
@@ -888,11 +893,13 @@ bidirectional protocol channel rather than separate upload/download server
 commands.
 
 Container-side `aw-ssh-command-filter` implements the SFTP exec-form and legacy
-SCP checks. When either transfer mode is restrictive, commands containing shell
-control syntax such as `;`, `&&`, pipes, redirection, command substitution, or
-newlines are rejected before the shell runs them. Install or mount the binary
-alongside the agent whenever transfer policy may deny or direction-limit file
-transfer.
+SCP checks. When either transfer mode is restrictive, commands containing raw
+shell-control bytes (`;`, `|`, `&`, `<`, `>`, `(`, `)`, `` ` ``, `$`, LF, or
+CR), shell assignment prefixes such as `NAME=value command`, or wrapper
+commands such as `command`, `env`, or `exec` are rejected before the shell runs
+them. Quoting does not exempt those bytes because the check runs before shell
+evaluation. Install or mount the binary alongside the agent whenever transfer
+policy may deny or direction-limit file transfer.
 
 `target_defaults.container_ssh.transfer` only applies to traffic that
 traverses the container SSHD. Gateway actions such as `run` execute through the
@@ -1103,7 +1110,7 @@ Caller variables are referenced only as `{var.<name>}`. Built-ins such as
 `{container_name}` remain unprefixed. Unknown variables fail config
 validation, and unprefixed caller variables such as `{repo}` are rejected.
 String launch variables supplied by callers, string defaults, and enum values
-must not contain NUL or newline characters.
+must not contain NUL, LF, or CR characters.
 
 Treat `{var.*}` values as untrusted caller input when rendering host-side launch
 step `command`, `cwd`, or `env` fields. Avoid mapping caller strings into
@@ -1626,7 +1633,7 @@ HTTP 201 with a short-lived single-use attach lease:
 
 For fixed targets, `session_id` is `null`.
 
-The POST is the authorized `run` or `launch` action and may block while the
+The POST is the authorized `run` or `launch-run` action and may block while the
 target becomes ready and launch steps run. The client then opens the WebSocket
 attach URL and sends the first text frame as `{"type":"auth","token":"..."}`.
 The attach token is a one-time lease-scoped capability; bearer headers are not

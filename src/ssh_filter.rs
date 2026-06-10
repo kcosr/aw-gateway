@@ -58,7 +58,7 @@ pub fn decide_command(
     if !policy.sftp.allows() && is_sftp_server_command(command) {
         return SshCommandDecision::RejectSftp;
     }
-    if policy_is_restrictive(policy) && contains_shell_control_syntax(command) {
+    if policy_is_restrictive(policy) && contains_restricted_shell_invocation(command) {
         return SshCommandDecision::RejectShellComposition;
     }
 
@@ -69,6 +69,10 @@ pub fn policy_is_restrictive(policy: &SshCommandFilterPolicy) -> bool {
     !policy.sftp.allows() || policy.legacy_scp != LegacyScpTransferMode::Allow
 }
 
+fn contains_restricted_shell_invocation(command: &str) -> bool {
+    contains_shell_control_syntax(command) || uses_shell_prefix_or_wrapper(command)
+}
+
 fn contains_shell_control_syntax(command: &str) -> bool {
     command.bytes().any(|byte| {
         matches!(
@@ -76,6 +80,32 @@ fn contains_shell_control_syntax(command: &str) -> bool {
             b';' | b'|' | b'&' | b'<' | b'>' | b'(' | b')' | b'`' | b'$' | b'\n' | b'\r'
         )
     })
+}
+
+fn uses_shell_prefix_or_wrapper(command: &str) -> bool {
+    let Ok(words) = shell_words::split(command) else {
+        return false;
+    };
+    let Some(first) = words.first() else {
+        return false;
+    };
+    is_assignment_prefix(first)
+        || matches!(
+            path_basename(first),
+            "command" | "env" | "exec" | "nohup" | "time"
+        )
+}
+
+fn is_assignment_prefix(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 pub fn is_legacy_scp_server_command(command: &str) -> bool {
@@ -324,6 +354,10 @@ mod tests {
                 "printf hi | scp -t /tmp/file",
                 "x=$(scp -t /tmp/file)",
                 "echo `scp -t /tmp/file`",
+                "x=1 scp -t /tmp/file",
+                "command scp -t /tmp/file",
+                "exec scp -t /tmp/file",
+                "env /usr/libexec/openssh/sftp-server",
             ] {
                 assert_eq!(
                     decide_command(&policy, Some(command)),

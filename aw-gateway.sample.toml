@@ -44,5 +44,6 @@ mode = "fixed"
 name = "{image_slug}"
 # Optional allow-list of non-secret aw-gateway process environment variables
 # copied into gateway-managed command execution. Do not use this for tokens or
-# other high-value secrets while runtime exec env is argv-backed.
+# other high-value secrets with host-sensitive env names such as PATH,
+# LD_PRELOAD, or DOCKER_HOST because those values are passed as runtime argv.
 # session_env_inherit = ["GIT_ASKPASS", "GIT_TERMINAL_PROMPT"]

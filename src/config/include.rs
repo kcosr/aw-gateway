@@ -151,6 +151,21 @@ fn reject_unknown_include_fields(value: &Value, path: &Path) -> anyhow::Result<(
             anyhow::bail!("include {} contains unknown field {key:?}", path.display());
         }
     }
+    for key in [
+        "target_templates",
+        "launch_templates",
+        "targets",
+        "launches",
+    ] {
+        if let Some(value) = table.get(key)
+            && !value.is_table()
+        {
+            anyhow::bail!(
+                "include {} field {key:?} must be a TOML table",
+                path.display()
+            );
+        }
+    }
     Ok(())
 }
 
