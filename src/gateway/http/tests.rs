@@ -211,7 +211,7 @@ schema_version = "1"
 [http]
 enabled = true
 listen = "127.0.0.1:0"
-enabled_actions = ["status", "targets", "launches", "run", "launch", "up", "stop", "remove"]
+enabled_actions = ["status", "targets", "launches", "run", "launch", "launch-run", "up", "stop", "remove"]
 
 [runtime]
 type = "podman"
@@ -908,6 +908,28 @@ async fn route_auth_and_disabled_action_return_json_errors() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn launch_show_and_run_use_separate_http_actions() {
+    let state = test_state(HttpConfig {
+        enabled: true,
+        listen: "127.0.0.1:0".into(),
+        enabled_actions: vec!["launch".into()],
+        auth: HttpAuthConfig::default(),
+    });
+
+    authorize_action(&state, &HeaderMap::new(), "launch")
+        .await
+        .unwrap();
+    let response = authorize_action(&state, &HeaderMap::new(), "launch-run")
+        .await
+        .unwrap_err();
+    let ActionAuthorizationError::Operation(OperationError::DisabledAction { message }) = response
+    else {
+        panic!("expected disabled-action operation error");
+    };
+    assert_eq!(message, "http action \"launch-run\" is disabled");
 }
 
 #[tokio::test]

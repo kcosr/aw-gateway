@@ -35,6 +35,7 @@ enabled_actions = [
   "run",
   "launches",
   "launch",
+  "launch-run",
   "status",
   "targets",
   "stop",

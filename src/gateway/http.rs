@@ -489,7 +489,7 @@ async fn launch_run(
     Path(name): Path<String>,
     body: Bytes,
 ) -> Response {
-    let request: LaunchRunRequest = match authorize_action(&state, &headers, "launch").await {
+    let request: LaunchRunRequest = match authorize_action(&state, &headers, "launch-run").await {
         Ok(()) => match parse_body(&body, ErrorCode::InvalidLaunchVar) {
             Ok(request) => request,
             Err(err) => return err.into_response(),

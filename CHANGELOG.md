@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Launch execution now requires `launch-run` in `ssh_dispatch.enabled_actions`
+  or `http.enabled_actions`; `launch` only permits inspecting one launch
+  definition.
+
 ### Changed
 
 - Restrictive container SSH transfer policies now install the command filter
