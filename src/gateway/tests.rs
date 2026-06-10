@@ -4189,6 +4189,22 @@ fn detects_current_process_session_marker_as_active() {
 }
 
 #[test]
+fn detects_current_process_session_marker_as_active_with_empty_start_time() {
+    let marker = SessionMarker {
+        id: "test".into(),
+        kind: "connect".into(),
+        gateway_pid: std::process::id(),
+        gateway_start_time: String::new(),
+        container: "ubuntu-dev".into(),
+        target: "default".into(),
+        launch: None,
+        context: BTreeMap::new(),
+        created_at_ms: 0,
+    };
+    assert!(session_marker_is_active(&marker));
+}
+
+#[test]
 fn session_marker_launch_round_trips_and_none_serializes_as_null() {
     let marker = SessionMarker {
         id: "test".into(),
@@ -4214,7 +4230,7 @@ fn session_marker_launch_round_trips_and_none_serializes_as_null() {
 }
 
 #[test]
-fn session_marker_requires_launch_field() {
+fn session_marker_without_launch_field_reads_as_none() {
     let raw = r#"
 {
   "id": "test",
@@ -4226,7 +4242,8 @@ fn session_marker_requires_launch_field() {
   "created_at_ms": 789
 }
 "#;
-    serde_json::from_str::<SessionMarker>(raw).unwrap_err();
+    let parsed = serde_json::from_str::<SessionMarker>(raw).unwrap();
+    assert_eq!(parsed.launch, None);
 }
 
 #[test]

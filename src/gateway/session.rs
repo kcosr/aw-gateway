@@ -53,7 +53,8 @@ impl Runtime {
             id,
             kind: kind.to_string(),
             gateway_pid: std::process::id(),
-            gateway_start_time: process_start_time(std::process::id()).unwrap_or_default(),
+            gateway_start_time: process_start_time(std::process::id())
+                .context("read current gateway process start time")?,
             container: self.identity.container_name.clone(),
             target: self.identity.target_name.clone(),
             launch: launch.map(str::to_string),
@@ -298,18 +299,19 @@ pub(super) fn read_session_marker(path: &Path) -> anyhow::Result<SessionMarker> 
 }
 
 pub(super) fn session_marker_is_active(marker: &SessionMarker) -> bool {
-    process_start_time(marker.gateway_pid).is_ok_and(|start_time| {
-        !marker.gateway_start_time.is_empty() && start_time == marker.gateway_start_time
-    })
+    gateway_record_is_active(marker.gateway_pid, &marker.gateway_start_time)
 }
 
 pub(super) fn local_listener_is_active(status: &LocalListenerStatus) -> bool {
-    if status.gateway_pid == std::process::id() {
+    gateway_record_is_active(status.gateway_pid, &status.gateway_start_time)
+}
+
+fn gateway_record_is_active(gateway_pid: u32, gateway_start_time: &str) -> bool {
+    if gateway_pid == std::process::id() {
         return true;
     }
-    process_start_time(status.gateway_pid).is_ok_and(|start_time| {
-        !status.gateway_start_time.is_empty() && start_time == status.gateway_start_time
-    })
+    process_start_time(gateway_pid)
+        .is_ok_and(|start_time| !gateway_start_time.is_empty() && start_time == gateway_start_time)
 }
 
 #[cfg(test)]

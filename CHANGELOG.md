@@ -33,6 +33,8 @@
   values in `podman`/`docker` argv.
 - In-container cancel marker files for cancelable exec/PTY sessions are now
   created with owner-only permissions.
+- Session marker reads now tolerate pre-launch-field marker JSON, and marker
+  liveness checks use the same self-process fast path as listener status.
 
 ## [0.6.0] - 2026-06-10
 

@@ -167,7 +167,7 @@ pub(super) struct SessionMarker {
     pub(super) gateway_start_time: String,
     pub(super) container: String,
     pub(super) target: String,
-    #[serde(deserialize_with = "deserialize_required_optional_string")]
+    #[serde(default, deserialize_with = "deserialize_required_optional_string")]
     pub(super) launch: Option<String>,
     #[serde(default)]
     pub(super) context: BTreeMap<String, String>,
