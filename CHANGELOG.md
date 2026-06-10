@@ -42,6 +42,8 @@
   cleanup cannot stop a container after a new session has registered.
 - Session marker creation and active-marker enumeration in async gateway paths
   now run on the blocking task pool instead of on async worker threads.
+- Container startup now resolves configured bind mounts once and reuses the
+  checked mount set for safety warnings and the runtime run spec.
 - Local SSH listener startup now serializes status-file checks and writes with
   the lifecycle lock, and transient accept errors no longer terminate the
   listener.
