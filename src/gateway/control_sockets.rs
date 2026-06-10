@@ -2,7 +2,7 @@ use super::{ControlSocketPaths, Runtime, UNIX_SOCKET_PATH_MAX_BYTES};
 use crate::config::{
     AGENT_SCHEMA_VERSION, BootstrapIdentity, ContainerAgentFile, ContainerBootstrapFile,
     ControlSocketConfig, ControlSocketsConfig, IdleCleanupAction, IdleCleanupOwner, LoggingConfig,
-    RenderedContainerBootstrapStep, TargetConfig, validate_name,
+    RenderedContainerBootstrapStep, TargetConfig, default_control_socket_host_dir, validate_name,
 };
 use crate::context::RuntimeContext;
 use crate::fileutil::{AtomicWritePolicy, atomic_write_toml, write_private_file};
@@ -592,7 +592,7 @@ pub(super) fn render_control_socket_paths(
         host_ssh_socket: host_dir.join("ssh.sock"),
         container_agent_socket: container_dir.join("agent.sock"),
         container_ssh_socket: container_dir.join("ssh.sock"),
-        default_host_dir: cfg.host_dir == "/run/user/{uid}/aw-gateway/{runtime_id}",
+        default_host_dir: cfg.host_dir == default_control_socket_host_dir(),
         host_dir,
         container_dir,
     })

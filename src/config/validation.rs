@@ -593,7 +593,7 @@ pub(super) fn default_workspace_state_dir() -> String {
     ".aw-gateway".into()
 }
 
-pub(super) fn default_control_socket_host_dir() -> String {
+pub(crate) fn default_control_socket_host_dir() -> String {
     "/run/user/{uid}/aw-gateway/{runtime_id}".into()
 }
 

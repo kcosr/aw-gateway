@@ -3377,6 +3377,36 @@ name = "{{image_slug}}"
 }
 
 #[test]
+fn rendered_default_control_socket_host_dir_is_marked_default() {
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let target = cfg.effective_target("default").unwrap();
+    let user = UserContext {
+        uid: 2450,
+        gid: 2450,
+        user: "alice".into(),
+        home: PathBuf::from("/home/alice"),
+    };
+
+    let paths = render_control_socket_paths(
+        &target.control_sockets,
+        &target,
+        "default",
+        "ubuntu-dev",
+        None,
+        "ubuntu-dev",
+        &user,
+        &RuntimeContext::empty(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        paths.host_dir,
+        PathBuf::from("/run/user/2450/aw-gateway/ubuntu-dev")
+    );
+    assert!(paths.default_host_dir);
+}
+
+#[test]
 fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
     let dir = tempfile::tempdir().unwrap();
     let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();

@@ -45,7 +45,9 @@ pub use target::{
 pub(crate) use validation::SERVICE_USER_TEMPLATE;
 pub use validation::parse_duration;
 use validation::*;
-pub(crate) use validation::{canonical_number_string, validate_name, validate_passwd_scalar};
+pub(crate) use validation::{
+    canonical_number_string, default_control_socket_host_dir, validate_name, validate_passwd_scalar,
+};
 
 pub const GATEWAY_SCHEMA_VERSION: &str = "1";
 pub const AGENT_SCHEMA_VERSION: &str = "1";
