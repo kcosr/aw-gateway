@@ -711,6 +711,9 @@ session_shell = "/bin/bash"
 
 Gateway configs commonly include:
 
+- Config identifiers such as target, launch, template, service, launch-var, and
+  runtime-profile names must start with an ASCII letter, number, or `_`, and
+  may then contain only ASCII letters, numbers, `.`, `-`, and `_`.
 - `[target_defaults]`: partial target-shaped defaults inherited by every
   target.
 - `[target_templates.<name>]`: reusable partial target-shaped templates that

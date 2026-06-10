@@ -340,13 +340,14 @@ pub(super) fn reject_template_use(field: &str, templates: &[String]) -> anyhow::
 
 pub(crate) fn validate_name(field: &str, value: &str) -> anyhow::Result<()> {
     if value.is_empty()
-        || value == "."
-        || value == ".."
+        || value.starts_with(['.', '-'])
         || !value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
     {
-        anyhow::bail!("{field} value {value:?} must contain only ASCII alnum, '.', '-', '_'");
+        anyhow::bail!(
+            "{field} value {value:?} must start with ASCII alnum or '_' and contain only ASCII alnum, '.', '-', '_'"
+        );
     }
     Ok(())
 }

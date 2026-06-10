@@ -634,7 +634,11 @@ cleanup = "always"
 fn path_segment_names_reject_dot_segments() {
     assert!(validate_name("target", ".").is_err());
     assert!(validate_name("target", "..").is_err());
+    assert!(validate_name("target", "...").is_err());
+    assert!(validate_name("target", ".hidden").is_err());
+    assert!(validate_name("target", "-flag").is_err());
     validate_name("target", "dev.shell-1").unwrap();
+    validate_name("target", "_dev.shell-1").unwrap();
 }
 
 #[test]
