@@ -31,6 +31,8 @@
 - Runtime-provided container and exec environment values are now passed through
   the spawned container-runtime process environment instead of embedding their
   values in `podman`/`docker` argv.
+- In-container cancel marker files for cancelable exec/PTY sessions are now
+  created with owner-only permissions.
 
 ## [0.6.0] - 2026-06-10
 

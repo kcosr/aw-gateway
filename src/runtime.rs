@@ -1461,7 +1461,8 @@ fn wrap_cancelable_command(
     let mut wrapped = vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
-        r#"printf "%s %s\n" "$$" "$2" > "$1"; shift 2; exec "$@""#.to_string(),
+        r#"( umask 077 && printf "%s %s\n" "$$" "$2" > "$1" ) || exit $?; shift 2; exec "$@""#
+            .to_string(),
         argv0.to_string(),
         marker.path.clone(),
         marker.token.clone(),
@@ -1909,6 +1910,7 @@ mod tests {
         assert_eq!(wrapped[4], marker.path.as_str());
         assert_eq!(wrapped[5], marker.token.as_str());
         assert_eq!(&wrapped[6..], command.as_slice());
+        assert!(wrapped[2].contains("umask 077"));
 
         let spec = ContainerExecSpec {
             stdin_tty: true,
