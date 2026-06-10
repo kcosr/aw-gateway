@@ -25,10 +25,8 @@ pub(crate) fn resolve_user_groups(user: &CStr, gid: u32) -> io::Result<Vec<libc:
             }
             return Ok(groups);
         }
-        if needed <= groups.len() {
-            return Err(io::Error::last_os_error());
-        }
-        groups.resize(needed, zero_group_list_entry());
+        let next_len = next_group_list_len(groups.len(), needed)?;
+        groups.resize(next_len, zero_group_list_entry());
     }
 }
 
@@ -110,9 +108,38 @@ fn zero_group_list_entry() -> GroupListEntry {
 }
 
 #[cfg(target_vendor = "apple")]
+fn next_group_list_len(current: usize, needed: usize) -> io::Result<usize> {
+    let max = apple_groups_max()?;
+    if current >= max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "group list exceeds NGROUPS_MAX",
+        ));
+    }
+    Ok(current.saturating_mul(2).max(needed).min(max))
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn next_group_list_len(current: usize, needed: usize) -> io::Result<usize> {
+    if needed <= current {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(needed)
+}
+
+#[cfg(target_vendor = "apple")]
+fn apple_groups_max() -> io::Result<usize> {
+    let value = unsafe { libc::sysconf(libc::_SC_NGROUPS_MAX) };
+    if value <= 0 {
+        return Ok(1024);
+    }
+    usize::try_from(value)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "NGROUPS_MAX out of range"))
+}
+
+#[cfg(target_vendor = "apple")]
 fn group_list_entry_to_gid_t(value: GroupListEntry) -> io::Result<libc::gid_t> {
-    libc::gid_t::try_from(value)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "group id out of range"))
+    Ok(value as libc::gid_t)
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -124,19 +151,34 @@ fn group_list_entry_to_gid_t(value: GroupListEntry) -> io::Result<libc::gid_t> {
 mod tests {
     use super::*;
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_vendor = "apple"))]
     #[test]
     fn initgroups_base_gid_uses_gid_t_cast() {
         let expected: libc::gid_t = 42;
         assert_eq!(initgroups_base_gid(42).unwrap(), expected);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(target_vendor = "apple")]
     #[test]
     fn initgroups_base_gid_rejects_c_int_overflow() {
         let err = initgroups_base_gid(u32::MAX).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(err.to_string(), "gid exceeds c_int");
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn apple_group_retry_grows_when_count_reports_current_capacity() {
+        assert!(next_group_list_len(1, 1).unwrap() > 1);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn apple_group_entries_preserve_negative_gid_bit_patterns() {
+        assert_eq!(
+            group_list_entry_to_gid_t(-2).unwrap(),
+            (-2_i32) as libc::gid_t
+        );
     }
 
     #[test]

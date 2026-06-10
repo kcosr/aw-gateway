@@ -1494,12 +1494,15 @@ fn runtime_client_sensitive_env_key(key: &str) -> bool {
             | "TEMP"
             | "XDG_RUNTIME_DIR"
             | "XDG_CONFIG_HOME"
+            | "XDG_DATA_HOME"
             | "DOCKER_HOST"
             | "DOCKER_CONTEXT"
             | "DOCKER_CONFIG"
             | "DOCKER_TLS_VERIFY"
             | "DOCKER_CERT_PATH"
             | "CONTAINER_HOST"
+            | "CONTAINER_CONNECTION"
+            | "CONTAINER_SSHKEY"
             | "CONTAINERS_CONF"
             | "CONTAINERS_REGISTRIES_CONF"
             | "CONTAINERS_STORAGE_CONF"
@@ -2521,10 +2524,13 @@ exit 0
                 ("PATH".into(), "/tmp/attacker".into()),
                 ("HOME".into(), "/tmp/home".into()),
                 ("XDG_CONFIG_HOME".into(), "/tmp/config".into()),
+                ("XDG_DATA_HOME".into(), "/tmp/data".into()),
                 ("LD_PRELOAD".into(), "/tmp/libhook.so".into()),
                 ("DOCKER_HOST".into(), "tcp://example.test:2375".into()),
                 ("DOCKER_TLS_VERIFY".into(), "0".into()),
                 ("DOCKER_CERT_PATH".into(), "/tmp/certs".into()),
+                ("CONTAINER_CONNECTION".into(), "attacker".into()),
+                ("CONTAINER_SSHKEY".into(), "/tmp/key".into()),
             ]),
             container_name: "ubuntu-dev".into(),
             command: vec!["true".into()],
@@ -2549,6 +2555,10 @@ exit 0
         );
         assert!(
             args.windows(2)
+                .any(|pair| pair[0] == "--env" && pair[1] == "XDG_DATA_HOME=/tmp/data")
+        );
+        assert!(
+            args.windows(2)
                 .any(|pair| pair[0] == "--env" && pair[1] == "LD_PRELOAD=/tmp/libhook.so")
         );
         assert!(
@@ -2563,6 +2573,14 @@ exit 0
             args.windows(2)
                 .any(|pair| pair[0] == "--env" && pair[1] == "DOCKER_CERT_PATH=/tmp/certs")
         );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--env" && pair[1] == "CONTAINER_CONNECTION=attacker")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--env" && pair[1] == "CONTAINER_SSHKEY=/tmp/key")
+        );
 
         assert!(runtime_env_can_passthrough_client_process("AW_SAFE"));
         assert!(!runtime_env_can_passthrough_client_process("PATH"));
@@ -2570,6 +2588,7 @@ exit 0
         assert!(!runtime_env_can_passthrough_client_process(
             "XDG_CONFIG_HOME"
         ));
+        assert!(!runtime_env_can_passthrough_client_process("XDG_DATA_HOME"));
         assert!(!runtime_env_can_passthrough_client_process("LD_PRELOAD"));
         assert!(!runtime_env_can_passthrough_client_process("DOCKER_HOST"));
         assert!(!runtime_env_can_passthrough_client_process(
@@ -2577,6 +2596,12 @@ exit 0
         ));
         assert!(!runtime_env_can_passthrough_client_process(
             "DOCKER_CERT_PATH"
+        ));
+        assert!(!runtime_env_can_passthrough_client_process(
+            "CONTAINER_CONNECTION"
+        ));
+        assert!(!runtime_env_can_passthrough_client_process(
+            "CONTAINER_SSHKEY"
         ));
     }
 
