@@ -505,6 +505,7 @@ pub enum HealthCheck {
     },
     Command {
         command: Vec<String>,
+        timeout: Option<String>,
     },
 }
 
@@ -538,14 +539,19 @@ impl HealthCheck {
                     parse_duration(value)?;
                 }
             }
-            HealthCheck::Command { command } => validate_command("health_check.command", command)?,
+            HealthCheck::Command { command, timeout } => {
+                validate_command("health_check.command", command)?;
+                if let Some(timeout) = timeout {
+                    parse_duration(timeout)?;
+                }
+            }
         }
         Ok(())
     }
 
     pub(super) fn validate_templates(&self, allowed: &[&str]) -> anyhow::Result<()> {
         match self {
-            HealthCheck::Command { command } => {
+            HealthCheck::Command { command, .. } => {
                 validate_command_templates("health_check.command", command, allowed)
             }
             HealthCheck::Http { url, .. } => validate_template("health_check.url", url, allowed),

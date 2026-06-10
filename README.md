@@ -931,7 +931,8 @@ per-step `timeout` when a hook legitimately needs more time. The timeout uses
 the same explicit units as other durations: `ms`, `s`, `m`, or `h`. Timed-out
 required hooks fail the operation after the child process is killed and reaped;
 timed-out optional hooks warn and continue. `host_steps.health_check` timeouts
-are separate from the host step command timeout.
+are separate from the host step command timeout and default to `5s` for command,
+TCP, and HTTP health checks.
 
 ```toml
 [[target_defaults.lifecycle_steps]]
@@ -950,6 +951,7 @@ command = ["/opt/site-policy/bin/network-policy", "add", "{container_pid}"]
 [target_defaults.host_steps.health_check]
 type = "command"
 command = ["/opt/site-policy/bin/network-policy", "check", "{container_pid}"]
+timeout = "5s"
 ```
 
 Common target behavior can also be factored into named

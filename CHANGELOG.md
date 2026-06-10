@@ -17,6 +17,8 @@
   constant-time comparison.
 - Container-agent startup now rejects malformed `AW_AUTHENTICATED_UID` /
   `AW_AUTHENTICATED_GID` values instead of silently disabling peer validation.
+- Command health checks now run with a configurable timeout, defaulting to
+  `5s`, and timed command stderr draining is bounded after process exit.
 
 ## [0.6.0] - 2026-06-10
 

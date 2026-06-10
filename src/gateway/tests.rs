@@ -4264,9 +4264,11 @@ async fn command_health_check_uses_exit_status() {
     let vars = Vars::new();
     let ok = HealthCheck::Command {
         command: vec!["/usr/bin/true".into()],
+        timeout: None,
     };
     let fail = HealthCheck::Command {
         command: vec!["/usr/bin/false".into()],
+        timeout: None,
     };
     assert!(run_health_check(&ok, &vars).await.is_ok());
     assert!(run_health_check(&fail, &vars).await.is_err());
@@ -4283,6 +4285,7 @@ async fn command_health_check_renders_variables() {
             "=".into(),
             "expected".into(),
         ],
+        timeout: None,
     };
     assert!(run_health_check(&check, &vars).await.is_ok());
 }
