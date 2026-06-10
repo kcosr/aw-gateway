@@ -637,9 +637,12 @@ where
                     )
                 })?,
             TargetStepPatchPosition::Append => result.len(),
-            TargetStepPatchPosition::ConflictingBeforeAfter => unreachable!(
-                "raw target step validation rejects patches with both before and after"
-            ),
+            TargetStepPatchPosition::ConflictingBeforeAfter => {
+                anyhow::bail!(
+                    "{list_name} {} sets both before and after",
+                    patch.key.label()
+                );
+            }
         };
         result.insert(insert_at, convert(entry, None)?);
         effective_keys.insert(insert_at, patch.key);
@@ -649,4 +652,42 @@ where
         anyhow::bail!("{list_name} contains duplicate effective keys");
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_target_step_patches_rejects_conflicting_before_after() {
+        let raw = vec![RawHostStep {
+            name: "firewall".into(),
+            enabled: true,
+            before: Some("setup".into()),
+            after: Some("cleanup".into()),
+            required: None,
+            command: Some(vec!["/bin/true".into()]),
+            health_check: None,
+            timeout: None,
+        }];
+
+        let err = merge_target_step_patches(
+            "host_steps",
+            Vec::<HostStep>::new(),
+            &raw,
+            |step| StepKey {
+                name: step.name.clone(),
+            },
+            |step| StepKey {
+                name: step.name.clone(),
+            },
+            |step, inherited| step.to_effective(inherited),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "host_steps firewall sets both before and after"
+        );
+    }
 }
