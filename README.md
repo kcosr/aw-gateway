@@ -1102,6 +1102,14 @@ Caller variables are referenced only as `{var.<name>}`. Built-ins such as
 `{workspace}`, `{container_home}`, `{session_id}`, `{target}`, and
 `{container_name}` remain unprefixed. Unknown variables fail config
 validation, and unprefixed caller variables such as `{repo}` are rejected.
+String launch variables supplied by callers, string defaults, and enum values
+must not contain NUL or newline characters.
+
+Treat `{var.*}` values as untrusted caller input when rendering host-side launch
+step `command`, `cwd`, or `env` fields. Avoid mapping caller strings into
+host-sensitive environment keys such as `PATH`, `LD_PRELOAD`, shell startup
+variables, or language loader paths unless the variable is constrained to a
+small configured enum.
 
 ```toml
 [launches.repo-shell]

@@ -20,6 +20,7 @@ pub use agent::{
     RestartPolicy, ServiceConfig, SshBridgeConfig, SshBridgeConfigInput,
 };
 pub use http::{HttpAuthConfig, HttpAuthType, HttpConfig};
+pub(crate) use launch::validate_launch_var_string_value;
 pub use launch::{
     LaunchConfig, LaunchConfigInput, LaunchStep, LaunchStepLocation, LaunchStepPhase,
     LaunchVarConfig, LaunchVarType, LaunchVarValue,

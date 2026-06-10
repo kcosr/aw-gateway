@@ -3045,6 +3045,45 @@ command = ["prep", "{var.repo}"]
 }
 
 #[test]
+fn launch_string_vars_reject_control_character_values() {
+    for (vars, expected) in [
+        (
+            r#"repo = { type = "string", default = "line\nbreak" }
+mode = { type = "enum", values = ["fast", "safe"], default = "fast" }"#,
+            "launch \"agent\" variable \"repo\" string default must not contain NUL or newline",
+        ),
+        (
+            r#"repo = { type = "string", default = "repo" }
+mode = { type = "enum", values = ["fast", "safe\r"], default = "fast" }"#,
+            "launch \"agent\" enum variable \"mode\" values must not contain NUL or newline",
+        ),
+    ] {
+        let toml = [
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.agent]
+target = "default"
+command = ["agent", "{var.repo}", "{var.mode}"]
+
+[launches.agent.vars]
+"#,
+            vars,
+        ]
+        .concat();
+        let cfg: GatewayConfig = toml::from_str(&toml).unwrap();
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains(expected), "{err}");
+    }
+}
+
+#[test]
 fn launch_defaults_overlay_into_effective_launch_shape() {
     let cfg: GatewayConfig = toml::from_str(
         r#"

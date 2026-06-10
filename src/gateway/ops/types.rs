@@ -373,7 +373,10 @@ impl CanonicalLaunchVarValue {
     ) -> OperationResult<Self> {
         match var.var_type {
             config::LaunchVarType::String => match self {
-                Self::String(value) => Ok(Self::String(value.clone())),
+                Self::String(value) => {
+                    validate_launch_var_string(name, value)?;
+                    Ok(Self::String(value.clone()))
+                }
                 _ => Err(OperationError::invalid_launch_variable(format!(
                     "invalid string launch variable {name:?}; expected string"
                 ))),
@@ -384,6 +387,7 @@ impl CanonicalLaunchVarValue {
                         "invalid enum launch variable {name:?}; expected string"
                     )));
                 };
+                validate_launch_var_string(name, value)?;
                 let values = var.values.as_deref().unwrap_or(&[]);
                 if values.iter().any(|allowed| allowed == value) {
                     Ok(Self::String(value.clone()))
@@ -431,6 +435,14 @@ impl CanonicalLaunchVarValue {
             Self::Boolean(value) => value.to_string(),
         }
     }
+}
+
+fn validate_launch_var_string(name: &str, value: &str) -> OperationResult<()> {
+    config::validate_launch_var_string_value(value).map_err(|reason| {
+        OperationError::invalid_launch_variable(format!(
+            "invalid launch variable {name:?}; {reason}"
+        ))
+    })
 }
 
 fn canonical_cli_number(raw: &str, parsed: f64) -> String {

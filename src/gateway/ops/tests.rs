@@ -145,10 +145,22 @@ fn canonical_launch_var_values_coerce_render_and_convert_defaults_for_config_typ
         "invalid string launch variable \"repo\"; expected string",
     );
     assert_coercion_error(
+        "repo",
+        launch_var_config(LaunchVarType::String, None),
+        CanonicalLaunchVarValue::String("line\nbreak".into()),
+        "invalid launch variable \"repo\"; must not contain NUL or newline",
+    );
+    assert_coercion_error(
         "mode",
         launch_var_config(LaunchVarType::Enum, Some(vec!["fast", "safe"])),
         CanonicalLaunchVarValue::Boolean(true),
         "invalid enum launch variable \"mode\"; expected string",
+    );
+    assert_coercion_error(
+        "mode",
+        launch_var_config(LaunchVarType::Enum, Some(vec!["fast", "safe"])),
+        CanonicalLaunchVarValue::String("safe\r".into()),
+        "invalid launch variable \"mode\"; must not contain NUL or newline",
     );
     assert_coercion_error(
         "count",

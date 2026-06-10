@@ -352,12 +352,17 @@ impl LaunchVarConfig {
         }
         match self.var_type {
             LaunchVarType::String => {
-                if let Some(default) = &self.default
-                    && !matches!(default, LaunchVarValue::String(_))
-                {
-                    anyhow::bail!(
-                        "launch {launch_name:?} variable {var_name:?} string default must be a TOML string"
-                    );
+                if let Some(default) = &self.default {
+                    let LaunchVarValue::String(default) = default else {
+                        anyhow::bail!(
+                            "launch {launch_name:?} variable {var_name:?} string default must be a TOML string"
+                        );
+                    };
+                    if let Err(reason) = validate_launch_var_string_value(default) {
+                        anyhow::bail!(
+                            "launch {launch_name:?} variable {var_name:?} string default {reason}"
+                        );
+                    }
                 }
             }
             LaunchVarType::Enum => {
@@ -375,6 +380,11 @@ impl LaunchVarConfig {
                     if value.is_empty() {
                         anyhow::bail!(
                             "launch {launch_name:?} enum variable {var_name:?} values must not include empty strings"
+                        );
+                    }
+                    if let Err(reason) = validate_launch_var_string_value(value) {
+                        anyhow::bail!(
+                            "launch {launch_name:?} enum variable {var_name:?} values {reason}"
                         );
                     }
                 }
@@ -420,6 +430,14 @@ impl LaunchVarConfig {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_launch_var_string_value(value: &str) -> Result<(), &'static str> {
+    if value.contains('\0') || value.contains('\n') || value.contains('\r') {
+        Err("must not contain NUL or newline")
+    } else {
         Ok(())
     }
 }

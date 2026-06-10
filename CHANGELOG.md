@@ -68,6 +68,9 @@
 - Target image references now reject malformed values such as leading flags,
   whitespace, empty path components, invalid tags, and invalid digests during
   config validation.
+- String launch variable values now reject NUL and newline characters, and the
+  launch documentation now calls out `{var.*}` values as untrusted when used in
+  host-side launch step environment values.
 - Include patterns now fail config loading when they match no files.
 - Root `extends` chains now fail config loading after 64 root config files.
 - Config identifiers such as target, launch, template, service, launch-var, and

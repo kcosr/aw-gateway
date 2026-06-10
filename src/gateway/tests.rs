@@ -2083,6 +2083,16 @@ mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
         .to_string();
     assert!(err.contains("invalid boolean launch variable"), "{err}");
 
+    let invalid_string =
+        SuppliedLaunchVars::from_cli_pairs(vec!["repo=line\nbreak".into()]).unwrap();
+    let err = resolve_launch_vars("agent", &launch, &invalid_string)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("invalid launch variable \"repo\"; must not contain NUL or newline"),
+        "{err}"
+    );
+
     let mut typed = SuppliedLaunchVars::default();
     typed
         .insert(
