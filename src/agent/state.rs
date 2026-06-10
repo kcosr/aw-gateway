@@ -63,10 +63,33 @@ pub(super) struct SocketOwner {
 }
 
 impl SocketOwner {
-    pub(super) fn from_env() -> Option<Self> {
-        let uid = std::env::var("AW_AUTHENTICATED_UID").ok()?.parse().ok()?;
-        let gid = std::env::var("AW_AUTHENTICATED_GID").ok()?.parse().ok()?;
-        Some(Self { uid, gid })
+    pub(super) fn from_env() -> anyhow::Result<Option<Self>> {
+        let uid = optional_env("AW_AUTHENTICATED_UID")?;
+        let gid = optional_env("AW_AUTHENTICATED_GID")?;
+        match (uid, gid) {
+            (None, None) => Ok(None),
+            (Some(uid), Some(gid)) => Ok(Some(Self {
+                uid: uid
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("AW_AUTHENTICATED_UID must be numeric"))?,
+                gid: gid
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("AW_AUTHENTICATED_GID must be numeric"))?,
+            })),
+            _ => {
+                anyhow::bail!("AW_AUTHENTICATED_UID and AW_AUTHENTICATED_GID must be set together")
+            }
+        }
+    }
+}
+
+fn optional_env(name: &str) -> anyhow::Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{name} must be valid Unicode")
+        }
     }
 }
 

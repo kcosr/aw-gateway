@@ -2,6 +2,7 @@ use crate::agent_control::{
     AuthRequirement, ControlEnvelope, ControlFailure, ControlRequest, ControlRequestId,
     ControlSuccess, DecodedControlEnvelope, ReapResult, SessionHoldResult, ShutdownResult,
 };
+use crate::secret::constant_time_eq;
 use anyhow::Context;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -205,8 +206,17 @@ pub(super) fn unauthorized_if_needed(
     if request.auth_requirement() == AuthRequirement::None {
         return None;
     }
-    let expected = state.control_token.as_deref()?;
-    if request.token() == Some(expected) {
+    let Some(expected) = state.control_token.as_deref() else {
+        return Some(ControlFailure::new(
+            id.clone(),
+            "unauthorized",
+            "control token is required",
+        ));
+    };
+    if request
+        .token()
+        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
+    {
         return None;
     }
     Some(ControlFailure::new(

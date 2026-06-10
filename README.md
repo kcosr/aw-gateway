@@ -503,7 +503,9 @@ The container agent supervises configured services, exposes the SSH bridge, and
 answers gateway control requests over a private Unix-domain control socket.
 Disabling the control socket is useful for published-port SSH backends, but it
 also removes agent-control readiness and mutating control requests through that
-socket.
+socket. Mutating control requests require `AW_CONTAINER_CONTROL_TOKEN`; if the
+control socket is enabled without that token, status remains available but
+shutdown, reap, and session-hold requests fail as unauthorized.
 Gateway-managed control and SSH bridge sockets live under target control socket
 config, not under durable workspace state. Before starting a container, the gateway
 checks the resolved host and in-container Unix socket paths and fails fast if
@@ -1742,10 +1744,11 @@ private state files:
 - `AW_IDENTITY_TOKEN`: generated or inherited by the gateway and exposed only
   to services that explicitly request it.
 - `AW_CONTAINER_CONTROL_TOKEN`: generated per container and passed only to the
-  container agent for mutating control-socket requests.
+  container agent for mutating control-socket requests. Mutating requests fail
+  closed when this token is absent.
 - `AW_AUTHENTICATED_UID` and `AW_AUTHENTICATED_GID`: authenticated host user
   identity used by the container agent for peer validation and service-user
-  handling.
+  handling. If either variable is present, both must be present and numeric.
 - `AW_CONTAINER_STATE_DIR`: in-container durable state path for generated agent
   config, logs, SSH policy snippets, and session data.
 - `AW_CONTAINER_AGENT_ALLOW_PROCESS_REAP=1`: enables actual process reaping;

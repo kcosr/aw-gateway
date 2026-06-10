@@ -2,10 +2,9 @@ use super::AppState;
 use super::response::{HttpError, operation_error_response};
 use crate::config::HttpAuthType;
 use crate::gateway::ops::OperationError;
+use crate::secret::constant_time_eq;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-
-const MAX_BEARER_TOKEN_BYTES: usize = 4096;
 
 pub(super) async fn authorize_action(
     state: &AppState,
@@ -79,17 +78,4 @@ async fn authorize_bearer(state: &AppState, headers: &HeaderMap) -> Result<(), H
         return Err(HttpError::unauthorized("unauthorized"));
     }
     Ok(())
-}
-
-pub(super) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() > MAX_BEARER_TOKEN_BYTES || right.len() > MAX_BEARER_TOKEN_BYTES {
-        return false;
-    }
-    let mut diff = left.len() ^ right.len();
-    for index in 0..MAX_BEARER_TOKEN_BYTES {
-        let left_byte = left.get(index).copied().unwrap_or_default();
-        let right_byte = right.get(index).copied().unwrap_or_default();
-        diff |= usize::from(left_byte ^ right_byte);
-    }
-    diff == 0
 }

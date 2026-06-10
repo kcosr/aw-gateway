@@ -64,7 +64,7 @@ async fn run_agent(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         .ssh_bridge
         .as_ref()
         .is_some_and(|bridge| bridge.enabled);
-    let socket_owner = SocketOwner::from_env();
+    let socket_owner = SocketOwner::from_env()?;
     let state = Arc::new(AgentState::new(
         state_dir.clone(),
         cfg.container_agent.idle_cleanup.clone(),
@@ -238,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn control_auth_helper_only_requires_configured_token_for_mutating_methods() {
+    fn control_auth_helper_requires_token_for_mutating_methods() {
         let no_token_state = AgentState::new(PathBuf::from("/tmp"), None, false, None, None);
         let token_state = AgentState::new(
             PathBuf::from("/tmp"),
@@ -258,9 +258,14 @@ mod tests {
             kind: Some("run".into()),
         });
 
-        assert!(unauthorized_if_needed(&no_token_state, &wrong_hold, &id).is_none());
         assert!(unauthorized_if_needed(&token_state, &status, &id).is_none());
         assert!(unauthorized_if_needed(&token_state, &correct_hold, &id).is_none());
+
+        let failure = unauthorized_if_needed(&no_token_state, &wrong_hold, &id).unwrap();
+        assert_eq!(failure.id, id);
+        assert!(!failure.ok);
+        assert_eq!(failure.error.code, "unauthorized");
+        assert_eq!(failure.error.message, "control token is required");
 
         let failure = unauthorized_if_needed(&token_state, &wrong_hold, &id).unwrap();
         assert_eq!(failure.id, id);

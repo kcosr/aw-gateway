@@ -12,6 +12,11 @@
   reported with `output_truncated`.
 - Enabled HTTP listeners now require bearer auth when `http.listen` is
   non-loopback.
+- Container-agent mutating control-socket methods now fail closed when no
+  control token is configured, and control-token checks use shared
+  constant-time comparison.
+- Container-agent startup now rejects malformed `AW_AUTHENTICATED_UID` /
+  `AW_AUTHENTICATED_GID` values instead of silently disabling peer validation.
 
 ## [0.6.0] - 2026-06-10
 

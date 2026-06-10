@@ -34,7 +34,8 @@ mod auth;
 mod output_projection;
 mod response;
 
-use auth::{authorize, authorize_action, constant_time_eq};
+use crate::secret::constant_time_eq;
+use auth::{authorize, authorize_action};
 use output_projection::{OutputFormat, OutputFormats};
 use response::{
     ErrorCode, HttpError, execution_response, metadata_result_response, operation_error_response,

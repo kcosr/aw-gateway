@@ -74,8 +74,9 @@ poll_interval = "30s"
     BufReader::new(stream).read_line(&mut line).unwrap();
     let response: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(response["id"], "2");
-    assert_eq!(response["ok"], true);
-    assert_eq!(response["result"]["dry_run"], true);
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "unauthorized");
+    assert_eq!(response["error"]["message"], "control token is required");
 
     child.kill().unwrap();
     let _ = child.wait();
@@ -210,6 +211,53 @@ poll_interval = "30s"
     );
     assert_eq!(response["ok"], true);
     assert_eq!(response["result"]["dry_run"], true);
+
+    child.kill().unwrap();
+    let _ = child.wait();
+}
+
+#[test]
+fn container_agent_rejects_mutating_control_methods_without_configured_token() {
+    let dir = tempdir().unwrap();
+    let control_socket = dir.path().join("agent.sock");
+    let state_dir = dir.path().join("state");
+    let config = dir.path().join("container-agent.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+
+[container_agent]
+control_socket = "{}"
+"#,
+            control_socket.display()
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::cargo_bin("aw-container-agent")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .env("AW_CONTAINER_STATE_DIR", &state_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    wait_for_path(&control_socket);
+
+    let response = control_request(&control_socket, br#"{"id":"status","method":"status"}"#);
+    assert_eq!(response["ok"], true);
+
+    let response = control_request(
+        &control_socket,
+        br#"{"id":"shutdown","method":"shutdown","params":{"reason":"test"}}"#,
+    );
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "unauthorized");
+    assert_eq!(response["error"]["message"], "control token is required");
 
     child.kill().unwrap();
     let _ = child.wait();

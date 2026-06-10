@@ -13,6 +13,7 @@ pub mod logging;
 pub mod paths;
 mod rotating_log;
 pub mod runtime;
+mod secret;
 pub mod ssh_dispatch;
 pub mod ssh_filter;
 pub mod template;
