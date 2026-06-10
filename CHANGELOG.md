@@ -60,6 +60,8 @@
 - Target image references now reject malformed values such as leading flags,
   whitespace, empty path components, invalid tags, and invalid digests during
   config validation.
+- `local_ssh.host` loopback validation now applies only when
+  `local_ssh.mode = "listen"`, matching the effective config rules.
 - Local SSH listener startup now serializes status-file checks and writes with
   the lifecycle lock, and transient accept errors no longer terminate the
   listener.

@@ -1060,6 +1060,40 @@ host = "127.0.0.1"
 }
 
 #[test]
+fn local_ssh_non_loopback_host_is_only_rejected_for_listen_mode() {
+    let cfg = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+mode = "proxy_command"
+host = "0.0.0.0"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    cfg.validate().unwrap();
+
+    let cfg = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+mode = "listen"
+host = "0.0.0.0"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("loopback-only"), "{err}");
+}
+
+#[test]
 fn env_value_requires_exactly_one_source() {
     let value = EnvValue {
         value: Some("a".into()),
