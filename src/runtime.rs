@@ -444,8 +444,7 @@ fn terminate_process_group_nonblocking(child_pid: u32) {
 
 #[cfg(unix)]
 fn signal_process_group(child_pid: u32, signal: libc::c_int) {
-    let pid = child_pid as libc::pid_t;
-    if pid > 1 {
+    if let Some(pid) = signalable_pid(child_pid) {
         unsafe {
             libc::kill(-pid, signal);
         }
@@ -454,12 +453,16 @@ fn signal_process_group(child_pid: u32, signal: libc::c_int) {
 
 #[cfg(unix)]
 fn signal_process(child_pid: u32, signal: libc::c_int) {
-    let pid = child_pid as libc::pid_t;
-    if pid > 1 {
+    if let Some(pid) = signalable_pid(child_pid) {
         unsafe {
             libc::kill(pid, signal);
         }
     }
+}
+
+#[cfg(unix)]
+fn signalable_pid(child_pid: u32) -> Option<libc::pid_t> {
+    libc::pid_t::try_from(child_pid).ok().filter(|pid| *pid > 1)
 }
 
 fn run_pty_master_pump(
@@ -1980,6 +1983,15 @@ mod tests {
     #[test]
     fn host_process_is_active_rejects_out_of_range_pid() {
         assert!(!host_process_is_active(u32::MAX));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signalable_pid_rejects_group_zero_one_and_out_of_range_pid() {
+        assert_eq!(signalable_pid(0), None);
+        assert_eq!(signalable_pid(1), None);
+        assert_eq!(signalable_pid(u32::MAX), None);
+        assert_eq!(signalable_pid(2), Some(2));
     }
 
     #[test]

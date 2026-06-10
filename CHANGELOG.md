@@ -31,6 +31,8 @@
 - Runtime-provided container and exec environment values are now passed through
   the spawned container-runtime process environment instead of embedding their
   values in `podman`/`docker` argv.
+- Runtime process signaling now uses checked PID conversions to avoid
+  out-of-range PID wraparound.
 - In-container cancel marker files for cancelable exec/PTY sessions are now
   created with owner-only permissions.
 - Session marker reads now tolerate pre-launch-field marker JSON, and marker
