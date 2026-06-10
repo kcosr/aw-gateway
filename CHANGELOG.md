@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added delegated runtime context declarations, CLI/HTTP context handoff,
+  context labels/session metadata, context-aware status output, and
+  fail-closed lifecycle filtering for scoped containers.
+
 ### Changed
 
 - Documented single-platform release archives and mixed host/container

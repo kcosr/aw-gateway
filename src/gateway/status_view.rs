@@ -1,5 +1,6 @@
 use super::model::{AllStatusEntry, SessionStatus};
 use crate::config::{GatewayConfig, TargetMode};
+use crate::context::context_from_labels;
 use crate::runtime::ManagedContainer;
 
 const UNKNOWN_STATUS_LABEL: &str = "unknown";
@@ -82,6 +83,7 @@ fn status_all_entry(cfg: &GatewayConfig, container: ManagedContainer) -> AllStat
         uid,
         image,
         container: container_name,
+        context: context_from_labels(&container.labels),
         status,
     }
 }

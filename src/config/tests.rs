@@ -8,6 +8,111 @@ fn sample_gateway_config_validates() {
 }
 
 #[test]
+fn context_vars_allow_declared_context_templates_in_gateway_owned_fields() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[context_vars.tenant]
+required = true
+format = "slug"
+description = "Tenant namespace"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}-{context.tenant}"
+
+[targets.default.workspace]
+path = "{home}/aw-gateway/{context.tenant}/{target}"
+state_dir = ".state-{context.tenant}"
+
+[targets.default.control_sockets]
+host_dir = "/tmp/aw-gateway/{context.tenant}/{runtime_id}"
+"#,
+    )
+    .unwrap();
+
+    cfg.validate().unwrap();
+}
+
+#[test]
+fn context_vars_reject_unknown_context_template_keys() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[context_vars.tenant]
+required = true
+format = "slug"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}-{context.workspace}"
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("context.workspace"), "{err}");
+}
+
+#[test]
+fn context_vars_are_not_allowed_in_launch_process_templates() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[context_vars.tenant]
+required = false
+format = "slug"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.agent]
+target = "default"
+command = ["agent", "{context.tenant}"]
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(
+        err.contains("unknown interpolation variable {context.tenant}"),
+        "{err}"
+    );
+}
+
+#[test]
+fn required_context_rejects_fixed_target_name_without_required_key() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[context_vars.tenant]
+required = true
+format = "slug"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(
+        err.contains("must reference required context key {context.tenant}"),
+        "{err}"
+    );
+}
+
+#[test]
 fn http_config_defaults_to_disabled_loopback_none_auth() {
     let cfg: GatewayConfig = toml::from_str(
         r#"

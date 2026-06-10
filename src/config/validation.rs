@@ -1,4 +1,5 @@
 use super::{LaunchStep, ServiceConfig};
+use crate::context::validate_context_slug;
 use crate::{action, template};
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet};
@@ -230,15 +231,23 @@ pub(super) fn validate_command_templates(
 #[derive(Debug, Clone, Copy)]
 pub(super) struct TemplatePolicy {
     allow_unbound_var_prefix: bool,
+    allow_unbound_context_prefix: bool,
 }
 
 impl TemplatePolicy {
     pub(super) const STRICT: Self = Self {
         allow_unbound_var_prefix: false,
+        allow_unbound_context_prefix: false,
     };
 
     pub(super) const ALLOW_UNBOUND_VAR_PREFIX: Self = Self {
         allow_unbound_var_prefix: true,
+        allow_unbound_context_prefix: false,
+    };
+
+    pub(super) const ALLOW_UNBOUND_CONTEXT_PREFIX: Self = Self {
+        allow_unbound_var_prefix: false,
+        allow_unbound_context_prefix: true,
     };
 }
 
@@ -257,6 +266,40 @@ pub(super) fn validate_template_with_policy(
         {
             validate_name("launch var", var_name).with_context(|| format!("validate {field}"))?;
             continue;
+        }
+        if policy.allow_unbound_context_prefix
+            && let Some(context_name) = key.strip_prefix("context.")
+        {
+            validate_context_slug(context_name).with_context(|| format!("validate {field}"))?;
+            continue;
+        }
+        return Err(anyhow::anyhow!(
+            "unknown interpolation variable {{{key}}} in {value:?}"
+        ))
+        .with_context(|| format!("validate {field}"));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_template_with_context<'a, I>(
+    field: &str,
+    value: &str,
+    allowed: &[&str],
+    context_keys: I,
+) -> anyhow::Result<()>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let allowed_context: BTreeSet<String> = context_keys.into_iter().cloned().collect();
+    for key in template::referenced_keys(value).with_context(|| format!("validate {field}"))? {
+        if allowed.contains(&key) {
+            continue;
+        }
+        if let Some(context_name) = key.strip_prefix("context.") {
+            validate_context_slug(context_name).with_context(|| format!("validate {field}"))?;
+            if allowed_context.contains(context_name) {
+                continue;
+            }
         }
         return Err(anyhow::anyhow!(
             "unknown interpolation variable {{{key}}} in {value:?}"

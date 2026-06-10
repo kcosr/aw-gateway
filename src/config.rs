@@ -1,4 +1,5 @@
 use crate::action;
+use crate::context::{ContextVarConfig, validate_context_var_declarations};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -68,6 +69,8 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub client_config: ClientConfig,
     #[serde(default)]
+    pub context_vars: BTreeMap<String, ContextVarConfig>,
+    #[serde(default)]
     pub target_defaults: TargetConfigInput,
     #[serde(default)]
     pub target_templates: BTreeMap<String, TargetConfigInput>,
@@ -99,6 +102,7 @@ impl GatewayConfig {
                 GATEWAY_SCHEMA_VERSION
             );
         }
+        validate_context_var_declarations(&self.context_vars)?;
         reject_template_use("target_defaults", &self.target_defaults.use_templates)?;
         self.target_defaults.validate_partial("target_defaults")?;
         for (name, template) in &self.target_templates {
@@ -148,13 +152,80 @@ impl GatewayConfig {
             "client_config.gateway_path",
             &self.client_config.gateway_path,
         )?;
-        self.logging
-            .validate_templates("logging", GATEWAY_LOGGING_TEMPLATE_VARS)?;
+        if let Some(directory) = &self.logging.directory {
+            self.validate_context_template(
+                "logging.directory",
+                directory,
+                GATEWAY_LOGGING_TEMPLATE_VARS,
+            )?;
+        }
         self.http.validate()?;
         let effective_targets = self.effective_targets()?;
+        self.validate_target_context_templates(&effective_targets)?;
+        self.validate_required_context_fixed_targets(&effective_targets)?;
         self.validate_launch_definitions(&effective_targets)?;
         self.validate_target_agent_compatibility(&effective_targets)?;
         self.ssh_dispatch.validate()?;
+        Ok(())
+    }
+
+    fn validate_context_template(
+        &self,
+        field: &str,
+        value: &str,
+        allowed: &[&str],
+    ) -> anyhow::Result<()> {
+        validate_template_with_context(field, value, allowed, self.context_vars.keys())
+    }
+
+    fn validate_target_context_templates(
+        &self,
+        targets: &BTreeMap<String, TargetConfig>,
+    ) -> anyhow::Result<()> {
+        self.target_defaults
+            .validate_context_templates("target_defaults", &self.context_vars)?;
+        for (name, template) in &self.target_templates {
+            template.validate_context_templates(
+                &format!("target_templates.{name}"),
+                &self.context_vars,
+            )?;
+        }
+        for (name, target) in targets {
+            target.validate_context_templates(name, &self.context_vars)?;
+        }
+        for (name, target) in &self.targets {
+            target.validate_context_templates(&format!("targets.{name}"), &self.context_vars)?;
+        }
+        Ok(())
+    }
+
+    fn validate_required_context_fixed_targets(
+        &self,
+        targets: &BTreeMap<String, TargetConfig>,
+    ) -> anyhow::Result<()> {
+        let required: Vec<&str> = self
+            .context_vars
+            .iter()
+            .filter_map(|(key, cfg)| cfg.required.then_some(key.as_str()))
+            .collect();
+        if required.is_empty() {
+            return Ok(());
+        }
+        for (name, target) in targets {
+            if target.mode != TargetMode::Fixed {
+                continue;
+            }
+            let pattern = target.name.as_deref().unwrap_or("{image_slug}");
+            let refs = crate::template::referenced_keys(pattern)?;
+            for key in &required {
+                let context_ref = format!("context.{key}");
+                if !refs.iter().any(|reference| reference == &context_ref) {
+                    anyhow::bail!(
+                        "fixed target {name:?} name must reference required context key {{{context_ref}}}"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

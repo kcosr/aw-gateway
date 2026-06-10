@@ -11,6 +11,7 @@ use crate::cli::{
     StopArgs, TargetsArgs,
 };
 use crate::config::{GatewayConfig, LaunchConfig, LocalSshMode};
+use crate::context::{RuntimeContext, validate_runtime_context};
 use crate::paths::{self, UserContext};
 use crate::runtime::ContainerRuntime;
 use anyhow::Context;
@@ -195,19 +196,29 @@ pub(super) async fn execute_gateway_operation(
     config_path: Option<PathBuf>,
     operation: GatewayOperation,
 ) -> OperationResult<GatewayOperationResult> {
+    execute_gateway_operation_with_context(config_path, operation, RuntimeContext::empty()).await
+}
+
+pub(super) async fn execute_gateway_operation_with_context(
+    config_path: Option<PathBuf>,
+    operation: GatewayOperation,
+    context: RuntimeContext,
+) -> OperationResult<GatewayOperationResult> {
     match operation {
         GatewayOperation::Targets => {
             let cfg = load_config(config_path)?;
-            Ok(GatewayOperationResult::Targets(target_entries(&cfg)?))
+            Ok(GatewayOperationResult::Targets(target_entries(
+                &cfg, &context,
+            )?))
         }
         GatewayOperation::Status { target, session_id } => Ok(GatewayOperationResult::Status(
-            operation_status(config_path, target, session_id).await?,
+            operation_status(config_path, target, session_id, context).await?,
         )),
         GatewayOperation::StatusAll => Ok(GatewayOperationResult::StatusAll(
-            operation_status_all(config_path).await?,
+            operation_status_all(config_path, context).await?,
         )),
         GatewayOperation::Up { target, session_id } => Ok(GatewayOperationResult::Up(
-            operation_up(config_path, target, session_id).await?,
+            operation_up(config_path, target, session_id, context).await?,
         )),
         GatewayOperation::Run {
             target,
@@ -216,7 +227,16 @@ pub(super) async fn execute_gateway_operation(
             command,
             options,
         } => Ok(GatewayOperationResult::Run(
-            operation_run(config_path, target, session_id, cwd, command, options).await?,
+            operation_run(
+                config_path,
+                target,
+                session_id,
+                cwd,
+                command,
+                options,
+                context,
+            )
+            .await?,
         )),
         GatewayOperation::Launches => {
             let cfg = load_config(config_path)?;
@@ -226,7 +246,7 @@ pub(super) async fn execute_gateway_operation(
             let cfg = load_config(config_path)?;
             let launch = lookup_launch(&cfg, &name)?;
             Ok(GatewayOperationResult::LaunchShow(launch_detail(
-                &cfg, &name, &launch,
+                &cfg, &name, &launch, &context,
             )?))
         }
         GatewayOperation::Launch {
@@ -238,14 +258,15 @@ pub(super) async fn execute_gateway_operation(
         } => {
             let cfg = load_config(config_path)?;
             Ok(GatewayOperationResult::Launch(
-                launch_execute_with_config(cfg, &name, session_id, vars, args, options).await?,
+                launch_execute_with_config(cfg, &name, session_id, vars, args, options, context)
+                    .await?,
             ))
         }
         GatewayOperation::Stop { target, session_id } => Ok(GatewayOperationResult::Stop(
-            operation_stop(config_path, target, session_id).await?,
+            operation_stop(config_path, target, session_id, context).await?,
         )),
         GatewayOperation::Remove { target, session_id } => Ok(GatewayOperationResult::Remove(
-            operation_remove(config_path, target, session_id).await?,
+            operation_remove(config_path, target, session_id, context).await?,
         )),
         GatewayOperation::SetDefault { target_or_image } => {
             Ok(GatewayOperationResult::DefaultSelection(
@@ -272,10 +293,11 @@ pub(super) async fn execute_gateway_operation(
     }
 }
 
-pub(super) async fn execute_gateway_operation_cancelable(
+pub(super) async fn execute_gateway_operation_cancelable_with_context(
     config_path: Option<PathBuf>,
     operation: GatewayOperation,
     cancel: CancellationToken,
+    context: RuntimeContext,
 ) -> OperationResult<GatewayOperationResult> {
     match operation {
         GatewayOperation::Run {
@@ -293,6 +315,7 @@ pub(super) async fn execute_gateway_operation_cancelable(
                 command,
                 options,
                 cancel,
+                context,
             )
             .await?,
         )),
@@ -306,12 +329,12 @@ pub(super) async fn execute_gateway_operation_cancelable(
             let cfg = load_config(config_path)?;
             Ok(GatewayOperationResult::Launch(
                 launch_execute_with_config_cancelable(
-                    cfg, &name, session_id, vars, args, options, cancel,
+                    cfg, &name, session_id, vars, args, options, cancel, context,
                 )
                 .await?,
             ))
         }
-        operation => execute_gateway_operation(config_path, operation).await,
+        operation => execute_gateway_operation_with_context(config_path, operation, context).await,
     }
 }
 
@@ -322,13 +345,17 @@ async fn operation_run(
     cwd: Option<String>,
     command: Vec<String>,
     options: OperationExecutionOptions,
+    context: RuntimeContext,
 ) -> OperationResult<ExecutionOutcome> {
-    let runtime = Runtime::load(config_path, target.as_deref(), session_id, true).await?;
+    let runtime =
+        Runtime::load_with_context(config_path, target.as_deref(), session_id, true, context)
+            .await?;
     run_container_command_with_runtime(runtime, cwd, command, options)
         .await
         .map_err(OperationError::operation_failed)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn operation_run_cancelable(
     config_path: Option<PathBuf>,
     target: Option<String>,
@@ -337,8 +364,11 @@ async fn operation_run_cancelable(
     command: Vec<String>,
     options: OperationExecutionOptions,
     cancel: CancellationToken,
+    context: RuntimeContext,
 ) -> OperationResult<ExecutionOutcome> {
-    let runtime = Runtime::load(config_path, target.as_deref(), session_id, true).await?;
+    let runtime =
+        Runtime::load_with_context(config_path, target.as_deref(), session_id, true, context)
+            .await?;
     OperationRunner::run_command(runtime, options, cwd, command)
         .run_cancelable(cancel)
         .await
@@ -397,8 +427,11 @@ async fn operation_up(
     config_path: Option<PathBuf>,
     target: Option<String>,
     session_id: Option<String>,
+    context: RuntimeContext,
 ) -> OperationResult<ReadyStatus> {
-    let runtime = Runtime::load(config_path, target.as_deref(), session_id, true).await?;
+    let runtime =
+        Runtime::load_with_context(config_path, target.as_deref(), session_id, true, context)
+            .await?;
     operation_up_with_runtime(runtime)
         .await
         .map_err(OperationError::operation_failed)
@@ -419,8 +452,11 @@ async fn operation_stop(
     config_path: Option<PathBuf>,
     target: Option<String>,
     session_id: Option<String>,
+    context: RuntimeContext,
 ) -> OperationResult<StopResult> {
-    let runtime = Runtime::load(config_path, target.as_deref(), session_id, false).await?;
+    let runtime =
+        Runtime::load_with_context(config_path, target.as_deref(), session_id, false, context)
+            .await?;
     let _lock = runtime.acquire_lifecycle_lock().await?;
     let Some(inspect) = runtime
         .container_runtime
@@ -432,6 +468,7 @@ async fn operation_stop(
             stopped: false,
         });
     };
+    runtime.validate_labels(&inspect)?;
     runtime.stop_inspected_container(&inspect).await?;
     Ok(StopResult {
         container: runtime.identity.container_name,
@@ -443,8 +480,11 @@ async fn operation_remove(
     config_path: Option<PathBuf>,
     target: Option<String>,
     session_id: Option<String>,
+    context: RuntimeContext,
 ) -> OperationResult<RemoveResult> {
-    let runtime = Runtime::load(config_path, target.as_deref(), session_id, false).await?;
+    let runtime =
+        Runtime::load_with_context(config_path, target.as_deref(), session_id, false, context)
+            .await?;
     let _lock = runtime.acquire_lifecycle_lock().await?;
     let Some(inspect) = runtime
         .container_runtime
@@ -452,7 +492,9 @@ async fn operation_remove(
         .await?
     else {
         runtime.cleanup_control_socket_dir();
-        runtime.apply_explicit_remove_workspace_cleanup().await;
+        if runtime.should_cleanup_absent_container_workspace() {
+            runtime.apply_explicit_remove_workspace_cleanup().await;
+        }
         return Ok(RemoveResult {
             container: runtime.identity.container_name,
             removed: false,
@@ -488,20 +530,27 @@ async fn operation_status(
     config_path: Option<PathBuf>,
     target: Option<String>,
     session_id: Option<String>,
+    context: RuntimeContext,
 ) -> OperationResult<GatewayStatus> {
-    let runtime = Runtime::load(config_path, target.as_deref(), session_id, false).await?;
+    let runtime =
+        Runtime::load_with_context(config_path, target.as_deref(), session_id, false, context)
+            .await?;
     runtime
         .status()
         .await
         .map_err(OperationError::operation_failed)
 }
 
-async fn operation_status_all(config_path: Option<PathBuf>) -> anyhow::Result<Vec<AllStatusEntry>> {
+async fn operation_status_all(
+    config_path: Option<PathBuf>,
+    context: RuntimeContext,
+) -> anyhow::Result<Vec<AllStatusEntry>> {
     let cfg = load_config(config_path)?;
+    validate_runtime_context(&cfg.context_vars, &context)?;
     let user = UserContext::current()?;
     let container_runtime = ContainerRuntime::from_config(&cfg.runtime, &user.user, &user.home)?;
     let containers = container_runtime
-        .list_managed_containers(&user.user, user.uid)
+        .list_managed_containers(&user.user, user.uid, &context)
         .await?;
     Ok(status_all_entries(&cfg, containers))
 }

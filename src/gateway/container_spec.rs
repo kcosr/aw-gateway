@@ -1,5 +1,6 @@
 use super::Runtime;
 use crate::config::{ContainerMountMode, LocalSshBackend, TargetMode};
+use crate::context::{context_from_labels, context_label_key};
 use crate::runtime::{self, ContainerInspect, ContainerMountSpec, ContainerRunSpec};
 use crate::template::{self, Vars};
 use anyhow::Context;
@@ -30,7 +31,7 @@ impl Runtime {
     }
 
     pub(super) fn validation_labels(&self) -> BTreeMap<String, String> {
-        BTreeMap::from([
+        let mut labels = BTreeMap::from([
             ("io.aw-gateway.gateway".into(), "true".into()),
             ("io.aw-gateway.user".into(), self.identity.user.user.clone()),
             (
@@ -45,11 +46,20 @@ impl Runtime {
                 "io.aw-gateway.container_id".into(),
                 self.identity.container_name.clone(),
             ),
-        ])
+        ]);
+        for (key, value) in self.context.as_map() {
+            labels.insert(context_label_key(key), value.clone());
+        }
+        labels
     }
 
     pub(super) fn validate_labels(&self, inspect: &ContainerInspect) -> anyhow::Result<()> {
-        runtime::validate_gateway_labels(inspect, &self.validation_labels())
+        runtime::validate_gateway_labels(inspect, &self.validation_labels())?;
+        let stored = context_from_labels(&inspect.config.labels);
+        if !self.context.matches_stored(&stored) {
+            anyhow::bail!("container context does not match supplied runtime context");
+        }
+        Ok(())
     }
 
     pub(super) async fn start_container(&self) -> anyhow::Result<()> {
@@ -187,6 +197,7 @@ impl Runtime {
         if let Some(session_id) = &self.identity.session_id {
             vars.insert("session_id".into(), session_id.clone());
         }
+        self.context.insert_template_vars(&mut vars);
         vars.insert("image".into(), self.target.image.clone());
         vars.insert(
             "image_slug".into(),

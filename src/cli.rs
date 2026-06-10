@@ -13,6 +13,12 @@ pub struct GatewayArgs {
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
+    #[arg(long, global = true)]
+    pub context: Vec<String>,
+
+    #[arg(long = "context-file", global = true)]
+    pub context_files: Vec<PathBuf>,
+
     #[arg(long, env = "AW_GATEWAY_LOG_LEVEL", global = true)]
     pub log_level: Option<String>,
 

@@ -9,6 +9,7 @@ use crate::config::{
     LocalSshMode, LocalSshReadiness, TargetConfig, TargetMode, validate_name,
     validate_passwd_scalar,
 };
+use crate::context::{RuntimeContext, parse_context_sources, validate_runtime_context};
 use crate::launch_args::{LaunchRunArgRole, LaunchRunArgs, parse_launch_run_args_from};
 use crate::paths::{self, UserContext};
 use crate::runtime::{
@@ -89,7 +90,8 @@ use ops::{
     CanonicalLaunchVarValue, ExecutionOutcome, GatewayOperation, GatewayOperationResult,
     LaunchPassthroughArgs, OperationError, OperationExecutionOptions, OperationMode,
     OperationResult, SshGatewayOperation, SshRenderOptions, SuppliedLaunchVars,
-    execute_gateway_operation, lookup_launch, operation_up_with_runtime,
+    execute_gateway_operation, execute_gateway_operation_with_context, lookup_launch,
+    operation_up_with_runtime,
 };
 use render::{
     render_default_selection, render_launch_detail, render_launches, render_remove_result,
@@ -137,16 +139,31 @@ use tokio::time::{Duration, sleep};
 use workspace::validate_workspace_cleanup_path;
 
 pub async fn run(args: GatewayArgs) -> anyhow::Result<()> {
+    let context = parse_context_sources(&args.context_files, &args.context)?;
+    run_with_context(args, context).await
+}
+
+pub async fn run_with_context(args: GatewayArgs, context: RuntimeContext) -> anyhow::Result<()> {
     match args.command {
         Some(GatewayCommand::Config(command)) => run_config(command, args.config).await,
-        Some(GatewayCommand::Connect(connect_args)) => connect(args.config, connect_args).await,
-        Some(GatewayCommand::Up(status)) => up(args.config, status).await,
-        Some(GatewayCommand::Run(run_args)) => run_container_command(args.config, run_args).await,
-        Some(GatewayCommand::Launch(launch_command)) => launch(args.config, launch_command).await,
-        Some(GatewayCommand::Launches(launches_args)) => launches(args.config, launches_args).await,
-        Some(GatewayCommand::Stop(stop_args)) => stop(args.config, stop_args).await,
-        Some(GatewayCommand::Remove(target_arg)) => remove(args.config, target_arg).await,
-        Some(GatewayCommand::Status(status_args)) => status(args.config, status_args).await,
+        Some(GatewayCommand::Connect(connect_args)) => {
+            connect(args.config, connect_args, context).await
+        }
+        Some(GatewayCommand::Up(status)) => up(args.config, status, context).await,
+        Some(GatewayCommand::Run(run_args)) => {
+            run_container_command(args.config, run_args, context).await
+        }
+        Some(GatewayCommand::Launch(launch_command)) => {
+            launch(args.config, launch_command, context).await
+        }
+        Some(GatewayCommand::Launches(launches_args)) => {
+            launches(args.config, launches_args, context).await
+        }
+        Some(GatewayCommand::Stop(stop_args)) => stop(args.config, stop_args, context).await,
+        Some(GatewayCommand::Remove(target_arg)) => remove(args.config, target_arg, context).await,
+        Some(GatewayCommand::Status(status_args)) => {
+            status(args.config, status_args, context).await
+        }
         Some(GatewayCommand::Targets(targets_args)) => targets(args.config, targets_args).await,
         Some(GatewayCommand::Http) => http_listener(args.config).await,
         Some(GatewayCommand::SetDefault(set_default_args)) => {
@@ -292,6 +309,7 @@ async fn dispatch_from_ssh(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                     cwd: None,
                     command: vec!["/usr/bin/bash".into()],
                 },
+                RuntimeContext::empty(),
             )
             .await
         }
@@ -304,6 +322,7 @@ async fn dispatch_from_ssh(config_path: Option<PathBuf>) -> anyhow::Result<()> {
                     cwd: None,
                     command: vec!["/usr/bin/bash".into(), "-lc".into(), command],
                 },
+                RuntimeContext::empty(),
             )
             .await
         }
@@ -330,6 +349,7 @@ async fn run_gateway_action(
                     target: action.target,
                     session_id: action.session_id,
                 },
+                RuntimeContext::empty(),
             )
             .await
         }
@@ -525,8 +545,19 @@ fn gateway_help_text(cfg: &GatewayConfig) -> String {
     lines.join("\n")
 }
 
-async fn connect(config_path: Option<PathBuf>, args: ConnectArgs) -> anyhow::Result<()> {
-    let runtime = Runtime::load(config_path, args.target.as_deref(), args.session_id, true).await?;
+async fn connect(
+    config_path: Option<PathBuf>,
+    args: ConnectArgs,
+    context: RuntimeContext,
+) -> anyhow::Result<()> {
+    let runtime = Runtime::load_with_context(
+        config_path,
+        args.target.as_deref(),
+        args.session_id,
+        true,
+        context,
+    )
+    .await?;
     runtime.ensure_ssh_endpoint_configured()?;
     let session = runtime.create_session_marker("connect")?;
     let proxy_result = async {
@@ -540,12 +571,17 @@ async fn connect(config_path: Option<PathBuf>, args: ConnectArgs) -> anyhow::Res
         .await
 }
 
-async fn up(config_path: Option<PathBuf>, status: UpArgs) -> anyhow::Result<()> {
-    let runtime = Runtime::load(
+async fn up(
+    config_path: Option<PathBuf>,
+    status: UpArgs,
+    context: RuntimeContext,
+) -> anyhow::Result<()> {
+    let runtime = Runtime::load_with_context(
         config_path,
         status.target.as_deref(),
         status.session_id,
         true,
+        context,
     )
     .await?;
     if let Some(local_ssh) = &runtime.target.local_ssh
@@ -575,9 +611,13 @@ async fn up(config_path: Option<PathBuf>, status: UpArgs) -> anyhow::Result<()> 
     render_up_result(ready)
 }
 
-async fn run_container_command(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()> {
+async fn run_container_command(
+    config_path: Option<PathBuf>,
+    args: RunArgs,
+    context: RuntimeContext,
+) -> anyhow::Result<()> {
     let operation = GatewayOperation::from_run_args(args)?;
-    let result = execute_gateway_operation(config_path, operation).await?;
+    let result = execute_gateway_operation_with_context(config_path, operation, context).await?;
     let GatewayOperationResult::Run(outcome) = result else {
         unreachable!("run operation returned a different result");
     };
@@ -697,9 +737,13 @@ async fn exec_container_command_with_cancel(
     }
 }
 
-async fn stop(config_path: Option<PathBuf>, args: StopArgs) -> anyhow::Result<()> {
+async fn stop(
+    config_path: Option<PathBuf>,
+    args: StopArgs,
+    context: RuntimeContext,
+) -> anyhow::Result<()> {
     let operation = GatewayOperation::from_stop_args(args);
-    let result = execute_gateway_operation(config_path, operation).await?;
+    let result = execute_gateway_operation_with_context(config_path, operation, context).await?;
     let GatewayOperationResult::Stop(result) = result else {
         unreachable!("stop operation returned a different result");
     };
@@ -707,9 +751,13 @@ async fn stop(config_path: Option<PathBuf>, args: StopArgs) -> anyhow::Result<()
     Ok(())
 }
 
-async fn remove(config_path: Option<PathBuf>, args: RemoveArgs) -> anyhow::Result<()> {
+async fn remove(
+    config_path: Option<PathBuf>,
+    args: RemoveArgs,
+    context: RuntimeContext,
+) -> anyhow::Result<()> {
     let operation = GatewayOperation::from_remove_args(args);
-    let result = execute_gateway_operation(config_path, operation).await?;
+    let result = execute_gateway_operation_with_context(config_path, operation, context).await?;
     let GatewayOperationResult::Remove(result) = result else {
         unreachable!("remove operation returned a different result");
     };
@@ -751,7 +799,11 @@ async fn client_config(config_path: Option<PathBuf>, args: ClientConfigArgs) -> 
     Ok(())
 }
 
-async fn status(config_path: Option<PathBuf>, status: StatusArg) -> anyhow::Result<()> {
+async fn status(
+    config_path: Option<PathBuf>,
+    status: StatusArg,
+    context: RuntimeContext,
+) -> anyhow::Result<()> {
     if status.all {
         if status.target.is_some() {
             anyhow::bail!("--all cannot be combined with a target");
@@ -760,7 +812,12 @@ async fn status(config_path: Option<PathBuf>, status: StatusArg) -> anyhow::Resu
             anyhow::bail!("--all cannot be combined with --session-id");
         }
         let json = status.json;
-        let result = execute_gateway_operation(config_path, GatewayOperation::StatusAll).await?;
+        let result = execute_gateway_operation_with_context(
+            config_path,
+            GatewayOperation::StatusAll,
+            context,
+        )
+        .await?;
         let GatewayOperationResult::StatusAll(entries) = result else {
             unreachable!("status-all operation returned a different result");
         };
@@ -768,7 +825,7 @@ async fn status(config_path: Option<PathBuf>, status: StatusArg) -> anyhow::Resu
     }
     let json = status.json;
     let operation = GatewayOperation::from_status_args(status);
-    let result = execute_gateway_operation(config_path, operation).await?;
+    let result = execute_gateway_operation_with_context(config_path, operation, context).await?;
     let GatewayOperationResult::Status(result) = result else {
         unreachable!("status operation returned a different result");
     };
@@ -785,19 +842,27 @@ async fn targets(config_path: Option<PathBuf>, args: TargetsArgs) -> anyhow::Res
     render_targets(entries, json)
 }
 
-async fn launches(config_path: Option<PathBuf>, args: LaunchesArgs) -> anyhow::Result<()> {
+async fn launches(
+    config_path: Option<PathBuf>,
+    args: LaunchesArgs,
+    context: RuntimeContext,
+) -> anyhow::Result<()> {
     let json = args.json;
     let operation = GatewayOperation::from_launches_args(args);
-    let result = execute_gateway_operation(config_path, operation).await?;
+    let result = execute_gateway_operation_with_context(config_path, operation, context).await?;
     let GatewayOperationResult::Launches(entries) = result else {
         unreachable!("launches operation returned a different result");
     };
     render_launches(entries, json)
 }
 
-async fn launch(config_path: Option<PathBuf>, command: LaunchCommand) -> anyhow::Result<()> {
+async fn launch(
+    config_path: Option<PathBuf>,
+    command: LaunchCommand,
+    context: RuntimeContext,
+) -> anyhow::Result<()> {
     match command {
-        LaunchCommand::Show(args) => launch_show(config_path, args).await,
+        LaunchCommand::Show(args) => launch_show(config_path, args, context).await,
         LaunchCommand::Run(raw) => {
             let parsed = parse_launch_run_args(raw)?;
             launch_execute(
@@ -806,6 +871,7 @@ async fn launch(config_path: Option<PathBuf>, command: LaunchCommand) -> anyhow:
                 parsed.session_id,
                 parsed.vars,
                 parsed.args,
+                context,
             )
             .await
         }
@@ -837,10 +903,11 @@ fn launch_arg_utf8_error(role: LaunchRunArgRole) -> &'static str {
 async fn launch_show(
     config_path: Option<PathBuf>,
     args: crate::cli::LaunchShowArgs,
+    context: RuntimeContext,
 ) -> anyhow::Result<()> {
     let json = args.json;
     let operation = GatewayOperation::from_launch_show_args(args);
-    let result = execute_gateway_operation(config_path, operation).await?;
+    let result = execute_gateway_operation_with_context(config_path, operation, context).await?;
     let GatewayOperationResult::LaunchShow(detail) = result else {
         unreachable!("launch-show operation returned a different result");
     };
@@ -853,12 +920,14 @@ async fn launch_execute(
     session_id: Option<String>,
     supplied: Vec<String>,
     args: Vec<String>,
+    context: RuntimeContext,
 ) -> anyhow::Result<()> {
     let supplied = SuppliedLaunchVars::from_cli_pairs(supplied)?;
     let args = LaunchPassthroughArgs::from_strings(args)?;
-    let result = execute_gateway_operation(
+    let result = execute_gateway_operation_with_context(
         config_path,
         GatewayOperation::launch_run(name.to_string(), session_id, supplied, args),
+        context,
     )
     .await?;
     let GatewayOperationResult::Launch(outcome) = result else {
@@ -874,19 +943,28 @@ async fn launch_execute_with_config(
     supplied: SuppliedLaunchVars,
     args: LaunchPassthroughArgs,
     options: OperationExecutionOptions,
+    context: RuntimeContext,
 ) -> OperationResult<ExecutionOutcome> {
     let launch = lookup_launch(&cfg, name)?;
     let resolved_vars = resolve_launch_vars(name, &launch, &supplied)?;
     validate_launch_passthrough_args(name, &launch, &args)?;
     let target = launch.target.clone();
-    let runtime =
-        Runtime::from_config(cfg, Some(&target), session_id, true, Some(name.to_string())).await?;
+    let runtime = Runtime::from_config(
+        cfg,
+        Some(&target),
+        session_id,
+        true,
+        Some(name.to_string()),
+        context,
+    )
+    .await?;
     OperationRunner::launch(runtime, options, launch, resolved_vars, args)
         .run()
         .await
         .map_err(OperationError::operation_failed)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn launch_execute_with_config_cancelable(
     cfg: GatewayConfig,
     name: &str,
@@ -895,13 +973,21 @@ async fn launch_execute_with_config_cancelable(
     args: LaunchPassthroughArgs,
     options: OperationExecutionOptions,
     cancel: CancellationToken,
+    context: RuntimeContext,
 ) -> OperationResult<ExecutionOutcome> {
     let launch = lookup_launch(&cfg, name)?;
     let resolved_vars = resolve_launch_vars(name, &launch, &supplied)?;
     validate_launch_passthrough_args(name, &launch, &args)?;
     let target = launch.target.clone();
-    let runtime =
-        Runtime::from_config(cfg, Some(&target), session_id, true, Some(name.to_string())).await?;
+    let runtime = Runtime::from_config(
+        cfg,
+        Some(&target),
+        session_id,
+        true,
+        Some(name.to_string()),
+        context,
+    )
+    .await?;
     OperationRunner::launch(runtime, options, launch, resolved_vars, args)
         .run_cancelable(cancel)
         .await
@@ -914,8 +1000,10 @@ async fn prepare_run_execution_with_config(
     session_id: Option<String>,
     cwd: Option<String>,
     command: Vec<String>,
+    context: RuntimeContext,
 ) -> OperationResult<PreparedExecution> {
-    let runtime = Runtime::from_config(cfg, target.as_deref(), session_id, true, None).await?;
+    let runtime =
+        Runtime::from_config(cfg, target.as_deref(), session_id, true, None, context).await?;
     OperationRunner::run_command(runtime, OperationExecutionOptions::STREAM, cwd, command)
         .prepare()
         .await
@@ -928,13 +1016,21 @@ async fn prepare_launch_execution_with_config(
     session_id: Option<String>,
     supplied: SuppliedLaunchVars,
     args: LaunchPassthroughArgs,
+    context: RuntimeContext,
 ) -> OperationResult<PreparedExecution> {
     let launch = lookup_launch(&cfg, name)?;
     let resolved_vars = resolve_launch_vars(name, &launch, &supplied)?;
     validate_launch_passthrough_args(name, &launch, &args)?;
     let target = launch.target.clone();
-    let runtime =
-        Runtime::from_config(cfg, Some(&target), session_id, true, Some(name.to_string())).await?;
+    let runtime = Runtime::from_config(
+        cfg,
+        Some(&target),
+        session_id,
+        true,
+        Some(name.to_string()),
+        context,
+    )
+    .await?;
     OperationRunner::launch(
         runtime,
         OperationExecutionOptions::STREAM,
@@ -978,6 +1074,7 @@ fn launch_detail(
     cfg: &GatewayConfig,
     name: &str,
     launch: &LaunchConfig,
+    context: &RuntimeContext,
 ) -> anyhow::Result<LaunchDetail> {
     let target = cfg.effective_target(&launch.target)?;
     Ok(LaunchDetail {
@@ -986,7 +1083,7 @@ fn launch_detail(
         target_mode: target_mode_name(target.mode).into(),
         allow_args: launch.allow_args,
         target_container: if target.mode == TargetMode::Fixed {
-            Some(target.container_name(None)?)
+            Some(target_container_display(&target, context)?)
         } else {
             None
         },
@@ -1202,7 +1299,10 @@ fn launch_template_vars(
     vars
 }
 
-fn target_entries(cfg: &GatewayConfig) -> anyhow::Result<Vec<TargetEntry>> {
+fn target_entries(
+    cfg: &GatewayConfig,
+    context: &RuntimeContext,
+) -> anyhow::Result<Vec<TargetEntry>> {
     let user = UserContext::current()?;
     let default_selection = client::read_default_selection(&user)
         .transpose()?
@@ -1217,7 +1317,7 @@ fn target_entries(cfg: &GatewayConfig) -> anyhow::Result<Vec<TargetEntry>> {
                 target: name.clone(),
                 image: target.image.clone(),
                 mode: target_mode_name(target.mode).into(),
-                container: target_container_display(target)?,
+                container: target_container_display(target, context)?,
                 default: name == &default_target,
             })
         })
@@ -1225,9 +1325,23 @@ fn target_entries(cfg: &GatewayConfig) -> anyhow::Result<Vec<TargetEntry>> {
     Ok(entries)
 }
 
-fn target_container_display(target: &TargetConfig) -> anyhow::Result<String> {
+fn target_container_display(
+    target: &TargetConfig,
+    context: &RuntimeContext,
+) -> anyhow::Result<String> {
     Ok(match target.mode {
-        TargetMode::Fixed => target.container_name(None)?,
+        TargetMode::Fixed => {
+            if context.is_empty()
+                && target.name.as_deref().is_some_and(|name| {
+                    template::referenced_keys(name)
+                        .is_ok_and(|refs| refs.iter().any(|key| key.starts_with("context.")))
+                })
+            {
+                target.name.clone().unwrap_or_else(|| "{image_slug}".into())
+            } else {
+                target.container_name_with_context(None, context)?
+            }
+        }
         TargetMode::Ephemeral => target
             .ephemeral_name
             .as_deref()
@@ -1246,6 +1360,7 @@ fn target_mode_name(mode: TargetMode) -> &'static str {
 #[derive(Debug)]
 struct Runtime {
     cfg: GatewayConfig,
+    context: RuntimeContext,
     target: TargetConfig,
     identity: RuntimeIdentity,
     paths: RuntimePaths,
@@ -1333,6 +1448,7 @@ impl SessionOutcome {
 }
 
 impl RuntimeIdentity {
+    #[allow(clippy::too_many_arguments)]
     fn resolve(
         target_name: String,
         launch_name: Option<String>,
@@ -1341,12 +1457,14 @@ impl RuntimeIdentity {
         target: &TargetConfig,
         container_name: String,
         container_runtime: &ContainerRuntime,
+        context: &RuntimeContext,
     ) -> anyhow::Result<Self> {
         let mut identity_vars = Vars::new();
         identity_vars.insert("user".into(), user.user.clone());
         identity_vars.insert("uid".into(), user.uid.to_string());
         identity_vars.insert("gid".into(), user.gid.to_string());
         identity_vars.insert("home".into(), user.home.display().to_string());
+        context.insert_template_vars(&mut identity_vars);
 
         let default_container_user = target.container_user.clone().unwrap_or_else(|| {
             if container_runtime.kind() == ContainerRuntimeType::Podman {
@@ -1436,6 +1554,7 @@ impl RuntimePaths {
         target: &TargetConfig,
         identity: &RuntimeIdentity,
         workspace: PathBuf,
+        context: &RuntimeContext,
     ) -> anyhow::Result<Self> {
         let session_id = identity.session_id.as_deref();
         let session_id = || session_id.expect("ephemeral target has a session id");
@@ -1447,15 +1566,23 @@ impl RuntimePaths {
             TargetMode::Fixed => identity.target_name.as_str(),
             TargetMode::Ephemeral => session_id(),
         };
-        let container_state_dir = workspace
-            .join(&target.workspace.state_dir)
-            .join(state_kind)
-            .join(state_id);
-        let container_state_dir_in_container = resolve_container_path(
-            &identity.container_home,
-            &target.workspace.state_dir,
-            [state_kind, state_id],
-        );
+        let mut vars = Vars::new();
+        vars.insert("user".into(), identity.user.user.clone());
+        vars.insert("uid".into(), identity.session_uid.to_string());
+        vars.insert("gid".into(), identity.session_gid.to_string());
+        vars.insert("home".into(), identity.user.home.display().to_string());
+        vars.insert("target".into(), identity.target_name.clone());
+        vars.insert("image".into(), target.image.clone());
+        vars.insert("image_slug".into(), template::image_slug(&target.image));
+        vars.insert("container_name".into(), identity.container_name.clone());
+        if let Some(session_id) = identity.session_id.as_deref() {
+            vars.insert("session_id".into(), session_id.to_string());
+        }
+        context.insert_template_vars(&mut vars);
+        let state_dir = template::render(&target.workspace.state_dir, &vars)?;
+        let container_state_dir = workspace.join(&state_dir).join(state_kind).join(state_id);
+        let container_state_dir_in_container =
+            resolve_container_path(&identity.container_home, &state_dir, [state_kind, state_id]);
         let control_sockets = render_control_socket_paths(
             &target.control_sockets,
             target,
@@ -1464,6 +1591,7 @@ impl RuntimePaths {
             identity.session_id.as_deref(),
             runtime_id,
             &identity.user,
+            context,
         )?;
         Ok(Self {
             workspace,
@@ -1481,8 +1609,25 @@ impl Runtime {
         session_id: Option<String>,
         generate_session_id: bool,
     ) -> OperationResult<Runtime> {
+        Self::load_with_context(
+            config_path,
+            target,
+            session_id,
+            generate_session_id,
+            RuntimeContext::empty(),
+        )
+        .await
+    }
+
+    async fn load_with_context(
+        config_path: Option<PathBuf>,
+        target: Option<&str>,
+        session_id: Option<String>,
+        generate_session_id: bool,
+        context: RuntimeContext,
+    ) -> OperationResult<Runtime> {
         let cfg = load_config(config_path)?;
-        Self::from_config(cfg, target, session_id, generate_session_id, None).await
+        Self::from_config(cfg, target, session_id, generate_session_id, None, context).await
     }
 
     async fn from_config(
@@ -1491,7 +1636,10 @@ impl Runtime {
         session_id: Option<String>,
         generate_session_id: bool,
         launch_name: Option<String>,
+        context: RuntimeContext,
     ) -> OperationResult<Runtime> {
+        validate_runtime_context(&cfg.context_vars, &context)
+            .map_err(|err| OperationError::invalid_request(err.to_string()))?;
         let user = UserContext::current()?;
         let target_name = match target {
             Some(target) => resolve_target_selection(&cfg, Some(target))?,
@@ -1524,9 +1672,15 @@ impl Runtime {
                 }
             },
         };
-        let container_name = target_cfg.container_name(session_id.as_deref())?;
-        let workspace =
-            resolve_target_workspace(&target_cfg, &target_name, &user, session_id.as_deref())?;
+        let container_name =
+            target_cfg.container_name_with_context(session_id.as_deref(), &context)?;
+        let workspace = resolve_target_workspace(
+            &target_cfg,
+            &target_name,
+            &user,
+            session_id.as_deref(),
+            &context,
+        )?;
         let container_runtime =
             ContainerRuntime::from_config(&cfg.runtime, &user.user, &user.home)?;
         let identity = RuntimeIdentity::resolve(
@@ -1537,10 +1691,12 @@ impl Runtime {
             &target_cfg,
             container_name,
             &container_runtime,
+            &context,
         )?;
-        let paths = RuntimePaths::resolve(&target_cfg, &identity, workspace)?;
+        let paths = RuntimePaths::resolve(&target_cfg, &identity, workspace, &context)?;
         let runtime = Runtime {
             cfg,
+            context,
             target: target_cfg,
             identity,
             paths,
@@ -1617,6 +1773,7 @@ impl Runtime {
             user: self.identity.user.user.clone(),
             image: self.target.image.clone(),
             container: self.identity.container_name.clone(),
+            context: self.context.as_map().clone(),
             container_pid: inspect.state.pid,
             ssh_socket: self.ssh_socket(),
             ssh_tcp: self.published_ssh_endpoint().await?,
@@ -1639,6 +1796,9 @@ impl Runtime {
             .container_runtime
             .inspect(&self.identity.container_name)
             .await?;
+        if let Some(inspect) = &inspect {
+            self.validate_labels(inspect)?;
+        }
         let agent = if self.agent_control_enabled() {
             self.agent_status().await.ok()
         } else {
@@ -1657,6 +1817,7 @@ impl Runtime {
             container: inspect
                 .as_ref()
                 .map(|_| self.identity.container_name.clone()),
+            context: self.context.as_map().clone(),
             container_pid: inspect.as_ref().map(|value| value.state.pid),
             active_sessions: sessions.len(),
             sessions,

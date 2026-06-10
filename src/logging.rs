@@ -1,4 +1,5 @@
 use crate::config::{ContainerAgentFile, GatewayConfig, LoggingConfig, WorkspaceConfig};
+use crate::context::{RuntimeContext, validate_supplied_context};
 use crate::paths::{self, UserContext};
 use crate::rotating_log::{RotationState, RotationStep};
 use crate::template::{self, Vars};
@@ -16,13 +17,17 @@ pub fn init_gateway(
     config_path: Option<&Path>,
     level: Option<&str>,
     protocol_mode: bool,
+    context: &RuntimeContext,
 ) -> anyhow::Result<LoggingGuard> {
     let config = match config_path {
         Some(path) => {
             let cfg = GatewayConfig::load(path)?;
+            validate_supplied_context(&cfg.context_vars, context)?;
             let mut logging = cfg.logging.clone();
             cfg.effective_workspace_defaults()
-                .and_then(|workspace| render_gateway_logging_directory(&mut logging, &workspace))
+                .and_then(|workspace| {
+                    render_gateway_logging_directory(&mut logging, &workspace, context)
+                })
                 .context("render gateway logging directory")?;
             logging
         }
@@ -108,6 +113,7 @@ fn fallback_config(console: bool) -> LoggingConfig {
 fn render_gateway_logging_directory(
     config: &mut LoggingConfig,
     workspace_cfg: &WorkspaceConfig,
+    context: &RuntimeContext,
 ) -> anyhow::Result<()> {
     let Some(directory) = config.directory.as_deref() else {
         return Ok(());
@@ -123,6 +129,7 @@ fn render_gateway_logging_directory(
     vars.insert("workspace".into(), workspace.display().to_string());
     vars.insert("state".into(), state.display().to_string());
     vars.insert("state_dir".into(), state.display().to_string());
+    context.insert_template_vars(&mut vars);
     config.directory = Some(template::render(directory, &vars)?);
     Ok(())
 }
@@ -292,5 +299,47 @@ mod tests {
             message.contains("initialize file logging for test"),
             "{message}"
         );
+    }
+
+    #[test]
+    fn gateway_logging_init_does_not_require_all_context_keys() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("gateway.toml");
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+schema_version = "1"
+
+[logging]
+console = true
+
+[runtime]
+type = "podman"
+program = "/bin/true"
+
+[context_vars.tenant]
+required = true
+
+[target_defaults.workspace]
+path = "{workspace}"
+state_dir = ".aw-gateway"
+cleanup = "never"
+
+[target_defaults.container_agent]
+enabled = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "ubuntu-dev-{{context.tenant}}"
+stop_when_idle = false
+"#,
+                workspace = dir.path().join("workspace").display()
+            ),
+        )
+        .unwrap();
+
+        init_gateway(Some(&config), None, false, &RuntimeContext::empty()).unwrap();
     }
 }

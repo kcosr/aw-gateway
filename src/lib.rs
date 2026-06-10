@@ -4,6 +4,7 @@ mod agent_control;
 pub mod bootstrap;
 pub mod cli;
 pub mod config;
+pub mod context;
 mod fileutil;
 pub mod gateway;
 mod health_probe;

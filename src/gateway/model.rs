@@ -17,6 +17,8 @@ pub(super) struct ReadyStatus {
     pub(super) user: String,
     pub(super) image: String,
     pub(super) container: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub(super) context: BTreeMap<String, String>,
     pub(super) container_pid: i64,
     pub(super) ssh_socket: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -58,6 +60,8 @@ pub(super) struct GatewayStatus {
     pub(super) user: String,
     pub(super) image: String,
     pub(super) container: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub(super) context: BTreeMap<String, String>,
     pub(super) container_pid: Option<i64>,
     pub(super) active_sessions: usize,
     pub(super) sessions: Vec<SessionStatus>,
@@ -150,6 +154,8 @@ pub(super) struct AllStatusEntry {
     pub(super) uid: String,
     pub(super) image: String,
     pub(super) container: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub(super) context: BTreeMap<String, String>,
     pub(super) status: String,
 }
 
@@ -163,6 +169,8 @@ pub(super) struct SessionMarker {
     pub(super) target: String,
     #[serde(deserialize_with = "deserialize_required_optional_string")]
     pub(super) launch: Option<String>,
+    #[serde(default)]
+    pub(super) context: BTreeMap<String, String>,
     pub(super) created_at_ms: u128,
 }
 
@@ -174,6 +182,8 @@ pub(super) struct SessionStatus {
     pub(super) container: String,
     pub(super) target: String,
     pub(super) launch: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub(super) context: BTreeMap<String, String>,
     pub(super) created_at_ms: u128,
 }
 
@@ -195,6 +205,7 @@ impl From<SessionMarker> for SessionStatus {
             container: marker.container,
             target: marker.target,
             launch: marker.launch,
+            context: marker.context,
             created_at_ms: marker.created_at_ms,
         }
     }

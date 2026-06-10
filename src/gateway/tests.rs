@@ -185,6 +185,7 @@ fn test_runtime_from_parts(
     let container_state_dir_in_container = user.home.join(".aw-gateway/containers/ubuntu-dev");
     Runtime {
         cfg,
+        context: RuntimeContext::empty(),
         target,
         identity: RuntimeIdentity {
             target_name: "default".into(),
@@ -795,6 +796,74 @@ async fn explicit_remove_workspace_cleanup_skips_when_session_id_is_absent() {
     assert!(workspace.exists());
 }
 
+#[test]
+fn absent_container_workspace_cleanup_allows_no_context_without_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "abc123def456";
+    let workspace = dir
+        .path()
+        .join(".cache/aw-gateway/workspaces/default-abc123def456");
+    let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+        cfg.runtime.runtime_type = crate::config::ContainerRuntimeType::Docker;
+    });
+    configure_workspace_cleanup_runtime(
+        &mut runtime,
+        WorkspaceCleanup::Always,
+        workspace,
+        dir.path().into(),
+        session_id,
+    );
+
+    assert!(runtime.should_cleanup_absent_container_workspace());
+}
+
+#[test]
+fn absent_container_workspace_cleanup_allows_matching_marker_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "abc123def456";
+    let workspace = dir
+        .path()
+        .join(".cache/aw-gateway/workspaces/default-abc123def456");
+    let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+        cfg.runtime.runtime_type = crate::config::ContainerRuntimeType::Docker;
+    });
+    configure_workspace_cleanup_runtime(
+        &mut runtime,
+        WorkspaceCleanup::Always,
+        workspace,
+        dir.path().into(),
+        session_id,
+    );
+    runtime.context = RuntimeContext::from_map(BTreeMap::from([("tenant".into(), "acme".into())]));
+    let _session = runtime.create_session_marker("test").unwrap();
+
+    assert!(runtime.should_cleanup_absent_container_workspace());
+}
+
+#[test]
+fn absent_container_workspace_cleanup_skips_mismatched_marker_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let session_id = "abc123def456";
+    let workspace = dir
+        .path()
+        .join(".cache/aw-gateway/workspaces/default-abc123def456");
+    let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+        cfg.runtime.runtime_type = crate::config::ContainerRuntimeType::Docker;
+    });
+    configure_workspace_cleanup_runtime(
+        &mut runtime,
+        WorkspaceCleanup::Always,
+        workspace,
+        dir.path().into(),
+        session_id,
+    );
+    runtime.context = RuntimeContext::from_map(BTreeMap::from([("tenant".into(), "acme".into())]));
+    let _session = runtime.create_session_marker("test").unwrap();
+    runtime.context = RuntimeContext::empty();
+
+    assert!(!runtime.should_cleanup_absent_container_workspace());
+}
+
 #[tokio::test]
 async fn remove_session_workspace_uses_podman_unshare_for_podman() {
     let dir = tempfile::tempdir().unwrap();
@@ -1002,9 +1071,35 @@ fn status_all_entry_projects_fixed_container_from_labels() {
             uid: "2450".into(),
             image: "ubuntu/dev".into(),
             container: "ubuntu-dev".into(),
+            context: BTreeMap::new(),
             status: "running".into(),
         }]
     );
+}
+
+#[test]
+fn status_all_entry_projects_context_labels() {
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let mut labels = managed_labels("default", "ubuntu-dev");
+    labels.insert("io.aw-gateway.mode".into(), "fixed".into());
+    labels.insert("io.aw-gateway.context.tenant".into(), "acme".into());
+
+    let entries = status_all_entries(
+        &cfg,
+        vec![managed_container(
+            "ubuntu-dev",
+            "runtime-image",
+            true,
+            labels,
+        )],
+    );
+
+    assert_eq!(
+        entries[0].context,
+        BTreeMap::from([("tenant".into(), "acme".into())])
+    );
+    let serialized = serde_json::to_string(&entries).unwrap();
+    assert!(serialized.contains("tenant"));
 }
 
 #[test]
@@ -1153,6 +1248,7 @@ fn status_launch_prefers_selected_session() {
             container: "ubuntu-dev".into(),
             target: "default".into(),
             launch: Some("first".into()),
+            context: BTreeMap::new(),
             created_at_ms: 1,
         },
         model::SessionStatus {
@@ -1162,6 +1258,7 @@ fn status_launch_prefers_selected_session() {
             container: "ubuntu-dev".into(),
             target: "default".into(),
             launch: Some("second".into()),
+            context: BTreeMap::new(),
             created_at_ms: 2,
         },
     ];
@@ -1230,7 +1327,7 @@ command = ["/bin/true"]
     assert_eq!(summaries[0].name, "metadata");
 
     let launch = cfg.effective_launch("metadata").unwrap();
-    let detail = launch_detail(&cfg, "metadata", &launch).unwrap();
+    let detail = launch_detail(&cfg, "metadata", &launch, &RuntimeContext::empty()).unwrap();
     assert!(!detail.env.contains_key("AW_GATEWAY_TEST_METADATA_ENV"));
     assert_eq!(
         detail.env.get("LAUNCH_ONLY").map(String::as_str),
@@ -1601,6 +1698,7 @@ async fn launch_operation_core_returns_nonzero_exit_without_exiting_process() {
         SuppliedLaunchVars::default(),
         LaunchPassthroughArgs::default(),
         OperationExecutionOptions::STREAM,
+        RuntimeContext::empty(),
     )
     .await
     .unwrap();
@@ -1675,6 +1773,7 @@ exit 0
         SuppliedLaunchVars::default(),
         LaunchPassthroughArgs::from_strings(vec!["--skill".into(), "fresh-eyes".into()]).unwrap(),
         OperationExecutionOptions::STREAM,
+        RuntimeContext::empty(),
     )
     .await
     .unwrap();
@@ -1708,6 +1807,7 @@ async fn detached_launch_keeps_launch_marker_until_background_finishes() {
         None,
         true,
         Some("detached-launch".into()),
+        RuntimeContext::empty(),
     )
     .await
     .unwrap();
@@ -1720,6 +1820,7 @@ async fn detached_launch_keeps_launch_marker_until_background_finishes() {
         SuppliedLaunchVars::default(),
         LaunchPassthroughArgs::default(),
         OperationExecutionOptions::DETACH,
+        RuntimeContext::empty(),
     )
     .await
     .unwrap();
@@ -2067,6 +2168,7 @@ async fn operation_boundary_classifies_launch_variable_errors() {
         unknown,
         LaunchPassthroughArgs::default(),
         OperationExecutionOptions::STREAM,
+        RuntimeContext::empty(),
     )
     .await
     .unwrap_err();
@@ -2079,6 +2181,7 @@ async fn operation_boundary_classifies_launch_variable_errors() {
         SuppliedLaunchVars::default(),
         LaunchPassthroughArgs::default(),
         OperationExecutionOptions::STREAM,
+        RuntimeContext::empty(),
     )
     .await
     .unwrap_err();
@@ -2096,6 +2199,7 @@ async fn operation_boundary_classifies_launch_variable_errors() {
         invalid_enum,
         LaunchPassthroughArgs::default(),
         OperationExecutionOptions::STREAM,
+        RuntimeContext::empty(),
     )
     .await
     .unwrap_err();
@@ -2113,6 +2217,7 @@ async fn operation_boundary_classifies_launch_variable_errors() {
         invalid_number,
         LaunchPassthroughArgs::default(),
         OperationExecutionOptions::STREAM,
+        RuntimeContext::empty(),
     )
     .await
     .unwrap_err();
@@ -2129,6 +2234,7 @@ async fn operation_boundary_classifies_launch_variable_errors() {
         invalid_type,
         LaunchPassthroughArgs::default(),
         OperationExecutionOptions::STREAM,
+        RuntimeContext::empty(),
     )
     .await
     .unwrap_err();
@@ -2159,6 +2265,7 @@ exit 1
         SuppliedLaunchVars::default(),
         LaunchPassthroughArgs::from_strings(vec!["--skill".into(), "fresh-eyes".into()]).unwrap(),
         OperationExecutionOptions::STREAM,
+        RuntimeContext::empty(),
     )
     .await
     .unwrap_err();
@@ -2177,6 +2284,7 @@ async fn operation_boundary_classifies_unknown_launch_and_session_errors() {
         SuppliedLaunchVars::default(),
         LaunchPassthroughArgs::default(),
         OperationExecutionOptions::STREAM,
+        RuntimeContext::empty(),
     )
     .await
     .unwrap_err();
@@ -2336,6 +2444,7 @@ fn status_json_serializes_nullable_launch_fields() {
         user: "alice".into(),
         image: "ubuntu/dev".into(),
         container: Some("ubuntu-dev".into()),
+        context: BTreeMap::new(),
         container_pid: Some(123),
         active_sessions: 1,
         sessions: vec![model::SessionStatus {
@@ -2345,6 +2454,7 @@ fn status_json_serializes_nullable_launch_fields() {
             container: "ubuntu-dev".into(),
             target: "default".into(),
             launch: None,
+            context: BTreeMap::new(),
             created_at_ms: 10,
         }],
         agent_ready: false,
@@ -2365,6 +2475,7 @@ fn status_json_serializes_nullable_launch_fields() {
         uid: "2450".into(),
         image: "ubuntu/dev".into(),
         container: "ubuntu-dev".into(),
+        context: BTreeMap::new(),
         status: "running".into(),
     };
     let value = serde_json::to_value(&all).unwrap();
@@ -3284,6 +3395,63 @@ fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
 }
 
 #[test]
+fn context_labels_are_validation_labels_and_enforced() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let target = cfg.effective_target("default").unwrap();
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    let mut runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+    runtime.context = RuntimeContext::from_map(BTreeMap::from([("tenant".into(), "acme".into())]));
+
+    let labels = runtime.validation_labels();
+    assert_eq!(
+        labels
+            .get("io.aw-gateway.context.tenant")
+            .map(String::as_str),
+        Some("acme")
+    );
+
+    runtime
+        .validate_labels(&ContainerInspect {
+            id: "id".into(),
+            name: "ubuntu-dev".into(),
+            state: runtime::ContainerState {
+                running: true,
+                pid: 123,
+            },
+            config: runtime::ContainerConfig { labels },
+        })
+        .unwrap();
+
+    let empty_context_runtime = {
+        let mut clone = runtime;
+        clone.context = RuntimeContext::empty();
+        clone
+    };
+    let mut scoped_labels = empty_context_runtime.validation_labels();
+    scoped_labels.insert("io.aw-gateway.context.tenant".into(), "acme".into());
+    let err = empty_context_runtime
+        .validate_labels(&ContainerInspect {
+            id: "id".into(),
+            name: "ubuntu-dev".into(),
+            state: runtime::ContainerState {
+                running: true,
+                pid: 123,
+            },
+            config: runtime::ContainerConfig {
+                labels: scoped_labels,
+            },
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("context does not match"), "{err}");
+}
+
+#[test]
 fn prepare_control_socket_dir_is_private_and_preserves_socket_files() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
@@ -3429,6 +3597,7 @@ fn target_workspace_override_resolves_relative_to_user_home() {
         "default",
         &user,
         None,
+        &RuntimeContext::empty(),
     )
     .unwrap();
 
@@ -3987,6 +4156,7 @@ fn detects_current_process_session_marker_as_active() {
         container: "ubuntu-dev".into(),
         target: "default".into(),
         launch: None,
+        context: BTreeMap::new(),
         created_at_ms: 0,
     };
     assert!(session_marker_is_active(&marker));
@@ -4002,6 +4172,7 @@ fn session_marker_launch_round_trips_and_none_serializes_as_null() {
         container: "ubuntu-dev".into(),
         target: "default".into(),
         launch: Some("agent-pack-codex".into()),
+        context: BTreeMap::new(),
         created_at_ms: 789,
     };
     let raw = serde_json::to_string(&marker).unwrap();

@@ -1,4 +1,5 @@
 use crate::config::{ContainerRuntimeType, RuntimeConfig};
+use crate::context::{RuntimeContext, context_from_labels, context_label_key};
 use crate::template::{self, Vars};
 use anyhow::Context;
 use serde::Deserialize;
@@ -1113,10 +1114,11 @@ impl ContainerRuntime {
         &self,
         user: &str,
         uid: u32,
+        context: &RuntimeContext,
     ) -> anyhow::Result<Vec<ManagedContainer>> {
         let output = self
             .command()
-            .args(self.list_managed_args(user, uid))
+            .args(self.list_managed_args(user, uid, context))
             .output()
             .await
             .with_context(|| format!("run {} ps", self.runtime_label()))?;
@@ -1132,7 +1134,10 @@ impl ContainerRuntime {
         })?;
         Ok(containers
             .into_iter()
-            .filter(|container| parse::is_aw_gateway_managed_container_for(container, user, uid))
+            .filter(|container| {
+                parse::is_aw_gateway_managed_container_for(container, user, uid)
+                    && context.matches_stored(&context_from_labels(&container.labels))
+            })
             .collect())
     }
 
@@ -1145,8 +1150,8 @@ impl ContainerRuntime {
         }
     }
 
-    pub fn list_managed_args(&self, user: &str, uid: u32) -> Vec<String> {
-        vec![
+    pub fn list_managed_args(&self, user: &str, uid: u32, context: &RuntimeContext) -> Vec<String> {
+        let mut args = vec![
             "ps".into(),
             "-a".into(),
             "--filter".into(),
@@ -1157,7 +1162,12 @@ impl ContainerRuntime {
             format!("label=io.aw-gateway.uid={uid}"),
             "--format".into(),
             "json".into(),
-        ]
+        ];
+        for (key, value) in context.as_map() {
+            args.push("--filter".into());
+            args.push(format!("label={}={value}", context_label_key(key)));
+        }
+        args
     }
 
     pub fn exec_args(&self, spec: &ContainerExecSpec) -> Vec<String> {
@@ -1998,7 +2008,7 @@ exit 0
             env: BTreeMap::new(),
         };
         assert_eq!(
-            runtime.list_managed_args("alice", 2450),
+            runtime.list_managed_args("alice", 2450, &RuntimeContext::empty()),
             vec![
                 "ps",
                 "-a",
@@ -2012,6 +2022,24 @@ exit 0
                 "json",
             ]
         );
+    }
+
+    #[test]
+    fn list_managed_args_include_supplied_context_filters() {
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::Podman,
+            program: "podman".into(),
+            env: BTreeMap::new(),
+        };
+        let context = RuntimeContext::from_map(BTreeMap::from([
+            ("tenant".into(), "acme".into()),
+            ("workspace".into(), "web".into()),
+        ]));
+
+        let args = runtime.list_managed_args("alice", 2450, &context);
+
+        assert!(args.contains(&"label=io.aw-gateway.context.tenant=acme".to_string()));
+        assert!(args.contains(&"label=io.aw-gateway.context.workspace=web".to_string()));
     }
 
     #[test]
@@ -2031,8 +2059,8 @@ exit 0
         };
 
         assert_eq!(
-            docker.list_managed_args("alice", 2450),
-            colima.list_managed_args("alice", 2450)
+            docker.list_managed_args("alice", 2450, &RuntimeContext::empty()),
+            colima.list_managed_args("alice", 2450, &RuntimeContext::empty())
         );
         assert_eq!(
             colima.env().get("DOCKER_HOST").map(String::as_str),

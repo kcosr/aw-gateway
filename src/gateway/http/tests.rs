@@ -631,6 +631,52 @@ fn output_format_validation_uses_effective_output_selection() {
 }
 
 #[test]
+fn status_query_accepts_flattened_context_parameters() {
+    let query = parse_status_query(Some(
+        "target=default&session_id=s1&context.tenant=acme&context.workspace=web",
+    ))
+    .unwrap();
+
+    assert_eq!(query.target.as_deref(), Some("default"));
+    assert_eq!(query.session_id.as_deref(), Some("s1"));
+    assert_eq!(
+        query.context.as_map(),
+        &BTreeMap::from([
+            ("tenant".into(), "acme".into()),
+            ("workspace".into(), "web".into()),
+        ])
+    );
+}
+
+#[test]
+fn status_query_rejects_nested_context_encoding() {
+    let err = parse_status_query(Some("context%5Btenant%5D=acme")).unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::InvalidRequest);
+    assert!(err.message.contains("unknown status query parameter"));
+}
+
+#[test]
+fn status_query_rejects_duplicate_context_parameters() {
+    let err = parse_status_query(Some("context.tenant=acme&context.tenant=other")).unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::InvalidRequest);
+    assert!(err.message.contains("duplicate context key"));
+}
+
+#[test]
+fn http_body_context_rejects_duplicate_keys() {
+    let err = parse_body::<RunRequest>(
+        br#"{"command":["x"],"context":{"tenant":"acme","tenant":"other"}}"#,
+        ErrorCode::InvalidRequest,
+    )
+    .unwrap_err();
+
+    assert_eq!(err.code, ErrorCode::InvalidRequest);
+    assert!(err.message.contains("duplicate context key"));
+}
+
+#[test]
 fn launch_vars_parse_typed_values_and_reject_duplicates_and_structured_values() {
     let parsed: LaunchRunRequest = serde_json::from_str(
         r#"{"vars":{"repo":"https://example.test/repo.git","debug":true,"count":3,"ratio":1.5}}"#,
@@ -1678,6 +1724,65 @@ async fn metadata_routes_return_data_envelopes() {
 }
 
 #[tokio::test]
+async fn status_all_accepts_required_context_from_flattened_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    write_fake_runtime(&fake_runtime, &fake_running_runtime_script(&log));
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+
+[http]
+enabled = true
+listen = "127.0.0.1:0"
+enabled_actions = ["status"]
+
+[runtime]
+type = "podman"
+program = "{program}"
+
+[context_vars.tenant]
+required = true
+
+[target_defaults.workspace]
+path = "{workspace}"
+state_dir = ".aw-gateway"
+cleanup = "never"
+
+[target_defaults.container_agent]
+enabled = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "ubuntu-dev-{{context.tenant}}"
+stop_when_idle = false
+"#,
+            program = fake_runtime.display(),
+            workspace = dir.path().join("workspace").display()
+        ),
+    )
+    .unwrap();
+    let app = app_for_config(config);
+
+    let (status, body) = get_json(app.clone(), "/api/v1/status/all").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing required context key")
+    );
+
+    let (status, body) = get_json(app, "/api/v1/status/all?context.tenant=acme").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
 async fn unknown_launch_route_returns_not_found_json_error() {
     let dir = tempfile::tempdir().unwrap();
     let fake_runtime = dir.path().join("runtime");
@@ -1760,6 +1865,7 @@ async fn status_shape_can_be_wrapped_in_data_envelope() {
         user: "alice".into(),
         image: "ubuntu/dev".into(),
         container: Some("ubuntu-dev".into()),
+        context: BTreeMap::new(),
         container_pid: Some(123),
         active_sessions: 0,
         sessions: Vec::new(),

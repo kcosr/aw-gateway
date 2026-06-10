@@ -57,6 +57,7 @@ impl Runtime {
             container: self.identity.container_name.clone(),
             target: self.identity.target_name.clone(),
             launch: launch.map(str::to_string),
+            context: self.context.as_map().clone(),
             created_at_ms: unix_time_ms()?,
         };
         write_private_file(&path, &serde_json::to_vec_pretty(&marker)?, 0o600)
@@ -78,7 +79,10 @@ impl Runtime {
                 continue;
             }
             match read_session_marker(&path) {
-                Ok(marker) if session_marker_is_active(&marker) => {
+                Ok(marker)
+                    if session_marker_is_active(&marker)
+                        && self.context.matches_stored(&marker.context) =>
+                {
                     sessions.push(SessionStatus::from(marker));
                 }
                 Ok(_) => {
@@ -288,7 +292,7 @@ pub(super) fn parse_process_start_time(stat: &str) -> anyhow::Result<String> {
     Ok(start_time.to_string())
 }
 
-fn read_session_marker(path: &Path) -> anyhow::Result<SessionMarker> {
+pub(super) fn read_session_marker(path: &Path) -> anyhow::Result<SessionMarker> {
     let raw = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
     Ok(serde_json::from_slice(&raw)?)
 }

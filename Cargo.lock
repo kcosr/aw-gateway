@@ -102,6 +102,7 @@ dependencies = [
  "assert_cmd",
  "axum",
  "clap",
+ "form_urlencoded",
  "futures-util",
  "glob",
  "libc",
