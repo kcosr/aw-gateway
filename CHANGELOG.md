@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+_No unreleased changes._
+
 ## [0.6.0] - 2026-06-10
 
 ### Added
