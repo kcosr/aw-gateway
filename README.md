@@ -545,7 +545,9 @@ FROM_FILE = { file = "/run/secrets/example", required = false }
 ```
 
 Service env entries can use literal `value`, inherit from the agent
-environment, or read a file.
+environment, or read a file. Template interpolation applies to literal `value`
+strings and `file` paths when `interpolate = true`; values loaded from files or
+inherited environment variables are passed through literally.
 
 ## Gateway Config Shape
 
@@ -1784,7 +1786,7 @@ merging, and references are deterministic.
 | `target.lifecycle_steps[].command` | Gateway lifecycle execution | Pre-start supports gateway vars except `{container_pid}`; later phases support all gateway vars |
 | `target.host_steps[].command` and HTTP health-check URLs | Gateway host-step execution | All gateway vars, including `{container_pid}` |
 | `container_agent.services[].user` in gateway config | Gateway-managed agent config render | `{container_user}` |
-| `container_agent.services[].command`, `cwd`, `env`, and health-check URL | Container-agent service execution | `{container_state_dir}` |
+| `container_agent.services[].command`, `cwd`, literal env `value`, env `file` paths, and health-check URL | Container-agent service execution | `{container_state_dir}` |
 | `container_agent.control_socket` and `ssh_bridge.socket` in standalone agent config | Container-agent startup | `{container_state_dir}` |
 | `launch.cwd`, `launch.command`, `launch.env`, and `launch.steps[]` command/cwd/env | Launch execution | Launch built-ins plus `{var.<name>}` |
 | `client_config.inner_alias_template`, `container_host_template`, `default_identity_dir` | Client config generation | `{user}`, `{uid}`, `{gid}`, `{home}`, `{container_user}`, `{container_home}`, `{workspace}`, `{state}`, `{state_dir}`, `{target}`, `{image}`, `{image_slug}`, `{container_name}`, `{container_state_dir}`, `{container_state_dir_in_container}`, `{session_id}`, `{host}` |

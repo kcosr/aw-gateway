@@ -406,8 +406,12 @@ pub struct EnvValue {
 impl EnvValue {
     pub fn resolve(&self, vars: &BTreeMap<String, String>) -> anyhow::Result<Option<String>> {
         self.validate()?;
-        let mut value = if let Some(value) = &self.value {
-            Some(value.clone())
+        let value = if let Some(value) = &self.value {
+            if self.interpolate {
+                Some(template::render(value, vars)?)
+            } else {
+                Some(value.clone())
+            }
         } else if let Some(path) = &self.file {
             let rendered_path = if self.interpolate {
                 template::render(path, vars)?
@@ -446,11 +450,6 @@ impl EnvValue {
         } else {
             None
         };
-        if self.interpolate
-            && let Some(raw) = &value
-        {
-            value = Some(template::render(raw, vars)?);
-        }
         Ok(value)
     }
 

@@ -1108,11 +1108,19 @@ command = ["/bin/true"]
 }
 
 #[test]
-fn env_value_renders_file_path_and_file_contents() {
+fn env_value_renders_literal_values_and_file_paths_only() {
     let dir = tempfile::tempdir().unwrap();
     let token_file = dir.path().join("token");
     std::fs::write(&token_file, "token-{name}\n").unwrap();
-    let value = EnvValue {
+
+    let literal_value = EnvValue {
+        value: Some("token-{name}".into()),
+        file: None,
+        inherit: None,
+        interpolate: true,
+        required: true,
+    };
+    let file_value = EnvValue {
         value: None,
         file: Some("{dir}/token".into()),
         inherit: None,
@@ -1125,8 +1133,12 @@ fn env_value_renders_file_path_and_file_contents() {
     ]);
 
     assert_eq!(
-        value.resolve(&vars).unwrap(),
+        literal_value.resolve(&vars).unwrap(),
         Some("token-workspace".into())
+    );
+    assert_eq!(
+        file_value.resolve(&vars).unwrap(),
+        Some("token-{name}".into())
     );
 }
 

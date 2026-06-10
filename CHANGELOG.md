@@ -19,6 +19,9 @@
   `AW_AUTHENTICATED_GID` values instead of silently disabling peer validation.
 - Container-agent service environment entries now validate the exactly-one
   `value` / `file` / `inherit` source rule during gateway config validation.
+- Container-agent service environment interpolation now renders literal
+  `value` entries and `file` paths only; values loaded from files or inherited
+  environment variables are passed through literally.
 - Command health checks now run with a configurable timeout, defaulting to
   `5s`, and timed command stderr draining is bounded after process exit.
 - Container-agent service restarts now keep backing off for immediate crash
