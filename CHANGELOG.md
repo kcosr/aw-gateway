@@ -38,6 +38,8 @@
 - Local SSH listener startup now serializes status-file checks and writes with
   the lifecycle lock, and transient accept errors no longer terminate the
   listener.
+- Stale in-container cancel marker sweeping no longer treats inaccessible or
+  out-of-range host PIDs as active.
 
 ## [0.6.0] - 2026-06-10
 

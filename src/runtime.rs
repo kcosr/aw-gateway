@@ -1626,15 +1626,13 @@ fn parse_cancel_marker_host_pid(path: &str) -> Option<u32> {
 
 #[cfg(unix)]
 fn host_process_is_active(pid: u32) -> bool {
-    let pid = pid as libc::pid_t;
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
     if pid <= 0 {
         return false;
     }
-    let rc = unsafe { libc::kill(pid, 0) };
-    if rc == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    (unsafe { libc::kill(pid, 0) }) == 0
 }
 
 #[cfg(not(unix))]
@@ -1982,6 +1980,12 @@ mod tests {
         let stale = stale_cancel_marker_paths(paths, |pid| pid == 222);
 
         assert_eq!(stale, vec!["/tmp/aw-gateway-exec-111-1.pid"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_process_is_active_rejects_out_of_range_pid() {
+        assert!(!host_process_is_active(u32::MAX));
     }
 
     #[test]
