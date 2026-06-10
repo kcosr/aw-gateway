@@ -6,7 +6,8 @@
 
 - Added delegated runtime context declarations, CLI/HTTP context handoff,
   context labels/session metadata, context-aware status output, and
-  fail-closed lifecycle filtering for scoped containers.
+  fail-closed lifecycle filtering for scoped containers
+  ([#57](https://github.com/kcosr/aw-gateway/pull/57)).
 
 ### Changed
 
@@ -14,7 +15,7 @@
   deployment installs assembled from separate host and Linux runtime archives.
 - Relaxed Colima HTTP close/disconnect smoke timing to account for delegated
   runtime cancellation over SSH-forwarded API connections
-  ([#TBD](https://github.com/kcosr/aw-gateway/pull/TBD)).
+  ([#57](https://github.com/kcosr/aw-gateway/pull/57)).
 
 ## [0.5.2] - 2026-06-09
 
