@@ -3,9 +3,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::net::{TcpStream, UnixStream};
+use tokio::sync::Semaphore;
+use tokio::time::{Duration, sleep};
 
 use super::socket::bind_private_unix_socket;
 use super::state::AgentState;
+
+const MAX_BRIDGE_STREAMS: usize = 1024;
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 pub(super) async fn run_bridge(
     state: Arc<AgentState>,
@@ -20,14 +25,30 @@ pub(super) async fn run_bridge(
     let socket = PathBuf::from(template::render(&socket_template, &vars)?);
     let listener = bind_private_unix_socket(&socket, state.socket_owner).await?;
     state.bridge_ready.store(true, Ordering::SeqCst);
+    let stream_slots = Arc::new(Semaphore::new(MAX_BRIDGE_STREAMS));
     loop {
-        let (client, _) = listener.accept().await?;
+        let (client, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                tracing::warn!(error = %err, "ssh bridge accept failed");
+                sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
+        };
         if !state.accepting_bridge.load(Ordering::SeqCst) {
             continue;
         }
+        let Ok(stream_permit) = stream_slots.clone().try_acquire_owned() else {
+            tracing::warn!(
+                limit = MAX_BRIDGE_STREAMS,
+                "ssh bridge stream limit reached; rejecting connection"
+            );
+            continue;
+        };
         let target = target.clone();
         let state = state.clone();
         tokio::spawn(async move {
+            let _stream_permit = stream_permit;
             state.active_streams.fetch_add(1, Ordering::SeqCst);
             let result = proxy_to_tcp(client, &target).await;
             state.active_streams.fetch_sub(1, Ordering::SeqCst);

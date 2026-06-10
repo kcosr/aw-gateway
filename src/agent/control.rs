@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Duration, sleep};
 
 use super::idle::reap_processes;
@@ -24,10 +25,15 @@ use super::status::status_payload;
 
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONTROL_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_CONTROL_CONNECTIONS: usize = 256;
+const MAX_CONTROL_SESSION_HOLDS: usize = 256;
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 pub(super) async fn run_control_socket(state: Arc<AgentState>, path: &Path) -> anyhow::Result<()> {
     let listener = bind_private_unix_socket(path, state.socket_owner).await?;
     let mut shutdown = Box::pin(shutdown_signal());
+    let connection_slots = Arc::new(Semaphore::new(MAX_CONTROL_CONNECTIONS));
+    let session_slots = Arc::new(Semaphore::new(MAX_CONTROL_SESSION_HOLDS));
     loop {
         tokio::select! {
             result = &mut shutdown => {
@@ -38,10 +44,26 @@ pub(super) async fn run_control_socket(state: Arc<AgentState>, path: &Path) -> a
                 return Ok(());
             }
             result = listener.accept() => {
-                let (stream, _) = result?;
+                let (stream, _) = match result {
+                    Ok(accepted) => accepted,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "control socket accept failed");
+                        sleep(ACCEPT_ERROR_BACKOFF).await;
+                        continue;
+                    }
+                };
+                let Ok(connection_permit) = connection_slots.clone().try_acquire_owned() else {
+                    tracing::warn!(
+                        limit = MAX_CONTROL_CONNECTIONS,
+                        "control connection limit reached; rejecting connection"
+                    );
+                    continue;
+                };
                 let state = state.clone();
+                let session_slots = session_slots.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle_control_connection(state, stream).await {
+                    let _connection_permit = connection_permit;
+                    if let Err(err) = handle_control_connection(state, stream, session_slots).await {
                         tracing::warn!(error = %err, "control connection failed");
                     }
                 });
@@ -80,6 +102,7 @@ async fn shutdown_signal() -> anyhow::Result<()> {
 async fn handle_control_connection(
     state: Arc<AgentState>,
     stream: UnixStream,
+    session_slots: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     validate_control_peer(&stream, state.socket_owner.map(|owner| owner.uid))?;
     let mut reader = BufReader::new(stream);
@@ -129,13 +152,19 @@ async fn handle_control_connection(
             write_control_response(reader.into_inner(), response).await?;
         }
         ControlRequest::SessionHold(_) => {
+            let Ok(session_permit) = session_slots.try_acquire_owned() else {
+                let response =
+                    ControlFailure::new(id, "too_many_sessions", "too many active sessions");
+                write_control_response(reader.into_inner(), response).await?;
+                return Ok(());
+            };
             let mut stream = reader.into_inner();
             write_control_response_ref(
                 &mut stream,
                 ControlSuccess::new(id, SessionHoldResult { held: true }),
             )
             .await?;
-            hold_control_session(state, stream).await;
+            hold_control_session(state, stream, session_permit).await;
             return Ok(());
         }
         ControlRequest::Shutdown(_) => {
@@ -244,7 +273,11 @@ async fn write_control_response_ref<T: Serialize>(
     Ok(())
 }
 
-async fn hold_control_session(state: Arc<AgentState>, mut stream: UnixStream) {
+async fn hold_control_session(
+    state: Arc<AgentState>,
+    mut stream: UnixStream,
+    _session_permit: OwnedSemaphorePermit,
+) {
     state.active_sessions.fetch_add(1, Ordering::SeqCst);
     let mut buffer = [0_u8; 1024];
     loop {

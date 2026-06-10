@@ -21,6 +21,8 @@
   `5s`, and timed command stderr draining is bounded after process exit.
 - Container-agent service restarts now keep backing off for immediate crash
   loops, and service shutdown no longer holds the child lock while waiting.
+- Container-agent SSH bridge and control socket accept loops now continue after
+  transient accept errors and enforce fixed connection/session limits.
 
 ## [0.6.0] - 2026-06-10
 
