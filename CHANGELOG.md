@@ -28,6 +28,9 @@
   output.
 - Private file writes now use atomic replace semantics, and existing control
   token files must have private permissions before they are trusted.
+- Runtime-provided container and exec environment values are now passed through
+  the spawned container-runtime process environment instead of embedding their
+  values in `podman`/`docker` argv.
 
 ## [0.6.0] - 2026-06-10
 

@@ -394,7 +394,11 @@ command = ["launch-command"]
         .success();
 
     let log = std::fs::read_to_string(runtime_log).unwrap();
-    assert!(log.contains("AW_GATEWAY_TEST_ARGV_ENV=argv-value"), "{log}");
+    assert!(log.contains("--env\nAW_GATEWAY_TEST_ARGV_ENV"), "{log}");
+    assert!(
+        !log.contains("AW_GATEWAY_TEST_ARGV_ENV=argv-value"),
+        "{log}"
+    );
 }
 
 #[test]

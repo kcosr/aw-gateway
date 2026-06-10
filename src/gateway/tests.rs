@@ -3355,11 +3355,11 @@ fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
         })
         .unwrap();
 
-    let args = runtime.container_runtime.run_args(
-        &runtime
-            .container_run_spec(Some("identity-token"), Some("control-token"))
-            .unwrap(),
-    );
+    let spec = runtime
+        .container_run_spec(Some("identity-token"), Some("control-token"))
+        .unwrap();
+    let args = runtime.container_runtime.run_args(&spec);
+    let env = runtime.container_runtime.run_env(&spec);
     let arg = |value: &str| args.iter().position(|item| item == value);
 
     assert!(args.contains(&"--userns=keep-id".to_string()));
@@ -3371,10 +3371,36 @@ fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
         "{}:/home/alice:Z",
         runtime.paths.workspace.display()
     )));
-    assert!(args.contains(&"AW_IDENTITY_TOKEN=identity-token".to_string()));
-    assert!(args.contains(&"AW_CONTAINER_CONTROL_TOKEN=control-token".to_string()));
-    assert!(args.contains(&"AW_AUTHENTICATED_UID=2450".to_string()));
-    assert!(args.contains(&"AW_AUTHENTICATED_GID=2450".to_string()));
+    assert!(args.contains(&"AW_IDENTITY_TOKEN".to_string()));
+    assert!(args.contains(&"AW_CONTAINER_CONTROL_TOKEN".to_string()));
+    assert!(args.contains(&"AW_AUTHENTICATED_UID".to_string()));
+    assert!(args.contains(&"AW_AUTHENTICATED_GID".to_string()));
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg == "AW_IDENTITY_TOKEN=identity-token")
+    );
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg == "AW_CONTAINER_CONTROL_TOKEN=control-token")
+    );
+    assert_eq!(
+        env.get("AW_IDENTITY_TOKEN").map(String::as_str),
+        Some("identity-token")
+    );
+    assert_eq!(
+        env.get("AW_CONTAINER_CONTROL_TOKEN").map(String::as_str),
+        Some("control-token")
+    );
+    assert_eq!(
+        env.get("AW_AUTHENTICATED_UID").map(String::as_str),
+        Some("2450")
+    );
+    assert_eq!(
+        env.get("AW_AUTHENTICATED_GID").map(String::as_str),
+        Some("2450")
+    );
     assert!(args.contains(&"io.aw-gateway.gateway=true".to_string()));
     assert!(args.contains(&"io.aw-gateway.target=default".to_string()));
     assert!(args.contains(&"io.aw-gateway.mode=fixed".to_string()));

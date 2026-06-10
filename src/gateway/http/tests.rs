@@ -1584,16 +1584,16 @@ async fn launch_route_renders_typed_json_vars_into_steps_and_final_exec() {
 
     let log = std::fs::read_to_string(&log).unwrap();
     assert!(log.contains("--workdir /step-safe-3"), "{log}");
-    assert!(log.contains("--env STEP_DEBUG=true"), "{log}");
-    assert!(log.contains("--env STEP_REPO=alpha"), "{log}");
-    assert!(log.contains("--env STEP_RATIO=1.5"), "{log}");
+    assert!(log.contains("--env STEP_DEBUG"), "{log}");
+    assert!(log.contains("--env STEP_REPO"), "{log}");
+    assert!(log.contains("--env STEP_RATIO"), "{log}");
     assert!(log.contains("ubuntu-dev step-command alpha 3 1.5"), "{log}");
     assert!(log.contains("--workdir /repo-alpha-3"), "{log}");
-    assert!(log.contains("--env COUNT=3"), "{log}");
-    assert!(log.contains("--env DEBUG=true"), "{log}");
-    assert!(log.contains("--env MODE=safe"), "{log}");
-    assert!(log.contains("--env RATIO=1.5"), "{log}");
-    assert!(log.contains("--env REPO=alpha"), "{log}");
+    assert!(log.contains("--env COUNT"), "{log}");
+    assert!(log.contains("--env DEBUG"), "{log}");
+    assert!(log.contains("--env MODE"), "{log}");
+    assert!(log.contains("--env RATIO"), "{log}");
+    assert!(log.contains("--env REPO"), "{log}");
     assert!(log.contains("aw-gateway-exec"), "{log}");
     assert!(
         log.contains("launch-command alpha safe true 3 1.5"),

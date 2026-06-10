@@ -754,7 +754,8 @@ impl ContainerRuntime {
     }
 
     pub async fn run_detached(&self, spec: &ContainerRunSpec) -> anyhow::Result<()> {
-        self.run_status("run", self.run_args(spec)).await
+        self.run_status_with_env("run", self.run_args(spec), self.run_env(spec))
+            .await
     }
 
     pub async fn stop(&self, name: &str) -> anyhow::Result<()> {
@@ -797,6 +798,7 @@ impl ContainerRuntime {
         timeout_duration: Option<Duration>,
     ) -> anyhow::Result<i32> {
         let mut command = self.command();
+        apply_command_env(&mut command, self.exec_env(spec));
         command
             .arg("exec")
             .args(self.exec_args(spec))
@@ -831,6 +833,7 @@ impl ContainerRuntime {
         timeout_duration: Option<Duration>,
     ) -> anyhow::Result<ContainerExecOutput> {
         let mut command = self.command();
+        apply_command_env(&mut command, self.exec_env(spec));
         command
             .arg("exec")
             .args(self.exec_args(spec))
@@ -899,6 +902,7 @@ impl ContainerRuntime {
         let remove_spec = cancel_marker_remove_spec(spec, &marker, "aw-gateway-exec-rm");
 
         let mut command = self.command();
+        apply_command_env(&mut command, self.exec_env(&exec_spec));
         command
             .arg("exec")
             .args(self.exec_args(&exec_spec))
@@ -980,6 +984,7 @@ impl ContainerRuntime {
         let remove_spec = cancel_marker_remove_spec(spec, &marker, "aw-gateway-exec-rm");
 
         let mut command = self.command();
+        apply_command_env(&mut command, self.exec_env(&exec_spec));
         command
             .arg("exec")
             .args(self.exec_args(&exec_spec))
@@ -1035,6 +1040,7 @@ impl ContainerRuntime {
         timeout_duration: Option<Duration>,
     ) -> anyhow::Result<i32> {
         let mut command = self.command();
+        apply_command_env(&mut command, self.exec_env(spec));
         command
             .arg("exec")
             .args(self.exec_args(spec))
@@ -1083,6 +1089,7 @@ impl ContainerRuntime {
         for (key, value) in &self.env {
             command.env(key, value);
         }
+        apply_pty_command_env(&mut command, self.exec_env(&pty_spec));
 
         let mut writer = pair.master.take_writer()?;
         let mut child = pair.slave.spawn_command(command)?;
@@ -1195,6 +1202,10 @@ impl ContainerRuntime {
         }
     }
 
+    pub fn run_env<'a>(&self, spec: &'a ContainerRunSpec) -> &'a BTreeMap<String, String> {
+        &spec.env
+    }
+
     pub fn list_managed_args(&self, user: &str, uid: u32, context: &RuntimeContext) -> Vec<String> {
         let mut args = vec![
             "ps".into(),
@@ -1226,13 +1237,17 @@ impl ContainerRuntime {
             args.push("--workdir".to_string());
             args.push(cwd.display().to_string());
         }
-        for (key, value) in &spec.env {
+        for key in spec.env.keys() {
             args.push("--env".to_string());
-            args.push(format!("{key}={value}"));
+            args.push(key.clone());
         }
         args.push(spec.container_name.clone());
         args.extend(spec.command.clone());
         args
+    }
+
+    pub fn exec_env<'a>(&self, spec: &'a ContainerExecSpec) -> &'a BTreeMap<String, String> {
+        &spec.env
     }
 
     fn podman_run_args(&self, spec: &ContainerRunSpec) -> Vec<String> {
@@ -1327,9 +1342,9 @@ impl ContainerRuntime {
             args.push("-v".into());
             args.push("/etc/bashrc:/etc/bashrc:ro".into());
         }
-        for (key, value) in &spec.env {
+        for key in spec.env.keys() {
             args.push("-e".into());
-            args.push(format!("{key}={value}"));
+            args.push(key.clone());
         }
         for (key, value) in &spec.labels {
             args.push("--label".into());
@@ -1350,8 +1365,23 @@ impl ContainerRuntime {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let output = self
-            .command()
+        let env = BTreeMap::new();
+        self.run_status_with_env(subcommand, args, &env).await
+    }
+
+    async fn run_status_with_env<I, S>(
+        &self,
+        subcommand: &str,
+        args: I,
+        env: &BTreeMap<String, String>,
+    ) -> anyhow::Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut command = self.command();
+        apply_command_env(&mut command, env);
+        let output = command
             .arg(subcommand)
             .args(args)
             .output()
@@ -1373,6 +1403,21 @@ impl ContainerRuntime {
             ContainerRuntimeType::Docker => "docker",
             ContainerRuntimeType::Colima => "colima/docker",
         }
+    }
+}
+
+fn apply_command_env(command: &mut Command, env: &BTreeMap<String, String>) {
+    for (key, value) in env {
+        command.env(key, value);
+    }
+}
+
+fn apply_pty_command_env(
+    command: &mut portable_pty::CommandBuilder,
+    env: &BTreeMap<String, String>,
+) {
+    for (key, value) in env {
+        command.env(key, value);
     }
 }
 
@@ -2284,7 +2329,7 @@ exit 0
             program: "podman".into(),
             env: BTreeMap::new(),
         };
-        let args = runtime.exec_args(&ContainerExecSpec {
+        let spec = ContainerExecSpec {
             stdin_tty: true,
             stdout_tty: true,
             user: "2450:100".into(),
@@ -2292,7 +2337,8 @@ exit 0
             env: BTreeMap::from([("SHELL".into(), "/usr/bin/bash".into())]),
             container_name: "ubuntu-dev".into(),
             command: vec!["/usr/bin/bash".into(), "-lc".into(), "id -u".into()],
-        });
+        };
+        let args = runtime.exec_args(&spec);
 
         assert_eq!(
             args,
@@ -2303,12 +2349,16 @@ exit 0
                 "--workdir",
                 "/home/alice/project",
                 "--env",
-                "SHELL=/usr/bin/bash",
+                "SHELL",
                 "ubuntu-dev",
                 "/usr/bin/bash",
                 "-lc",
                 "id -u",
             ]
+        );
+        assert_eq!(
+            runtime.exec_env(&spec).get("SHELL").map(String::as_str),
+            Some("/usr/bin/bash")
         );
     }
 
