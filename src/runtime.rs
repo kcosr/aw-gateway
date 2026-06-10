@@ -6,7 +6,6 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::Read;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
@@ -1445,12 +1444,7 @@ fn next_cancel_marker(kind: &str) -> anyhow::Result<ContainerCancelMarker> {
 }
 
 fn random_cancel_marker_token() -> anyhow::Result<String> {
-    let mut bytes = [0_u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .context("open /dev/urandom")?
-        .read_exact(&mut bytes)
-        .context("read /dev/urandom")?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    crate::random::random_hex(32)
 }
 
 fn wrap_cancelable_command(

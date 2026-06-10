@@ -40,6 +40,8 @@
   listener.
 - Stale in-container cancel marker sweeping no longer treats inaccessible or
   out-of-range host PIDs as active.
+- Random token and temporary suffix generation now uses `getrandom` directly
+  instead of opening `/dev/urandom`.
 
 ## [0.6.0] - 2026-06-10
 

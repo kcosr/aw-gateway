@@ -1,6 +1,6 @@
 use anyhow::Context;
 use serde::Serialize;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy)]
@@ -169,12 +169,7 @@ fn temp_path(parent: &Path, name: &str) -> anyhow::Result<PathBuf> {
 }
 
 fn random_hex_suffix() -> anyhow::Result<String> {
-    let mut bytes = [0_u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .context("open /dev/urandom")?
-        .read_exact(&mut bytes)
-        .context("read /dev/urandom")?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    crate::random::random_hex(32)
 }
 
 #[cfg(test)]
