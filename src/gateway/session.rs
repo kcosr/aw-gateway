@@ -2,9 +2,11 @@ use super::Runtime;
 use super::model::{LocalListenerStatus, SessionMarker, SessionStatus};
 use super::token::random_hex_token;
 use crate::config::LocalSshConfig;
+use crate::context::RuntimeContext;
 use crate::fileutil::write_private_file;
 use crate::paths;
 use anyhow::Context;
+use std::collections::BTreeMap;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -32,74 +34,61 @@ impl Runtime {
         .context("join lifecycle lock task")?
     }
 
+    #[cfg(test)]
     pub(super) fn create_session_marker(&self, kind: &str) -> anyhow::Result<SessionGuard> {
         self.create_session_marker_with_launch(kind, None)
     }
 
+    #[cfg(test)]
     pub(super) fn create_launch_session_marker(&self, kind: &str) -> anyhow::Result<SessionGuard> {
         self.create_session_marker_with_launch(kind, self.identity.launch_name.as_deref())
     }
 
+    #[cfg(test)]
     fn create_session_marker_with_launch(
         &self,
         kind: &str,
         launch: Option<&str>,
     ) -> anyhow::Result<SessionGuard> {
-        let dir = self.session_marker_dir();
-        paths::ensure_private_dir(&dir)?;
-        let id = generate_session_id_value()?;
-        let path = dir.join(format!("{id}.json"));
-        let marker = SessionMarker {
-            id,
+        write_session_marker(self.session_marker_spec(kind, launch))
+    }
+
+    pub(super) async fn create_session_marker_async(
+        &self,
+        kind: &str,
+        launch_marker: bool,
+    ) -> anyhow::Result<SessionGuard> {
+        let launch = launch_marker
+            .then_some(self.identity.launch_name.as_deref())
+            .flatten();
+        let spec = self.session_marker_spec(kind, launch);
+        tokio::task::spawn_blocking(move || write_session_marker(spec))
+            .await
+            .context("join session marker creation task")?
+    }
+
+    fn session_marker_spec(&self, kind: &str, launch: Option<&str>) -> SessionMarkerSpec {
+        SessionMarkerSpec {
+            dir: self.session_marker_dir(),
             kind: kind.to_string(),
-            gateway_pid: std::process::id(),
-            gateway_start_time: process_start_time(std::process::id())
-                .context("read current gateway process start time")?,
             container: self.identity.container_name.clone(),
             target: self.identity.target_name.clone(),
             launch: launch.map(str::to_string),
             context: self.context.as_map().clone(),
-            created_at_ms: unix_time_ms()?,
-        };
-        write_private_file(&path, &serde_json::to_vec_pretty(&marker)?, 0o600)
-            .with_context(|| format!("write session marker {}", path.display()))?;
-        Ok(SessionGuard { path })
+        }
     }
 
+    #[cfg(test)]
     pub(super) fn active_session_markers(&self) -> anyhow::Result<Vec<SessionStatus>> {
+        active_session_markers_from_dir(self.session_marker_dir(), self.context.clone())
+    }
+
+    pub(super) async fn active_session_markers_async(&self) -> anyhow::Result<Vec<SessionStatus>> {
         let dir = self.session_marker_dir();
-        let mut sessions = Vec::new();
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(sessions),
-            Err(err) => return Err(err).with_context(|| format!("read {}", dir.display())),
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            match read_session_marker(&path) {
-                Ok(marker)
-                    if session_marker_is_active(&marker)
-                        && self.context.matches_stored(&marker.context) =>
-                {
-                    sessions.push(SessionStatus::from(marker));
-                }
-                Ok(_) => {
-                    let _ = std::fs::remove_file(&path);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "failed to read session marker"
-                    );
-                }
-            }
-        }
-        sessions.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(sessions)
+        let context = self.context.clone();
+        tokio::task::spawn_blocking(move || active_session_markers_from_dir(dir, context))
+            .await
+            .context("join active session marker task")?
     }
 
     pub(super) fn session_marker_dir(&self) -> PathBuf {
@@ -171,6 +160,73 @@ impl Runtime {
         }
         Ok(status.port)
     }
+}
+
+struct SessionMarkerSpec {
+    dir: PathBuf,
+    kind: String,
+    container: String,
+    target: String,
+    launch: Option<String>,
+    context: BTreeMap<String, String>,
+}
+
+fn write_session_marker(spec: SessionMarkerSpec) -> anyhow::Result<SessionGuard> {
+    paths::ensure_private_dir(&spec.dir)?;
+    let id = generate_session_id_value()?;
+    let path = spec.dir.join(format!("{id}.json"));
+    let marker = SessionMarker {
+        id,
+        kind: spec.kind,
+        gateway_pid: std::process::id(),
+        gateway_start_time: process_start_time(std::process::id())
+            .context("read current gateway process start time")?,
+        container: spec.container,
+        target: spec.target,
+        launch: spec.launch,
+        context: spec.context,
+        created_at_ms: unix_time_ms()?,
+    };
+    write_private_file(&path, &serde_json::to_vec_pretty(&marker)?, 0o600)
+        .with_context(|| format!("write session marker {}", path.display()))?;
+    Ok(SessionGuard { path })
+}
+
+fn active_session_markers_from_dir(
+    dir: PathBuf,
+    context: RuntimeContext,
+) -> anyhow::Result<Vec<SessionStatus>> {
+    let mut sessions = Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(sessions),
+        Err(err) => return Err(err).with_context(|| format!("read {}", dir.display())),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        match read_session_marker(&path) {
+            Ok(marker)
+                if session_marker_is_active(&marker) && context.matches_stored(&marker.context) =>
+            {
+                sessions.push(SessionStatus::from(marker));
+            }
+            Ok(_) => {
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to read session marker"
+                );
+            }
+        }
+    }
+    sessions.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(sessions)
 }
 
 #[derive(Debug)]

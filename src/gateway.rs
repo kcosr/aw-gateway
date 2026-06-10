@@ -1732,11 +1732,9 @@ impl Runtime {
         launch_marker: bool,
     ) -> anyhow::Result<(session::SessionGuard, anyhow::Result<ReadyStatus>)> {
         let _lock = self.acquire_lifecycle_lock().await?;
-        let session = if launch_marker {
-            self.create_launch_session_marker(kind)?
-        } else {
-            self.create_session_marker(kind)?
-        };
+        let session = self
+            .create_session_marker_async(kind, launch_marker)
+            .await?;
         let ready = self.ensure_ready_locked().await;
         Ok((session, ready))
     }
@@ -1837,7 +1835,7 @@ impl Runtime {
         } else {
             None
         };
-        let sessions = self.active_session_markers()?;
+        let sessions = self.active_session_markers_async().await?;
         let launch = status_launch(self.identity.session_id.as_deref(), &sessions);
         let agent_ready = agent.as_ref().is_some_and(|status| status.ready);
         Ok(GatewayStatus {

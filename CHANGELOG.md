@@ -38,6 +38,8 @@
 - Session marker creation for active run, launch, connect, and local-listen
   sessions is now serialized with readiness under the lifecycle lock so idle
   cleanup cannot stop a container after a new session has registered.
+- Session marker creation and active-marker enumeration in async gateway paths
+  now run on the blocking task pool instead of on async worker threads.
 - Local SSH listener startup now serializes status-file checks and writes with
   the lifecycle lock, and transient accept errors no longer terminate the
   listener.
