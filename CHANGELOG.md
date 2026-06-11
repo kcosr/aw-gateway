@@ -6,7 +6,7 @@
 
 - Launch execution now requires `launch-run` in `ssh_dispatch.enabled_actions`
   or `http.enabled_actions`; `launch` only permits inspecting one launch
-  definition.
+  definition ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Several unsafe or ambiguous configs now fail validation or startup instead of
   being accepted: enabled non-loopback HTTP listeners require bearer auth,
   include patterns must match files, include definition sections must be TOML
@@ -14,7 +14,8 @@
   references are rejected, `logging.max_files` is capped at `1024`, service env
   entries must declare exactly one source at config load, rendered bind mount
   paths may not contain `:` or `,`, read-write bind mount sources may not be
-  world-writable, and string launch var values may not contain NUL, LF, or CR.
+  world-writable, and string launch var values may not contain NUL, LF, or CR
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 
 ### Changed
 
@@ -26,84 +27,110 @@
   `` ` ``, newlines); bare redirection (`<`, `>`) and variable expansion (`$`)
   are now allowed so ordinary commands such as `echo "$HOME"` or `cmd > out` are
   not blocked under restrictive transfer policy. Transfer policy is a best-effort
-  convenience control, not a security boundary.
+  convenience control, not a security boundary
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - HTTP wait-mode command output, container-agent control responses, and HTTP
   health-probe responses are now size bounded; truncated wait streams are
-  reported with `output_truncated`.
+  reported with `output_truncated`
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Enabled HTTP listeners now require bearer auth when `http.listen` is
-  non-loopback.
+  non-loopback ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - HTTP 500-class operation errors now return a generic client-facing message
-  while logging detailed internal error sources server-side.
+  while logging detailed internal error sources server-side
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Container-agent mutating control-socket methods now fail closed when no
   control token is configured, and control-token checks use shared
-  constant-time comparison.
+  constant-time comparison ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Container-agent startup now rejects malformed `AW_AUTHENTICATED_UID` /
-  `AW_AUTHENTICATED_GID` values instead of silently disabling peer validation.
+  `AW_AUTHENTICATED_GID` values instead of silently disabling peer validation
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Container-agent service environment entries now validate the exactly-one
-  `value` / `file` / `inherit` source rule during gateway config validation.
+  `value` / `file` / `inherit` source rule during gateway config validation
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Container-agent service environment interpolation now renders literal
   `value` entries and `file` paths only; values loaded from files or inherited
-  environment variables are passed through literally.
+  environment variables are passed through literally
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Command health checks now run with a configurable timeout, defaulting to
-  `5s`, and timed command stderr draining is bounded after process exit.
+  `5s`, and timed command stderr draining is bounded after process exit
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Container-agent service restarts now keep backing off for immediate crash
-  loops, and service shutdown no longer holds the child lock while waiting.
+  loops, and service shutdown no longer holds the child lock while waiting
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Container-agent SSH bridge and control socket accept loops now continue after
-  transient accept errors and enforce fixed connection/session limits.
+  transient accept errors and enforce fixed connection/session limits
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - File logging now creates private log directories/files, rejects
   `logging.max_files` above `1024`, and redacts HTTP bearer tokens from Debug
-  output.
+  output ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - File logging now recovers from a poisoned writer mutex instead of panicking on
-  subsequent log writes.
+  subsequent log writes ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Private file writes now use atomic replace semantics, and existing control
-  token files must have private permissions before they are trusted.
+  token files must have private permissions before they are trusted
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Runtime-provided container and exec environment values are now normally passed
   through the spawned container-runtime process environment instead of embedding
   their values in `podman`/`docker` argv; host-runtime-sensitive names such as
   `PATH`, `LD_PRELOAD`, and `DOCKER_HOST` still use explicit `KEY=value`
-  runtime arguments so they cannot alter the runtime client process itself.
+  runtime arguments so they cannot alter the runtime client process itself
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Container-agent service user groups are now resolved before spawning the
   child process, so the post-fork `pre_exec` path only performs setgroups,
-  setgid, and setuid.
+  setgid, and setuid ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Runtime process signaling now uses checked PID conversions to avoid
-  out-of-range PID wraparound.
+  out-of-range PID wraparound
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - In-container cancel marker files for cancelable exec/PTY sessions are now
-  created with owner-only permissions.
+  created with owner-only permissions
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Session marker reads now tolerate pre-launch-field marker JSON, and marker
-  liveness checks use the same self-process fast path as listener status.
+  liveness checks use the same self-process fast path as listener status
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Session marker creation for active run, launch, connect, and local-listen
   sessions is now serialized with readiness under the lifecycle lock so idle
-  cleanup cannot stop a container after a new session has registered.
+  cleanup cannot stop a container after a new session has registered
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Session marker creation and active-marker enumeration in async gateway paths
-  now run on the blocking task pool instead of on async worker threads.
+  now run on the blocking task pool instead of on async worker threads
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Container startup now resolves configured bind mounts once and reuses the
-  checked mount set for safety warnings and the runtime run spec.
+  checked mount set for safety warnings and the runtime run spec
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Rendered container bind mount sources and targets, including generated
   workspace and control-socket mounts, now reject `:` and `,` separators, and
-  configured mount targets must render to absolute paths.
+  configured mount targets must render to absolute paths
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Container startup now rejects read-write bind mounts whose resolved source is
-  world-writable.
+  world-writable ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Container inspect results now fail closed when the runtime returns more than
-  one inspected container for a single-name inspect request.
+  one inspected container for a single-name inspect request
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Target image references now reject malformed values such as leading flags,
   whitespace, empty path components, invalid tags, and invalid digests during
-  config validation.
+  config validation ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - String launch variable values now reject NUL, LF, and CR characters, and the
   launch documentation now calls out `{var.*}` values as untrusted when used in
-  host-side launch step environment values.
-- Include patterns now fail config loading when they match no files.
-- Root `extends` chains now fail config loading after 64 root config files.
+  host-side launch step environment values
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
+- Include patterns now fail config loading when they match no files
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
+- Root `extends` chains now fail config loading after 64 root config files
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Config identifiers such as target, launch, template, service, launch-var, and
-  runtime-profile names now reject leading `.` or `-`.
+  runtime-profile names now reject leading `.` or `-`
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - `local_ssh.host` loopback validation now applies only when
-  `local_ssh.mode = "listen"`, matching the effective config rules.
+  `local_ssh.mode = "listen"`, matching the effective config rules
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Local SSH listener startup now serializes status-file checks and writes with
   the lifecycle lock, and transient accept errors no longer terminate the
-  listener.
+  listener ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Stale in-container cancel marker sweeping no longer treats inaccessible or
-  out-of-range host PIDs as active.
+  out-of-range host PIDs as active
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - PTY lease tokens, cancel marker tokens, and temporary suffix generation now
-  use `getrandom` directly instead of opening `/dev/urandom`.
+  use `getrandom` directly instead of opening `/dev/urandom`
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 
 ### Fixed
 
@@ -114,11 +141,12 @@
   file in append mode instead of truncating, tolerates already-moved generation
   files, and always resets its byte counter after a rotation attempt, so a
   failed reopen can no longer leave the writer attached to the rotated-away file
-  and re-rotating on every write.
+  and re-rotating on every write
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - The container-agent control socket now caps held sessions below the connection
   limit, so a burst of session holds can no longer exhaust all control
   connections and starve `status`/shutdown requests; the `too_many_sessions`
-  response is now reachable.
+  response is now reachable ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 
 ## [0.6.0] - 2026-06-10
 
