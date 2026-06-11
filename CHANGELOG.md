@@ -107,6 +107,9 @@
 
 ### Fixed
 
+- Smoke-generated HTTP configs now enable `launch-run`, so HTTP launch
+  execution coverage matches the split launch metadata/execution action model
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Size-based log rotation (gateway and container-agent) now reopens the rotated
   file in append mode instead of truncating, tolerates already-moved generation
   files, and always resets its byte counter after a rotation attempt, so a
