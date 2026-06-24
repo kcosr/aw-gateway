@@ -1575,12 +1575,12 @@ fn ssh_dispatch_defaults_include_launch_actions() {
             .iter()
             .any(|action| action == "launches")
     );
-    assert!(cfg.enabled_actions.iter().any(|action| action == "launch"));
     assert!(
         cfg.enabled_actions
             .iter()
-            .any(|action| action == "launch-run")
+            .any(|action| action == "launch-show")
     );
+    assert!(cfg.enabled_actions.iter().any(|action| action == "launch"));
     cfg.validate().unwrap();
 }
 
@@ -1593,8 +1593,8 @@ enabled_actions = [
   "up",
   "run",
   "launches",
+  "launch-show",
   "launch",
-  "launch-run",
   "status",
   "targets",
   "stop",

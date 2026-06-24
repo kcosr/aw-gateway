@@ -4,9 +4,10 @@
 
 ### Breaking Changes
 
-- Launch execution now requires `launch-run` in `ssh_dispatch.enabled_actions`
-  or `http.enabled_actions`; `launch` only permits inspecting one launch
-  definition ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
+- Launch execution now requires `launch` in `ssh_dispatch.enabled_actions` or
+  `http.enabled_actions`; `launch-show` permits inspecting one launch
+  definition without granting execution
+  ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Several unsafe or ambiguous configs now fail validation or startup instead of
   being accepted: enabled non-loopback HTTP listeners require bearer auth,
   include patterns must match files, include definition sections must be TOML
@@ -134,8 +135,8 @@
 
 ### Fixed
 
-- Smoke-generated HTTP configs now enable `launch-run`, so HTTP launch
-  execution coverage matches the split launch metadata/execution action model
+- Smoke-generated HTTP configs now enable `launch`, so HTTP launch execution
+  coverage matches the split launch catalog/detail/execution action model
   ([#58](https://github.com/kcosr/aw-gateway/pull/58)).
 - Size-based log rotation (gateway and container-agent) now reopens the rotated
   file in append mode instead of truncating, tolerates already-moved generation
@@ -206,7 +207,7 @@
 - Added resolved target metadata to launch detail responses
   ([#49](https://github.com/kcosr/aw-gateway/pull/49)).
 - Added opt-in launch passthrough args with `allow_args = true`, CLI/SSH
-  `launch ... -- <args...>`, and HTTP launch-run `args`
+  `launch ... -- <args...>`, and HTTP launch request `args`
   ([#50](https://github.com/kcosr/aw-gateway/pull/50)).
 - Added `assets/acl-proxy.example.toml` as a starter allowlist for common
   coding-agent proxy egress

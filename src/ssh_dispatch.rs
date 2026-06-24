@@ -329,7 +329,7 @@ fn parse_launch_action(words: &[String], cfg: &SshDispatchConfig) -> anyhow::Res
         anyhow::bail!("launch requires a launch name");
     };
     if name == "show" {
-        if !action_enabled(cfg, "launch") {
+        if !action_enabled(cfg, "launch-show") {
             anyhow::bail!(
                 "invalid or disabled gateway action shape: {}",
                 words.join(" ")
@@ -356,7 +356,7 @@ fn parse_launch_action(words: &[String], cfg: &SshDispatchConfig) -> anyhow::Res
         });
     }
 
-    if !action_enabled(cfg, "launch-run") {
+    if !action_enabled(cfg, "launch") {
         anyhow::bail!(
             "invalid or disabled gateway action shape: {}",
             words.join(" ")
@@ -882,7 +882,7 @@ mod tests {
     fn disabled_launch_actions_are_rejected() {
         let mut cfg = SshDispatchConfig::default();
         cfg.enabled_actions
-            .retain(|action| !matches!(action.as_str(), "launch" | "launch-run" | "launches"));
+            .retain(|action| !matches!(action.as_str(), "launch" | "launch-show" | "launches"));
         for command in [
             "launches",
             "launches --json",
@@ -901,7 +901,7 @@ mod tests {
     #[test]
     fn launch_show_and_run_use_separate_actions() {
         let mut cfg = SshDispatchConfig::default();
-        cfg.enabled_actions.retain(|action| action != "launch-run");
+        cfg.enabled_actions.retain(|action| action != "launch");
 
         assert_eq!(
             parse_gateway_action("launch show repo-shell", &cfg).unwrap(),
@@ -917,8 +917,8 @@ mod tests {
             "{err}"
         );
 
-        cfg.enabled_actions.push("launch-run".into());
-        cfg.enabled_actions.retain(|action| action != "launch");
+        cfg.enabled_actions.push("launch".into());
+        cfg.enabled_actions.retain(|action| action != "launch-show");
         assert!(parse_gateway_action("launch show repo-shell", &cfg).is_err());
         assert_eq!(
             parse_gateway_action("launch repo-shell --var repo=x", &cfg).unwrap(),
@@ -935,7 +935,7 @@ mod tests {
     fn disabled_session_actions_are_rejected() {
         let mut cfg = SshDispatchConfig::default();
         cfg.enabled_actions
-            .retain(|action| !matches!(action.as_str(), "connect" | "run" | "launch-run"));
+            .retain(|action| !matches!(action.as_str(), "connect" | "run" | "launch"));
         for command in [
             "connect default --session-id abc123def456",
             "run default --session-id abc123def456 -- pwd",

@@ -211,7 +211,7 @@ schema_version = "1"
 [http]
 enabled = true
 listen = "127.0.0.1:0"
-enabled_actions = ["status", "targets", "launches", "run", "launch", "launch-run", "up", "stop", "remove"]
+enabled_actions = ["status", "targets", "launches", "run", "launch-show", "launch", "up", "stop", "remove"]
 
 [runtime]
 type = "podman"
@@ -915,6 +915,25 @@ async fn launch_show_and_run_use_separate_http_actions() {
     let state = test_state(HttpConfig {
         enabled: true,
         listen: "127.0.0.1:0".into(),
+        enabled_actions: vec!["launch-show".into()],
+        auth: HttpAuthConfig::default(),
+    });
+
+    authorize_action(&state, &HeaderMap::new(), "launch-show")
+        .await
+        .unwrap();
+    let response = authorize_action(&state, &HeaderMap::new(), "launch")
+        .await
+        .unwrap_err();
+    let ActionAuthorizationError::Operation(OperationError::DisabledAction { message }) = response
+    else {
+        panic!("expected disabled-action operation error");
+    };
+    assert_eq!(message, "http action \"launch\" is disabled");
+
+    let state = test_state(HttpConfig {
+        enabled: true,
+        listen: "127.0.0.1:0".into(),
         enabled_actions: vec!["launch".into()],
         auth: HttpAuthConfig::default(),
     });
@@ -922,14 +941,14 @@ async fn launch_show_and_run_use_separate_http_actions() {
     authorize_action(&state, &HeaderMap::new(), "launch")
         .await
         .unwrap();
-    let response = authorize_action(&state, &HeaderMap::new(), "launch-run")
+    let response = authorize_action(&state, &HeaderMap::new(), "launch-show")
         .await
         .unwrap_err();
     let ActionAuthorizationError::Operation(OperationError::DisabledAction { message }) = response
     else {
         panic!("expected disabled-action operation error");
     };
-    assert_eq!(message, "http action \"launch-run\" is disabled");
+    assert_eq!(message, "http action \"launch-show\" is disabled");
 }
 
 #[tokio::test]
@@ -1303,7 +1322,7 @@ schema_version = "1"
 [http]
 enabled = true
 listen = "127.0.0.1:0"
-enabled_actions = ["launches", "launch"]
+enabled_actions = ["launches", "launch-show"]
 
 [runtime]
 type = "podman"

@@ -924,14 +924,15 @@ Host-gateway SSH dispatch checks the default transfer table before dispatch;
 per-target transfer overrides do not relax that host-side gate and only affect
 direct container-SSHD access. If a deployment intends to expose management-only
 SSH commands without arbitrary container exec, omit `run` from
-`ssh_dispatch.enabled_actions`; omit `launch-run` if users should not start
-configured launch workflows; omit `launch` if users should not inspect a single
-configured launch; omit `launches` if users should not discover configured
-launches; also omit `connect` if users should not receive a full container SSH
-session. `allow_interactive_shell = false` blocks
-SSH-dispatched interactive shells, while `allow_container_commands = false`
-blocks non-gateway passthrough commands. Both default to `true`, and neither
-option disables explicitly enabled gateway actions.
+`ssh_dispatch.enabled_actions`; omit `launch` if users should not start
+configured launch workflows; omit `launch-show` if users should not inspect a
+single configured launch's implementation details; omit `launches` if users
+should not discover configured launches and their inputs; also omit `connect`
+if users should not receive a full container SSH session.
+`allow_interactive_shell = false` blocks SSH-dispatched interactive shells,
+while `allow_container_commands = false` blocks non-gateway passthrough
+commands. Both default to `true`, and neither option disables explicitly enabled
+gateway actions.
 
 Default lifecycle, host, and bootstrap step lists are inherited by every target.
 Target entries use the same key as the default list (`phase + name` for
@@ -1243,7 +1244,7 @@ no args; non-empty args are rejected unless the effective launch has
 `allow_args = true`.
 
 When a launch is reachable through SSH dispatch, `allow_args = true` exposes the
-configured program's CLI surface to authorized launch callers. Omit `launch-run`
+configured program's CLI surface to authorized launch callers. Omit `launch`
 from `ssh_dispatch.enabled_actions` if callers should not be able to supply
 program arguments.
 
@@ -1259,7 +1260,7 @@ aw-gateway launch repo-shell --session-id abc123def456 --var repo=https://exampl
 aw-gateway launch agent-pack-review --var manifest=/opt/agent-pack/review.yaml -- --skill engineering/fresh-eyes "Review this branch."
 ```
 
-When `launches`, `launch`, and `launch-run` are present in
+When `launches`, `launch-show`, and `launch` are present in
 `ssh_dispatch.enabled_actions`, the same commands can be invoked
 through the host SSH gateway:
 
@@ -1271,10 +1272,10 @@ ssh host 'launch repo-shell --session-id=abc123def456 --var=repo=https://example
 ssh host 'launch agent-pack-review --var manifest=/opt/agent-pack/review.yaml -- --skill engineering/fresh-eyes "Review this branch."'
 ```
 
-Omit `launch-run` from `ssh_dispatch.enabled_actions` if SSH users should not
-start configured launch workflows. Omit `launch` if SSH users should not inspect
-one configured launch. Omit `launches` if SSH users should not list configured
-launches.
+Omit `launch` from `ssh_dispatch.enabled_actions` if SSH users should not start
+configured launch workflows. Omit `launch-show` if SSH users should not inspect
+one configured launch's implementation details. Omit `launches` if SSH users
+should not list configured launches and their inputs.
 
 `launches --json` emits a bare array of launch summaries. Each summary includes
 `name`, `target`, `allow_args`, optional `description`, and a `vars` object
@@ -1512,7 +1513,7 @@ socket string such as `127.0.0.1:8080` or `[::1]:8080`.
 [http]
 enabled = true
 listen = "127.0.0.1:8080"
-enabled_actions = ["status", "targets", "launches", "launch", "launch-run", "up", "run", "stop", "remove"]
+enabled_actions = ["status", "targets", "launches", "launch-show", "launch", "up", "run", "stop", "remove"]
 
 [http.auth]
 type = "none"
@@ -1532,7 +1533,7 @@ token = "change-me"
 ```
 
 `http.enabled_actions` is an HTTP-specific allow list. Supported values are
-exactly `status`, `targets`, `launches`, `launch`, `launch-run`, `up`, `run`,
+exactly `status`, `targets`, `launches`, `launch-show`, `launch`, `up`, `run`,
 `stop`, and `remove`. Other gateway actions such as `connect`, key management,
 client-config/bundle, proxy/tunnel helpers, and default-target management are
 not HTTP API actions.
@@ -1649,7 +1650,7 @@ HTTP 201 with a short-lived single-use attach lease:
 
 For fixed targets, `session_id` is `null`.
 
-The POST is the authorized `run` or `launch-run` action and may block while the
+The POST is the authorized `run` or `launch` action and may block while the
 target becomes ready and launch steps run. The client then opens the WebSocket
 attach URL and sends the first text frame as `{"type":"auth","token":"..."}`.
 The attach token is a one-time lease-scoped capability; bearer headers are not
@@ -1678,8 +1679,8 @@ server-side.
 | `POST` | `/api/v1/stop` | `stop` | `GatewayOperation::Stop` |
 | `POST` | `/api/v1/remove` | `remove` | `GatewayOperation::Remove` |
 | `GET` | `/api/v1/launches` | `launches` | `GatewayOperation::Launches` |
-| `GET` | `/api/v1/launches/{name}` | `launch` | `GatewayOperation::LaunchShow` |
-| `POST` | `/api/v1/launches/{name}/run` | `launch-run` | `GatewayOperation::Launch` |
+| `GET` | `/api/v1/launches/{name}` | `launch-show` | `GatewayOperation::LaunchShow` |
+| `POST` | `/api/v1/launches/{name}/run` | `launch` | `GatewayOperation::Launch` |
 | `POST` | `/api/v1/run` | `run` | `GatewayOperation::Run` |
 | `GET` | `/api/v1/pty/{pty_id}` | lease token | WebSocket PTY attach |
 
