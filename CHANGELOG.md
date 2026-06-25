@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+_No unreleased changes._
+
 ## [0.7.0] - 2026-06-25
 
 ### Breaking Changes
