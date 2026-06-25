@@ -113,7 +113,8 @@ impl ManagedService {
     pub(super) async fn stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         tracing::info!(service = self.config.name, "stopping service");
-        if let Some(child) = self.child.lock().await.take() {
+        let child = { self.child.lock().await.take() };
+        if let Some(child) = child {
             stop_child_gracefully(self, child).await;
         } else {
             tracing::debug!(service = self.config.name, "service already stopped");
@@ -153,17 +154,22 @@ pub(super) async fn service_supervisor(
                 continue;
             }
         }
-        let exit_success = if let Err(err) = start_service(&service).await {
+        let run_result = if let Err(err) = start_service(&service).await {
             *service.last_error.lock().await = Some(err.to_string());
             tracing::error!(service = service.config.name, error = %err, "service start failed");
-            false
+            ServiceRunResult {
+                exit_success: false,
+                healthy_uptime: false,
+            }
         } else {
-            current_backoff = base_backoff;
             wait_for_service_exit_or_unhealthy(&service).await
         };
+        if run_result.healthy_uptime {
+            current_backoff = base_backoff;
+        }
 
         if service.stopping.load(Ordering::SeqCst)
-            || !should_restart(service.config.restart, exit_success)
+            || !should_restart(service.config.restart, run_result.exit_success)
         {
             break;
         }
@@ -173,7 +179,7 @@ pub(super) async fn service_supervisor(
             service = service.config.name,
             restart_count,
             backoff_ms = current_backoff.as_millis(),
-            exit_success,
+            exit_success = run_result.exit_success,
             "service restart scheduled"
         );
         sleep(current_backoff).await;
@@ -181,9 +187,16 @@ pub(super) async fn service_supervisor(
     }
 }
 
-async fn wait_for_service_exit_or_unhealthy(service: &ManagedService) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServiceRunResult {
+    exit_success: bool,
+    healthy_uptime: bool,
+}
+
+async fn wait_for_service_exit_or_unhealthy(service: &ManagedService) -> ServiceRunResult {
     let health_grace = service_startup_timeout(service);
     let started_at = Instant::now();
+    let mut healthy_uptime = false;
     loop {
         sleep(health_check_interval(service.config.health_check.as_ref())).await;
         let exit_status = {
@@ -205,6 +218,8 @@ async fn wait_for_service_exit_or_unhealthy(service: &ManagedService) -> bool {
         };
         match exit_status {
             Some(Ok(success)) => {
+                let healthy_uptime =
+                    healthy_uptime || (success && started_at.elapsed() >= health_grace);
                 if success {
                     *service.last_error.lock().await = None;
                     tracing::info!(
@@ -218,7 +233,10 @@ async fn wait_for_service_exit_or_unhealthy(service: &ManagedService) -> bool {
                         "service process exited unsuccessfully"
                     );
                 }
-                return success;
+                return ServiceRunResult {
+                    exit_success: success,
+                    healthy_uptime,
+                };
             }
             Some(Err(err)) => {
                 *service.last_error.lock().await = Some(err.to_string());
@@ -227,24 +245,36 @@ async fn wait_for_service_exit_or_unhealthy(service: &ManagedService) -> bool {
                     error = %err,
                     "failed to observe service exit status"
                 );
-                return false;
+                return ServiceRunResult {
+                    exit_success: false,
+                    healthy_uptime,
+                };
             }
             None => {
-                if service.required_health_restart()
-                    && started_at.elapsed() >= health_grace
-                    && !service.health_check().await.unwrap_or(false)
-                {
-                    *service.last_error.lock().await =
-                        Some("required service health check failed".into());
-                    tracing::warn!(
-                        service = service.config.name,
-                        startup_timeout_ms = health_grace.as_millis(),
-                        "required service health check failed"
-                    );
-                    if let Some(child) = service.child.lock().await.take() {
-                        stop_child_gracefully(service, child).await;
+                if started_at.elapsed() >= health_grace {
+                    if service.required_health_restart() {
+                        if service.health_check().await.unwrap_or(false) {
+                            healthy_uptime = true;
+                        } else {
+                            *service.last_error.lock().await =
+                                Some("required service health check failed".into());
+                            tracing::warn!(
+                                service = service.config.name,
+                                startup_timeout_ms = health_grace.as_millis(),
+                                "required service health check failed"
+                            );
+                            let child = { service.child.lock().await.take() };
+                            if let Some(child) = child {
+                                stop_child_gracefully(service, child).await;
+                            }
+                            return ServiceRunResult {
+                                exit_success: false,
+                                healthy_uptime,
+                            };
+                        }
+                    } else {
+                        healthy_uptime = true;
                     }
-                    return false;
                 }
             }
         }
@@ -393,9 +423,13 @@ async fn start_service(service: &ManagedService) -> anyhow::Result<()> {
         let identity = resolve_service_user(&service.config.user)?;
         let user = CString::new(service.config.user.clone())
             .with_context(|| format!("service user {:?} contains NUL", service.config.user))?;
+        let groups =
+            crate::unix_priv::resolve_user_groups(&user, identity.gid).with_context(|| {
+                format!("resolve groups for service user {:?}", service.config.user)
+            })?;
         unsafe {
             command.pre_exec(move || {
-                crate::unix_priv::drop_to_user_pre_exec(&user, identity.uid, identity.gid)
+                crate::unix_priv::drop_to_user_pre_exec(identity.uid, identity.gid, &groups)
             });
         }
     }
@@ -511,21 +545,34 @@ impl RotatingServiceLog {
                     let _ = tokio::fs::remove_file(path).await;
                 }
                 RotationStep::Rename { from, to } => {
-                    if tokio::fs::try_exists(from).await? {
-                        tokio::fs::rename(from, to).await?;
-                    }
+                    rename_log_if_exists(from, to).await?;
                 }
             }
         }
-        self.file = tokio::fs::OpenOptions::new()
+        // Reopen in append mode (not truncate) and reset accounting whether or
+        // not the reopen succeeds, so a failed reopen cannot leave the writer on
+        // the rotated-away inode with a stale byte counter that re-rotates on
+        // every subsequent write.
+        let opened = tokio::fs::OpenOptions::new()
             .create(true)
-            .truncate(true)
-            .write(true)
+            .append(true)
             .open(plan.active_path())
             .await
-            .with_context(|| format!("open {}", plan.active_path().display()))?;
+            .with_context(|| format!("open {}", plan.active_path().display()));
         self.rotation.reset_after_rotation();
+        self.file = opened?;
         Ok(())
+    }
+}
+
+// Rename `from` to `to`, treating a missing source as success. Avoids the
+// try_exists()-then-rename TOCTOU and tolerates a generation file that another
+// rotation already moved.
+async fn rename_log_if_exists(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    match tokio::fs::rename(from, to).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
     }
 }
 
@@ -656,5 +703,76 @@ async fn stop_child_gracefully(service: &ManagedService, mut child: Child) {
             );
             let _ = child.kill().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service_config(name: &str, command: Vec<String>) -> ServiceConfig {
+        ServiceConfig {
+            name: name.to_string(),
+            required: true,
+            user: "root".to_string(),
+            command,
+            cwd: None,
+            restart: RestartPolicy::Always,
+            restart_backoff: None,
+            restart_backoff_max: None,
+            startup_timeout: Some("20ms".into()),
+            shutdown_timeout: None,
+            depends_on: Vec::new(),
+            env: BTreeMap::new(),
+            health_check: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn service_run_result_does_not_reset_backoff_for_immediate_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ManagedService::new(
+            service_config(
+                "crash",
+                vec!["/bin/sh".into(), "-c".into(), "exit 17".into()],
+            ),
+            dir.path().to_path_buf(),
+            LoggingConfig::default(),
+        );
+
+        start_service(&service).await.unwrap();
+        let result = wait_for_service_exit_or_unhealthy(&service).await;
+
+        assert_eq!(
+            result,
+            ServiceRunResult {
+                exit_success: false,
+                healthy_uptime: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn service_run_result_resets_backoff_after_startup_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = ManagedService::new(
+            service_config(
+                "stable",
+                vec!["/bin/sh".into(), "-c".into(), "sleep 0.1".into()],
+            ),
+            dir.path().to_path_buf(),
+            LoggingConfig::default(),
+        );
+
+        start_service(&service).await.unwrap();
+        let result = wait_for_service_exit_or_unhealthy(&service).await;
+
+        assert_eq!(
+            result,
+            ServiceRunResult {
+                exit_success: true,
+                healthy_uptime: true,
+            }
+        );
     }
 }

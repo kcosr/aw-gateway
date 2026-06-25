@@ -3,6 +3,7 @@ pub const GATEWAY_ACTION_NAMES: &[&str] = &[
     "up",
     "run",
     "launches",
+    "launch-show",
     "launch",
     "status",
     "targets",
@@ -20,7 +21,15 @@ pub const GATEWAY_ACTION_NAMES: &[&str] = &[
 ];
 
 pub const HTTP_ACTION_NAMES: &[&str] = &[
-    "status", "targets", "up", "launches", "launch", "run", "stop", "remove",
+    "status",
+    "targets",
+    "up",
+    "launches",
+    "launch-show",
+    "launch",
+    "run",
+    "stop",
+    "remove",
 ];
 
 pub fn is_gateway_action_name(name: &str) -> bool {
@@ -51,6 +60,7 @@ mod tests {
                 "up",
                 "run",
                 "launches",
+                "launch-show",
                 "launch",
                 "status",
                 "targets",
@@ -71,7 +81,15 @@ mod tests {
         assert_eq!(
             HTTP_ACTION_NAMES,
             &[
-                "status", "targets", "up", "launches", "launch", "run", "stop", "remove",
+                "status",
+                "targets",
+                "up",
+                "launches",
+                "launch-show",
+                "launch",
+                "run",
+                "stop",
+                "remove",
             ]
         );
         assert!(!is_http_action_name("connect"));

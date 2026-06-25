@@ -159,6 +159,16 @@ async fn wait_for_background_marker_clear(log: &Path, marker_dir: &Path, panic_m
     panic!("{panic_message}");
 }
 
+async fn wait_for_session_marker_count(marker_dir: &Path, expected: usize, panic_message: &str) {
+    for _ in 0..20 {
+        if session_marker_count(marker_dir) == expected {
+            return;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{panic_message}");
+}
+
 fn test_control_socket_paths(base: &Path) -> ControlSocketPaths {
     let host_dir = base.join("runtime-sockets");
     let container_dir = PathBuf::from("/run/aw-gateway");
@@ -1669,7 +1679,12 @@ async fn detached_run_keeps_session_marker_until_background_finishes() {
     .unwrap();
 
     assert!(matches!(outcome, ExecutionOutcome::Detached { .. }));
-    assert_eq!(session_marker_count(&marker_dir), 1);
+    wait_for_session_marker_count(
+        &marker_dir,
+        1,
+        "detached background operation did not create marker",
+    )
+    .await;
 
     wait_for_background_marker_clear(
         &log,
@@ -1826,7 +1841,7 @@ async fn detached_launch_keeps_launch_marker_until_background_finishes() {
     .unwrap();
 
     assert!(matches!(outcome, ExecutionOutcome::Detached { .. }));
-    assert_eq!(session_marker_count(&marker_dir), 1);
+    wait_for_session_marker_count(&marker_dir, 1, "detached launch did not create marker").await;
     let sessions = marker_runtime.active_session_markers().unwrap();
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].kind, "launch");
@@ -1944,6 +1959,39 @@ exit 0
     drop(session);
 }
 
+#[tokio::test]
+async fn begin_ready_session_writes_marker_under_lifecycle_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    write_fake_runtime(&fake_runtime, &fake_running_runtime_script(0));
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        cfg.target_defaults.host_steps.clear();
+    });
+
+    let lock = runtime.acquire_lifecycle_lock().await.unwrap();
+    let ready_session = runtime.begin_ready_session("run-command", false);
+    tokio::pin!(ready_session);
+
+    let blocked = tokio::time::timeout(Duration::from_millis(50), &mut ready_session).await;
+    assert!(
+        blocked.is_err(),
+        "ready session should wait for lifecycle lock"
+    );
+    assert_eq!(session_marker_count(&runtime.session_marker_dir()), 0);
+
+    drop(lock);
+    let (session, ready_result) = tokio::time::timeout(Duration::from_secs(2), ready_session)
+        .await
+        .unwrap()
+        .unwrap();
+    let ready = ready_result.unwrap();
+
+    assert_eq!(ready.target, "default");
+    assert_eq!(session_marker_count(&runtime.session_marker_dir()), 1);
+    drop(session);
+    assert_eq!(session_marker_count(&runtime.session_marker_dir()), 0);
+}
+
 #[test]
 fn prepare_container_state_dir_precreates_agent_log_dir() {
     let dir = tempfile::tempdir().unwrap();
@@ -2034,6 +2082,16 @@ mode = { type = "enum", values = ["fast", "safe"], default = "fast" }
         .unwrap_err()
         .to_string();
     assert!(err.contains("invalid boolean launch variable"), "{err}");
+
+    let invalid_string =
+        SuppliedLaunchVars::from_cli_pairs(vec!["repo=line\nbreak".into()]).unwrap();
+    let err = resolve_launch_vars("agent", &launch, &invalid_string)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("invalid launch variable \"repo\"; must not contain NUL, LF, or CR"),
+        "{err}"
+    );
 
     let mut typed = SuppliedLaunchVars::default();
     typed
@@ -3329,6 +3387,36 @@ name = "{{image_slug}}"
 }
 
 #[test]
+fn rendered_default_control_socket_host_dir_is_marked_default() {
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let target = cfg.effective_target("default").unwrap();
+    let user = UserContext {
+        uid: 2450,
+        gid: 2450,
+        user: "alice".into(),
+        home: PathBuf::from("/home/alice"),
+    };
+
+    let paths = render_control_socket_paths(
+        &target.control_sockets,
+        &target,
+        "default",
+        "ubuntu-dev",
+        None,
+        "ubuntu-dev",
+        &user,
+        &RuntimeContext::empty(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        paths.host_dir,
+        PathBuf::from("/run/user/2450/aw-gateway/ubuntu-dev")
+    );
+    assert!(paths.default_host_dir);
+}
+
+#[test]
 fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
     let dir = tempfile::tempdir().unwrap();
     let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
@@ -3355,11 +3443,11 @@ fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
         })
         .unwrap();
 
-    let args = runtime.container_runtime.run_args(
-        &runtime
-            .container_run_spec(Some("identity-token"), Some("control-token"))
-            .unwrap(),
-    );
+    let spec = runtime
+        .container_run_spec(Some("identity-token"), Some("control-token"))
+        .unwrap();
+    let args = runtime.container_runtime.run_args(&spec);
+    let env = runtime.container_runtime.run_env(&spec);
     let arg = |value: &str| args.iter().position(|item| item == value);
 
     assert!(args.contains(&"--userns=keep-id".to_string()));
@@ -3371,10 +3459,36 @@ fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
         "{}:/home/alice:Z",
         runtime.paths.workspace.display()
     )));
-    assert!(args.contains(&"AW_IDENTITY_TOKEN=identity-token".to_string()));
-    assert!(args.contains(&"AW_CONTAINER_CONTROL_TOKEN=control-token".to_string()));
-    assert!(args.contains(&"AW_AUTHENTICATED_UID=2450".to_string()));
-    assert!(args.contains(&"AW_AUTHENTICATED_GID=2450".to_string()));
+    assert!(args.contains(&"AW_IDENTITY_TOKEN".to_string()));
+    assert!(args.contains(&"AW_CONTAINER_CONTROL_TOKEN".to_string()));
+    assert!(args.contains(&"AW_AUTHENTICATED_UID".to_string()));
+    assert!(args.contains(&"AW_AUTHENTICATED_GID".to_string()));
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg == "AW_IDENTITY_TOKEN=identity-token")
+    );
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg == "AW_CONTAINER_CONTROL_TOKEN=control-token")
+    );
+    assert_eq!(
+        env.get("AW_IDENTITY_TOKEN").map(String::as_str),
+        Some("identity-token")
+    );
+    assert_eq!(
+        env.get("AW_CONTAINER_CONTROL_TOKEN").map(String::as_str),
+        Some("control-token")
+    );
+    assert_eq!(
+        env.get("AW_AUTHENTICATED_UID").map(String::as_str),
+        Some("2450")
+    );
+    assert_eq!(
+        env.get("AW_AUTHENTICATED_GID").map(String::as_str),
+        Some("2450")
+    );
     assert!(args.contains(&"io.aw-gateway.gateway=true".to_string()));
     assert!(args.contains(&"io.aw-gateway.target=default".to_string()));
     assert!(args.contains(&"io.aw-gateway.mode=fixed".to_string()));
@@ -4098,6 +4212,158 @@ fn container_mounts_error_when_source_is_missing() {
 }
 
 #[test]
+fn container_mounts_reject_separator_paths_and_relative_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad_source = dir.path().join("bad:source");
+    std::fs::write(&bad_source, "").unwrap();
+    let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    cfg.target_defaults
+        .container_mounts
+        .push(crate::config::ContainerMountConfig {
+            source: bad_source.display().to_string(),
+            target: "/opt/good".into(),
+            mode: ContainerMountMode::Ro,
+        });
+    let target = cfg.effective_target("default").unwrap();
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+
+    let err = runtime.container_mounts().unwrap_err();
+    assert!(
+        err.to_string().contains("must not contain ':' or ','"),
+        "{err:#}"
+    );
+
+    let good_source = dir.path().join("good-source");
+    std::fs::write(&good_source, "").unwrap();
+    let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    cfg.target_defaults
+        .container_mounts
+        .push(crate::config::ContainerMountConfig {
+            source: good_source.display().to_string(),
+            target: "/opt/bad,target".into(),
+            mode: ContainerMountMode::Ro,
+        });
+    let target = cfg.effective_target("default").unwrap();
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+
+    let err = runtime.container_mounts().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("container mount target #0 must not contain ':' or ','"),
+        "{err:#}"
+    );
+
+    let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    cfg.target_defaults
+        .container_mounts
+        .push(crate::config::ContainerMountConfig {
+            source: good_source.display().to_string(),
+            target: "relative-target".into(),
+            mode: ContainerMountMode::Ro,
+        });
+    let target = cfg.effective_target("default").unwrap();
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+
+    let err = runtime.container_mounts().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("container mount target #0 must render to an absolute path"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn generated_mounts_reject_separator_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let target = cfg.effective_target("default").unwrap();
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    let mut runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+
+    runtime.paths.control_sockets.container_dir = PathBuf::from("/run/aw-gateway/bad:image");
+    let err = runtime.container_mounts().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("control socket container directory must not contain ':' or ','"),
+        "{err:#}"
+    );
+
+    runtime.paths.control_sockets.container_dir = PathBuf::from("/run/aw-gateway");
+    runtime.paths.workspace = PathBuf::from("/tmp/bad:workspace");
+    let err = runtime.container_run_spec(None, None).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("workspace path must not contain ':' or ','"),
+        "{err:#}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn start_container_rejects_world_writable_read_write_mount_source() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    echo '[]'
+    ;;
+  run)
+    echo "$@" >> "{log}"
+    ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        ),
+    );
+    let mount_source = dir.path().join("shared");
+    std::fs::create_dir(&mount_source).unwrap();
+    std::fs::set_permissions(&mount_source, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        let target = cfg.targets.get_mut("default").unwrap();
+        target.container_mounts = vec![crate::config::ContainerMountConfig {
+            source: mount_source.display().to_string(),
+            target: "/mnt/shared".into(),
+            mode: ContainerMountMode::Rw,
+        }];
+    });
+
+    let err = runtime.ensure_ready().await.unwrap_err();
+
+    assert!(err.to_string().contains("world-writable"), "{err:#}");
+    assert!(
+        !log.exists(),
+        "runtime should not be invoked after unsafe mount rejection"
+    );
+}
+
+#[test]
 fn target_selection_accepts_configured_target_or_image() {
     let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
     assert_eq!(
@@ -4163,6 +4429,22 @@ fn detects_current_process_session_marker_as_active() {
 }
 
 #[test]
+fn detects_current_process_session_marker_as_active_with_empty_start_time() {
+    let marker = SessionMarker {
+        id: "test".into(),
+        kind: "connect".into(),
+        gateway_pid: std::process::id(),
+        gateway_start_time: String::new(),
+        container: "ubuntu-dev".into(),
+        target: "default".into(),
+        launch: None,
+        context: BTreeMap::new(),
+        created_at_ms: 0,
+    };
+    assert!(session_marker_is_active(&marker));
+}
+
+#[test]
 fn session_marker_launch_round_trips_and_none_serializes_as_null() {
     let marker = SessionMarker {
         id: "test".into(),
@@ -4188,7 +4470,7 @@ fn session_marker_launch_round_trips_and_none_serializes_as_null() {
 }
 
 #[test]
-fn session_marker_requires_launch_field() {
+fn session_marker_without_launch_field_reads_as_none() {
     let raw = r#"
 {
   "id": "test",
@@ -4200,7 +4482,8 @@ fn session_marker_requires_launch_field() {
   "created_at_ms": 789
 }
 "#;
-    serde_json::from_str::<SessionMarker>(raw).unwrap_err();
+    let parsed = serde_json::from_str::<SessionMarker>(raw).unwrap();
+    assert_eq!(parsed.launch, None);
 }
 
 #[test]
@@ -4240,6 +4523,35 @@ fn identity_token_validation_requires_single_non_empty_line() {
 }
 
 #[test]
+fn control_token_validation_requires_single_non_empty_line() {
+    let path = PathBuf::from("/tmp/control.token");
+    assert_eq!(
+        validate_control_token_content("abc\n", &path).unwrap(),
+        "abc"
+    );
+    assert!(validate_control_token_content("", &path).is_err());
+    assert!(validate_control_token_content("a\nb", &path).is_err());
+    assert!(validate_control_token_content(&"x".repeat(4097), &path).is_err());
+}
+
+#[test]
+fn control_token_file_rejects_unsafe_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("control.token");
+    std::fs::write(&path, "abc\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_control_token_file(&path).is_err());
+    }
+    #[cfg(not(unix))]
+    {
+        assert_eq!(read_control_token_file(&path).unwrap(), "abc");
+    }
+}
+
+#[test]
 fn identity_token_is_generated_once_with_private_permissions() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config/identity-token");
@@ -4264,9 +4576,11 @@ async fn command_health_check_uses_exit_status() {
     let vars = Vars::new();
     let ok = HealthCheck::Command {
         command: vec!["/usr/bin/true".into()],
+        timeout: None,
     };
     let fail = HealthCheck::Command {
         command: vec!["/usr/bin/false".into()],
+        timeout: None,
     };
     assert!(run_health_check(&ok, &vars).await.is_ok());
     assert!(run_health_check(&fail, &vars).await.is_err());
@@ -4283,6 +4597,7 @@ async fn command_health_check_renders_variables() {
             "=".into(),
             "expected".into(),
         ],
+        timeout: None,
     };
     assert!(run_health_check(&check, &vars).await.is_ok());
 }

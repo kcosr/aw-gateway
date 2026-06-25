@@ -180,9 +180,11 @@ fn run_step(
         let identity = resolve_user(&step.user)?;
         let user = CString::new(step.user.clone())
             .with_context(|| format!("bootstrap user {:?} contains NUL", step.user))?;
+        let groups = crate::unix_priv::resolve_user_groups(&user, identity.gid)
+            .with_context(|| format!("resolve groups for bootstrap user {:?}", step.user))?;
         unsafe {
             command.pre_exec(move || {
-                crate::unix_priv::drop_to_user_pre_exec(&user, identity.uid, identity.gid)
+                crate::unix_priv::drop_to_user_pre_exec(identity.uid, identity.gid, &groups)
             });
         }
     }

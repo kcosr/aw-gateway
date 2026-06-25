@@ -5,12 +5,20 @@ use std::path::{Path, PathBuf};
 use toml::Value;
 use toml::map::Map;
 
+const MAX_EXTENDS_DEPTH: usize = 64;
+
 pub(super) fn load_gateway_root(path: &Path) -> anyhow::Result<Value> {
     let mut stack = BTreeSet::new();
     load_gateway_root_inner(path, &mut stack)
 }
 
 fn load_gateway_root_inner(path: &Path, stack: &mut BTreeSet<PathBuf>) -> anyhow::Result<Value> {
+    if stack.len() >= MAX_EXTENDS_DEPTH {
+        anyhow::bail!(
+            "extends chain exceeds maximum depth of {MAX_EXTENDS_DEPTH} at {}",
+            path.display()
+        );
+    }
     let canonical = path
         .canonicalize()
         .with_context(|| format!("canonicalize {}", path.display()))?;

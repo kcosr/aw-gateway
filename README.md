@@ -503,7 +503,9 @@ The container agent supervises configured services, exposes the SSH bridge, and
 answers gateway control requests over a private Unix-domain control socket.
 Disabling the control socket is useful for published-port SSH backends, but it
 also removes agent-control readiness and mutating control requests through that
-socket.
+socket. Mutating control requests require `AW_CONTAINER_CONTROL_TOKEN`; if the
+control socket is enabled without that token, status remains available but
+shutdown, reap, and session-hold requests fail as unauthorized.
 Gateway-managed control and SSH bridge sockets live under target control socket
 config, not under durable workspace state. Before starting a container, the gateway
 checks the resolved host and in-container Unix socket paths and fails fast if
@@ -543,7 +545,9 @@ FROM_FILE = { file = "/run/secrets/example", required = false }
 ```
 
 Service env entries can use literal `value`, inherit from the agent
-environment, or read a file.
+environment, or read a file. Template interpolation applies to literal `value`
+strings and `file` paths when `interpolate = true`; values loaded from files or
+inherited environment variables are passed through literally.
 
 ## Gateway Config Shape
 
@@ -595,9 +599,11 @@ stop_when_idle = true
 remove_on_stop = false
 ```
 
-Replace `ubuntu/dev` with a real container image. The deployment guides build
-and use working runtime-specific images from the included example
-Containerfiles.
+Replace `ubuntu/dev` with a real container image. Image references must not
+contain whitespace or control characters, must not start with `-`, and must use
+normal slash-separated repository syntax with optional `:tag` or `@digest`
+suffixes. The deployment guides build and use working runtime-specific images
+from the included example Containerfiles.
 
 Fixed targets reuse one named container across connections. Ephemeral targets
 create a per-session container and require `mode = "ephemeral"`,
@@ -705,6 +711,9 @@ session_shell = "/bin/bash"
 
 Gateway configs commonly include:
 
+- Config identifiers such as target, launch, template, service, launch-var, and
+  runtime-profile names must start with an ASCII letter, number, or `_`, and
+  may then contain only ASCII letters, numbers, `.`, `-`, and `_`.
 - `[target_defaults]`: partial target-shaped defaults inherited by every
   target.
 - `[target_templates.<name>]`: reusable partial target-shaped templates that
@@ -741,14 +750,17 @@ Gateway configs commonly include:
   launches opt into with ordered `use = [...]`.
 - `includes`: strict include globs for splitting target templates, launch
   templates, targets, and launches into separate TOML files. Strict includes
-  are lexicographically ordered and reject unknown fields, duplicate
-  definitions, cycles, and partial object overrides.
+  must match at least one file, are lexicographically ordered, and reject
+  unknown fields, duplicate definitions, cycles, and partial object overrides.
 - `extends`: root config inheritance for layering a selected config over a
-  managed base config.
+  managed base config. Extends chains are limited to 64 root config files.
 - `[[target_defaults.container_mounts]]` and `[[targets.<name>.container_mounts]]`: extra
   host-to-container bind mounts, typically read-only bootstrap
   binaries/configs/certs. Each mount uses `source`, `target`, and `mode`
-  (`"ro"` or `"rw"`).
+  (`"ro"` or `"rw"`). Rendered mount sources and targets must not contain `:`
+  or `,`, targets must be absolute paths, and read-write mount sources must not
+  resolve to world-writable paths. The generated workspace and control-socket
+  mounts use the same separator checks.
 - `[target_defaults.container_bootstrap]`: optional bootstrap entrypoint configuration and
   pre-agent container bootstrap steps. Targets may overlay
   `[targets.<name>.container_bootstrap]` field-by-field.
@@ -844,11 +856,13 @@ intentionally want host-process values to override the container-oriented
 defaults. Inherited values must be valid UTF-8; values that are present but not
 valid UTF-8 are skipped with a warning.
 
-Runtime exec env is passed to Podman, Docker, or Colima as runtime arguments,
-so inherited values can be visible in host process listings on standard Linux
-systems. Do not use `session_env_inherit` as the normal transport for personal
-access tokens, bearer tokens, identity tokens, or other high-value secrets until
-a non-argv secret transport is available.
+Runtime exec env values are normally supplied through the spawned Podman,
+Docker, or Colima process environment while only the env names appear on runtime
+argv. Env names that can alter the host-side runtime client itself, such as
+`PATH`, `LD_PRELOAD`, `DOCKER_HOST`, and related loader/runtime configuration
+keys, are passed as explicit `KEY=value` runtime arguments instead of being set
+on the client process environment. Avoid using those host-sensitive names for
+high-value secrets because their values can be visible in host process listings.
 
 Container SSH transfer policy is independent for SFTP and legacy SCP:
 
@@ -868,18 +882,39 @@ legacy_scp = "outbound"
 ```
 
 When `sftp = "deny"`, `start-container-sshd` removes the SFTP subsystem from
-the runtime SSHD config. Modern OpenSSH SCP uses SFTP, so that blocks both.
-When `legacy_scp` is not `"allow"`, the helper adds a container-side
-`ForceCommand` that runs `aw-ssh-command-filter`. Legacy SCP inbound means
-upload into the container (`scp -t`); outbound means download from the
-container (`scp -f`). SFTP has only allow/deny because the SFTP subsystem is a
+the runtime SSHD config. Modern OpenSSH SCP uses SFTP, so that blocks both. The
+helper also adds a container-side `ForceCommand` that runs
+`aw-ssh-command-filter` whenever either SFTP or legacy SCP policy is
+restrictive, so exec-form `sftp-server` and denied legacy SCP server commands
+are checked by the same policy boundary. Legacy SCP inbound means upload into
+the container (`scp -t`); outbound means download from the container
+(`scp -f`). SFTP has only allow/deny because the SFTP subsystem is a
 bidirectional protocol channel rather than separate upload/download server
 commands.
 
-Container-side `aw-ssh-command-filter` implements the legacy SCP checks. The
-`start-container-sshd` helper invokes it from the generated SSHD `ForceCommand`,
-so install or mount the binary alongside the agent when transfer policy uses
-legacy SCP restrictions.
+Container-side `aw-ssh-command-filter` implements the SFTP exec-form and legacy
+SCP checks. When either transfer mode is restrictive, commands containing shell
+chaining or substitution bytes (`;`, `|`, `&`, `(`, `)`, `` ` ``, LF, or CR),
+shell assignment prefixes such as `NAME=value command`, or wrapper commands such
+as `command`, `env`, `eval`, `exec`, `nice`, `nohup`, `time`, `timeout`,
+`setsid`, `stdbuf`, or shell re-entry through `sh -c`, `bash -c`, `dash -c`,
+`fish -c`, `ksh -c`, or `zsh -c` are rejected before the shell runs them.
+Quoting does not exempt those bytes because the check runs before shell
+evaluation. Bare redirection (`<`, `>`) and variable expansion (`$VAR`) are not
+rejected, since they cannot by themselves invoke a transfer program; command and
+process substitution stay blocked through the `` ` `` and `(` / `)` bytes.
+Install or mount the binary alongside the agent whenever transfer policy may deny
+or direction-limit file transfer.
+
+This filter is a best-effort policy control to discourage casual `scp`/`sftp`
+use, **not a security boundary**. The wrapper list is a deliberately
+non-exhaustive denylist, and any user permitted to run commands over the
+container SSHD can still move data by other means — for example streaming a file
+over an ordinary command's stdin or stdout (`cat > file`, `cat file`). Use
+transfer policy to enforce a stated "do not transfer files" convention; do not
+rely on it to contain a motivated or compromised user. Removing arbitrary
+command execution (a transfer-only session) is the only way to make the
+direction limits an actual boundary.
 
 `target_defaults.container_ssh.transfer` only applies to traffic that
 traverses the container SSHD. Gateway actions such as `run` execute through the
@@ -890,12 +925,14 @@ per-target transfer overrides do not relax that host-side gate and only affect
 direct container-SSHD access. If a deployment intends to expose management-only
 SSH commands without arbitrary container exec, omit `run` from
 `ssh_dispatch.enabled_actions`; omit `launch` if users should not start
-configured launch workflows; omit `launches` if users should not discover
-configured launches; also omit `connect` if users should not receive a full
-container SSH session. `allow_interactive_shell = false` blocks
-SSH-dispatched interactive shells, while `allow_container_commands = false`
-blocks non-gateway passthrough commands. Both default to `true`, and neither
-option disables explicitly enabled gateway actions.
+configured launch workflows; omit `launch-show` if users should not inspect a
+single configured launch's implementation details; omit `launches` if users
+should not discover configured launches and their inputs; also omit `connect`
+if users should not receive a full container SSH session.
+`allow_interactive_shell = false` blocks SSH-dispatched interactive shells,
+while `allow_container_commands = false` blocks non-gateway passthrough
+commands. Both default to `true`, and neither option disables explicitly enabled
+gateway actions.
 
 Default lifecycle, host, and bootstrap step lists are inherited by every target.
 Target entries use the same key as the default list (`phase + name` for
@@ -925,7 +962,8 @@ per-step `timeout` when a hook legitimately needs more time. The timeout uses
 the same explicit units as other durations: `ms`, `s`, `m`, or `h`. Timed-out
 required hooks fail the operation after the child process is killed and reaped;
 timed-out optional hooks warn and continue. `host_steps.health_check` timeouts
-are separate from the host step command timeout.
+are separate from the host step command timeout and default to `5s` for command,
+TCP, and HTTP health checks.
 
 ```toml
 [[target_defaults.lifecycle_steps]]
@@ -944,6 +982,7 @@ command = ["/opt/site-policy/bin/network-policy", "add", "{container_pid}"]
 [target_defaults.host_steps.health_check]
 type = "command"
 command = ["/opt/site-policy/bin/network-policy", "check", "{container_pid}"]
+timeout = "5s"
 ```
 
 Common target behavior can also be factored into named
@@ -987,10 +1026,11 @@ Target and launch definitions can be split into strict include files:
 includes = ["/etc/aw-gateway/config.d/*.toml"]
 ```
 
-Include glob matches are sorted lexicographically before composition. Includes
-are resolved relative to the file that declares them, may be nested, and reject
-cycles, duplicate target/template or launch/template names, unknown fields, and
-partial object merge or override behavior. Include files may define nested
+Include glob matches are sorted lexicographically before composition. Each
+declared include pattern must match at least one file. Includes are resolved
+relative to the file that declares them, may be nested, and reject cycles,
+duplicate target/template or launch/template names, unknown fields, and partial
+object merge or override behavior. Include files may define nested
 `includes`, `[target_templates.<name>]`, `[launch_templates.<name>]`,
 `[targets.<name>]`, and `[launches.<name>]`.
 
@@ -1048,9 +1088,10 @@ extends = "/etc/aw-gateway/gateway.toml"
 
 `extends` is honored only by the selected root config. Unlike include files, an
 extended root may define root-owned policy, defaults, templates, targets, and
-launches. Extends chains may have multiple levels. The loader composes each
-file's own `includes` relative to that file, strips loader-only `extends` and
-`includes`, then merges deepest base-to-child before normal validation.
+launches. Extends chains may have multiple levels, up to 64 root config files.
+The loader composes each file's own `includes` relative to that file, strips
+loader-only `extends` and `includes`, then merges deepest base-to-child before
+normal validation.
 
 Root inheritance uses these merge rules:
 
@@ -1084,6 +1125,15 @@ Caller variables are referenced only as `{var.<name>}`. Built-ins such as
 `{workspace}`, `{container_home}`, `{session_id}`, `{target}`, and
 `{container_name}` remain unprefixed. Unknown variables fail config
 validation, and unprefixed caller variables such as `{repo}` are rejected.
+String launch variables supplied by callers, string defaults, and enum values
+must not contain NUL, LF, or CR characters.
+
+Treat `{var.*}` values as untrusted caller input when rendering host-side launch
+step `command`, `cwd`, or `env` fields. Avoid mapping caller strings into
+host-sensitive environment keys such as `HOME`, `XDG_CONFIG_HOME`,
+`XDG_DATA_HOME`, `PATH`, `LD_PRELOAD`, runtime client settings such as
+`CONTAINER_CONNECTION`, shell startup variables, or language loader paths
+unless the variable is constrained to a small configured enum.
 
 ```toml
 [launches.repo-shell]
@@ -1210,7 +1260,7 @@ aw-gateway launch repo-shell --session-id abc123def456 --var repo=https://exampl
 aw-gateway launch agent-pack-review --var manifest=/opt/agent-pack/review.yaml -- --skill engineering/fresh-eyes "Review this branch."
 ```
 
-When `launches` and `launch` are present in
+When `launches`, `launch-show`, and `launch` are present in
 `ssh_dispatch.enabled_actions`, the same commands can be invoked
 through the host SSH gateway:
 
@@ -1222,9 +1272,10 @@ ssh host 'launch repo-shell --session-id=abc123def456 --var=repo=https://example
 ssh host 'launch agent-pack-review --var manifest=/opt/agent-pack/review.yaml -- --skill engineering/fresh-eyes "Review this branch."'
 ```
 
-Omit `launch` from `ssh_dispatch.enabled_actions` if SSH users should
-not start configured launch workflows. Omit `launches` if SSH users should not
-list configured launches.
+Omit `launch` from `ssh_dispatch.enabled_actions` if SSH users should not start
+configured launch workflows. Omit `launch-show` if SSH users should not inspect
+one configured launch's implementation details. Omit `launches` if SSH users
+should not list configured launches and their inputs.
 
 `launches --json` emits a bare array of launch summaries. Each summary includes
 `name`, `target`, `allow_args`, optional `description`, and a `vars` object
@@ -1462,17 +1513,18 @@ socket string such as `127.0.0.1:8080` or `[::1]:8080`.
 [http]
 enabled = true
 listen = "127.0.0.1:8080"
-enabled_actions = ["status", "targets", "launches", "launch", "up", "run", "stop", "remove"]
+enabled_actions = ["status", "targets", "launches", "launch-show", "launch", "up", "run", "stop", "remove"]
 
 [http.auth]
 type = "none"
 ```
 
-When `auth.type = "none"`, no `Authorization` header is required. Bind to
-loopback or put the daemon behind an external auth boundary. Bearer auth reads
-the configured token and requires `Authorization: Bearer <token>` on every
-`/api/v1/*` route. The HTTP listener does not terminate TLS; use loopback or a
-TLS-terminating reverse proxy for bearer auth.
+When `auth.type = "none"`, no `Authorization` header is required and
+`http.listen` must be loopback. Non-loopback HTTP listeners require bearer auth.
+Bearer auth reads the configured token and requires
+`Authorization: Bearer <token>` on every `/api/v1/*` route. The HTTP listener
+does not terminate TLS; use loopback or a TLS-terminating reverse proxy for
+bearer auth.
 
 ```toml
 [http.auth]
@@ -1481,8 +1533,8 @@ token = "change-me"
 ```
 
 `http.enabled_actions` is an HTTP-specific allow list. Supported values are
-exactly `status`, `targets`, `launches`, `launch`, `up`, `run`, `stop`, and
-`remove`. Other gateway actions such as `connect`, key management,
+exactly `status`, `targets`, `launches`, `launch-show`, `launch`, `up`, `run`,
+`stop`, and `remove`. Other gateway actions such as `connect`, key management,
 client-config/bundle, proxy/tunnel helpers, and default-target management are
 not HTTP API actions.
 
@@ -1557,6 +1609,20 @@ If a selected stream is not valid UTF-8, the response still reports the
 completed command and omits only that stream, with an `invalid_utf8` entry in
 `output_errors`.
 
+Wait mode captures at most 4 MiB per selected stream. If stdout or stderr
+exceeds that cap, the stream is truncated to the cap and the response includes
+an `output_truncated` flag for that stream:
+
+```json
+{
+  "ok": true,
+  "mode": "wait",
+  "exit_code": 0,
+  "stdout": "...",
+  "output_truncated": {"stdout": true}
+}
+```
+
 Detach-mode command and launch responses return HTTP 202:
 
 ```json
@@ -1600,6 +1666,10 @@ Errors use a stable envelope:
 {"ok": false, "error": {"code": "invalid_request", "message": "human-readable message"}}
 ```
 
+Validation and authorization errors include specific client-facing messages.
+Internal operation failures use a generic message and log the detailed source
+server-side.
+
 | Method | Path | Action | Operation |
 | --- | --- | --- | --- |
 | `GET` | `/api/v1/status?target=default&session_id=abc` | `status` | `GatewayOperation::Status` |
@@ -1609,7 +1679,7 @@ Errors use a stable envelope:
 | `POST` | `/api/v1/stop` | `stop` | `GatewayOperation::Stop` |
 | `POST` | `/api/v1/remove` | `remove` | `GatewayOperation::Remove` |
 | `GET` | `/api/v1/launches` | `launches` | `GatewayOperation::Launches` |
-| `GET` | `/api/v1/launches/{name}` | `launch` | `GatewayOperation::LaunchShow` |
+| `GET` | `/api/v1/launches/{name}` | `launch-show` | `GatewayOperation::LaunchShow` |
 | `POST` | `/api/v1/launches/{name}/run` | `launch` | `GatewayOperation::Launch` |
 | `POST` | `/api/v1/run` | `run` | `GatewayOperation::Run` |
 | `GET` | `/api/v1/pty/{pty_id}` | lease token | WebSocket PTY attach |
@@ -1723,10 +1793,11 @@ private state files:
 - `AW_IDENTITY_TOKEN`: generated or inherited by the gateway and exposed only
   to services that explicitly request it.
 - `AW_CONTAINER_CONTROL_TOKEN`: generated per container and passed only to the
-  container agent for mutating control-socket requests.
+  container agent for mutating control-socket requests. Mutating requests fail
+  closed when this token is absent.
 - `AW_AUTHENTICATED_UID` and `AW_AUTHENTICATED_GID`: authenticated host user
   identity used by the container agent for peer validation and service-user
-  handling.
+  handling. If either variable is present, both must be present and numeric.
 - `AW_CONTAINER_STATE_DIR`: in-container durable state path for generated agent
   config, logs, SSH policy snippets, and session data.
 - `AW_CONTAINER_AGENT_ALLOW_PROCESS_REAP=1`: enables actual process reaping;
@@ -1758,7 +1829,7 @@ merging, and references are deterministic.
 | `target.lifecycle_steps[].command` | Gateway lifecycle execution | Pre-start supports gateway vars except `{container_pid}`; later phases support all gateway vars |
 | `target.host_steps[].command` and HTTP health-check URLs | Gateway host-step execution | All gateway vars, including `{container_pid}` |
 | `container_agent.services[].user` in gateway config | Gateway-managed agent config render | `{container_user}` |
-| `container_agent.services[].command`, `cwd`, `env`, and health-check URL | Container-agent service execution | `{container_state_dir}` |
+| `container_agent.services[].command`, `cwd`, literal env `value`, env `file` paths, and health-check URL | Container-agent service execution | `{container_state_dir}` |
 | `container_agent.control_socket` and `ssh_bridge.socket` in standalone agent config | Container-agent startup | `{container_state_dir}` |
 | `launch.cwd`, `launch.command`, `launch.env`, and `launch.steps[]` command/cwd/env | Launch execution | Launch built-ins plus `{var.<name>}` |
 | `client_config.inner_alias_template`, `container_host_template`, `default_identity_dir` | Client config generation | `{user}`, `{uid}`, `{gid}`, `{home}`, `{container_user}`, `{container_home}`, `{workspace}`, `{state}`, `{state_dir}`, `{target}`, `{image}`, `{image_slug}`, `{container_name}`, `{container_state_dir}`, `{container_state_dir_in_container}`, `{session_id}`, `{host}` |
@@ -1795,7 +1866,9 @@ max_files = 5
 console = false
 ```
 
-`max_bytes` accepts a raw byte integer; `104857600` is 100 MB.
+`max_bytes` accepts a raw byte integer; `104857600` is 100 MB. `max_files`
+must not exceed `1024`. File logging creates log directories with mode `0700`
+and active log files with mode `0600`.
 `console = true` writes structured logs to stderr. `console = false` disables
 that console writer, so diagnostics go only to configured file logging and
 explicit stderr messages.

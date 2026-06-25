@@ -32,7 +32,7 @@ impl Runtime {
                 return;
             }
         };
-        match self.active_session_markers() {
+        match self.active_session_markers_async().await {
             Ok(sessions) if sessions.is_empty() => {}
             Ok(_) => {
                 tracing::warn!(

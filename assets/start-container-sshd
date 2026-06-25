@@ -58,16 +58,18 @@ esac
 
 case "$legacy_scp" in
   allow) ;;
-  deny|inbound|outbound)
-    filter=${AW_SSH_COMMAND_FILTER:-/opt/aw-gateway/bin/aw-ssh-command-filter}
-    if [[ ! -x "$filter" ]]; then
-      echo "ssh command filter is not executable: $filter" >&2
-      exit 1
-    fi
-    printf '\nForceCommand %s --config %s\n' "$filter" "$policy" >> "$config"
-    ;;
+  deny|inbound|outbound) ;;
   *) echo "invalid legacy_scp policy value: $legacy_scp" >&2; exit 1 ;;
 esac
+
+if [[ "$sftp" == "deny" || "$legacy_scp" != "allow" ]]; then
+  filter=${AW_SSH_COMMAND_FILTER:-/opt/aw-gateway/bin/aw-ssh-command-filter}
+  if [[ ! -x "$filter" ]]; then
+    echo "ssh command filter is not executable: $filter" >&2
+    exit 1
+  fi
+  printf '\nForceCommand %s --config %s\n' "$filter" "$policy" >> "$config"
+fi
 
 if [[ "${AW_SSHD_DRY_RUN_CONFIG:-}" == "1" ]]; then
   cat "$config"

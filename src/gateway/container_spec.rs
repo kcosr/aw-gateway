@@ -1,5 +1,5 @@
 use super::Runtime;
-use crate::config::{ContainerMountMode, LocalSshBackend, TargetMode};
+use crate::config::{ContainerMountConfig, ContainerMountMode, LocalSshBackend, TargetMode};
 use crate::context::{context_from_labels, context_label_key};
 use crate::runtime::{self, ContainerInspect, ContainerMountSpec, ContainerRunSpec};
 use crate::template::{self, Vars};
@@ -73,16 +73,31 @@ impl Runtime {
             .agent_control_enabled()
             .then(|| self.ensure_control_token())
             .transpose()?;
-        self.warn_about_unsafe_container_mounts()?;
-        let run_spec =
-            self.container_run_spec(identity_token.as_deref(), control_token.as_deref())?;
+        let mounts = self.container_mounts_async().await?;
+        warn_about_unsafe_container_mounts_async(&mounts).await?;
+        let run_spec = self.container_run_spec_with_mounts(
+            identity_token.as_deref(),
+            control_token.as_deref(),
+            mounts,
+        )?;
         self.container_runtime.run_detached(&run_spec).await
     }
 
+    #[cfg(test)]
     pub(super) fn container_run_spec(
         &self,
         identity_token: Option<&str>,
         control_token: Option<&str>,
+    ) -> anyhow::Result<ContainerRunSpec> {
+        let mounts = self.container_mounts()?;
+        self.container_run_spec_with_mounts(identity_token, control_token, mounts)
+    }
+
+    fn container_run_spec_with_mounts(
+        &self,
+        identity_token: Option<&str>,
+        control_token: Option<&str>,
+        mounts: Vec<ContainerMountSpec>,
     ) -> anyhow::Result<ContainerRunSpec> {
         let mut env = BTreeMap::new();
         if let Some(identity_token) = identity_token {
@@ -105,6 +120,8 @@ impl Runtime {
             );
         }
         env.extend(self.render_env_map(&self.target.container_env)?);
+        validate_bind_mount_path("workspace path", &self.paths.workspace)?;
+        validate_bind_mount_path("container_home", &self.identity.container_home)?;
         let command = if self.agent_enabled() {
             if self.target.container_bootstrap.enabled {
                 vec![
@@ -147,7 +164,7 @@ impl Runtime {
                 .is_podman()
                 .then(|| self.passwd_entry()),
             state_dir_in_container: self.paths.container_state_dir_in_container.clone(),
-            mounts: self.container_mounts()?,
+            mounts,
             env,
             labels: self.labels(),
             publish_ssh: self.ssh_endpoint_configured()
@@ -236,55 +253,25 @@ impl Runtime {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn container_mounts(&self) -> anyhow::Result<Vec<ContainerMountSpec>> {
-        let mut mounts = self
-            .target
-            .container_mounts
-            .iter()
-            .enumerate()
-            .map(|(index, mount)| {
-                let vars = self.vars(None);
-                let source = PathBuf::from(template::render(&mount.source, &vars)?);
-                let source = source.canonicalize().with_context(|| {
-                    format!("container mount source #{index} {}", source.display())
-                })?;
-                Ok(ContainerMountSpec {
-                    source,
-                    target: PathBuf::from(template::render(&mount.target, &vars)?),
-                    readonly: mount.mode == ContainerMountMode::Ro,
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        mounts.push(ContainerMountSpec {
-            source: self.paths.control_sockets.host_dir.clone(),
-            target: self.paths.control_sockets.container_dir.clone(),
-            readonly: false,
-        });
-        Ok(mounts)
+        render_container_mounts(self.container_mount_inputs())
     }
 
-    fn warn_about_unsafe_container_mounts(&self) -> anyhow::Result<()> {
-        for (index, mount) in self.container_mounts()?.into_iter().enumerate() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let metadata = std::fs::metadata(&mount.source).with_context(|| {
-                    format!(
-                        "stat container mount source #{} {}",
-                        index,
-                        mount.source.display()
-                    )
-                })?;
-                if metadata.permissions().mode() & 0o002 != 0 {
-                    tracing::warn!(
-                        mount = index,
-                        source = %mount.source.display(),
-                        "container mount source is world-writable"
-                    );
-                }
-            }
+    async fn container_mounts_async(&self) -> anyhow::Result<Vec<ContainerMountSpec>> {
+        let inputs = self.container_mount_inputs();
+        tokio::task::spawn_blocking(move || render_container_mounts(inputs))
+            .await
+            .context("join container mount resolution task")?
+    }
+
+    fn container_mount_inputs(&self) -> ContainerMountInputs {
+        ContainerMountInputs {
+            configured: self.target.container_mounts.clone(),
+            vars: self.vars(None),
+            control_socket_host_dir: self.paths.control_sockets.host_dir.clone(),
+            control_socket_container_dir: self.paths.control_sockets.container_dir.clone(),
         }
-        Ok(())
     }
 
     fn render_value(&self, value: &str) -> anyhow::Result<String> {
@@ -352,4 +339,103 @@ impl Runtime {
         env.extend(self.render_env_map(&self.target.session_env)?);
         Ok(env)
     }
+}
+
+struct ContainerMountInputs {
+    configured: Vec<ContainerMountConfig>,
+    vars: Vars,
+    control_socket_host_dir: PathBuf,
+    control_socket_container_dir: PathBuf,
+}
+
+fn render_container_mounts(
+    inputs: ContainerMountInputs,
+) -> anyhow::Result<Vec<ContainerMountSpec>> {
+    let mut mounts = inputs
+        .configured
+        .into_iter()
+        .enumerate()
+        .map(|(index, mount)| {
+            let source = PathBuf::from(template::render(&mount.source, &inputs.vars)?);
+            let source = source
+                .canonicalize()
+                .with_context(|| format!("container mount source #{index} {}", source.display()))?;
+            validate_bind_mount_path(&format!("container mount source #{index}"), &source)?;
+            let target = PathBuf::from(template::render(&mount.target, &inputs.vars)?);
+            if !target.is_absolute() {
+                anyhow::bail!(
+                    "container mount target #{} must render to an absolute path",
+                    index
+                );
+            }
+            validate_bind_mount_path(&format!("container mount target #{index}"), &target)?;
+            Ok(ContainerMountSpec {
+                source,
+                target,
+                readonly: mount.mode == ContainerMountMode::Ro,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    validate_bind_mount_path(
+        "control socket host directory",
+        &inputs.control_socket_host_dir,
+    )?;
+    validate_bind_mount_path(
+        "control socket container directory",
+        &inputs.control_socket_container_dir,
+    )?;
+    mounts.push(ContainerMountSpec {
+        source: inputs.control_socket_host_dir,
+        target: inputs.control_socket_container_dir,
+        readonly: false,
+    });
+    Ok(mounts)
+}
+
+fn validate_bind_mount_path(label: &str, path: &std::path::Path) -> anyhow::Result<()> {
+    let value = path.as_os_str().to_string_lossy();
+    if value.contains(':') || value.contains(',') {
+        anyhow::bail!("{label} must not contain ':' or ','");
+    }
+    Ok(())
+}
+
+async fn warn_about_unsafe_container_mounts_async(
+    mounts: &[ContainerMountSpec],
+) -> anyhow::Result<()> {
+    let mounts = mounts.to_vec();
+    tokio::task::spawn_blocking(move || warn_about_unsafe_container_mounts(&mounts))
+        .await
+        .context("join container mount safety task")?
+}
+
+fn warn_about_unsafe_container_mounts(mounts: &[ContainerMountSpec]) -> anyhow::Result<()> {
+    for (index, mount) in mounts.iter().enumerate() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(&mount.source).with_context(|| {
+                format!(
+                    "stat container mount source #{} {}",
+                    index,
+                    mount.source.display()
+                )
+            })?;
+            if metadata.permissions().mode() & 0o002 != 0 {
+                if !mount.readonly {
+                    anyhow::bail!(
+                        "container mount source #{} {} is world-writable; refusing read-write mount",
+                        index,
+                        mount.source.display()
+                    );
+                }
+                tracing::warn!(
+                    mount = index,
+                    source = %mount.source.display(),
+                    "container mount source is world-writable"
+                );
+            }
+        }
+    }
+    Ok(())
 }

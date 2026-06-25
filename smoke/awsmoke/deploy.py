@@ -381,7 +381,17 @@ def ssh_command_filter_env_block(filter_path: str) -> str:
 
 
 def append_http_smoke_config(text: str, host: Host, *, http_actions: list[str] | None = None) -> str:
-    actions = http_actions or ["status", "targets", "launches", "launch", "up", "run", "stop", "remove"]
+    actions = http_actions or [
+        "status",
+        "targets",
+        "launches",
+        "launch-show",
+        "launch",
+        "up",
+        "run",
+        "stop",
+        "remove",
+    ]
     action_lines = "\n".join(f'  "{action}",' for action in actions)
     return (
         text.rstrip()

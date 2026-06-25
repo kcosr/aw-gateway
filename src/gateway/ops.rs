@@ -23,9 +23,9 @@ mod types;
 
 pub(super) use ssh::{SshGatewayOperation, SshRenderOptions};
 pub(super) use types::{
-    CanonicalLaunchVarValue, ExecutionOutcome, LaunchPassthroughArgs, OperationError,
-    OperationExecutionOptions, OperationMode, OperationResult, OutputSelection, RemoveResult,
-    StopResult, SuppliedLaunchVars,
+    CanonicalLaunchVarValue, CapturedStream, ExecutionOutcome, LaunchPassthroughArgs,
+    OperationError, OperationExecutionOptions, OperationMode, OperationResult, OutputSelection,
+    RemoveResult, StopResult, SuppliedLaunchVars,
 };
 
 #[derive(Debug, Clone, PartialEq)]

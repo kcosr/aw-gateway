@@ -176,8 +176,8 @@ pub(in crate::gateway) enum ExecutionOutcome {
     // choose its own encoding policy instead of inheriting an accidental string conversion.
     Captured {
         exit_code: i32,
-        stdout: Option<Vec<u8>>,
-        stderr: Option<Vec<u8>>,
+        stdout: Option<CapturedStream>,
+        stderr: Option<CapturedStream>,
     },
     // The operation_id is intentionally not a registry key. Detached
     // background failures are logged and cannot be queried through the API.
@@ -189,15 +189,40 @@ pub(in crate::gateway) enum ExecutionOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::gateway) struct CapturedStream {
+    pub(in crate::gateway) bytes: Vec<u8>,
+    pub(in crate::gateway) truncated: bool,
+}
+
+impl CapturedStream {
+    pub(in crate::gateway) fn new(bytes: Vec<u8>, truncated: bool) -> Self {
+        Self { bytes, truncated }
+    }
+}
+
 impl ExecutionOutcome {
     pub(in crate::gateway) fn new(exit_code: i32) -> Self {
         Self::Streamed { exit_code }
     }
 
+    #[cfg(test)]
     pub(in crate::gateway) fn captured(
         exit_code: i32,
         stdout: Option<Vec<u8>>,
         stderr: Option<Vec<u8>>,
+    ) -> Self {
+        Self::captured_streams(
+            exit_code,
+            stdout.map(|bytes| CapturedStream::new(bytes, false)),
+            stderr.map(|bytes| CapturedStream::new(bytes, false)),
+        )
+    }
+
+    pub(in crate::gateway) fn captured_streams(
+        exit_code: i32,
+        stdout: Option<CapturedStream>,
+        stderr: Option<CapturedStream>,
     ) -> Self {
         Self::Captured {
             exit_code,
@@ -348,7 +373,10 @@ impl CanonicalLaunchVarValue {
     ) -> OperationResult<Self> {
         match var.var_type {
             config::LaunchVarType::String => match self {
-                Self::String(value) => Ok(Self::String(value.clone())),
+                Self::String(value) => {
+                    validate_launch_var_string(name, value)?;
+                    Ok(Self::String(value.clone()))
+                }
                 _ => Err(OperationError::invalid_launch_variable(format!(
                     "invalid string launch variable {name:?}; expected string"
                 ))),
@@ -359,6 +387,7 @@ impl CanonicalLaunchVarValue {
                         "invalid enum launch variable {name:?}; expected string"
                     )));
                 };
+                validate_launch_var_string(name, value)?;
                 let values = var.values.as_deref().unwrap_or(&[]);
                 if values.iter().any(|allowed| allowed == value) {
                     Ok(Self::String(value.clone()))
@@ -406,6 +435,14 @@ impl CanonicalLaunchVarValue {
             Self::Boolean(value) => value.to_string(),
         }
     }
+}
+
+fn validate_launch_var_string(name: &str, value: &str) -> OperationResult<()> {
+    config::validate_launch_var_string_value(value).map_err(|reason| {
+        OperationError::invalid_launch_variable(format!(
+            "invalid launch variable {name:?}; {reason}"
+        ))
+    })
 }
 
 fn canonical_cli_number(raw: &str, parsed: f64) -> String {

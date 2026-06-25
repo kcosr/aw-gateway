@@ -109,8 +109,7 @@ impl OperationRunner {
             session_spec,
             body,
         } = self;
-        let session = runtime
-            .begin_operation_session(session_spec.kind(), session_spec.uses_launch_marker())?;
+        let session = runtime.begin_operation_session();
         run_operation_session(runtime, session_spec, session, body, options).await
     }
 
@@ -127,8 +126,7 @@ impl OperationRunner {
             session_spec,
             body,
         } = self;
-        let session = runtime
-            .begin_operation_session(session_spec.kind(), session_spec.uses_launch_marker())?;
+        let session = runtime.begin_operation_session();
         run_operation_session_cancelable(runtime, session_spec, session, body, options, cancel)
             .await
     }
@@ -140,8 +138,7 @@ impl OperationRunner {
             body,
             options,
         } = self;
-        let mut session = runtime
-            .begin_operation_session(session_spec.kind(), session_spec.uses_launch_marker())?;
+        let mut session = runtime.begin_operation_session();
         let prepared = match prepare_operation_session_body(
             &runtime,
             session_spec,
@@ -184,8 +181,7 @@ impl OperationRunner {
             body,
             options: _,
         } = self;
-        let session = runtime
-            .begin_operation_session(session_spec.kind(), session_spec.uses_launch_marker())?;
+        let session = runtime.begin_operation_session();
         let background_id = operation_id.clone();
         tokio::spawn(async move {
             let result = run_operation_session(
@@ -411,7 +407,11 @@ async fn prepare_operation_session_body(
     body: OperationBody,
     mode: OperationMode,
 ) -> anyhow::Result<PreparedCommand> {
-    let ready = runtime.ensure_ready().await?;
+    let (marker, ready_result) = runtime
+        .begin_ready_session(session_spec.kind(), session_spec.uses_launch_marker())
+        .await?;
+    session.session = Some(marker);
+    let ready = ready_result?;
     runtime
         .hold_operation_agent_session(session, session_spec.kind())
         .await?;
@@ -618,20 +618,11 @@ pub(super) fn detach_discard_options() -> OperationExecutionOptions {
 }
 
 impl Runtime {
-    fn begin_operation_session(
-        &self,
-        kind: &str,
-        launch_marker: bool,
-    ) -> anyhow::Result<OperationSessionGuard> {
-        let session = if launch_marker {
-            self.create_launch_session_marker(kind)?
-        } else {
-            self.create_session_marker(kind)?
-        };
-        Ok(OperationSessionGuard {
-            session: Some(session),
+    fn begin_operation_session(&self) -> OperationSessionGuard {
+        OperationSessionGuard {
+            session: None,
             agent_session: None,
-        })
+        }
     }
 
     async fn hold_operation_agent_session(
@@ -650,10 +641,9 @@ impl Runtime {
         outcome: SessionOutcome,
     ) -> anyhow::Result<T> {
         drop(session.agent_session.take());
-        let marker = session
-            .session
-            .take()
-            .expect("operation session marker must be present");
+        let Some(marker) = session.session.take() else {
+            return result;
+        };
         self.finish_post_session(marker, result, outcome).await
     }
 }

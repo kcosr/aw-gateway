@@ -89,7 +89,7 @@ impl Runtime {
             sleep(idle_grace).await;
         }
         let _lock = self.acquire_lifecycle_lock().await?;
-        if !self.active_session_markers()?.is_empty() {
+        if !self.active_session_markers_async().await?.is_empty() {
             return Ok(());
         }
         if self.has_preserve_process(cleanup).await? {

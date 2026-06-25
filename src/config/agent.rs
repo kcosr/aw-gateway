@@ -348,6 +348,7 @@ impl ServiceConfig {
             validate_template("service.cwd", cwd, AGENT_TEMPLATE_VARS)?;
         }
         for value in self.env.values() {
+            value.validate()?;
             value.validate_templates(AGENT_TEMPLATE_VARS)?;
         }
         for value in [
@@ -405,13 +406,12 @@ pub struct EnvValue {
 impl EnvValue {
     pub fn resolve(&self, vars: &BTreeMap<String, String>) -> anyhow::Result<Option<String>> {
         self.validate()?;
-        let present =
-            self.value.is_some() as u8 + self.file.is_some() as u8 + self.inherit.is_some() as u8;
-        if present != 1 {
-            anyhow::bail!("environment value must specify exactly one of value, file, or inherit");
-        }
-        let mut value = if let Some(value) = &self.value {
-            Some(value.clone())
+        let value = if let Some(value) = &self.value {
+            if self.interpolate {
+                Some(template::render(value, vars)?)
+            } else {
+                Some(value.clone())
+            }
         } else if let Some(path) = &self.file {
             let rendered_path = if self.interpolate {
                 template::render(path, vars)?
@@ -450,11 +450,6 @@ impl EnvValue {
         } else {
             None
         };
-        if self.interpolate
-            && let Some(raw) = &value
-        {
-            value = Some(template::render(raw, vars)?);
-        }
         Ok(value)
     }
 
@@ -505,6 +500,7 @@ pub enum HealthCheck {
     },
     Command {
         command: Vec<String>,
+        timeout: Option<String>,
     },
 }
 
@@ -538,14 +534,19 @@ impl HealthCheck {
                     parse_duration(value)?;
                 }
             }
-            HealthCheck::Command { command } => validate_command("health_check.command", command)?,
+            HealthCheck::Command { command, timeout } => {
+                validate_command("health_check.command", command)?;
+                if let Some(timeout) = timeout {
+                    parse_duration(timeout)?;
+                }
+            }
         }
         Ok(())
     }
 
     pub(super) fn validate_templates(&self, allowed: &[&str]) -> anyhow::Result<()> {
         match self {
-            HealthCheck::Command { command } => {
+            HealthCheck::Command { command, .. } => {
                 validate_command_templates("health_check.command", command, allowed)
             }
             HealthCheck::Http { url, .. } => validate_template("health_check.url", url, allowed),

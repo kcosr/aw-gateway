@@ -70,7 +70,8 @@ impl LocalSshConfigInput {
     }
 
     pub(super) fn validate_partial(&self) -> anyhow::Result<()> {
-        if let Some(host) = &self.host
+        if self.mode == Some(LocalSshMode::Listen)
+            && let Some(host) = &self.host
             && host != "127.0.0.1"
             && host != "::1"
         {

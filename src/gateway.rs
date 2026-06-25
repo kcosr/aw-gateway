@@ -16,9 +16,7 @@ use crate::runtime::{
     ContainerExecCaptureResult, ContainerExecSpec, ContainerExecStatusResult, ContainerRuntime,
 };
 use crate::ssh_dispatch::{self, Dispatch, GatewayAction};
-use crate::ssh_filter::{
-    is_sftp_server_command, legacy_scp_mode_allows, legacy_scp_server_direction,
-};
+use crate::ssh_filter::{SshCommandDecision, SshCommandFilterPolicy, decide_command};
 use crate::template::{self, Vars};
 use anyhow::Context;
 use std::collections::BTreeMap;
@@ -87,9 +85,9 @@ use model::{
     TargetEntry, TcpEndpoint, gateway_status_name,
 };
 use ops::{
-    CanonicalLaunchVarValue, ExecutionOutcome, GatewayOperation, GatewayOperationResult,
-    LaunchPassthroughArgs, OperationError, OperationExecutionOptions, OperationMode,
-    OperationResult, SshGatewayOperation, SshRenderOptions, SuppliedLaunchVars,
+    CanonicalLaunchVarValue, CapturedStream, ExecutionOutcome, GatewayOperation,
+    GatewayOperationResult, LaunchPassthroughArgs, OperationError, OperationExecutionOptions,
+    OperationMode, OperationResult, SshGatewayOperation, SshRenderOptions, SuppliedLaunchVars,
     execute_gateway_operation, execute_gateway_operation_with_context, lookup_launch,
     operation_up_with_runtime,
 };
@@ -115,8 +113,8 @@ use client::{configured_default_display, normalize_image_selection};
 use execution::detach_discard_options;
 #[cfg(test)]
 use identity::{
-    ensure_identity_token_file, is_plausible_public_key, validate_identity_token_content,
-    validate_public_key_content,
+    ensure_identity_token_file, is_plausible_public_key, read_control_token_file,
+    validate_control_token_content, validate_identity_token_content, validate_public_key_content,
 };
 #[cfg(test)]
 use lifecycle::ContainerReadinessPlan;
@@ -289,13 +287,23 @@ async fn dispatch_from_ssh(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     }
     if let Some(command) = original.as_deref() {
         let transfer = cfg.effective_container_ssh_defaults()?.transfer;
-        if let Some(direction) = legacy_scp_server_direction(command)
-            && !legacy_scp_mode_allows(transfer.legacy_scp, direction)
-        {
-            anyhow::bail!("blocked by policy: legacy scp is not allowed");
-        }
-        if !transfer.sftp.allows() && is_sftp_server_command(command) {
-            anyhow::bail!("blocked by policy: sftp is not allowed");
+        let policy = SshCommandFilterPolicy {
+            sftp: transfer.sftp,
+            legacy_scp: transfer.legacy_scp,
+        };
+        match decide_command(&policy, Some(command)) {
+            SshCommandDecision::RejectLegacyScp => {
+                anyhow::bail!("blocked by policy: legacy scp is not allowed");
+            }
+            SshCommandDecision::RejectSftp => {
+                anyhow::bail!("blocked by policy: sftp is not allowed");
+            }
+            SshCommandDecision::RejectShellComposition => {
+                anyhow::bail!(
+                    "blocked by policy: shell composition is not allowed when transfer policy is restrictive"
+                );
+            }
+            SshCommandDecision::LoginShell | SshCommandDecision::RunCommand(_) => {}
         }
     }
     let has_pty = std::io::stdin().is_terminal();
@@ -559,9 +567,9 @@ async fn connect(
     )
     .await?;
     runtime.ensure_ssh_endpoint_configured()?;
-    let session = runtime.create_session_marker("connect")?;
+    let (session, ready_result) = runtime.begin_ready_session("connect", false).await?;
     let proxy_result = async {
-        let ready = runtime.ensure_ready().await?;
+        let ready = ready_result?;
         listener::proxy_ready_to_stdio(&ready).await
     }
     .await;
@@ -588,9 +596,9 @@ async fn up(
         && local_ssh.mode == LocalSshMode::Listen
     {
         runtime.ensure_ssh_endpoint_configured()?;
-        let session = runtime.create_session_marker("local-listen")?;
+        let (session, ready_result) = runtime.begin_ready_session("local-listen", false).await?;
         let up_result = async {
-            let mut ready = runtime.ensure_ready().await?;
+            let mut ready = ready_result?;
             let bound = listener::bind_local_ssh(&runtime).await?;
             ready.local_ssh = Some(bound.ready.clone());
             let config = runtime.render_client_config(None)?;
@@ -725,10 +733,16 @@ async fn exec_container_command_with_cancel(
             } else {
                 runtime.container_runtime.exec_capture(exec_spec).await?
             };
-            Ok(ExecutionOutcome::captured(
+            Ok(ExecutionOutcome::captured_streams(
                 output.exit_code,
-                options.output.stdout.then_some(output.stdout),
-                options.output.stderr.then_some(output.stderr),
+                options
+                    .output
+                    .stdout
+                    .then(|| CapturedStream::new(output.stdout, output.stdout_truncated)),
+                options
+                    .output
+                    .stderr
+                    .then(|| CapturedStream::new(output.stderr, output.stderr_truncated)),
             ))
         }
         OperationMode::Detach => Ok(ExecutionOutcome::new(
@@ -1709,6 +1723,23 @@ impl Runtime {
 
     async fn ensure_ready(&self) -> anyhow::Result<ReadyStatus> {
         let _lock = self.acquire_lifecycle_lock().await?;
+        self.ensure_ready_locked().await
+    }
+
+    async fn begin_ready_session(
+        &self,
+        kind: &str,
+        launch_marker: bool,
+    ) -> anyhow::Result<(session::SessionGuard, anyhow::Result<ReadyStatus>)> {
+        let _lock = self.acquire_lifecycle_lock().await?;
+        let session = self
+            .create_session_marker_async(kind, launch_marker)
+            .await?;
+        let ready = self.ensure_ready_locked().await;
+        Ok((session, ready))
+    }
+
+    async fn ensure_ready_locked(&self) -> anyhow::Result<ReadyStatus> {
         let mut failed_start_cleanup = FailedStartCleanup::default();
         let result = async {
             self.prepare_container_state_dir()?;
@@ -1804,7 +1835,7 @@ impl Runtime {
         } else {
             None
         };
-        let sessions = self.active_session_markers()?;
+        let sessions = self.active_session_markers_async().await?;
         let launch = status_launch(self.identity.session_id.as_deref(), &sessions);
         let agent_ready = agent.as_ref().is_some_and(|status| status.ready);
         Ok(GatewayStatus {

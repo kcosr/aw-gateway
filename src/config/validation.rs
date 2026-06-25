@@ -340,13 +340,149 @@ pub(super) fn reject_template_use(field: &str, templates: &[String]) -> anyhow::
 
 pub(crate) fn validate_name(field: &str, value: &str) -> anyhow::Result<()> {
     if value.is_empty()
-        || value == "."
-        || value == ".."
+        || value.starts_with(['.', '-'])
         || !value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
     {
-        anyhow::bail!("{field} value {value:?} must contain only ASCII alnum, '.', '-', '_'");
+        anyhow::bail!(
+            "{field} value {value:?} must start with ASCII alnum or '_' and contain only ASCII alnum, '.', '-', '_'"
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn validate_image_reference(field: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{field} reference must not be empty");
+    }
+    if value != value.trim()
+        || value
+            .chars()
+            .any(|ch| ch.is_ascii_whitespace() || ch.is_ascii_control())
+    {
+        anyhow::bail!("{field} reference must not contain whitespace or control characters");
+    }
+    if value.starts_with('-') {
+        anyhow::bail!("{field} reference must not start with '-'");
+    }
+    if value.contains("://") {
+        anyhow::bail!("{field} reference must not contain a URI scheme");
+    }
+
+    let at_count = value.bytes().filter(|byte| *byte == b'@').count();
+    if at_count > 1 {
+        anyhow::bail!("{field} reference must not contain multiple digest separators");
+    }
+    let (name_and_tag, digest) = match value.split_once('@') {
+        Some((name, digest)) => {
+            if name.is_empty() || digest.is_empty() {
+                anyhow::bail!("{field} reference has an invalid digest suffix");
+            }
+            (name, Some(digest))
+        }
+        None => (value, None),
+    };
+    if let Some(digest) = digest {
+        validate_image_digest(field, digest)?;
+    }
+
+    let last_slash = name_and_tag.rfind('/');
+    let last_colon = name_and_tag.rfind(':');
+    let (name, tag) =
+        if last_colon.is_some_and(|colon| last_slash.is_none_or(|slash| colon > slash)) {
+            let colon = last_colon.unwrap();
+            let (name, tag) = name_and_tag.split_at(colon);
+            (name, Some(&tag[1..]))
+        } else {
+            (name_and_tag, None)
+        };
+    if name.is_empty() {
+        anyhow::bail!("{field} reference must include an image name");
+    }
+    if let Some(tag) = tag {
+        validate_image_tag(field, tag)?;
+    }
+
+    let components: Vec<&str> = name.split('/').collect();
+    if components.iter().any(|component| component.is_empty()) {
+        anyhow::bail!("{field} reference must not contain empty path components");
+    }
+    if components.len() > 1 && is_registry_component(components[0]) {
+        validate_image_registry(field, components[0])?;
+        for component in &components[1..] {
+            validate_image_name_component(field, component)?;
+        }
+    } else {
+        for component in &components {
+            validate_image_name_component(field, component)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_registry_component(component: &str) -> bool {
+    component == "localhost" || component.contains('.') || component.contains(':')
+}
+
+fn validate_image_registry(field: &str, value: &str) -> anyhow::Result<()> {
+    if value.starts_with('-')
+        || value.ends_with('-')
+        || value.chars().any(|ch| {
+            !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '-' | ':'))
+        })
+    {
+        anyhow::bail!("{field} reference has an invalid registry component");
+    }
+    if let Some((host, port)) = value.rsplit_once(':')
+        && (host.is_empty() || port.is_empty() || !port.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        anyhow::bail!("{field} reference has an invalid registry port");
+    }
+    Ok(())
+}
+
+fn validate_image_name_component(field: &str, value: &str) -> anyhow::Result<()> {
+    let valid_edge = |ch: char| ch.is_ascii_lowercase() || ch.is_ascii_digit();
+    if !value.chars().next().is_some_and(valid_edge)
+        || !value.chars().last().is_some_and(valid_edge)
+        || value.chars().any(|ch| {
+            !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
+        })
+    {
+        anyhow::bail!("{field} reference has an invalid repository component");
+    }
+    Ok(())
+}
+
+fn validate_image_tag(field: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        || value
+            .chars()
+            .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')))
+    {
+        anyhow::bail!("{field} reference has an invalid tag");
+    }
+    Ok(())
+}
+
+fn validate_image_digest(field: &str, value: &str) -> anyhow::Result<()> {
+    let Some((algorithm, digest)) = value.split_once(':') else {
+        anyhow::bail!("{field} reference has an invalid digest suffix");
+    };
+    if algorithm.is_empty()
+        || digest.is_empty()
+        || !algorithm
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '.' | '_' | '-'))
+        || !digest.chars().all(|ch| ch.is_ascii_hexdigit())
+    {
+        anyhow::bail!("{field} reference has an invalid digest suffix");
     }
     Ok(())
 }
@@ -458,7 +594,7 @@ pub(super) fn default_workspace_state_dir() -> String {
     ".aw-gateway".into()
 }
 
-pub(super) fn default_control_socket_host_dir() -> String {
+pub(crate) fn default_control_socket_host_dir() -> String {
     "/run/user/{uid}/aw-gateway/{runtime_id}".into()
 }
 

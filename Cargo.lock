@@ -104,6 +104,7 @@ dependencies = [
  "clap",
  "form_urlencoded",
  "futures-util",
+ "getrandom 0.3.4",
  "glob",
  "libc",
  "portable-pty",

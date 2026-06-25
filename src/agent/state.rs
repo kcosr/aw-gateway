@@ -63,10 +63,37 @@ pub(super) struct SocketOwner {
 }
 
 impl SocketOwner {
-    pub(super) fn from_env() -> Option<Self> {
-        let uid = std::env::var("AW_AUTHENTICATED_UID").ok()?.parse().ok()?;
-        let gid = std::env::var("AW_AUTHENTICATED_GID").ok()?.parse().ok()?;
-        Some(Self { uid, gid })
+    pub(super) fn from_env() -> anyhow::Result<Option<Self>> {
+        let uid = optional_env("AW_AUTHENTICATED_UID")?;
+        let gid = optional_env("AW_AUTHENTICATED_GID")?;
+        Self::from_values(uid, gid)
+    }
+
+    fn from_values(uid: Option<String>, gid: Option<String>) -> anyhow::Result<Option<Self>> {
+        match (uid, gid) {
+            (None, None) => Ok(None),
+            (Some(uid), Some(gid)) => Ok(Some(Self {
+                uid: uid
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("AW_AUTHENTICATED_UID must be numeric"))?,
+                gid: gid
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("AW_AUTHENTICATED_GID must be numeric"))?,
+            })),
+            _ => {
+                anyhow::bail!("AW_AUTHENTICATED_UID and AW_AUTHENTICATED_GID must be set together")
+            }
+        }
+    }
+}
+
+fn optional_env(name: &str) -> anyhow::Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{name} must be valid Unicode")
+        }
     }
 }
 
@@ -78,4 +105,47 @@ pub(super) struct IdleRuntimeState {
     pub(super) preserve_reason: Option<String>,
     pub(super) matched_processes: Vec<ProcessMatch>,
     pub(super) last_reap_result: Option<ReapResult>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SocketOwner;
+
+    #[test]
+    fn socket_owner_absent_when_neither_uid_nor_gid_set() {
+        assert!(SocketOwner::from_values(None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn socket_owner_parses_numeric_uid_and_gid() {
+        let owner = SocketOwner::from_values(Some("1000".into()), Some("1001".into()))
+            .unwrap()
+            .expect("owner present");
+        assert_eq!(owner.uid, 1000);
+        assert_eq!(owner.gid, 1001);
+    }
+
+    #[test]
+    fn socket_owner_rejects_malformed_uid() {
+        let err = SocketOwner::from_values(Some("root".into()), Some("0".into())).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("AW_AUTHENTICATED_UID must be numeric")
+        );
+    }
+
+    #[test]
+    fn socket_owner_rejects_malformed_gid() {
+        let err = SocketOwner::from_values(Some("0".into()), Some("wheel".into())).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("AW_AUTHENTICATED_GID must be numeric")
+        );
+    }
+
+    #[test]
+    fn socket_owner_rejects_uid_without_gid() {
+        let err = SocketOwner::from_values(Some("1000".into()), None).unwrap_err();
+        assert!(err.to_string().contains("must be set together"));
+    }
 }

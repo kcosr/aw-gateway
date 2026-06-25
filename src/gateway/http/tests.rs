@@ -211,7 +211,7 @@ schema_version = "1"
 [http]
 enabled = true
 listen = "127.0.0.1:0"
-enabled_actions = ["status", "targets", "launches", "run", "launch", "up", "stop", "remove"]
+enabled_actions = ["status", "targets", "launches", "run", "launch-show", "launch", "up", "stop", "remove"]
 
 [runtime]
 type = "podman"
@@ -827,7 +827,7 @@ async fn operation_errors_map_all_typed_variants_to_http_codes() {
             OperationError::operation_failed(anyhow::anyhow!("runtime failed")),
             StatusCode::INTERNAL_SERVER_ERROR,
             "operation_failed",
-            "runtime failed",
+            "internal operation failed",
         ),
         (
             OperationError::operation_failed(anyhow::Error::new(
@@ -835,7 +835,7 @@ async fn operation_errors_map_all_typed_variants_to_http_codes() {
             )),
             StatusCode::INTERNAL_SERVER_ERROR,
             "operation_failed",
-            "container agent did not become ready",
+            "internal operation failed",
         ),
         (
             OperationError::operation_failed(anyhow::Error::new(
@@ -843,7 +843,7 @@ async fn operation_errors_map_all_typed_variants_to_http_codes() {
             )),
             StatusCode::INTERNAL_SERVER_ERROR,
             "operation_failed",
-            "container did not exist after start",
+            "internal operation failed",
         ),
         (
             OperationError::operation_failed(anyhow::Error::new(
@@ -853,7 +853,7 @@ async fn operation_errors_map_all_typed_variants_to_http_codes() {
             )),
             StatusCode::INTERNAL_SERVER_ERROR,
             "operation_failed",
-            "container missing required label \"io.aw-gateway.target\"",
+            "internal operation failed",
         ),
     ];
 
@@ -908,6 +908,47 @@ async fn route_auth_and_disabled_action_return_json_errors() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn launch_show_and_run_use_separate_http_actions() {
+    let state = test_state(HttpConfig {
+        enabled: true,
+        listen: "127.0.0.1:0".into(),
+        enabled_actions: vec!["launch-show".into()],
+        auth: HttpAuthConfig::default(),
+    });
+
+    authorize_action(&state, &HeaderMap::new(), "launch-show")
+        .await
+        .unwrap();
+    let response = authorize_action(&state, &HeaderMap::new(), "launch")
+        .await
+        .unwrap_err();
+    let ActionAuthorizationError::Operation(OperationError::DisabledAction { message }) = response
+    else {
+        panic!("expected disabled-action operation error");
+    };
+    assert_eq!(message, "http action \"launch\" is disabled");
+
+    let state = test_state(HttpConfig {
+        enabled: true,
+        listen: "127.0.0.1:0".into(),
+        enabled_actions: vec!["launch".into()],
+        auth: HttpAuthConfig::default(),
+    });
+
+    authorize_action(&state, &HeaderMap::new(), "launch")
+        .await
+        .unwrap();
+    let response = authorize_action(&state, &HeaderMap::new(), "launch-show")
+        .await
+        .unwrap_err();
+    let ActionAuthorizationError::Operation(OperationError::DisabledAction { message }) = response
+    else {
+        panic!("expected disabled-action operation error");
+    };
+    assert_eq!(message, "http action \"launch-show\" is disabled");
 }
 
 #[tokio::test]
@@ -1281,7 +1322,7 @@ schema_version = "1"
 [http]
 enabled = true
 listen = "127.0.0.1:0"
-enabled_actions = ["launches", "launch"]
+enabled_actions = ["launches", "launch-show"]
 
 [runtime]
 type = "podman"
@@ -1584,16 +1625,16 @@ async fn launch_route_renders_typed_json_vars_into_steps_and_final_exec() {
 
     let log = std::fs::read_to_string(&log).unwrap();
     assert!(log.contains("--workdir /step-safe-3"), "{log}");
-    assert!(log.contains("--env STEP_DEBUG=true"), "{log}");
-    assert!(log.contains("--env STEP_REPO=alpha"), "{log}");
-    assert!(log.contains("--env STEP_RATIO=1.5"), "{log}");
+    assert!(log.contains("--env STEP_DEBUG"), "{log}");
+    assert!(log.contains("--env STEP_REPO"), "{log}");
+    assert!(log.contains("--env STEP_RATIO"), "{log}");
     assert!(log.contains("ubuntu-dev step-command alpha 3 1.5"), "{log}");
     assert!(log.contains("--workdir /repo-alpha-3"), "{log}");
-    assert!(log.contains("--env COUNT=3"), "{log}");
-    assert!(log.contains("--env DEBUG=true"), "{log}");
-    assert!(log.contains("--env MODE=safe"), "{log}");
-    assert!(log.contains("--env RATIO=1.5"), "{log}");
-    assert!(log.contains("--env REPO=alpha"), "{log}");
+    assert!(log.contains("--env COUNT"), "{log}");
+    assert!(log.contains("--env DEBUG"), "{log}");
+    assert!(log.contains("--env MODE"), "{log}");
+    assert!(log.contains("--env RATIO"), "{log}");
+    assert!(log.contains("--env REPO"), "{log}");
     assert!(log.contains("aw-gateway-exec"), "{log}");
     assert!(
         log.contains("launch-command alpha safe true 3 1.5"),

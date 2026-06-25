@@ -108,9 +108,13 @@ pub(super) fn parse_container_inspect(
     stdout: &[u8],
     runtime_label: &str,
 ) -> anyhow::Result<Option<ContainerInspect>> {
-    let mut values: Vec<ContainerInspectRaw> = serde_json::from_slice(stdout)
+    let values: Vec<ContainerInspectRaw> = serde_json::from_slice(stdout)
         .with_context(|| format!("parse {runtime_label} inspect JSON"))?;
-    Ok(values.pop().map(Into::into))
+    match values.len() {
+        0 => Ok(None),
+        1 => Ok(values.into_iter().next().map(Into::into)),
+        count => anyhow::bail!("{runtime_label} inspect returned {count} containers; expected one"),
+    }
 }
 
 pub fn parse_managed_containers(stdout: &[u8]) -> anyhow::Result<Vec<ManagedContainer>> {

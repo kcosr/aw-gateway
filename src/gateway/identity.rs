@@ -124,7 +124,10 @@ impl Runtime {
     pub(super) fn ensure_control_token(&self) -> anyhow::Result<String> {
         let path = self.control_token_path();
         match std::fs::read_to_string(&path) {
-            Ok(value) if !value.trim().is_empty() => return Ok(value.trim().to_string()),
+            Ok(value) if !value.trim().is_empty() => {
+                validate_secret_file_permissions(&path)?;
+                return validate_control_token_content(&value, &path);
+            }
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
@@ -137,13 +140,7 @@ impl Runtime {
 
     pub(super) fn control_token(&self) -> anyhow::Result<String> {
         let path = self.control_token_path();
-        let value =
-            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let token = value.trim();
-        if token.is_empty() {
-            anyhow::bail!("control token file {} is empty", path.display());
-        }
-        Ok(token.to_string())
+        read_control_token_file(&path)
     }
 }
 
@@ -367,6 +364,30 @@ pub(super) fn validate_identity_token_content(value: &str, path: &Path) -> anyho
         );
     }
     Ok(value)
+}
+
+pub(super) fn validate_control_token_content(value: &str, path: &Path) -> anyhow::Result<String> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        anyhow::bail!("control token file {} is empty", path.display());
+    }
+    if value.len() > 4096 {
+        anyhow::bail!("control token file {} is too large", path.display());
+    }
+    if value.lines().count() != 1 {
+        anyhow::bail!(
+            "control token file {} must contain exactly one line",
+            path.display()
+        );
+    }
+    Ok(value)
+}
+
+pub(super) fn read_control_token_file(path: &Path) -> anyhow::Result<String> {
+    let value =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    validate_secret_file_permissions(path)?;
+    validate_control_token_content(&value, path)
 }
 
 pub(super) fn is_plausible_public_key(key: &str) -> bool {

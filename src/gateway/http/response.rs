@@ -5,6 +5,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde_json::json;
+use std::fmt;
+
+const INTERNAL_OPERATION_FAILED_MESSAGE: &str = "internal operation failed";
 
 pub(super) fn metadata_result_response(result: GatewayOperationResult) -> Response {
     match result {
@@ -56,29 +59,42 @@ pub(super) fn execution_response(outcome: ExecutionOutcome, formats: OutputForma
 }
 
 pub(super) fn operation_error_response(err: OperationError) -> Response {
-    let message = err.to_string();
     match err {
-        OperationError::InvalidRequest { .. } | OperationError::InvalidSession { .. } => {
+        OperationError::InvalidRequest { message } | OperationError::InvalidSession { message } => {
             HttpError::invalid_request(message)
         }
-        OperationError::DisabledAction { .. } => HttpError::disabled_action(message),
-        OperationError::UnknownLaunch { .. } => HttpError::not_found(message),
-        OperationError::InvalidLaunchVariable { .. } => HttpError::new(
+        OperationError::DisabledAction { message } => HttpError::disabled_action(message),
+        OperationError::UnknownLaunch { message } => HttpError::not_found(message),
+        OperationError::InvalidLaunchVariable { message } => HttpError::new(
             StatusCode::BAD_REQUEST,
             ErrorCode::InvalidLaunchVar,
             message,
         ),
-        OperationError::InvalidLaunchArgs { .. } => HttpError::new(
+        OperationError::InvalidLaunchArgs { message } => HttpError::new(
             StatusCode::BAD_REQUEST,
             ErrorCode::InvalidLaunchArgs,
             message,
         ),
-        OperationError::AgentNotReady { .. }
-        | OperationError::ContainerNotFound { .. }
-        | OperationError::ContainerLabelMismatch { .. }
-        | OperationError::OperationFailed { .. } => HttpError::operation_failed(message),
+        OperationError::AgentNotReady { source }
+        | OperationError::ContainerNotFound { source }
+        | OperationError::ContainerLabelMismatch { source }
+        | OperationError::OperationFailed { source } => {
+            internal_operation_failed(source, "gateway HTTP operation failed")
+        }
     }
     .into_response()
+}
+
+pub(super) fn internal_operation_error_response(
+    error: impl fmt::Display,
+    event: &'static str,
+) -> Response {
+    internal_operation_failed(error, event).into_response()
+}
+
+fn internal_operation_failed(error: impl fmt::Display, event: &'static str) -> HttpError {
+    tracing::warn!(error = %error, "{event}");
+    HttpError::operation_failed(INTERNAL_OPERATION_FAILED_MESSAGE)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

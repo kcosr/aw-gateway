@@ -34,10 +34,12 @@ mod auth;
 mod output_projection;
 mod response;
 
-use auth::{authorize, authorize_action, constant_time_eq};
+use crate::secret::constant_time_eq;
+use auth::{authorize, authorize_action};
 use output_projection::{OutputFormat, OutputFormats};
 use response::{
-    ErrorCode, HttpError, execution_response, metadata_result_response, operation_error_response,
+    ErrorCode, HttpError, execution_response, internal_operation_error_response,
+    metadata_result_response, operation_error_response,
 };
 
 const PTY_ATTACH_LEASE_TTL: Duration = Duration::from_secs(30);
@@ -472,7 +474,7 @@ async fn launch_show(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    handle_metadata(state, headers, "launch", || {
+    handle_metadata(state, headers, "launch-show", || {
         Ok((
             GatewayOperation::LaunchShow { name },
             RuntimeContext::empty(),
@@ -568,6 +570,9 @@ async fn pty_attach(
     Path(pty_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    // PTY attach intentionally uses a short-lived single-use lease token as the
+    // WebSocket capability instead of bearer auth headers; browser clients send
+    // that token in the first frame after upgrade.
     if !state.pty_leases.contains(&pty_id).await {
         return HttpError::not_found("pty lease not found").into_response();
     }
@@ -875,7 +880,7 @@ async fn prepare_pty_run(state: AppState, request: RunRequest) -> Response {
     };
     match state.pty_leases.insert(prepared, terminal).await {
         Ok(created) => (StatusCode::CREATED, Json(created)).into_response(),
-        Err(err) => HttpError::operation_failed(err.to_string()).into_response(),
+        Err(err) => internal_operation_error_response(err, "PTY run lease creation failed"),
     }
 }
 
@@ -902,7 +907,7 @@ async fn prepare_pty_launch(state: AppState, name: String, request: LaunchRunReq
     };
     match state.pty_leases.insert(prepared, terminal).await {
         Ok(created) => (StatusCode::CREATED, Json(created)).into_response(),
-        Err(err) => HttpError::operation_failed(err.to_string()).into_response(),
+        Err(err) => internal_operation_error_response(err, "PTY launch lease creation failed"),
     }
 }
 

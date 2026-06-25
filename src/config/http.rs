@@ -2,6 +2,7 @@ use super::validation::*;
 use crate::action;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::net::SocketAddr;
 
 const MAX_HTTP_BEARER_TOKEN_BYTES: usize = 4096;
@@ -32,11 +33,17 @@ impl Default for HttpConfig {
 
 impl HttpConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
-        self.listen
+        let listen = self
+            .listen
             .parse::<SocketAddr>()
             .with_context(|| format!("parse http.listen {:?}", self.listen))?;
         if self.enabled && self.enabled_actions.is_empty() {
             anyhow::bail!("http.enabled_actions must not be empty when http.enabled = true");
+        }
+        if self.enabled && !listen.ip().is_loopback() && self.auth.auth_type == HttpAuthType::None {
+            anyhow::bail!(
+                "http.auth.type = \"bearer\" is required when http.listen is non-loopback"
+            );
         }
         for enabled_action in &self.enabled_actions {
             if !action::is_http_action_name(enabled_action) {
@@ -55,12 +62,21 @@ impl HttpConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpAuthConfig {
     #[serde(default, rename = "type")]
     pub auth_type: HttpAuthType,
     pub token: Option<String>,
+}
+
+impl fmt::Debug for HttpAuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpAuthConfig")
+            .field("auth_type", &self.auth_type)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl Default for HttpAuthConfig {
@@ -105,4 +121,21 @@ pub enum HttpAuthType {
     #[default]
     None,
     Bearer,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_auth_debug_redacts_bearer_token() {
+        let auth = HttpAuthConfig {
+            auth_type: HttpAuthType::Bearer,
+            token: Some("secret-token".into()),
+        };
+        let rendered = format!("{auth:?}");
+
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(!rendered.contains("secret-token"), "{rendered}");
+    }
 }

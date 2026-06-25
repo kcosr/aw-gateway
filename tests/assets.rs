@@ -242,6 +242,43 @@ fn start_container_sshd_dry_run_disables_transfer_policy() {
 }
 
 #[test]
+fn start_container_sshd_dry_run_installs_forcecommand_for_sftp_deny() {
+    let dir = tempdir().unwrap();
+    let base_config = dir.path().join("sshd_config_agent");
+    let runtime_config = dir.path().join("runtime_sshd_config");
+    let run_dir = dir.path().join("run");
+    let policy = dir.path().join("ssh-command-filter.toml");
+    let filter = dir.path().join("aw-ssh-command-filter");
+    std::fs::write(
+        &base_config,
+        "Port 22\nSubsystem sftp /usr/libexec/openssh/sftp-server\n",
+    )
+    .unwrap();
+    std::fs::write(&policy, "sftp = \"deny\"\nlegacy_scp = \"allow\"\n").unwrap();
+    std::fs::write(&filter, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = StdCommand::new(asset("start-container-sshd"))
+        .env("AW_SSHD_BASE_CONFIG", &base_config)
+        .env("AW_SSHD_RUNTIME_CONFIG", &runtime_config)
+        .env("AW_SSHD_RUN_DIR", &run_dir)
+        .env("AW_SSHD_POLICY_CONFIG", &policy)
+        .env("AW_SSH_COMMAND_FILTER", &filter)
+        .env("AW_SSHD_DRY_RUN_CONFIG", "1")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains("Subsystem sftp"));
+    assert!(stdout.contains(&format!(
+        "ForceCommand {} --config {}",
+        filter.display(),
+        policy.display()
+    )));
+}
+
+#[test]
 fn start_container_sshd_dry_run_installs_forcecommand_for_directional_legacy_scp() {
     for mode in ["inbound", "outbound"] {
         let dir = tempdir().unwrap();

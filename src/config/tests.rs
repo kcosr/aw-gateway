@@ -317,6 +317,79 @@ name = "{image_slug}"
 }
 
 #[test]
+fn http_config_requires_bearer_auth_for_enabled_non_loopback_listen() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[http]
+enabled = true
+listen = "0.0.0.0:8080"
+enabled_actions = ["status"]
+
+[http.auth]
+type = "none"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(
+        err.contains("bearer") && err.contains("non-loopback"),
+        "{err}"
+    );
+
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[http]
+enabled = true
+listen = "0.0.0.0:8080"
+enabled_actions = ["status"]
+
+[http.auth]
+type = "bearer"
+token = "secret-token"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+    cfg.validate().unwrap();
+}
+
+#[test]
+fn http_config_non_loopback_none_auth_is_allowed_when_disabled() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[http]
+enabled = false
+listen = "0.0.0.0:8080"
+
+[http.auth]
+type = "none"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+    cfg.validate().unwrap();
+}
+
+#[test]
 fn http_config_rejects_non_socket_listen() {
     let cfg: GatewayConfig = toml::from_str(
         r#"
@@ -561,7 +634,11 @@ cleanup = "always"
 fn path_segment_names_reject_dot_segments() {
     assert!(validate_name("target", ".").is_err());
     assert!(validate_name("target", "..").is_err());
+    assert!(validate_name("target", "...").is_err());
+    assert!(validate_name("target", ".hidden").is_err());
+    assert!(validate_name("target", "-flag").is_err());
     validate_name("target", "dev.shell-1").unwrap();
+    validate_name("target", "_dev.shell-1").unwrap();
 }
 
 #[test]
@@ -987,6 +1064,40 @@ host = "127.0.0.1"
 }
 
 #[test]
+fn local_ssh_non_loopback_host_is_only_rejected_for_listen_mode() {
+    let cfg = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+mode = "proxy_command"
+host = "0.0.0.0"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    cfg.validate().unwrap();
+
+    let cfg = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+mode = "listen"
+host = "0.0.0.0"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("loopback-only"), "{err}");
+}
+
+#[test]
 fn env_value_requires_exactly_one_source() {
     let value = EnvValue {
         value: Some("a".into()),
@@ -999,11 +1110,55 @@ fn env_value_requires_exactly_one_source() {
 }
 
 #[test]
-fn env_value_renders_file_path_and_file_contents() {
+fn service_env_values_validate_sources_at_config_load() {
+    for env in [
+        r#"
+[targets.default.container_agent.services.env.BAD]
+"#,
+        r#"
+[targets.default.container_agent.services.env.BAD]
+value = "a"
+file = "/tmp/a"
+"#,
+    ] {
+        let cfg: GatewayConfig = toml::from_str(&format!(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+
+[[targets.default.container_agent.services]]
+name = "worker"
+command = ["/bin/true"]
+{env}
+"#
+        ))
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(
+            err.contains("environment value must specify exactly one"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn env_value_renders_literal_values_and_file_paths_only() {
     let dir = tempfile::tempdir().unwrap();
     let token_file = dir.path().join("token");
     std::fs::write(&token_file, "token-{name}\n").unwrap();
-    let value = EnvValue {
+
+    let literal_value = EnvValue {
+        value: Some("token-{name}".into()),
+        file: None,
+        inherit: None,
+        interpolate: true,
+        required: true,
+    };
+    let file_value = EnvValue {
         value: None,
         file: Some("{dir}/token".into()),
         inherit: None,
@@ -1016,8 +1171,12 @@ fn env_value_renders_file_path_and_file_contents() {
     ]);
 
     assert_eq!(
-        value.resolve(&vars).unwrap(),
+        literal_value.resolve(&vars).unwrap(),
         Some("token-workspace".into())
+    );
+    assert_eq!(
+        file_value.resolve(&vars).unwrap(),
+        Some("token-{name}".into())
     );
 }
 
@@ -1046,6 +1205,26 @@ name = "{image_slug}"
     )
     .unwrap();
     assert!(cfg.logging.console);
+}
+
+#[test]
+fn logging_max_files_is_bounded() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[logging]
+max_files = 1025
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+    let err = cfg.validate().unwrap_err();
+    assert!(err.to_string().contains("logging.max_files"), "{err:#}");
 }
 
 #[test]
@@ -1231,6 +1410,45 @@ CODEX_HOME = "/var/lib/codex"
 }
 
 #[test]
+fn target_image_references_are_shape_validated() {
+    let valid: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ghcr.io/kcosr/aw-gateway@sha256:0123456789abcdef"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+    valid.validate().unwrap();
+
+    for image in [
+        "--privileged",
+        "ubuntu dev",
+        "ubuntu//dev",
+        "registry:port/ubuntu",
+        "ubuntu:",
+        "ubuntu@sha256:not-hex",
+    ] {
+        let cfg: GatewayConfig = toml::from_str(&format!(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "{image}"
+mode = "fixed"
+name = "{{image_slug}}"
+"#
+        ))
+        .unwrap();
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(err.contains("image reference"), "{image}: {err}");
+    }
+}
+
+#[test]
 fn target_session_env_inherit_composes_and_validates() {
     let cfg: GatewayConfig = toml::from_str(
         r#"
@@ -1357,6 +1575,11 @@ fn ssh_dispatch_defaults_include_launch_actions() {
             .iter()
             .any(|action| action == "launches")
     );
+    assert!(
+        cfg.enabled_actions
+            .iter()
+            .any(|action| action == "launch-show")
+    );
     assert!(cfg.enabled_actions.iter().any(|action| action == "launch"));
     cfg.validate().unwrap();
 }
@@ -1370,6 +1593,7 @@ enabled_actions = [
   "up",
   "run",
   "launches",
+  "launch-show",
   "launch",
   "status",
   "targets",
@@ -2664,6 +2888,27 @@ name = "{image_slug}"
 }
 
 #[test]
+fn target_defaults_validate_image_references_before_overlay() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+default_target = "default"
+
+[target_defaults]
+image = "--privileged"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("image reference"), "{err}");
+}
+
+#[test]
 fn target_defaults_validate_present_fields_before_overlay() {
     let cfg: GatewayConfig = toml::from_str(
         r#"
@@ -2797,6 +3042,50 @@ command = ["prep", "{var.repo}"]
     )
     .unwrap();
     cfg.validate().unwrap();
+}
+
+#[test]
+fn launch_string_vars_reject_control_character_values() {
+    for (vars, expected) in [
+        (
+            r#"repo = { type = "string", default = "line\nbreak" }
+mode = { type = "enum", values = ["fast", "safe"], default = "fast" }"#,
+            "launch \"agent\" variable \"repo\" string default must not contain NUL, LF, or CR",
+        ),
+        (
+            r#"repo = { type = "string", default = "bad\u0000value" }
+mode = { type = "enum", values = ["fast", "safe"], default = "fast" }"#,
+            "launch \"agent\" variable \"repo\" string default must not contain NUL, LF, or CR",
+        ),
+        (
+            r#"repo = { type = "string", default = "repo" }
+mode = { type = "enum", values = ["fast", "safe\r"], default = "fast" }"#,
+            "launch \"agent\" enum variable \"mode\" values must not contain NUL, LF, or CR",
+        ),
+    ] {
+        let toml = [
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[launches.agent]
+target = "default"
+command = ["agent", "{var.repo}", "{var.mode}"]
+
+[launches.agent.vars]
+"#,
+            vars,
+        ]
+        .concat();
+        let cfg: GatewayConfig = toml::from_str(&toml).unwrap();
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains(expected), "{err}");
+    }
 }
 
 #[test]
@@ -3851,6 +4140,37 @@ includes = ["config.d/*.toml"]
 }
 
 #[test]
+fn includes_reject_patterns_that_match_no_files() {
+    for (case, include_pattern) in [
+        ("literal", "config.d/missing.toml"),
+        ("wildcard", "config.d/*.toml"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config.d")).unwrap();
+        let root = dir.path().join("gateway.toml");
+        std::fs::write(
+            &root,
+            format!(
+                r#"
+schema_version = "1"
+includes = ["{include_pattern}"]
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "default"
+"#
+            ),
+        )
+        .unwrap();
+
+        let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
+        assert!(err.contains("matched no files"), "{case}: {err}");
+        assert!(err.contains(include_pattern), "{case}: {err}");
+    }
+}
+
+#[test]
 fn included_templates_can_be_used_by_root_definitions() {
     let dir = tempfile::tempdir().unwrap();
     let config_dir = dir.path().join("config.d");
@@ -4051,6 +4371,35 @@ name = "default"
         let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
         assert!(err.contains(expected), "{case}: {err}");
     }
+}
+
+#[test]
+fn includes_reject_non_table_definition_sections() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_dir = dir.path().join("config.d");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("bad.toml"),
+        r#"
+targets = "config.d/target.toml"
+"#,
+    )
+    .unwrap();
+    let root = dir.path().join("gateway.toml");
+    std::fs::write(
+        &root,
+        r#"
+schema_version = "1"
+includes = ["config.d/bad.toml"]
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
+    assert!(
+        err.contains("field \"targets\" must be a TOML table"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -4391,6 +4740,34 @@ fn extends_rejects_glob_paths() {
 
     let err = format!("{:#}", GatewayConfig::load(&root).unwrap_err());
     assert!(err.contains("globs are not supported"), "{err}");
+}
+
+#[test]
+fn extends_rejects_deep_chains() {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..65 {
+        let path = dir.path().join(format!("config-{index}.toml"));
+        let next = dir.path().join(format!("config-{}.toml", index + 1));
+        std::fs::write(&path, format!("extends = \"{}\"\n", next.display())).unwrap();
+    }
+    std::fs::write(
+        dir.path().join("config-65.toml"),
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "default"
+"#,
+    )
+    .unwrap();
+
+    let err = format!(
+        "{:#}",
+        GatewayConfig::load(&dir.path().join("config-0.toml")).unwrap_err()
+    );
+    assert!(err.contains("maximum depth"), "{err}");
 }
 
 #[test]

@@ -4,6 +4,7 @@ use super::session::LocalListenerGuard;
 use crate::runtime;
 use anyhow::Context;
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 
@@ -31,6 +32,7 @@ pub(super) async fn bind_local_ssh(runtime: &Runtime) -> anyhow::Result<BoundLoc
         .local_ssh
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("target does not configure local_ssh"))?;
+    let _lock = runtime.acquire_lifecycle_lock().await?;
     if let Some(active) = runtime.active_local_listener_status()? {
         anyhow::bail!(
             "local SSH listener is already active on {}:{}",
@@ -66,13 +68,20 @@ pub(super) async fn serve_local_ssh(
     loop {
         tokio::select! {
             accept = listener.accept() => {
-                let (client, _) = accept?;
-                let target = target.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = proxy_local_ssh(client, target).await {
-                        tracing::warn!(error = %err, "local SSH listener connection failed");
+                match accept {
+                    Ok((client, _)) => {
+                        let target = target.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = proxy_local_ssh(client, target).await {
+                                tracing::warn!(error = %err, "local SSH listener connection failed");
+                            }
+                        });
                     }
-                });
+                    Err(err) => {
+                        tracing::warn!(error = %err, "local SSH listener accept failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
             }
             signal = tokio::signal::ctrl_c() => {
                 signal?;

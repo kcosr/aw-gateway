@@ -11,6 +11,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::{Duration, Instant, sleep};
 
+const MAX_AGENT_RESPONSE_BYTES: usize = 64 * 1024;
+
 pub(super) struct AgentSessionHold {
     pub(super) _reader: BufReader<UnixStream>,
 }
@@ -77,8 +79,7 @@ impl Runtime {
             payload.push(b'\n');
             stream.write_all(&payload).await?;
             let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            reader.read_line(&mut line).await?;
+            let line = read_agent_response(&mut reader).await?;
             let response = Self::parse_agent_control_success(&line)?;
             Ok((response, reader))
         })
@@ -145,5 +146,51 @@ impl Runtime {
                 cleanup.owner == IdleCleanupOwner::Agent
                     && cleanup.action != IdleCleanupAction::None
             })
+    }
+}
+
+async fn read_agent_response(reader: &mut BufReader<UnixStream>) -> anyhow::Result<String> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            anyhow::bail!("empty agent control response");
+        }
+        let end = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(available.len());
+        if line.len() + end > MAX_AGENT_RESPONSE_BYTES {
+            anyhow::bail!("agent control response exceeds {MAX_AGENT_RESPONSE_BYTES} bytes");
+        }
+        line.extend_from_slice(&available[..end]);
+        reader.consume(end);
+        if line.ends_with(b"\n") {
+            return String::from_utf8(line).context("agent control response is not UTF-8");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_agent_response_rejects_oversized_line() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let writer = tokio::spawn(async move {
+            server
+                .write_all(&vec![b'x'; MAX_AGENT_RESPONSE_BYTES + 1])
+                .await
+                .unwrap();
+        });
+        let mut reader = BufReader::new(client);
+
+        let err = read_agent_response(&mut reader).await.unwrap_err();
+        drop(reader);
+        writer.await.unwrap();
+
+        assert!(err.to_string().contains("response exceeds"), "{err:#}");
     }
 }

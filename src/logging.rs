@@ -1,13 +1,16 @@
 use crate::config::{ContainerAgentFile, GatewayConfig, LoggingConfig, WorkspaceConfig};
 use crate::context::{RuntimeContext, validate_supplied_context};
+use crate::fileutil::{ensure_private_dir, set_mode};
 use crate::paths::{self, UserContext};
 use crate::rotating_log::{RotationState, RotationStep};
 use crate::template::{self, Vars};
 use anyhow::Context;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -183,19 +186,21 @@ struct SizeRotatingWriter {
     inner: Arc<Mutex<SizeRotatingFile>>,
 }
 
-impl Write for SizeRotatingWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+impl SizeRotatingWriter {
+    fn lock_inner(&self) -> MutexGuard<'_, SizeRotatingFile> {
         self.inner
             .lock()
-            .expect("log writer mutex poisoned")
-            .write(buf)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Write for SizeRotatingWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.lock_inner().write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner
-            .lock()
-            .expect("log writer mutex poisoned")
-            .flush()
+        self.lock_inner().flush()
     }
 }
 
@@ -211,11 +216,11 @@ impl SizeRotatingFile {
         max_bytes: u64,
         max_files: usize,
     ) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(&directory)
+        ensure_private_dir(&directory)
             .with_context(|| format!("create log directory {}", directory.display()))?;
         let file_name = format!("{file_prefix}.log");
         let path = directory.join(&file_name);
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = open_log_file(&path)?;
         let bytes_written = file.metadata()?.len();
         Ok(Self {
             rotation: RotationState::new(path, max_bytes, max_files, bytes_written),
@@ -235,20 +240,52 @@ impl SizeRotatingFile {
                     let _ = std::fs::remove_file(path);
                 }
                 RotationStep::Rename { from, to } => {
-                    if from.exists() {
-                        std::fs::rename(from, to)?;
-                    }
+                    rename_if_exists(from, to)?;
                 }
             }
         }
-        self.file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(plan.active_path())?;
-        self.rotation.reset_after_rotation();
-        Ok(())
+        // Reopen the active path in append mode (not truncate): after the rename
+        // above the path is gone, so create+append yields a fresh file, and any
+        // file that unexpectedly survived the rename is appended to rather than
+        // destroyed. Reset the byte counter whether or not the reopen succeeds,
+        // so a failed reopen cannot leave the writer attached to the
+        // rotated-away inode while still counting toward the next rotation --
+        // which would otherwise re-rotate on every subsequent write.
+        match open_log_file(plan.active_path()) {
+            Ok(file) => {
+                self.file = file;
+                self.rotation.reset_after_rotation();
+                Ok(())
+            }
+            Err(err) => {
+                self.rotation.reset_after_rotation();
+                Err(err)
+            }
+        }
     }
+}
+
+// Rename `from` to `to`, treating a missing source as success. Avoids the
+// exists()-then-rename TOCTOU and tolerates a generation file that another
+// rotation already moved.
+fn rename_if_exists(from: &Path, to: &Path) -> io::Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn open_log_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    set_mode(path, 0o600).map_err(io::Error::other)?;
+    Ok(file)
 }
 
 impl Write for SizeRotatingFile {
@@ -278,6 +315,78 @@ mod tests {
         writer.flush().unwrap();
         assert!(dir.path().join("test.log").exists());
         assert!(dir.path().join("test.log.1").exists());
+    }
+
+    #[test]
+    fn rotation_preserves_previous_generation_and_continues_in_fresh_active() {
+        let dir = tempdir().unwrap();
+        let mut writer = SizeRotatingFile::new(dir.path().to_path_buf(), "test", 4, 3).unwrap();
+        writer.write_all(b"AAAA").unwrap();
+        writer.write_all(b"BBBB").unwrap();
+        writer.flush().unwrap();
+        // The previous generation must survive rotation (no truncation / loss),
+        // and writes after rotation land in a fresh active file.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("test.log.1")).unwrap(),
+            "AAAA"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("test.log")).unwrap(),
+            "BBBB"
+        );
+    }
+
+    #[test]
+    fn rotation_tolerates_missing_generation_files() {
+        let dir = tempdir().unwrap();
+        // max_files = 3 so the plan renames generations 1 and 2 that do not yet
+        // exist; rename_if_exists must treat the missing sources as success.
+        let mut writer = SizeRotatingFile::new(dir.path().to_path_buf(), "test", 4, 3).unwrap();
+        writer.write_all(b"AAAA").unwrap();
+        writer.write_all(b"BBBB").unwrap();
+        writer.flush().unwrap();
+        assert!(dir.path().join("test.log").exists());
+        assert!(dir.path().join("test.log.1").exists());
+    }
+
+    #[test]
+    fn size_rotating_writer_uses_private_directory_and_file_modes() {
+        let dir = tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        let _writer = SizeRotatingFile::new(log_dir.clone(), "test", 8, 2).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&log_dir).unwrap().permissions().mode() & 0o777;
+            let file_mode = std::fs::metadata(log_dir.join("test.log"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            assert_eq!(file_mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn size_rotating_writer_recovers_from_poisoned_mutex() {
+        let dir = tempdir().unwrap();
+        let make_writer =
+            SizeRotatingMakeWriter::new(dir.path().to_path_buf(), "test", 1024, 2).unwrap();
+        let inner = make_writer.inner.clone();
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = inner.lock().unwrap();
+            panic!("poison log writer");
+        });
+        assert!(make_writer.inner.lock().is_err());
+
+        let mut writer = make_writer.make_writer();
+        writer.write_all(b"after poison\n").unwrap();
+        writer.flush().unwrap();
+
+        let text = std::fs::read_to_string(dir.path().join("test.log")).unwrap();
+        assert!(text.contains("after poison"));
     }
 
     #[test]

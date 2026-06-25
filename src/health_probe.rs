@@ -3,6 +3,9 @@ use std::collections::BTreeMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+const MAX_HTTP_HEALTH_RESPONSE_BYTES: usize = 256 * 1024;
+
+#[derive(Debug)]
 pub(crate) struct HttpHealthResponse {
     response: String,
 }
@@ -38,7 +41,11 @@ pub(crate) async fn http_get(url: &str) -> anyhow::Result<HttpHealthResponse> {
     let request = format!("GET /{path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await?;
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
+    let mut limited = stream.take((MAX_HTTP_HEALTH_RESPONSE_BYTES + 1) as u64);
+    limited.read_to_end(&mut buf).await?;
+    if buf.len() > MAX_HTTP_HEALTH_RESPONSE_BYTES {
+        anyhow::bail!("HTTP health check response exceeds {MAX_HTTP_HEALTH_RESPONSE_BYTES} bytes");
+    }
     Ok(HttpHealthResponse {
         response: String::from_utf8_lossy(&buf).into_owned(),
     })
@@ -151,5 +158,38 @@ mod tests {
         );
         assert!(response.status_matches(200));
         assert_eq!(response.body(), Some("{\"status\":\"ready\"}"));
+    }
+
+    #[tokio::test]
+    async fn http_get_rejects_oversized_response() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 256];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+            stream
+                .write_all(&vec![b'x'; MAX_HTTP_HEALTH_RESPONSE_BYTES + 1])
+                .await
+                .unwrap();
+        });
+
+        let err = http_get(&format!("http://127.0.0.1:{port}/ready"))
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(err.to_string().contains("response exceeds"), "{err:#}");
     }
 }

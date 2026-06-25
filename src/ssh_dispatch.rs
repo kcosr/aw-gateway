@@ -166,7 +166,7 @@ fn parse_native(
         "launches" if action_enabled(cfg, "launches") => GatewayAction::Launches {
             json: parse_json_flag(words, "launches")?,
         },
-        "launch" if action_enabled(cfg, "launch") => parse_launch_action(words)?,
+        "launch" => parse_launch_action(words, cfg)?,
         "status" if action_enabled(cfg, "status") => parse_status_action(words)?,
         "targets" if action_enabled(cfg, "targets") => GatewayAction::Targets {
             json: parse_json_flag(words, "targets")?,
@@ -324,11 +324,17 @@ fn parse_run_action(words: &[String]) -> anyhow::Result<GatewayAction> {
     anyhow::bail!("run requires -- followed by a command")
 }
 
-fn parse_launch_action(words: &[String]) -> anyhow::Result<GatewayAction> {
+fn parse_launch_action(words: &[String], cfg: &SshDispatchConfig) -> anyhow::Result<GatewayAction> {
     let Some(name) = words.get(1) else {
         anyhow::bail!("launch requires a launch name");
     };
     if name == "show" {
+        if !action_enabled(cfg, "launch-show") {
+            anyhow::bail!(
+                "invalid or disabled gateway action shape: {}",
+                words.join(" ")
+            );
+        }
         let Some(launch_name) = words.get(2) else {
             anyhow::bail!("launch show requires a launch name");
         };
@@ -350,6 +356,12 @@ fn parse_launch_action(words: &[String]) -> anyhow::Result<GatewayAction> {
         });
     }
 
+    if !action_enabled(cfg, "launch") {
+        anyhow::bail!(
+            "invalid or disabled gateway action shape: {}",
+            words.join(" ")
+        );
+    }
     let parsed = parse_launch_run_strings(words[1..].iter().cloned())?;
 
     Ok(GatewayAction::LaunchRun {
@@ -870,7 +882,7 @@ mod tests {
     fn disabled_launch_actions_are_rejected() {
         let mut cfg = SshDispatchConfig::default();
         cfg.enabled_actions
-            .retain(|action| action != "launch" && action != "launches");
+            .retain(|action| !matches!(action.as_str(), "launch" | "launch-show" | "launches"));
         for command in [
             "launches",
             "launches --json",
@@ -887,10 +899,43 @@ mod tests {
     }
 
     #[test]
+    fn launch_show_and_run_use_separate_actions() {
+        let mut cfg = SshDispatchConfig::default();
+        cfg.enabled_actions.retain(|action| action != "launch");
+
+        assert_eq!(
+            parse_gateway_action("launch show repo-shell", &cfg).unwrap(),
+            Some(GatewayAction::LaunchShow {
+                name: "repo-shell".into(),
+                json: false,
+            })
+        );
+        let err = parse_gateway_action("launch repo-shell --var repo=x", &cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid or disabled gateway action shape"),
+            "{err}"
+        );
+
+        cfg.enabled_actions.push("launch".into());
+        cfg.enabled_actions.retain(|action| action != "launch-show");
+        assert!(parse_gateway_action("launch show repo-shell", &cfg).is_err());
+        assert_eq!(
+            parse_gateway_action("launch repo-shell --var repo=x", &cfg).unwrap(),
+            Some(GatewayAction::LaunchRun {
+                name: "repo-shell".into(),
+                session_id: None,
+                vars: vec!["repo=x".into()],
+                args: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
     fn disabled_session_actions_are_rejected() {
         let mut cfg = SshDispatchConfig::default();
         cfg.enabled_actions
-            .retain(|action| action != "connect" && action != "run" && action != "launch");
+            .retain(|action| !matches!(action.as_str(), "connect" | "run" | "launch"));
         for command in [
             "connect default --session-id abc123def456",
             "run default --session-id abc123def456 -- pwd",
