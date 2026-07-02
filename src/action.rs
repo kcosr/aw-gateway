@@ -78,6 +78,7 @@ mod tests {
             ]
         );
         assert!(!is_gateway_action_name("rm"));
+        assert!(!is_gateway_action_name("shell"));
         assert_eq!(
             HTTP_ACTION_NAMES,
             &[
@@ -93,5 +94,6 @@ mod tests {
             ]
         );
         assert!(!is_http_action_name("connect"));
+        assert!(!is_http_action_name("shell"));
     }
 }

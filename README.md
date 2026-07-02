@@ -446,9 +446,11 @@ method = "runtime_exec"
 
 Runtime-exec targets do not expose container SSH, do not generate SSH client
 config, and do not support SCP, SFTP, VS Code Remote-SSH, `connect`,
-`add-container-key`, `client-config`, or `client-bundle`. They do support
-`up`, `run`, `shell`, `launch`, `launches`, `status`, `status --all`,
-`targets`, `stop`, and `remove` through the host container runtime.
+`add-key`, `add-container-key`, `client-config`, or `client-bundle`.
+`add-host-key` remains available because it only mutates the host user's SSH
+configuration. Runtime-exec targets do support `up`, `run`, `shell`, `launch`,
+`launches`, `status`, `status --all`, `targets`, `stop`, and `remove` through
+the host container runtime.
 
 Start a no-SSH target and open an interactive shell with the configured
 `identity.session_shell`:

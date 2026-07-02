@@ -684,6 +684,11 @@ mod tests {
         );
         assert!(parse_gateway_action("rm default", &cfg).unwrap().is_none());
         assert!(
+            parse_gateway_action("shell default", &cfg)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
             parse_gateway_action("gateway-help", &cfg)
                 .unwrap()
                 .is_none()
