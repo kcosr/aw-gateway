@@ -1,8 +1,9 @@
 use super::{ControlSocketPaths, Runtime, UNIX_SOCKET_PATH_MAX_BYTES};
 use crate::config::{
-    AGENT_SCHEMA_VERSION, BootstrapIdentity, ContainerAgentFile, ContainerBootstrapFile,
-    ControlSocketConfig, ControlSocketsConfig, IdleCleanupAction, IdleCleanupOwner, LoggingConfig,
-    RenderedContainerBootstrapStep, TargetConfig, default_control_socket_host_dir, validate_name,
+    AGENT_SCHEMA_VERSION, BOOTSTRAP_SCHEMA_VERSION, BootstrapIdentity, ContainerAgentFile,
+    ContainerBootstrapFile, ContainerRuntimeType, ControlSocketConfig, ControlSocketsConfig,
+    IdleCleanupAction, IdleCleanupOwner, LoggingConfig, RenderedContainerBootstrapStep,
+    TargetConfig, default_control_socket_host_dir, validate_name,
 };
 use crate::context::RuntimeContext;
 use crate::fileutil::{AtomicWritePolicy, atomic_write_toml, write_private_file};
@@ -140,13 +141,15 @@ impl Runtime {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         let cfg = ContainerBootstrapFile {
-            schema_version: AGENT_SCHEMA_VERSION.to_string(),
+            schema_version: BOOTSTRAP_SCHEMA_VERSION.to_string(),
             agent_program: template::render(&self.target.container_bootstrap.agent_program, &vars)?,
             agent_config: self
                 .container_agent_config_in_container()
                 .display()
                 .to_string(),
             skip_identity_prepare: self.container_runtime.is_podman(),
+            chown_existing_identity_dirs: self.container_runtime.kind()
+                != ContainerRuntimeType::AppleContainer,
             identity: BootstrapIdentity {
                 session_user: self.identity.container_user.clone(),
                 session_uid: self.identity.session_uid,

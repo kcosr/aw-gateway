@@ -10,6 +10,19 @@
   `configuration.image` JSON parsing, validated bare-key exec env inheritance,
   plus a local Apple container deployment guide and sample config.
 
+### Changed
+
+- Bumped the internal container bootstrap config `schema_version` to `2`.
+  `aw-gateway` and the bind-mounted `aw-container-bootstrap` binary must be
+  upgraded together; mismatches fail container startup with an unsupported
+  bootstrap schema error.
+
+### Fixed
+
+- Fixed Apple container bootstrap identity preparation so pre-existing session
+  home and state directories are not chowned, which avoids Apple virtiofs
+  bind-mount `EPERM` failures during Apple container startup.
+
 ## [0.7.0] - 2026-06-25
 
 ### Breaking Changes

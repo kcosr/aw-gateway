@@ -53,6 +53,7 @@ pub(crate) use validation::{
 
 pub const GATEWAY_SCHEMA_VERSION: &str = "1";
 pub const AGENT_SCHEMA_VERSION: &str = "1";
+pub const BOOTSTRAP_SCHEMA_VERSION: &str = "2";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -614,6 +615,7 @@ pub struct ContainerBootstrapFile {
     pub agent_config: String,
     #[serde(default)]
     pub skip_identity_prepare: bool,
+    pub chown_existing_identity_dirs: bool,
     pub identity: BootstrapIdentity,
     #[serde(default)]
     pub steps: Vec<RenderedContainerBootstrapStep>,
@@ -623,6 +625,15 @@ impl ContainerBootstrapFile {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let schema: BootstrapSchemaOnly =
+            toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        if schema.schema_version != BOOTSTRAP_SCHEMA_VERSION {
+            anyhow::bail!(
+                "unsupported bootstrap schema_version {:?}; expected {:?}",
+                schema.schema_version,
+                BOOTSTRAP_SCHEMA_VERSION
+            );
+        }
         let cfg: Self =
             toml::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
         cfg.validate()?;
@@ -630,11 +641,11 @@ impl ContainerBootstrapFile {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.schema_version != AGENT_SCHEMA_VERSION {
+        if self.schema_version != BOOTSTRAP_SCHEMA_VERSION {
             anyhow::bail!(
                 "unsupported bootstrap schema_version {:?}; expected {:?}",
                 self.schema_version,
-                AGENT_SCHEMA_VERSION
+                BOOTSTRAP_SCHEMA_VERSION
             );
         }
         if self.agent_program.trim().is_empty() {
@@ -649,6 +660,11 @@ impl ContainerBootstrapFile {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct BootstrapSchemaOnly {
+    schema_version: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

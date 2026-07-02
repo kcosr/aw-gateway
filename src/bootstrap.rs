@@ -4,7 +4,9 @@ use crate::fileutil::{self, AtomicWritePolicy};
 use anyhow::Context;
 use std::ffi::CStr;
 use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
@@ -40,11 +42,13 @@ fn prepare_identity(cfg: &ContainerBootstrapFile) -> anyhow::Result<()> {
         Path::new(&cfg.identity.session_home),
         cfg.identity.session_uid,
         cfg.identity.session_gid,
+        cfg.chown_existing_identity_dirs,
     )?;
     ensure_dir_owned_if_created(
         Path::new(&cfg.identity.state_dir),
         cfg.identity.session_uid,
         cfg.identity.session_gid,
+        cfg.chown_existing_identity_dirs,
     )?;
     Ok(())
 }
@@ -133,15 +137,42 @@ fn ensure_passwd_entry_at(
     Ok(())
 }
 
-fn ensure_dir_owned_if_created(path: &Path, uid: u32, gid: u32) -> anyhow::Result<()> {
-    if path
-        .symlink_metadata()
-        .is_ok_and(|meta| meta.file_type().is_symlink())
-    {
-        anyhow::bail!("refusing to chown symlink {}", path.display());
+fn ensure_dir_owned_if_created(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    chown_existing: bool,
+) -> anyhow::Result<()> {
+    match path.symlink_metadata() {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            anyhow::bail!("refusing to chown symlink {}", path.display());
+        }
+        Ok(meta) if meta.is_dir() => {
+            if chown_existing {
+                chown_dir_no_follow(path, uid, gid)
+                    .with_context(|| format!("chown {}", path.display()))?;
+            } else if meta.uid() != uid || meta.gid() != gid {
+                tracing::warn!(
+                    path = %path.display(),
+                    owner_uid = meta.uid(),
+                    owner_gid = meta.gid(),
+                    requested_uid = uid,
+                    requested_gid = gid,
+                    "pre-existing identity directory ownership differs; leaving ownership unchanged",
+                );
+            }
+            return Ok(());
+        }
+        Ok(_) => {
+            anyhow::bail!("{} exists but is not a directory", path.display());
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("stat {}", path.display()));
+        }
     }
     std::fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
-    chown(path, uid, gid).with_context(|| format!("chown {}", path.display()))?;
+    chown_dir_no_follow(path, uid, gid).with_context(|| format!("chown {}", path.display()))?;
     Ok(())
 }
 
@@ -153,12 +184,22 @@ fn atomic_write_preserve_mode(path: &Path, contents: &[u8]) -> anyhow::Result<()
     )
 }
 
-fn chown(path: &Path, uid: u32, gid: u32) -> anyhow::Result<()> {
+fn chown_dir_no_follow(path: &Path, uid: u32, gid: u32) -> anyhow::Result<()> {
     let c_path = CString::new(path.as_os_str().as_bytes())
         .with_context(|| format!("path contains NUL: {}", path.display()))?;
-    let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open directory");
+    }
+    let dir = unsafe { std::fs::File::from_raw_fd(fd) };
+    let rc = unsafe { libc::fchown(dir.as_raw_fd(), uid, gid) };
     if rc != 0 {
-        return Err(std::io::Error::last_os_error()).context("chown");
+        return Err(std::io::Error::last_os_error()).context("fchown");
     }
     Ok(())
 }
@@ -289,6 +330,7 @@ fn exec_agent(cfg: &ContainerBootstrapFile) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -376,6 +418,61 @@ mod tests {
             std::fs::metadata(&passwd).unwrap().permissions().mode() & 0o777,
             0o644
         );
+    }
+
+    #[test]
+    fn ensure_dir_owned_if_created_can_leave_existing_directory_ownership_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing");
+        std::fs::create_dir(&path).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let requested_uid = if before.uid() == 0 { 1 } else { 0 };
+        let requested_gid = if before.gid() == 0 { 1 } else { 0 };
+
+        ensure_dir_owned_if_created(&path, requested_uid, requested_gid, false).unwrap();
+
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
+    }
+
+    #[test]
+    fn ensure_dir_owned_if_created_creates_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("created");
+        let owner = std::fs::metadata(dir.path()).unwrap();
+
+        ensure_dir_owned_if_created(&path, owner.uid(), owner.gid(), true).unwrap();
+
+        let created = std::fs::metadata(&path).unwrap();
+        assert!(created.is_dir());
+        assert_eq!(created.uid(), owner.uid());
+        assert_eq!(created.gid(), owner.gid());
+    }
+
+    #[test]
+    fn ensure_dir_owned_if_created_rejects_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, "not a directory").unwrap();
+
+        let err = ensure_dir_owned_if_created(&path, 0, 0, true).unwrap_err();
+
+        assert!(err.to_string().contains("exists but is not a directory"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_dir_owned_if_created_rejects_existing_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = ensure_dir_owned_if_created(&link, 0, 0, true).unwrap_err();
+
+        assert!(err.to_string().contains("refusing to chown symlink"));
     }
 
     #[test]

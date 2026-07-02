@@ -4663,6 +4663,14 @@ fn bootstrap_enabled_run_spec_uses_bootstrap_entrypoint_and_mounts() {
     let bootstrap_path = runtime.write_container_bootstrap_config().unwrap();
     assert_file_mode(&bootstrap_path, 0o600);
     let bootstrap_config = std::fs::read_to_string(bootstrap_path).unwrap();
+    let parsed_bootstrap: crate::config::ContainerBootstrapFile =
+        toml::from_str(&bootstrap_config).unwrap();
+    assert_eq!(
+        parsed_bootstrap.schema_version,
+        crate::config::BOOTSTRAP_SCHEMA_VERSION
+    );
+    assert!(parsed_bootstrap.skip_identity_prepare);
+    assert!(parsed_bootstrap.chown_existing_identity_dirs);
     assert!(bootstrap_config.contains("agent_program = \"/opt/aw-gateway/bin/target-agent\""));
     assert!(bootstrap_config.contains("name = \"target-bootstrap\""));
     assert!(bootstrap_config.contains("command = [\"/bin/target\"]"));
@@ -4670,6 +4678,52 @@ fn bootstrap_enabled_run_spec_uses_bootstrap_entrypoint_and_mounts() {
     assert!(!bootstrap_config.contains("enabled"));
     assert!(!bootstrap_config.contains("before"));
     assert!(!bootstrap_config.contains("after"));
+}
+
+#[test]
+fn docker_bootstrap_config_chowns_existing_identity_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    cfg.runtime.runtime_type = ContainerRuntimeType::Docker;
+    cfg.validate().unwrap();
+    let target = cfg.effective_target("default").unwrap();
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    std::fs::create_dir_all(&container_state_dir).unwrap();
+    let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+
+    let bootstrap_config =
+        std::fs::read_to_string(runtime.write_container_bootstrap_config().unwrap()).unwrap();
+    let parsed: crate::config::ContainerBootstrapFile = toml::from_str(&bootstrap_config).unwrap();
+
+    assert!(!parsed.skip_identity_prepare);
+    assert!(parsed.chown_existing_identity_dirs);
+}
+
+#[test]
+fn apple_bootstrap_config_preserves_existing_identity_dir_ownership() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    configure_apple_published_port_target(&mut cfg);
+    cfg.validate().unwrap();
+    let target = cfg.effective_target("default").unwrap();
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    std::fs::create_dir_all(&container_state_dir).unwrap();
+    let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+
+    let bootstrap_config =
+        std::fs::read_to_string(runtime.write_container_bootstrap_config().unwrap()).unwrap();
+    let parsed: crate::config::ContainerBootstrapFile = toml::from_str(&bootstrap_config).unwrap();
+
+    assert!(!parsed.skip_identity_prepare);
+    assert!(!parsed.chown_existing_identity_dirs);
 }
 
 #[test]

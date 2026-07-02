@@ -881,6 +881,34 @@ session_shell = "/bin/bash"
 }
 
 #[test]
+fn bootstrap_file_load_rejects_old_schema_before_required_field_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("container-bootstrap.toml");
+    std::fs::write(
+        &path,
+        r#"
+schema_version = "1"
+agent_program = "/opt/aw-gateway/bin/aw-container-agent"
+agent_config = "/home/awuser/.aw-gateway/containers/default/container-agent.toml"
+
+[identity]
+session_user = "awuser"
+session_uid = 2450
+session_gid = 2450
+session_home = "/home/awuser"
+session_shell = "/bin/bash"
+state_dir = "/home/awuser/.aw-gateway/containers/default"
+"#,
+    )
+    .unwrap();
+
+    let err = ContainerBootstrapFile::load(&path).unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("unsupported bootstrap schema_version"));
+    assert!(!message.contains("missing field"));
+}
+
+#[test]
 fn literal_session_user_requires_explicit_uid_and_gid() {
     let cfg = r#"
 schema_version = "1"
