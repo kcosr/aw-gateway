@@ -22,6 +22,11 @@
 - Fixed Apple container bootstrap identity preparation so pre-existing session
   home and state directories are not chowned, which avoids Apple virtiofs
   bind-mount `EPERM` failures during Apple container startup.
+- Fixed container SSHD helpers so generated `session_env` values are merged
+  with base `SHELL`/`PATH` defaults into a single `SetEnv` directive, allowing
+  variables such as `CODEX_HOME` to reach SSH sessions. Runtime example helpers
+  now also match the documented transfer-policy `ForceCommand` behavior when
+  SFTP is denied.
 
 ## [0.7.0] - 2026-06-25
 

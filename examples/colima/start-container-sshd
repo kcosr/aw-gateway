@@ -8,9 +8,241 @@ base_config=${AW_SSHD_BASE_CONFIG:-/etc/ssh/sshd_config_agent}
 config=${AW_SSHD_RUNTIME_CONFIG:-/run/sshd_config_agent}
 cp "$base_config" "$config"
 
-if [[ -n "${AW_SSHD_SETENV_CONFIG:-}" && -r "${AW_SSHD_SETENV_CONFIG}" ]]; then
-  grep -E '^[[:space:]]*SetEnv[[:space:]]+' "$AW_SSHD_SETENV_CONFIG" >> "$config" || true
+if [[ -n "${AW_SSHD_SETENV_CONFIG:-}" && ! -r "${AW_SSHD_SETENV_CONFIG}" ]]; then
+  echo "sshd SetEnv config is not readable: $AW_SSHD_SETENV_CONFIG" >&2
+  exit 1
 fi
+
+setenv_tokens_from() {
+  local source=$1
+  [[ -r "$source" ]] || return 0
+  awk '
+    function is_directive(line, expected, trimmed, keyword) {
+      trimmed = line
+      sub(/^[[:space:]]+/, "", trimmed)
+      if (trimmed == "" || substr(trimmed, 1, 1) == "#") {
+        return 0
+      }
+      if (!match(trimmed, /^[^[:space:]=]+/)) {
+        return 0
+      }
+      keyword = substr(trimmed, RSTART, RLENGTH)
+      return tolower(keyword) == expected
+    }
+
+    function directive_args(line, trimmed) {
+      trimmed = line
+      sub(/^[[:space:]]+/, "", trimmed)
+      sub(/^[^[:space:]=]+/, "", trimmed)
+      sub(/^[[:space:]]*=?[[:space:]]*/, "", trimmed)
+      return trimmed
+    }
+
+    function flush_token() {
+      if (token == "") {
+        return
+      }
+      if (index(token, "=") == 0) {
+        printf "invalid SetEnv token: %s\n", token > "/dev/stderr"
+        exit 1
+      }
+      key = token
+      sub(/=.*/, "", key)
+      if (key == "") {
+        printf "invalid SetEnv token: %s\n", token > "/dev/stderr"
+        exit 1
+      }
+      print token
+      token = ""
+    }
+
+    function parse_setenv_args(args, i, ch) {
+      token = ""
+      quote = ""
+      escaped = 0
+      single_quote = sprintf("%c", 39)
+      for (i = 1; i <= length(args); i++) {
+        ch = substr(args, i, 1)
+        if (escaped) {
+          token = token ch
+          escaped = 0
+          continue
+        }
+        if (ch == "\\") {
+          token = token ch
+          escaped = 1
+          continue
+        }
+        if (quote != "") {
+          token = token ch
+          if (ch == quote) {
+            quote = ""
+          }
+          continue
+        }
+        if (ch == "\"" || ch == single_quote) {
+          token = token ch
+          quote = ch
+          continue
+        }
+        if (ch == "#" && token == "") {
+          break
+        }
+        if (ch ~ /[[:space:]]/) {
+          flush_token()
+          continue
+        }
+        token = token ch
+      }
+      if (quote != "") {
+        printf "invalid SetEnv directive: unterminated quote\n" > "/dev/stderr"
+        exit 1
+      }
+      flush_token()
+    }
+
+    !in_match && is_directive($0, "setenv") {
+      parse_setenv_args(directive_args($0))
+      next
+    }
+
+    is_directive($0, "match") {
+      in_match = 1
+    }
+  ' "$source"
+}
+
+merge_setenv_config() {
+  local merged_setenv
+  merged_setenv="$(
+    {
+      if [[ -n "${AW_SSHD_SETENV_CONFIG:-}" ]]; then
+        setenv_tokens_from "$AW_SSHD_SETENV_CONFIG"
+      fi
+      setenv_tokens_from "$config"
+    } | awk '
+      {
+        token = $0
+        key = token
+        sub(/=.*/, "", key)
+        if (!(key in seen)) {
+          seen[key] = 1
+          values[++count] = token
+        }
+      }
+      END {
+        for (i = 1; i <= count; i++) {
+          printf "%s%s", (i == 1 ? "" : " "), values[i]
+        }
+      }
+    '
+  )"
+  local tmp_config
+  tmp_config=$(mktemp "$run_dir/sshd_config_agent.XXXXXX")
+  MERGED_SETENV="$merged_setenv" awk '
+    BEGIN {
+      setenv = ENVIRON["MERGED_SETENV"]
+    }
+
+    function is_directive(line, expected, trimmed, keyword) {
+      trimmed = line
+      sub(/^[[:space:]]+/, "", trimmed)
+      if (trimmed == "" || substr(trimmed, 1, 1) == "#") {
+        return 0
+      }
+      if (!match(trimmed, /^[^[:space:]=]+/)) {
+        return 0
+      }
+      keyword = substr(trimmed, RSTART, RLENGTH)
+      return tolower(keyword) == expected
+    }
+
+    function print_setenv() {
+      if (setenv != "") {
+        print ""
+        print "SetEnv " setenv
+      }
+    }
+
+    !inserted && is_directive($0, "match") {
+      print_setenv()
+      inserted = 1
+      in_match = 1
+      print
+      next
+    }
+
+    !in_match && is_directive($0, "setenv") {
+      next
+    }
+
+    is_directive($0, "match") {
+      in_match = 1
+    }
+
+    {
+      print
+    }
+
+    END {
+      if (!inserted) {
+        print_setenv()
+      }
+    }
+  ' "$config" > "$tmp_config"
+  mv "$tmp_config" "$config"
+}
+
+merge_setenv_config
+
+insert_global_sshd_directive() {
+  local directive=$1
+  local tmp_config
+  tmp_config=$(mktemp "$run_dir/sshd_config_agent.XXXXXX")
+  AW_SSHD_GLOBAL_DIRECTIVE="$directive" awk '
+    BEGIN {
+      directive = ENVIRON["AW_SSHD_GLOBAL_DIRECTIVE"]
+    }
+
+    function is_directive(line, expected, trimmed, keyword) {
+      trimmed = line
+      sub(/^[[:space:]]+/, "", trimmed)
+      if (trimmed == "" || substr(trimmed, 1, 1) == "#") {
+        return 0
+      }
+      if (!match(trimmed, /^[^[:space:]=]+/)) {
+        return 0
+      }
+      keyword = substr(trimmed, RSTART, RLENGTH)
+      return tolower(keyword) == expected
+    }
+
+    function print_directive() {
+      if (directive != "") {
+        print ""
+        print directive
+      }
+    }
+
+    !inserted && is_directive($0, "match") {
+      print_directive()
+      inserted = 1
+      print
+      next
+    }
+
+    {
+      print
+    }
+
+    END {
+      if (!inserted) {
+        print_directive()
+      }
+    }
+  ' "$config" > "$tmp_config"
+  mv "$tmp_config" "$config"
+}
 
 policy=${AW_SSHD_POLICY_CONFIG:-}
 if [[ -n "$policy" && ! -r "$policy" ]]; then
@@ -58,16 +290,18 @@ esac
 
 case "$legacy_scp" in
   allow) ;;
-  deny|inbound|outbound)
-    filter=${AW_SSH_COMMAND_FILTER:-/opt/aw-gateway/bin/aw-ssh-command-filter}
-    if [[ ! -x "$filter" ]]; then
-      echo "ssh command filter is not executable: $filter" >&2
-      exit 1
-    fi
-    printf '\nForceCommand %s --config %s\n' "$filter" "$policy" >> "$config"
-    ;;
+  deny|inbound|outbound) ;;
   *) echo "invalid legacy_scp policy value: $legacy_scp" >&2; exit 1 ;;
 esac
+
+if [[ "$sftp" == "deny" || "$legacy_scp" != "allow" ]]; then
+  filter=${AW_SSH_COMMAND_FILTER:-/opt/aw-gateway/bin/aw-ssh-command-filter}
+  if [[ ! -x "$filter" ]]; then
+    echo "ssh command filter is not executable: $filter" >&2
+    exit 1
+  fi
+  insert_global_sshd_directive "$(printf 'ForceCommand %s --config %s' "$filter" "$policy")"
+fi
 
 if [[ "${AW_SSHD_DRY_RUN_CONFIG:-}" == "1" ]]; then
   cat "$config"
