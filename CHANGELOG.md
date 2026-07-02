@@ -26,7 +26,7 @@
   with base `SHELL`/`PATH` defaults into a single `SetEnv` directive, allowing
   variables such as `CODEX_HOME` to reach SSH sessions. Runtime example helpers
   now also match the documented transfer-policy `ForceCommand` behavior when
-  SFTP is denied.
+  SFTP is denied ([#59](https://github.com/kcosr/aw-gateway/pull/59)).
 
 ## [0.7.0] - 2026-06-25
 
