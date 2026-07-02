@@ -63,6 +63,11 @@ fn status_all_entry(cfg: &GatewayConfig, container: ManagedContainer) -> AllStat
         .get("io.aw-gateway.image")
         .cloned()
         .unwrap_or(container.image);
+    let access = container
+        .labels
+        .get("io.aw-gateway.access")
+        .cloned()
+        .unwrap_or_else(|| UNKNOWN_STATUS_LABEL.into());
     let container_name = container
         .labels
         .get("io.aw-gateway.container_id")
@@ -83,6 +88,7 @@ fn status_all_entry(cfg: &GatewayConfig, container: ManagedContainer) -> AllStat
         uid,
         image,
         container: container_name,
+        access,
         context: context_from_labels(&container.labels),
         status,
     }

@@ -133,6 +133,25 @@ fn connect_and_run_cli_parse_session_id_forms() {
             other => panic!("unexpected command: {other:?}"),
         }
     }
+
+    let args = GatewayArgs::try_parse_from([
+        "aw-gateway",
+        "shell",
+        "--session-id",
+        "abc123def456",
+        "code-review-worker",
+        "--",
+        "-l",
+    ])
+    .unwrap();
+    match args.command {
+        Some(GatewayCommand::Shell(shell)) => {
+            assert_eq!(shell.target.as_deref(), Some("code-review-worker"));
+            assert_eq!(shell.session_id.as_deref(), Some("abc123def456"));
+            assert_eq!(shell.args, vec!["-l".to_string()]);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
 }
 
 #[test]

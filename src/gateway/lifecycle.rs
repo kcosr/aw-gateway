@@ -180,14 +180,14 @@ impl Runtime {
         &self,
         inspect: &ContainerInspect,
     ) -> anyhow::Result<()> {
-        self.validate_labels(inspect)?;
+        self.validate_stable_labels(inspect)?;
         let container_pid = inspect.state.pid.map(|pid| pid.to_string());
         self.run_lifecycle_phase(LifecyclePhase::PreStop, container_pid.as_deref())
             .await?;
         if self.agent_control_enabled() {
             let _ = self.agent_shutdown().await;
             if let Some(current) = self.wait_for_container_exit().await? {
-                self.validate_labels(&current)?;
+                self.validate_stable_labels(&current)?;
                 self.container_runtime
                     .stop(&self.identity.container_name)
                     .await?;
@@ -203,7 +203,7 @@ impl Runtime {
                 .inspect(&self.identity.container_name)
                 .await?
             {
-                self.validate_labels(&current)?;
+                self.validate_stable_labels(&current)?;
                 self.container_runtime
                     .rm(&self.identity.container_name)
                     .await?;
@@ -227,7 +227,7 @@ impl Runtime {
             else {
                 return Ok(None);
             };
-            self.validate_labels(&inspect)?;
+            self.validate_stable_labels(&inspect)?;
             if !inspect.state.running {
                 return Ok(None);
             }

@@ -11,11 +11,18 @@ This guide shows a local macOS setup for `aw-gateway` using Apple's
 > runtime should be treated as production-ready.
 
 Apple `container` runs Linux containers as lightweight virtual machines on an
-Apple silicon Mac. This guide uses `local_ssh.backend = "published_port"` and
-`readiness = "ssh_only"` because the phase-one gateway integration does not use
-Apple socket publishing. The container agent supervises the inner SSH service,
-but its control socket is disabled because the host gateway does not use an
-agent control channel in this mode.
+Apple silicon Mac. AW Gateway supports two local Apple profiles:
+
+- No-SSH runtime execution with `access.method = "runtime_exec"`. This is the
+  simplest local shell/run/launch path and does not publish a container SSH
+  port.
+- SSH-compatible access with `local_ssh.backend = "published_port"` and
+  `readiness = "ssh_only"`. Use this when you need OpenSSH, SCP, SFTP, or VS
+  Code Remote-SSH.
+
+Apple socket publishing is not supported. When the container agent is enabled
+on Apple, set `container_agent.control_socket = false`; the host gateway does
+not use an agent control channel for Apple targets.
 
 This guide intentionally does not configure traffic interception, custom CA
 trust, command-policy wrappers, or proxy services. Those are site policy
@@ -53,6 +60,7 @@ Copyable examples live under:
 examples/apple-container/
   Containerfile.ubuntu
   gateway-local.toml
+  gateway-runtime-exec.toml
   sshd_config_agent
   start-container-sshd
 ```
@@ -183,7 +191,53 @@ SetEnv SHELL=/usr/bin/bash
 SetEnv PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 ```
 
-## Gateway Config
+## No-SSH Runtime-Exec Config
+
+Full file: `examples/apple-container/gateway-runtime-exec.toml`
+
+Important Apple-specific fields:
+
+```toml
+[runtime]
+type = "apple_container"
+
+[targets.ubuntu.access]
+method = "runtime_exec"
+
+[target_defaults.container_agent]
+enabled = true
+control_socket = false
+```
+
+This profile starts the container through Apple `container`, prepares the
+session identity with `aw-container-bootstrap`, and runs shells/commands with
+`container exec`. It does not mount SSHD helper files, does not publish port
+22, and does not support `connect`, `client-config`, `client-bundle`,
+`add-container-key`, SCP, SFTP, or VS Code Remote-SSH.
+
+Install and validate the no-SSH config:
+
+```bash
+install -d -m 0755 ~/aw-gateway/etc
+sed "s#/Users/example/aw-gateway#$HOME/aw-gateway#g" \
+  examples/apple-container/gateway-runtime-exec.toml > ~/aw-gateway/etc/gateway.toml
+~/aw-gateway/bin/aw-gateway --config ~/aw-gateway/etc/gateway.toml config validate
+```
+
+Start the target and open a shell:
+
+```bash
+~/aw-gateway/bin/aw-gateway --config ~/aw-gateway/etc/gateway.toml up ubuntu --json
+~/aw-gateway/bin/aw-gateway --config ~/aw-gateway/etc/gateway.toml shell ubuntu
+```
+
+Run one command:
+
+```bash
+~/aw-gateway/bin/aw-gateway --config ~/aw-gateway/etc/gateway.toml run ubuntu -- id
+```
+
+## SSH-Compatible Gateway Config
 
 Full file: `examples/apple-container/gateway-local.toml`
 
@@ -230,8 +284,8 @@ ssh aw-ubuntu
 ```
 
 `control_socket = false` tells `aw-container-agent` to supervise services
-without creating an unused Unix control socket. The phase-one Apple integration
-rejects `local_ssh.backend = "socket"`.
+without creating an unused Unix control socket. Apple integration rejects
+`local_ssh.backend = "socket"`.
 
 The identity block starts bootstrap as root, then creates the session login
 from the host user, UID, and GID macros. If the macOS numeric uid or gid
@@ -250,7 +304,7 @@ session_shell = "/bin/bash"
 The sample uses `/Users/example/aw-gateway` as a placeholder. Replace every
 `/Users/example/aw-gateway` path with your real local root before installing.
 
-Install and validate:
+Install and validate the SSH-compatible config:
 
 ```bash
 install -d -m 0755 ~/aw-gateway/etc
@@ -259,7 +313,7 @@ sed "s#/Users/example/aw-gateway#$HOME/aw-gateway#g" \
 ~/aw-gateway/bin/aw-gateway --config ~/aw-gateway/etc/gateway.toml config validate
 ```
 
-## Run
+## Run SSH-Compatible Access
 
 Start the target and local listener:
 
@@ -297,8 +351,11 @@ For VS Code Remote SSH, select the generated `aw-ubuntu` host alias.
 - Run the gateway process on the Apple silicon macOS host. The Apple runtime is
   not supported from WSL, Linux, or a remote non-macOS gateway host.
 - Run `container system start` before runtime operations.
-- Use `local_ssh.backend = "published_port"`; socket backend is not supported
-  in phase one.
+- Use `access.method = "runtime_exec"` for no-SSH local shell/run/launch
+  workflows, or `local_ssh.backend = "published_port"` for SSH-compatible
+  clients. Socket backend is not supported.
+- Keep `container_agent.control_socket = false`; Apple targets do not support
+  AW Gateway's agent control socket.
 - Do not configure Docker/Colima-specific `target.runtime.extra_run_args`.
   Runtime extra args are passed directly to `container run` and are not
   portable across runtimes.
@@ -325,12 +382,15 @@ container system version --format json
 container system status --format json
 ~/aw-gateway/bin/aw-gateway --config ~/aw-gateway/etc/gateway.toml config validate
 ~/aw-gateway/bin/aw-gateway --config ~/aw-gateway/etc/gateway.toml status ubuntu
+~/aw-gateway/bin/aw-gateway --config ~/aw-gateway/etc/gateway.toml shell ubuntu
 ssh aw-ubuntu 'pwd && id && hostname'
 scp ./README.md aw-ubuntu:~/README.md
 sftp aw-ubuntu
 ```
 
+For runtime-exec-only configs, skip the final `ssh`, `scp`, and `sftp` checks.
 Before production use, also run the repository fixture capture script and the
 macOS smoke checklist from the Apple runtime support spec. Those steps confirm
 the installed Apple CLI's JSON shapes, read-only mount behavior, bind-conflict
-stderr, and fixed-target published-port reuse semantics.
+stderr, runtime exec behavior, and fixed-target published-port reuse semantics
+when using the SSH-compatible profile.

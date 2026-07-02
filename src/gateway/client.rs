@@ -74,6 +74,7 @@ pub(super) fn normalize_image_selection(value: &str) -> String {
 
 pub(super) async fn add_key(config_path: Option<PathBuf>, args: AddKeyArgs) -> anyhow::Result<()> {
     let runtime = Runtime::load(config_path, args.target.as_deref(), None, false).await?;
+    runtime.ensure_ssh_operation_supported("add-key")?;
     let user = UserContext::current()?;
     let key = read_public_key_arg(args.public_key.as_deref(), "Paste one SSH public key:")?;
     let host_added = install_host_public_key(&user, &key)?;
@@ -101,6 +102,7 @@ pub(super) async fn add_container_key(
     args: AddContainerKeyArgs,
 ) -> anyhow::Result<()> {
     let runtime = Runtime::load(config_path, args.target.as_deref(), None, false).await?;
+    runtime.ensure_ssh_operation_supported("add-container-key")?;
     let key = read_public_key_arg(args.public_key.as_deref(), "Paste one SSH public key:")?;
     let added = install_inner_public_key(&runtime, &key).await?;
     println!("{}", key_status(added));
@@ -123,6 +125,7 @@ pub(super) async fn client_bundle(
     args: ClientBundleArgs,
 ) -> anyhow::Result<()> {
     let runtime = Runtime::load(config_path, args.target.as_deref(), None, false).await?;
+    runtime.ensure_ssh_operation_supported("client-bundle")?;
     let keypair = runtime.ensure_inner_keypair(args.rotate_key).await?;
     let identity = match args.identity_file {
         Some(identity_file) => identity_file,
@@ -181,6 +184,7 @@ impl Runtime {
         &self,
         identity_file: Option<&Path>,
     ) -> anyhow::Result<String> {
+        self.ensure_ssh_operation_supported("client-config")?;
         let vars = self.client_vars();
         let alias = template::render(&self.cfg.client_config.inner_alias_template, &vars)?;
         let host_name = template::render(&self.cfg.client_config.container_host_template, &vars)?;

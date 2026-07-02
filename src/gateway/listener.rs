@@ -9,7 +9,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 
 pub(super) async fn proxy_ready_to_stdio(ready: &ReadyStatus) -> anyhow::Result<()> {
-    match ready.ssh_target() {
+    match ready.ssh_target()? {
         SshTarget::Unix(socket) => {
             runtime::socket_is_safe(&socket)?;
             let stream = UnixStream::connect(&socket)

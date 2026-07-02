@@ -1,12 +1,13 @@
 use crate::cli::{
     AddContainerKeyArgs, AddHostKeyArgs, AddKeyArgs, ClientBundleArgs, ClientConfigArgs,
     ConfigPathsArgs, ConnectArgs, GatewayArgs, GatewayCommand, GatewayConfigCommand, LaunchCommand,
-    LaunchesArgs, RemoveArgs, RunArgs, SetDefaultArgs, StatusArg, StopArgs, TargetsArgs, UpArgs,
+    LaunchesArgs, RemoveArgs, RunArgs, SetDefaultArgs, ShellArgs, StatusArg, StopArgs, TargetsArgs,
+    UpArgs,
 };
 use crate::config::{
     ContainerRuntimeType, ControlSocketConfig, GatewayConfig, LaunchConfig, LaunchStep,
     LaunchStepLocation, LaunchVarConfig, LaunchVarType, LifecyclePhase, LocalSshBackend,
-    LocalSshMode, LocalSshReadiness, TargetConfig, TargetMode, validate_name,
+    LocalSshMode, LocalSshReadiness, TargetAccessMethod, TargetConfig, TargetMode, validate_name,
     validate_passwd_scalar,
 };
 use crate::context::{RuntimeContext, parse_context_sources, validate_runtime_context};
@@ -151,6 +152,9 @@ pub async fn run_with_context(args: GatewayArgs, context: RuntimeContext) -> any
         Some(GatewayCommand::Up(status)) => up(args.config, status, context).await,
         Some(GatewayCommand::Run(run_args)) => {
             run_container_command(args.config, run_args, context).await
+        }
+        Some(GatewayCommand::Shell(shell_args)) => {
+            shell_container(args.config, shell_args, context).await
         }
         Some(GatewayCommand::Launch(launch_command)) => {
             launch(args.config, launch_command, context).await
@@ -605,7 +609,7 @@ async fn up(
             let config = runtime.render_client_config(None)?;
             ready.client_config = Some(runtime.write_inner_config(&config)?);
             println!("{}", serde_json::to_string_pretty(&ready)?);
-            let target = ready.ssh_target();
+            let target = ready.ssh_target()?;
             listener::serve_local_ssh(bound, target).await
         }
         .await;
@@ -630,6 +634,32 @@ async fn run_container_command(
     let GatewayOperationResult::Run(outcome) = result else {
         unreachable!("run operation returned a different result");
     };
+    exit_with_execution_outcome(outcome)
+}
+
+async fn shell_container(
+    config_path: Option<PathBuf>,
+    args: ShellArgs,
+    context: RuntimeContext,
+) -> anyhow::Result<()> {
+    let runtime = Runtime::load_with_context(
+        config_path,
+        args.target.as_deref(),
+        args.session_id,
+        true,
+        context,
+    )
+    .await?;
+    let mut command = Vec::with_capacity(args.args.len() + 1);
+    command.push(runtime.identity.session_shell.clone());
+    command.extend(args.args);
+    let outcome = run_container_command_with_runtime(
+        runtime,
+        args.cwd,
+        command,
+        OperationExecutionOptions::STREAM,
+    )
+    .await?;
     exit_with_execution_outcome(outcome)
 }
 
@@ -1367,6 +1397,7 @@ fn target_entries(
             Ok(TargetEntry {
                 target: name.clone(),
                 image: target.image.clone(),
+                access: target.access.method.as_str().into(),
                 mode: target_mode_name(target.mode).into(),
                 container: target_container_display(target, context)?,
                 default: name == &default_target,
@@ -1780,9 +1811,13 @@ impl Runtime {
         let mut failed_start_cleanup = FailedStartCleanup::default();
         let result = async {
             self.prepare_container_state_dir()?;
-            self.prepare_control_socket_dir()?;
-            self.write_sshd_session_env_config()?;
-            self.write_ssh_command_filter_policy()?;
+            if self.requires_control_socket_dir() {
+                self.prepare_control_socket_dir()?;
+            }
+            if self.uses_ssh_access() {
+                self.write_sshd_session_env_config()?;
+                self.write_ssh_command_filter_policy()?;
+            }
             if self.ssh_endpoint_configured() {
                 self.ensure_inner_keypair(false).await?;
             }
@@ -1841,9 +1876,10 @@ impl Runtime {
             user: self.identity.user.user.clone(),
             image: self.target.image.clone(),
             container: self.identity.container_name.clone(),
+            access: self.access_name(),
             context: self.context.as_map().clone(),
             container_pid: inspect.state.pid,
-            ssh_socket: self.ssh_socket(),
+            ssh_socket: self.ssh_endpoint_configured().then(|| self.ssh_socket()),
             ssh_tcp: self.published_ssh_endpoint().await?,
             status: status.status,
             local_ssh: None,
@@ -1882,6 +1918,7 @@ impl Runtime {
             mode: format!("{:?}", self.target.mode).to_lowercase(),
             user: self.identity.user.user.clone(),
             image: self.target.image.clone(),
+            access: self.access_name(),
             container: inspect
                 .as_ref()
                 .map(|_| self.identity.container_name.clone()),
@@ -1890,7 +1927,8 @@ impl Runtime {
             active_sessions: sessions.len(),
             sessions,
             agent_ready,
-            ssh_socket: self.ssh_socket(),
+            ssh_socket: self.ssh_endpoint_configured().then(|| self.ssh_socket()),
+            ssh_tcp: self.published_ssh_endpoint().await?,
             status: gateway_status_name(
                 inspect.as_ref().is_some_and(|value| value.state.running),
                 self.requires_agent_control(),
@@ -1910,6 +1948,29 @@ impl Runtime {
             .unwrap_or_default()
     }
 
+    fn access_name(&self) -> String {
+        self.target.access.method.as_str().into()
+    }
+
+    fn uses_ssh_access(&self) -> bool {
+        self.target.access.method == TargetAccessMethod::Ssh
+    }
+
+    pub(super) fn ensure_ssh_operation_supported(&self, operation: &str) -> anyhow::Result<()> {
+        if self.uses_ssh_access() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "gateway operation {operation:?} requires an SSH target, but target {:?} uses access.method = \"runtime_exec\"",
+            self.identity.target_name
+        )
+    }
+
+    fn requires_control_socket_dir(&self) -> bool {
+        self.agent_control_enabled()
+            || (self.ssh_endpoint_configured() && self.ssh_backend() == LocalSshBackend::Socket)
+    }
+
     fn agent_enabled(&self) -> bool {
         self.target.container_agent.enabled
     }
@@ -1925,6 +1986,9 @@ impl Runtime {
     }
 
     fn ssh_endpoint_configured(&self) -> bool {
+        if !self.uses_ssh_access() {
+            return false;
+        }
         match self.ssh_backend() {
             LocalSshBackend::Socket => self
                 .target
@@ -1937,6 +2001,12 @@ impl Runtime {
     }
 
     fn ensure_ssh_endpoint_configured(&self) -> anyhow::Result<()> {
+        if !self.uses_ssh_access() {
+            anyhow::bail!(
+                "target {:?} uses access.method = \"runtime_exec\" and does not expose an SSH endpoint; use run, launch, shell, status, stop, or remove instead",
+                self.identity.target_name
+            );
+        }
         if self.ssh_endpoint_configured() {
             Ok(())
         } else {
@@ -1968,6 +2038,9 @@ impl Runtime {
     }
 
     async fn published_ssh_endpoint(&self) -> anyhow::Result<Option<TcpEndpoint>> {
+        if !self.ssh_endpoint_configured() {
+            return Ok(None);
+        }
         if self.ssh_backend() != LocalSshBackend::PublishedPort {
             return Ok(None);
         }

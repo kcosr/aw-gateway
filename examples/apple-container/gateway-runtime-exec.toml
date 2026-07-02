@@ -1,0 +1,82 @@
+schema_version = "1"
+default_target = "ubuntu"
+
+[runtime]
+type = "apple_container"
+
+[logging]
+level = "info"
+directory = "{state}/logs/gateway"
+max_bytes = 104857600
+max_files = 5
+console = true
+
+[target_defaults.workspace]
+path = "/Users/example/aw-gateway/workspace"
+state_dir = ".aw-gateway"
+
+[targets.ubuntu]
+image = "aw-gateway/ubuntu-base"
+mode = "fixed"
+name = "{image_slug}"
+stop_when_idle = true
+remove_on_stop = false
+container_user = "root"
+container_home = "/home/{user}"
+
+[targets.ubuntu.access]
+method = "runtime_exec"
+
+[targets.ubuntu.container_env]
+CODEX_HOME = "/var/lib/codex"
+
+[targets.ubuntu.session_env]
+CODEX_HOME = "/var/lib/codex"
+
+[targets.ubuntu.identity]
+bootstrap_user = "root"
+session_user = "{user}"
+session_uid = "{uid}"
+session_gid = "{gid}"
+session_home = "/home/{user}"
+session_shell = "/bin/bash"
+
+[targets.ubuntu.idle_cleanup]
+owner = "gateway"
+action = "exit_container"
+idle_grace = "30s"
+preserve_processes = ["tmux", "screen"]
+poll_interval = "10s"
+shutdown_timeout = "10s"
+
+[[target_defaults.lifecycle_steps]]
+phase = "pre_start"
+name = "ensure-workspace"
+required = true
+timeout = "60s"
+command = ["/bin/mkdir", "-p", "{workspace}"]
+
+[[target_defaults.container_bootstrap_steps]]
+name = "prepare-codex-home"
+required = true
+user = "root"
+command = ["/bin/sh", "-lc", "mkdir -p /var/lib/codex && chown {uid}:{gid} /var/lib/codex"]
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/aw-gateway/runtime/linux/aw-container-bootstrap"
+target = "/opt/aw-gateway/bin/aw-container-bootstrap"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/aw-gateway/runtime/linux/aw-container-agent"
+target = "/opt/aw-gateway/bin/aw-container-agent"
+mode = "ro"
+
+[target_defaults.container_bootstrap]
+enabled = true
+entrypoint = "/opt/aw-gateway/bin/aw-container-bootstrap"
+agent_program = "/opt/aw-gateway/bin/aw-container-agent"
+
+[target_defaults.container_agent]
+enabled = true
+control_socket = false

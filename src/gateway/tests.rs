@@ -1102,6 +1102,7 @@ fn status_all_entry_projects_fixed_container_from_labels() {
             uid: "2450".into(),
             image: "ubuntu/dev".into(),
             container: "ubuntu-dev".into(),
+            access: "unknown".into(),
             context: BTreeMap::new(),
             status: "running".into(),
         }]
@@ -1255,6 +1256,13 @@ fn runtime_labels_only_persist_launch_for_ephemeral_targets() {
     let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |_| {});
 
     assert_eq!(runtime.target.mode, TargetMode::Fixed);
+    assert_eq!(
+        runtime
+            .labels()
+            .get("io.aw-gateway.access")
+            .map(String::as_str),
+        Some("ssh")
+    );
     assert!(!runtime.labels().contains_key("io.aw-gateway.launch"));
 
     runtime.target.mode = TargetMode::Ephemeral;
@@ -1267,6 +1275,43 @@ fn runtime_labels_only_persist_launch_for_ephemeral_targets() {
             .map(String::as_str),
         Some("agent-pack-codex")
     );
+}
+
+#[test]
+fn runtime_exec_labels_persist_access_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+        cfg.targets.get_mut("default").unwrap().access =
+            Some(crate::config::TargetAccessConfigInput {
+                method: Some(crate::config::TargetAccessMethod::RuntimeExec),
+            });
+    });
+
+    assert_eq!(
+        runtime
+            .labels()
+            .get("io.aw-gateway.access")
+            .map(String::as_str),
+        Some("runtime_exec")
+    );
+}
+
+#[test]
+fn runtime_exec_rejects_ssh_only_operations_before_side_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+        cfg.targets.get_mut("default").unwrap().access =
+            Some(crate::config::TargetAccessConfigInput {
+                method: Some(crate::config::TargetAccessMethod::RuntimeExec),
+            });
+    });
+
+    let err = runtime
+        .ensure_ssh_operation_supported("client-config")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("client-config"), "{err}");
+    assert!(err.contains("runtime_exec"), "{err}");
 }
 
 #[test]
@@ -2522,6 +2567,7 @@ fn status_json_serializes_nullable_launch_fields() {
         mode: "fixed".into(),
         user: "alice".into(),
         image: "ubuntu/dev".into(),
+        access: "ssh".into(),
         container: Some("ubuntu-dev".into()),
         context: BTreeMap::new(),
         container_pid: Some(123),
@@ -2537,7 +2583,8 @@ fn status_json_serializes_nullable_launch_fields() {
             created_at_ms: 10,
         }],
         agent_ready: false,
-        ssh_socket: PathBuf::from("/tmp/ssh.sock"),
+        ssh_socket: Some(PathBuf::from("/tmp/ssh.sock")),
+        ssh_tcp: None,
         status: "container-running".into(),
         agent: None,
     };
@@ -2554,6 +2601,7 @@ fn status_json_serializes_nullable_launch_fields() {
         uid: "2450".into(),
         image: "ubuntu/dev".into(),
         container: "ubuntu-dev".into(),
+        access: "unknown".into(),
         context: BTreeMap::new(),
         status: "running".into(),
     };
@@ -3979,6 +4027,7 @@ fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
     );
     assert!(args.contains(&"io.aw-gateway.gateway=true".to_string()));
     assert!(args.contains(&"io.aw-gateway.target=default".to_string()));
+    assert!(args.contains(&"io.aw-gateway.access=ssh".to_string()));
     assert!(args.contains(&"io.aw-gateway.mode=fixed".to_string()));
     assert!(args.contains(&format!(
         "{}:/run/aw-gateway:Z",
@@ -3994,6 +4043,34 @@ fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
         ]
     );
     assert!(args.iter().any(|arg| arg == "aw-container-agent"));
+}
+
+#[test]
+fn runtime_exec_rejects_existing_container_without_access_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+        cfg.targets.get_mut("default").unwrap().access =
+            Some(crate::config::TargetAccessConfigInput {
+                method: Some(crate::config::TargetAccessMethod::RuntimeExec),
+            });
+    });
+    let labels = runtime.validation_labels();
+
+    let err = runtime
+        .validate_labels(&ContainerInspect {
+            id: "old-id".into(),
+            name: "ubuntu-dev".into(),
+            state: runtime::ContainerState {
+                running: true,
+                pid: Some(123),
+            },
+            config: runtime::ContainerConfig { labels },
+        })
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("io.aw-gateway.access"), "{err}");
+    assert!(err.contains("runtime_exec"), "{err}");
 }
 
 #[test]
@@ -4856,6 +4933,26 @@ fn generated_mounts_reject_separator_paths() {
         err.to_string()
             .contains("workspace path must not contain ':' or ','"),
         "{err:#}"
+    );
+}
+
+#[test]
+fn runtime_exec_without_agent_control_omits_control_socket_mount() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+        cfg.targets.get_mut("default").unwrap().access =
+            Some(crate::config::TargetAccessConfigInput {
+                method: Some(crate::config::TargetAccessMethod::RuntimeExec),
+            });
+    });
+
+    runtime.paths.control_sockets.container_dir = PathBuf::from("/run/aw-gateway/bad:image");
+    let mounts = runtime.container_mounts().unwrap();
+
+    assert!(
+        mounts
+            .iter()
+            .all(|mount| mount.target != PathBuf::from("/run/aw-gateway/bad:image"))
     );
 }
 

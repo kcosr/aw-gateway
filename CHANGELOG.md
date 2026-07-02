@@ -2,7 +2,20 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Added explicit target access modes with `access.method = "runtime_exec"` for
+  no-SSH runtime execution targets. Runtime-exec targets support lifecycle,
+  status, run, launch, and the new local `shell` command without exposing
+  container SSH, and Apple container targets can now use this mode without a
+  published SSH port.
+
+### Changed
+
+- Gateway status, target listing, and runtime labels now include the effective
+  target access mode. Existing configs default to `access.method = "ssh"`;
+  target-specific container reuse now fails closed when a labeled container's
+  access mode differs from the effective target config.
 
 ## [0.8.0] - 2026-07-02
 

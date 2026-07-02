@@ -30,6 +30,59 @@ pub use local_ssh::{
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct TargetAccessConfig {
+    #[serde(default)]
+    pub method: TargetAccessMethod,
+}
+
+impl Default for TargetAccessConfig {
+    fn default() -> Self {
+        Self {
+            method: TargetAccessMethod::Ssh,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetAccessConfigInput {
+    pub method: Option<TargetAccessMethod>,
+}
+
+impl TargetAccessConfigInput {
+    fn overlay(mut self, later: &Self) -> Self {
+        if let Some(method) = later.method {
+            self.method = Some(method);
+        }
+        self
+    }
+
+    fn into_effective(self) -> TargetAccessConfig {
+        TargetAccessConfig {
+            method: self.method.unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetAccessMethod {
+    #[default]
+    Ssh,
+    RuntimeExec,
+}
+
+impl TargetAccessMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ssh => "ssh",
+            Self::RuntimeExec => "runtime_exec",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceConfig {
     #[serde(default = "default_workspace_path")]
     pub path: String,
@@ -200,6 +253,7 @@ pub struct TargetConfigInput {
     pub mode: Option<TargetMode>,
     pub name: Option<String>,
     pub ephemeral_name: Option<String>,
+    pub access: Option<TargetAccessConfigInput>,
     pub workspace: Option<WorkspaceConfigInput>,
     pub runtime: Option<TargetRuntimeConfigInput>,
     pub identity: Option<TargetIdentityConfig>,
@@ -241,6 +295,9 @@ impl TargetConfigInput {
             runtime: Some(TargetRuntimeConfigInput {
                 extra_run_args: Some(Vec::new()),
             }),
+            access: Some(TargetAccessConfigInput {
+                method: Some(TargetAccessMethod::Ssh),
+            }),
             stop_when_idle: Some(false),
             remove_on_stop: Some(false),
             control_sockets: Some(TargetControlSocketsConfig {
@@ -270,6 +327,10 @@ impl TargetConfigInput {
     }
 
     pub(super) fn overlay(mut self, later: &Self) -> anyhow::Result<Self> {
+        later.validate_runtime_exec_layer()?;
+        if later.access_method() == Some(TargetAccessMethod::RuntimeExec) {
+            self.clear_inherited_ssh_access();
+        }
         if let Some(image) = &later.image {
             self.image = Some(image.clone());
         }
@@ -281,6 +342,9 @@ impl TargetConfigInput {
         }
         if let Some(ephemeral_name) = &later.ephemeral_name {
             self.ephemeral_name = Some(ephemeral_name.clone());
+        }
+        if let Some(access) = &later.access {
+            self.access = Some(self.access.take().unwrap_or_default().overlay(access));
         }
         if let Some(workspace) = &later.workspace {
             self.workspace = Some(self.workspace.take().unwrap_or_default().overlay(workspace));
@@ -404,10 +468,58 @@ impl TargetConfigInput {
         Ok(self)
     }
 
+    fn access_method(&self) -> Option<TargetAccessMethod> {
+        self.access.as_ref().and_then(|access| access.method)
+    }
+
+    fn clear_inherited_ssh_access(&mut self) {
+        self.local_ssh = None;
+        if let Some(container_agent) = &mut self.container_agent {
+            container_agent.ssh_bridge = None;
+            container_agent
+                .services
+                .retain(|service| service.name != "container-sshd");
+        }
+    }
+
+    fn validate_runtime_exec_layer(&self) -> anyhow::Result<()> {
+        if self.access_method() != Some(TargetAccessMethod::RuntimeExec) {
+            return Ok(());
+        }
+        if self.local_ssh.is_some() {
+            anyhow::bail!(
+                "access.method = \"runtime_exec\" must not be configured in the same layer as local_ssh"
+            );
+        }
+        if self
+            .container_agent
+            .as_ref()
+            .and_then(|agent| agent.ssh_bridge.as_ref())
+            .is_some_and(|bridge| bridge.enabled.unwrap_or(true))
+        {
+            anyhow::bail!(
+                "access.method = \"runtime_exec\" must not be configured in the same layer as enabled container_agent.ssh_bridge"
+            );
+        }
+        if self.container_agent.as_ref().is_some_and(|agent| {
+            agent
+                .services
+                .iter()
+                .any(|service| service.name == "container-sshd")
+        }) {
+            anyhow::bail!(
+                "access.method = \"runtime_exec\" must not be configured in the same layer as container_agent service \"container-sshd\""
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn validate_partial(&self, target_name: &str) -> anyhow::Result<()> {
         for template in &self.use_templates {
             validate_name("target template reference", template)?;
         }
+        self.validate_runtime_exec_layer()
+            .map_err(|err| anyhow::anyhow!("target {target_name:?} {err}"))?;
         if let Some(image) = &self.image
             && image.trim().is_empty()
         {
@@ -552,6 +664,7 @@ impl TargetConfigInput {
             ephemeral_name: self.ephemeral_name,
             workspace: self.workspace.unwrap_or_default().into_effective(),
             runtime: self.runtime.unwrap_or_default().into_effective(),
+            access: self.access.unwrap_or_default().into_effective(),
             identity: self.identity,
             container_user: self.container_user,
             container_home: self.container_home,
@@ -590,6 +703,7 @@ pub struct TargetConfig {
     pub mode: TargetMode,
     pub name: Option<String>,
     pub ephemeral_name: Option<String>,
+    pub access: TargetAccessConfig,
     pub workspace: WorkspaceConfig,
     pub runtime: TargetRuntimeConfig,
     pub identity: Option<TargetIdentityConfig>,
@@ -745,6 +859,51 @@ impl TargetConfig {
             local_ssh.validate()?;
         }
         self.container_ssh.validate()?;
+        if self.access.method == TargetAccessMethod::RuntimeExec {
+            if self.local_ssh.is_some() {
+                anyhow::bail!(
+                    "target {target_name:?} access.method = \"runtime_exec\" cannot configure local_ssh"
+                );
+            }
+            if self
+                .container_agent
+                .ssh_bridge
+                .as_ref()
+                .is_some_and(|bridge| bridge.enabled)
+            {
+                anyhow::bail!(
+                    "target {target_name:?} access.method = \"runtime_exec\" cannot enable container_agent.ssh_bridge"
+                );
+            }
+            if self
+                .container_agent
+                .services
+                .iter()
+                .any(|service| service.name == "container-sshd")
+            {
+                anyhow::bail!(
+                    "target {target_name:?} access.method = \"runtime_exec\" cannot define container_agent service \"container-sshd\""
+                );
+            }
+            if self.container_bootstrap.enabled && !self.container_agent.enabled {
+                anyhow::bail!(
+                    "target {target_name:?} access.method = \"runtime_exec\" requires container_agent.enabled = true when container_bootstrap.enabled = true"
+                );
+            }
+            if let Some(cleanup) = &self.idle_cleanup
+                && cleanup.owner == IdleCleanupOwner::Agent
+                && cleanup.action != IdleCleanupAction::None
+                && !self
+                    .container_agent
+                    .control_socket
+                    .as_ref()
+                    .is_none_or(super::ControlSocketConfig::is_enabled)
+            {
+                anyhow::bail!(
+                    "target {target_name:?} access.method = \"runtime_exec\" with agent-owned idle_cleanup requires container_agent.control_socket to be enabled"
+                );
+            }
+        }
         self.control_sockets.validate("target.control_sockets")?;
         self.container_bootstrap.validate()?;
         for step in &self.lifecycle_steps {

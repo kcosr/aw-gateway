@@ -19,6 +19,10 @@ impl Runtime {
         labels.extend([
             ("io.aw-gateway.image".into(), self.target.image.clone()),
             (
+                "io.aw-gateway.access".into(),
+                self.target.access.method.as_str().into(),
+            ),
+            (
                 "io.aw-gateway.mode".into(),
                 format!("{:?}", self.target.mode).to_lowercase(),
             ),
@@ -58,12 +62,38 @@ impl Runtime {
     }
 
     pub(super) fn validate_labels(&self, inspect: &ContainerInspect) -> anyhow::Result<()> {
+        self.validate_stable_labels(inspect)?;
+        self.validate_access_label(inspect)
+    }
+
+    pub(super) fn validate_stable_labels(&self, inspect: &ContainerInspect) -> anyhow::Result<()> {
         runtime::validate_gateway_labels(inspect, &self.validation_labels())?;
         let stored = context_from_labels(&inspect.config.labels);
         if !self.context.matches_stored(&stored) {
             anyhow::bail!("container context does not match supplied runtime context");
         }
         Ok(())
+    }
+
+    fn validate_access_label(&self, inspect: &ContainerInspect) -> anyhow::Result<()> {
+        let expected = self.target.access.method.as_str();
+        match inspect
+            .config
+            .labels
+            .get("io.aw-gateway.access")
+            .map(String::as_str)
+        {
+            Some(actual) if actual == expected => Ok(()),
+            Some(actual) => anyhow::bail!(
+                "container {:?} access label {actual:?} does not match configured access.method {expected:?}; stop or remove the existing container before switching access methods",
+                self.identity.container_name
+            ),
+            None if self.target.access.method == crate::config::TargetAccessMethod::Ssh => Ok(()),
+            None => anyhow::bail!(
+                "container {:?} is missing io.aw-gateway.access and cannot be reused for access.method = \"runtime_exec\"; remove the existing container before using runtime-exec access",
+                self.identity.container_name
+            ),
+        }
     }
 
     pub(super) async fn start_container(&self) -> anyhow::Result<()> {
@@ -397,6 +427,7 @@ impl Runtime {
             vars: self.vars(None),
             control_socket_host_dir: self.paths.control_sockets.host_dir.clone(),
             control_socket_container_dir: self.paths.control_sockets.container_dir.clone(),
+            include_control_socket_mount: self.requires_control_socket_dir(),
         }
     }
 
@@ -472,6 +503,7 @@ struct ContainerMountInputs {
     vars: Vars,
     control_socket_host_dir: PathBuf,
     control_socket_container_dir: PathBuf,
+    include_control_socket_mount: bool,
 }
 
 fn render_container_mounts(
@@ -502,19 +534,21 @@ fn render_container_mounts(
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    validate_bind_mount_path(
-        "control socket host directory",
-        &inputs.control_socket_host_dir,
-    )?;
-    validate_bind_mount_path(
-        "control socket container directory",
-        &inputs.control_socket_container_dir,
-    )?;
-    mounts.push(ContainerMountSpec {
-        source: inputs.control_socket_host_dir,
-        target: inputs.control_socket_container_dir,
-        readonly: false,
-    });
+    if inputs.include_control_socket_mount {
+        validate_bind_mount_path(
+            "control socket host directory",
+            &inputs.control_socket_host_dir,
+        )?;
+        validate_bind_mount_path(
+            "control socket container directory",
+            &inputs.control_socket_container_dir,
+        )?;
+        mounts.push(ContainerMountSpec {
+            source: inputs.control_socket_host_dir,
+            target: inputs.control_socket_container_dir,
+            readonly: false,
+        });
+    }
     Ok(mounts)
 }
 
