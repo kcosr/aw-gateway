@@ -14,6 +14,7 @@ fn example_gateway_configs_validate() {
         "examples/docker/gateway-local.toml",
         "examples/docker/gateway-remote.toml",
         "examples/colima/gateway-local.toml",
+        "examples/apple-container/gateway-local.toml",
     ] {
         let config = manifest_dir.join(config);
         Command::cargo_bin("aw-gateway")

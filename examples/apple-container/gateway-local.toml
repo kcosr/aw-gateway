@@ -1,0 +1,158 @@
+schema_version = "1"
+default_target = "ubuntu"
+
+[runtime]
+type = "apple_container"
+
+[logging]
+level = "info"
+directory = "{state}/logs/gateway"
+max_bytes = 104857600
+max_files = 5
+console = false
+
+[target_defaults.workspace]
+path = "/Users/example/aw-gateway/workspace"
+state_dir = ".aw-gateway"
+
+[target_defaults.control_sockets]
+host_dir = "/Users/example/aw-gateway/cache/sockets/{runtime_id}"
+container_dir = "/run/aw-gateway"
+
+[ssh_dispatch]
+allow_interactive_shell = true
+allow_container_commands = true
+enabled_actions = [
+  "connect",
+  "up",
+  "status",
+  "targets",
+  "stop",
+  "set-default",
+  "show-default",
+  "reset-default",
+  "add-key",
+  "add-host-key",
+  "add-container-key",
+  "client-config",
+  "client-bundle",
+  "help",
+]
+
+[client_config]
+inner_alias_template = "aw-{target}"
+container_host_template = "aw-container-{target}"
+host = "localhost"
+gateway_path = "/Users/example/aw-gateway/bin/aw-gateway"
+default_identity_dir = "~/.ssh/aw-gateway"
+
+[targets.ubuntu]
+image = "aw-gateway/ubuntu-base"
+mode = "fixed"
+name = "{image_slug}"
+stop_when_idle = true
+remove_on_stop = false
+container_user = "root"
+container_home = "/home/{user}"
+
+[targets.ubuntu.container_env]
+CODEX_HOME = "/var/lib/codex"
+
+[targets.ubuntu.session_env]
+CODEX_HOME = "/var/lib/codex"
+
+[targets.ubuntu.local_ssh]
+mode = "listen"
+backend = "published_port"
+readiness = "ssh_only"
+host = "127.0.0.1"
+
+[targets.ubuntu.identity]
+bootstrap_user = "root"
+session_user = "{user}"
+session_uid = "{uid}"
+session_gid = "{gid}"
+session_home = "/home/{user}"
+session_shell = "/bin/bash"
+
+[targets.ubuntu.idle_cleanup]
+owner = "gateway"
+action = "exit_container"
+idle_grace = "30s"
+preserve_processes = ["tmux", "screen"]
+poll_interval = "10s"
+shutdown_timeout = "10s"
+
+[[target_defaults.lifecycle_steps]]
+phase = "pre_start"
+name = "ensure-workspace"
+required = true
+timeout = "60s"
+command = ["/bin/mkdir", "-p", "{workspace}"]
+
+[[target_defaults.container_bootstrap_steps]]
+name = "prepare-codex-home"
+required = true
+user = "root"
+command = ["/bin/sh", "-lc", "mkdir -p /var/lib/codex && chown {uid}:{gid} /var/lib/codex"]
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/aw-gateway/runtime/linux/aw-container-bootstrap"
+target = "/opt/aw-gateway/bin/aw-container-bootstrap"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/aw-gateway/runtime/linux/aw-container-agent"
+target = "/opt/aw-gateway/bin/aw-container-agent"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/aw-gateway/runtime/linux/aw-ssh-command-filter"
+target = "/opt/aw-gateway/bin/aw-ssh-command-filter"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/aw-gateway/runtime/linux/start-container-sshd"
+target = "/opt/aw-gateway/bin/start-container-sshd"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/aw-gateway/runtime/linux/sshd_config_agent"
+target = "/etc/ssh/sshd_config_agent"
+mode = "ro"
+
+[target_defaults.container_bootstrap]
+enabled = true
+entrypoint = "/opt/aw-gateway/bin/aw-container-bootstrap"
+agent_program = "/opt/aw-gateway/bin/aw-container-agent"
+
+[target_defaults.container_ssh.transfer]
+sftp = "allow"
+legacy_scp = "allow"
+
+[target_defaults.container_agent]
+enabled = true
+control_socket = false
+
+[[target_defaults.container_agent.services]]
+name = "container-sshd"
+required = true
+user = "root"
+command = ["/opt/aw-gateway/bin/start-container-sshd"]
+restart = "always"
+depends_on = []
+
+[target_defaults.container_agent.services.health_check]
+type = "tcp"
+host = "127.0.0.1"
+port = 22
+interval = "2s"
+timeout = "1s"
+
+[target_defaults.container_agent.services.env.AW_SSHD_SETENV_CONFIG]
+value = "{container_state_dir}/sshd-session-env.conf"
+
+[target_defaults.container_agent.ssh_bridge]
+enabled = false
+target = "127.0.0.1:22"
+mode = "0600"

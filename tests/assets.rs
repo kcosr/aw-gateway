@@ -160,11 +160,12 @@ fn example_sshd_configs_match_documented_runtime_networking_and_ubuntu_sftp_path
         assert!(!config.contains("/usr/libexec/openssh/sftp-server"));
     }
 
-    let colima_config =
-        std::fs::read_to_string(example_asset("colima", "sshd_config_agent")).unwrap();
-    assert!(colima_config.contains("ListenAddress 0.0.0.0"));
-    assert!(colima_config.contains("Subsystem sftp /usr/lib/openssh/sftp-server"));
-    assert!(!colima_config.contains("/usr/libexec/openssh/sftp-server"));
+    for runtime in ["colima", "apple-container"] {
+        let config = std::fs::read_to_string(example_asset(runtime, "sshd_config_agent")).unwrap();
+        assert!(config.contains("ListenAddress 0.0.0.0"));
+        assert!(config.contains("Subsystem sftp /usr/lib/openssh/sftp-server"));
+        assert!(!config.contains("/usr/libexec/openssh/sftp-server"));
+    }
 }
 
 #[test]

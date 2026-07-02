@@ -112,6 +112,7 @@ files using the deployment guide for your runtime:
 - [Podman](docs/guides/podman.md)
 - [Docker](docs/guides/docker.md)
 - [Colima](docs/guides/colima.md)
+- [Apple Container](docs/guides/apple-container.md)
 
 For unsupported platforms or local development, build from source in the
 [Build](#build) section.
@@ -124,7 +125,8 @@ host and follow it before using the README as a reference:
 1. Download and extract the latest release archive for your host platform and,
    when needed, the Linux archive for your container or VM platform.
 2. Pick a deployment guide: [Podman](docs/guides/podman.md),
-   [Docker](docs/guides/docker.md), or [Colima](docs/guides/colima.md).
+   [Docker](docs/guides/docker.md), [Colima](docs/guides/colima.md), or
+   [Apple Container](docs/guides/apple-container.md).
 3. Install the host and container-side runtime files using that guide's
    layout.
 4. Copy or adapt the guide's gateway config and validate it.
@@ -222,16 +224,20 @@ target/release/aw-ssh-command-filter
 For managed deployments, `aw-gateway` is installed on the host.
 Container-side binaries can either be installed in the target image or mounted
 read-only through the bootstrap-mount mode.
-See [Podman](docs/guides/podman.md), [Docker](docs/guides/docker.md), or
-[Colima](docs/guides/colima.md) for the host and container install layout for
-your deployment. macOS readers should use a Linux release archive or source
-build whose architecture matches the Linux architecture used inside the VM.
+See [Podman](docs/guides/podman.md), [Docker](docs/guides/docker.md),
+[Colima](docs/guides/colima.md), or
+[Apple Container](docs/guides/apple-container.md) for the host and container
+install layout for your deployment. macOS readers should use a Linux release
+archive or source build whose architecture matches the Linux architecture used
+inside the VM or Apple container guest.
 
 ## Deployment Guides
 
 Pick a runtime before following a guide. Podman is rootless-friendly and the
 default fit for managed Linux hosts. Docker uses a daemon and works well on
 shared Linux workstations. Colima wraps Docker inside a Linux VM for macOS.
+Apple Container uses Apple's native `container` runtime on Apple silicon macOS
+26 or newer.
 
 - [Podman](docs/guides/podman.md): generic local workstation and remote SSH
   deployment patterns with a minimal Ubuntu image and copyable example configs.
@@ -239,6 +245,8 @@ shared Linux workstations. Colima wraps Docker inside a Linux VM for macOS.
   deployment patterns.
 - [Colima](docs/guides/colima.md): macOS local Colima deployment pattern using
   Docker through a Colima profile.
+- [Apple Container](docs/guides/apple-container.md): macOS local Apple
+  `container` deployment pattern using published-port SSH.
 - [Firewall Policy](docs/guides/firewall.md): optional host, container, or VM
   firewall hooks for egress control.
 - [Proxy And CA Policy](docs/guides/proxy.md): optional proxy service, CA trust,
@@ -321,7 +329,8 @@ container-agent.sample.toml
 ```
 
 For working platform deployments, start from the guide and example config for
-Podman, Docker, or Colima instead of copying the minimal gateway sample.
+Podman, Docker, Colima, or Apple Container instead of copying the minimal
+gateway sample.
 
 ## SSH Workflows
 
@@ -437,8 +446,8 @@ readiness = "agent_control"
 host = "127.0.0.1"
 ```
 
-Docker and Colima profiles can use a published loopback port as the gateway's
-backend for container SSH:
+Docker, Colima, and Apple Container profiles can use a published loopback port
+as the gateway's backend for container SSH:
 
 ```toml
 [targets.default.local_ssh]
@@ -454,7 +463,9 @@ control_socket = false
 
 Use `control_socket = false` when the host gateway only needs the published
 SSH port. This lets `aw-container-agent` supervise services without creating an
-unused Unix socket on a Docker/Colima bind mount.
+unused Unix socket on a Docker/Colima bind mount or Apple container guest bind
+mount. Docker and Colima ask the runtime for the mapped port after startup;
+Apple Container uses an explicit preallocated loopback port.
 
 On macOS, non-interactive SSH sessions may not include user-local package
 manager paths. If the Docker CLI used for Colima is not on the SSH session
@@ -2021,8 +2032,9 @@ stateDiagram-v2
 ### Local Workstation Listen Mode
 
 Local mode does not require host SSHD. The gateway can start a target and bind a
-loopback-only listener for local SSH-compatible tools. Docker and Colima can use
-a published loopback container SSH port instead of a host-visible Unix socket.
+loopback-only listener for local SSH-compatible tools. Docker, Colima, and Apple
+Container can use a published loopback container SSH port instead of a
+host-visible Unix socket.
 
 ```mermaid
 sequenceDiagram

@@ -1,0 +1,24 @@
+Port 22
+ListenAddress 0.0.0.0
+PidFile /run/sshd-agent.pid
+
+AuthenticationMethods publickey
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile .aw-gateway/ssh/authorized_keys
+
+AllowAgentForwarding no
+AllowTcpForwarding local
+PermitOpen 127.0.0.1:* localhost:* [::1]:*
+AllowStreamLocalForwarding yes
+X11Forwarding no
+PermitTunnel no
+PermitTTY yes
+PermitUserEnvironment no
+GatewayPorts no
+
+Subsystem sftp /usr/lib/openssh/sftp-server
+
+SetEnv SHELL=/usr/bin/bash
+SetEnv PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
