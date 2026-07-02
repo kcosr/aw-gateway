@@ -1800,8 +1800,8 @@ The `assets/` directory contains deployable helpers and image files:
 - `assets/sshd_config_agent`: container-local SSHD policy intended for gateway
   targets.
 - `assets/start-container-sshd`: prepares `/run/sshd`, generates missing SSH
-  host keys, renders transfer policy into a runtime SSHD config, validates it,
-  and execs container `sshd`.
+  host keys, merges SSHD session environment into a runtime SSHD config,
+  renders transfer policy, validates the result, and execs container `sshd`.
 
 ## Runtime Environment Contracts
 
@@ -1823,7 +1823,9 @@ private state files:
 - `AW_SSHD_POLICY_CONFIG`: generated SSH transfer-policy file consumed by
   container SSHD helper scripts.
 - `AW_SSHD_SETENV_CONFIG`: generated SSHD `SetEnv` snippet for configured
-  session environment variables.
+  session environment variables. When set, the helper requires this file to be
+  readable and merges its values with base `sshd_config_agent` `SetEnv`
+  defaults into one global `SetEnv` directive; generated values win by key.
 
 The SSHD helper also supports test/override hooks:
 `AW_SSHD_BASE_CONFIG`, `AW_SSHD_RUNTIME_CONFIG`, `AW_SSHD_RUN_DIR`,
