@@ -47,6 +47,7 @@ pub struct ContainerRunSpec {
     pub env: BTreeMap<String, String>,
     pub labels: BTreeMap<String, String>,
     pub publish_ssh: bool,
+    pub published_ssh_host_port: Option<u16>,
     pub extra_run_args: Vec<String>,
     pub command: Vec<String>,
 }
@@ -614,8 +615,8 @@ pub struct ManagedContainer {
 pub struct ContainerState {
     #[serde(rename = "Running")]
     pub running: bool,
-    #[serde(rename = "Pid")]
-    pub pid: i64,
+    #[serde(rename = "Pid", default)]
+    pub pid: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -633,6 +634,7 @@ impl ContainerRuntime {
         let mut env = BTreeMap::new();
         match cfg.runtime_type {
             ContainerRuntimeType::Podman => {}
+            ContainerRuntimeType::AppleContainer => {}
             ContainerRuntimeType::Docker => {
                 if let Some(docker_host) = &cfg.docker_host {
                     env.insert(
@@ -753,7 +755,11 @@ impl ContainerRuntime {
                 stderr.trim()
             );
         }
-        parse::parse_container_inspect(&output.stdout, self.runtime_label())
+        if self.kind == ContainerRuntimeType::AppleContainer {
+            parse::parse_apple_container_inspect(&output.stdout, self.runtime_label())
+        } else {
+            parse::parse_container_inspect(&output.stdout, self.runtime_label())
+        }
     }
 
     pub async fn run_detached(&self, spec: &ContainerRunSpec) -> anyhow::Result<()> {
@@ -770,6 +776,9 @@ impl ContainerRuntime {
     }
 
     pub async fn rm(&self, name: &str) -> anyhow::Result<()> {
+        if self.kind == ContainerRuntimeType::AppleContainer {
+            return self.run_status("delete", ["--force", name]).await;
+        }
         self.run_status("rm", [name]).await
     }
 
@@ -1138,11 +1147,33 @@ impl ContainerRuntime {
         })
     }
 
-    pub async fn exec_quiet<I, S>(&self, name: &str, args: I) -> anyhow::Result<i32>
+    pub async fn exec_quiet<I, S>(&self, name: &str, user: &str, args: I) -> anyhow::Result<i32>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        if self.kind == ContainerRuntimeType::AppleContainer {
+            let spec = ContainerExecSpec {
+                stdin_tty: false,
+                stdout_tty: false,
+                user: user.to_string(),
+                cwd: None,
+                env: BTreeMap::new(),
+                container_name: name.to_string(),
+                command: args
+                    .into_iter()
+                    .map(|arg| arg.as_ref().to_string_lossy().into_owned())
+                    .collect(),
+            };
+            let output = self
+                .command()
+                .arg("exec")
+                .args(self.exec_args(&spec))
+                .output()
+                .await
+                .with_context(|| format!("run {} exec {name}", self.runtime_label()))?;
+            return Ok(output.status.code().unwrap_or(1));
+        }
         let output = self
             .command()
             .arg("exec")
@@ -1159,6 +1190,9 @@ impl ContainerRuntime {
         name: &str,
         container_port: u16,
     ) -> anyhow::Result<Option<u16>> {
+        if self.kind == ContainerRuntimeType::AppleContainer {
+            return Ok(None);
+        }
         let output = self
             .command()
             .args(["port", name, &format!("{container_port}/tcp")])
@@ -1177,22 +1211,35 @@ impl ContainerRuntime {
         uid: u32,
         context: &RuntimeContext,
     ) -> anyhow::Result<Vec<ManagedContainer>> {
+        let command_label = self.list_command_label();
         let output = self
             .command()
             .args(self.list_managed_args(user, uid, context))
             .output()
             .await
-            .with_context(|| format!("run {} ps", self.runtime_label()))?;
+            .with_context(|| format!("run {} {command_label}", self.runtime_label()))?;
         if !output.status.success() {
             anyhow::bail!(
-                "{} ps failed: {}",
+                "{} {command_label} failed: {}",
                 self.runtime_label(),
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let containers = parse_managed_containers(&output.stdout).with_context(|| {
-            format!("parse {} managed container list JSON", self.runtime_label())
-        })?;
+        let containers = if self.kind == ContainerRuntimeType::AppleContainer {
+            parse::parse_apple_container_list(&output.stdout)
+        } else {
+            parse_managed_containers(&output.stdout)
+        }
+        .with_context(|| format!("parse {} managed container list JSON", self.runtime_label()))?;
+        if self.kind == ContainerRuntimeType::AppleContainer
+            && containers
+                .iter()
+                .any(|container| container.labels.is_empty())
+        {
+            anyhow::bail!(
+                "apple container list output omitted labels; managed container listing cannot safely identify aw-gateway ownership"
+            );
+        }
         Ok(containers
             .into_iter()
             .filter(|container| {
@@ -1208,6 +1255,7 @@ impl ContainerRuntime {
             ContainerRuntimeType::Docker | ContainerRuntimeType::Colima => {
                 self.docker_run_args(spec)
             }
+            ContainerRuntimeType::AppleContainer => self.apple_run_args(spec),
         }
     }
 
@@ -1216,6 +1264,14 @@ impl ContainerRuntime {
     }
 
     pub fn list_managed_args(&self, user: &str, uid: u32, context: &RuntimeContext) -> Vec<String> {
+        if self.kind == ContainerRuntimeType::AppleContainer {
+            return vec![
+                "list".into(),
+                "--all".into(),
+                "--format".into(),
+                "json".into(),
+            ];
+        }
         let mut args = vec![
             "ps".into(),
             "-a".into(),
@@ -1236,6 +1292,9 @@ impl ContainerRuntime {
     }
 
     pub fn exec_args(&self, spec: &ContainerExecSpec) -> Vec<String> {
+        if self.kind == ContainerRuntimeType::AppleContainer {
+            return self.apple_exec_args(spec);
+        }
         let mut args = Vec::new();
         if let Some(stdio_arg) = exec_stdio_arg(spec.stdin_tty, spec.stdout_tty) {
             args.push(stdio_arg.to_string());
@@ -1290,6 +1349,81 @@ impl ContainerRuntime {
         self.push_publish_ssh_args(&mut args, spec);
         self.push_common_run_args(&mut args, spec, false);
         args.push(docker_image_ref(&spec.image));
+        args.extend(spec.command.clone());
+        args
+    }
+
+    fn apple_run_args(&self, spec: &ContainerRunSpec) -> Vec<String> {
+        let mut args = vec![
+            "--detach".into(),
+            "--init".into(),
+            "--name".into(),
+            spec.name.clone(),
+        ];
+        args.push("--user".into());
+        args.push(spec.container_user.clone());
+        args.extend(spec.extra_run_args.clone());
+        if let Some(port) = spec.published_ssh_host_port {
+            args.push("--publish".into());
+            args.push(format!("127.0.0.1:{port}:22/tcp"));
+        }
+        args.push("--volume".into());
+        args.push(format!(
+            "{}:{}",
+            spec.workspace.display(),
+            spec.container_home.display()
+        ));
+        for mount in &spec.mounts {
+            args.push("--volume".into());
+            let options = if mount.readonly { ":ro" } else { "" };
+            args.push(format!(
+                "{}:{}{}",
+                mount.source.display(),
+                mount.target.display(),
+                options
+            ));
+        }
+        args.push("--workdir".into());
+        args.push(spec.container_home.display().to_string());
+        args.push("--env".into());
+        args.push(format!("HOME={}", spec.container_home.display()));
+        args.push("--env".into());
+        args.push(format!(
+            "AW_CONTAINER_STATE_DIR={}",
+            spec.state_dir_in_container.display()
+        ));
+        for (key, value) in &spec.env {
+            args.push("--env".into());
+            args.push(runtime_env_arg(key, value));
+        }
+        for (key, value) in &spec.labels {
+            args.push("--label".into());
+            args.push(format!("{key}={value}"));
+        }
+        args.push(docker_image_ref(&spec.image));
+        args.extend(spec.command.clone());
+        args
+    }
+
+    fn apple_exec_args(&self, spec: &ContainerExecSpec) -> Vec<String> {
+        let mut args = Vec::new();
+        if spec.stdin_tty {
+            args.push("--interactive".into());
+        }
+        if spec.stdout_tty {
+            args.push("--tty".into());
+        }
+        args.push("--user".into());
+        args.push(spec.user.clone());
+        if let Some(cwd) = &spec.cwd {
+            args.push("--workdir".into());
+            args.push(cwd.display().to_string());
+        }
+        for (key, value) in &spec.env {
+            args.push("--env".into());
+            args.push(runtime_env_arg(key, value));
+        }
+        args.push(spec.container_name.clone());
         args.extend(spec.command.clone());
         args
     }
@@ -1411,6 +1545,16 @@ impl ContainerRuntime {
             ContainerRuntimeType::Podman => "podman",
             ContainerRuntimeType::Docker => "docker",
             ContainerRuntimeType::Colima => "colima/docker",
+            ContainerRuntimeType::AppleContainer => "apple container",
+        }
+    }
+
+    fn list_command_label(&self) -> &'static str {
+        match self.kind {
+            ContainerRuntimeType::AppleContainer => "list",
+            ContainerRuntimeType::Podman
+            | ContainerRuntimeType::Docker
+            | ContainerRuntimeType::Colima => "ps",
         }
     }
 }
@@ -1737,6 +1881,7 @@ fn default_program(runtime_type: ContainerRuntimeType) -> &'static str {
     match runtime_type {
         ContainerRuntimeType::Podman => "podman",
         ContainerRuntimeType::Docker | ContainerRuntimeType::Colima => "docker",
+        ContainerRuntimeType::AppleContainer => "container",
     }
 }
 
@@ -2192,6 +2337,21 @@ exit 0
     }
 
     #[test]
+    fn apple_container_defaults_to_container_program_without_docker_env() {
+        let cfg = RuntimeConfig {
+            runtime_type: ContainerRuntimeType::AppleContainer,
+            program: None,
+            docker_host: None,
+            profile: None,
+        };
+        let runtime =
+            ContainerRuntime::from_config(&cfg, "alice", Path::new("/Users/alice")).unwrap();
+
+        assert_eq!(runtime.program, "container");
+        assert!(runtime.env().is_empty());
+    }
+
+    #[test]
     fn list_managed_args_filter_by_gateway_user_and_uid() {
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::Podman,
@@ -2256,6 +2416,20 @@ exit 0
         assert_eq!(
             colima.env().get("DOCKER_HOST").map(String::as_str),
             Some("unix:///Users/alice/.colima/default/docker.sock")
+        );
+    }
+
+    #[test]
+    fn apple_list_managed_args_use_unfiltered_json_list() {
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::AppleContainer,
+            program: "container".into(),
+            env: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            runtime.list_managed_args("alice", 2450, &RuntimeContext::empty()),
+            vec!["list", "--all", "--format", "json"]
         );
     }
 
@@ -2343,6 +2517,128 @@ exit 0
     }
 
     #[test]
+    fn apple_parse_container_inspect_accepts_lowercase_shape() {
+        let inspect = parse::parse_apple_container_inspect(
+            br#"[{
+  "status": "running",
+  "pid": 42,
+  "configuration": {
+    "id": "aw-default",
+    "hostname": "aw-default",
+    "labels": {
+      "io.aw-gateway.gateway": "true",
+      "io.aw-gateway.user": "alice",
+      "io.aw-gateway.uid": "2450"
+    }
+  }
+}]"#,
+            "apple container",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(inspect.id, "aw-default");
+        assert_eq!(inspect.name, "aw-default");
+        assert!(inspect.state.running);
+        assert_eq!(inspect.state.pid, Some(42));
+        assert_eq!(
+            inspect
+                .config
+                .labels
+                .get("io.aw-gateway.user")
+                .map(String::as_str),
+            Some("alice")
+        );
+    }
+
+    #[test]
+    fn apple_parse_container_inspect_accepts_missing_pid() {
+        let inspect = parse::parse_apple_container_inspect(
+            br#"[{
+  "status": "running",
+  "configuration": {
+    "id": "aw-default",
+    "hostname": "aw-default",
+    "labels": {"io.aw-gateway.gateway": "true"}
+  }
+}]"#,
+            "apple container",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(inspect.id, "aw-default");
+        assert_eq!(inspect.state.pid, None);
+    }
+
+    #[test]
+    fn apple_parse_container_inspect_requires_zero_or_one_result() {
+        let empty = parse::parse_apple_container_inspect(b"[]", "apple container").unwrap();
+        assert!(empty.is_none());
+
+        let err = parse::parse_apple_container_inspect(
+            br#"[
+  {"status": "running", "pid": 42, "configuration": {"id": "aw-default"}},
+  {"status": "stopped", "pid": 43, "configuration": {"id": "aw-other"}}
+]"#,
+            "apple container",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "apple container inspect returned 2 containers; expected one"
+        );
+    }
+
+    #[test]
+    fn apple_parse_container_list_normalizes_rows_without_pre_filtering() {
+        let raw = br#"
+[
+  {
+    "status": "running",
+    "image": "ubuntu/dev:latest",
+    "configuration": {
+      "id": "aw-ubuntu",
+      "labels": {
+        "io.aw-gateway.gateway": "true",
+        "io.aw-gateway.user": "alice",
+        "io.aw-gateway.uid": "2450"
+      }
+    }
+  },
+  {
+    "status": "stopped",
+    "configuration": {
+      "id": "unrelated",
+      "image": "busybox:latest",
+      "labels": {"com.example": "true"}
+    }
+  }
+]
+"#;
+
+        let containers = parse::parse_apple_container_list(raw).unwrap();
+
+        assert_eq!(containers.len(), 2);
+        assert_eq!(containers[0].name, "aw-ubuntu");
+        assert_eq!(containers[0].image, "ubuntu/dev:latest");
+        assert!(containers[0].running);
+        assert_eq!(containers[1].name, "unrelated");
+        assert_eq!(containers[1].image, "busybox:latest");
+        assert!(!containers[1].running);
+        assert!(is_aw_gateway_managed_container_for(
+            &containers[0],
+            "alice",
+            2450
+        ));
+        assert!(!is_aw_gateway_managed_container_for(
+            &containers[1],
+            "alice",
+            2450
+        ));
+    }
+
+    #[test]
     fn managed_container_for_requires_matching_user_and_uid() {
         let raw = br#"
 [
@@ -2386,7 +2682,7 @@ exit 0
             name: "aw-default".into(),
             state: ContainerState {
                 running: true,
-                pid: 123,
+                pid: Some(123),
             },
             config: ContainerConfig {
                 labels: BTreeMap::new(),
@@ -2455,6 +2751,7 @@ exit 0
             env: BTreeMap::from([("HOME".into(), "/root".into())]),
             labels: BTreeMap::from([("io.aw-gateway.gateway".into(), "true".into())]),
             publish_ssh: false,
+            published_ssh_host_port: None,
             extra_run_args: Vec::new(),
             command: vec!["aw-container-agent".into(), "run".into()],
         };
@@ -2465,6 +2762,133 @@ exit 0
         assert!(args.contains(&"root".to_string()));
         assert!(args.contains(&"/Users/alice/workspace:/root".to_string()));
         assert!(args.contains(&"aw-gateway/ubuntu-dev-local:latest".to_string()));
+    }
+
+    #[test]
+    fn apple_run_args_use_apple_container_shape() {
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::AppleContainer,
+            program: "container".into(),
+            env: BTreeMap::new(),
+        };
+        let spec = ContainerRunSpec {
+            name: "aw-local".into(),
+            hostname: "aw-local".into(),
+            image: "aw-gateway/ubuntu-dev-local".into(),
+            workspace: PathBuf::from("/Users/alice/workspace"),
+            container_home: PathBuf::from("/home/alice"),
+            container_user: "alice".into(),
+            passwd_entry: Some("ignored:x:2450:2450::/home/alice:/bin/bash".into()),
+            state_dir_in_container: PathBuf::from("/home/alice/.aw-gateway/containers/aw-local"),
+            mounts: vec![
+                ContainerMountSpec {
+                    source: PathBuf::from("/Users/alice/.aw-gateway/agent"),
+                    target: PathBuf::from("/usr/local/bin/aw-container-agent"),
+                    readonly: true,
+                },
+                ContainerMountSpec {
+                    source: PathBuf::from("/Users/alice/cache"),
+                    target: PathBuf::from("/cache"),
+                    readonly: false,
+                },
+            ],
+            env: BTreeMap::from([
+                ("AW_SAFE".into(), "1".into()),
+                ("PATH".into(), "/tmp/bad".into()),
+            ]),
+            labels: BTreeMap::from([
+                ("io.aw-gateway.gateway".into(), "true".into()),
+                ("io.aw-gateway.user".into(), "alice".into()),
+            ]),
+            publish_ssh: true,
+            published_ssh_host_port: Some(40222),
+            extra_run_args: vec!["--cpus".into(), "2".into()],
+            command: vec!["aw-container-agent".into(), "run".into()],
+        };
+
+        let args = runtime.run_args(&spec);
+
+        assert_eq!(&args[..4], ["--detach", "--init", "--name", "aw-local"]);
+        assert!(args.windows(2).any(|pair| pair == ["--user", "alice"]));
+        assert!(args.windows(2).any(|pair| pair == ["--cpus", "2"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--publish", "127.0.0.1:40222:22/tcp"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--volume", "/Users/alice/workspace:/home/alice"])
+        );
+        assert!(args.windows(2).any(|pair| pair
+            == [
+                "--volume",
+                "/Users/alice/.aw-gateway/agent:/usr/local/bin/aw-container-agent:ro"
+            ]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--volume", "/Users/alice/cache:/cache"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--workdir", "/home/alice"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--env", "HOME=/home/alice"])
+        );
+        assert!(args.windows(2).any(|pair| pair
+            == [
+                "--env",
+                "AW_CONTAINER_STATE_DIR=/home/alice/.aw-gateway/containers/aw-local"
+            ]));
+        assert!(args.windows(2).any(|pair| pair == ["--env", "AW_SAFE"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--env", "PATH=/tmp/bad"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--label", "io.aw-gateway.gateway=true"])
+        );
+        assert!(args.contains(&"aw-gateway/ubuntu-dev-local:latest".to_string()));
+        assert!(args.ends_with(&["aw-container-agent".to_string(), "run".to_string()]));
+        assert!(!args.contains(&"--hostname".to_string()));
+        assert!(!args.contains(&"--userns=keep-id".to_string()));
+        assert!(!args.contains(&"--passwd-entry".to_string()));
+        assert!(!args.iter().any(|arg| arg.contains(":Z")
+            || arg.contains("/etc/localtime")
+            || arg.contains("/etc/bashrc")));
+    }
+
+    #[test]
+    fn apple_run_args_do_not_publish_without_explicit_host_port() {
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::AppleContainer,
+            program: "container".into(),
+            env: BTreeMap::new(),
+        };
+        let spec = ContainerRunSpec {
+            name: "aw-local".into(),
+            hostname: "aw-local".into(),
+            image: "ubuntu/dev".into(),
+            workspace: PathBuf::from("/workspace"),
+            container_home: PathBuf::from("/root"),
+            container_user: "root".into(),
+            passwd_entry: None,
+            state_dir_in_container: PathBuf::from("/root/.aw-gateway/containers/aw-local"),
+            mounts: Vec::new(),
+            env: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            publish_ssh: true,
+            published_ssh_host_port: None,
+            extra_run_args: Vec::new(),
+            command: vec!["sleep".into(), "infinity".into()],
+        };
+
+        let args = runtime.run_args(&spec);
+
+        assert!(!args.contains(&"--publish".to_string()));
+        assert!(args.contains(&"ubuntu/dev:latest".to_string()));
     }
 
     #[test]
@@ -2505,6 +2929,104 @@ exit 0
             runtime.exec_env(&spec).get("SHELL").map(String::as_str),
             Some("/usr/bin/bash")
         );
+    }
+
+    #[test]
+    fn apple_exec_args_use_separate_stdio_flags() {
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::AppleContainer,
+            program: "container".into(),
+            env: BTreeMap::new(),
+        };
+        let spec = ContainerExecSpec {
+            stdin_tty: true,
+            stdout_tty: true,
+            user: "2450:100".into(),
+            cwd: Some(PathBuf::from("/home/alice/project")),
+            env: BTreeMap::from([("PATH".into(), "/tmp/bad".into())]),
+            container_name: "ubuntu-dev".into(),
+            command: vec!["/usr/bin/bash".into(), "-lc".into(), "id -u".into()],
+        };
+
+        assert_eq!(
+            runtime.exec_args(&spec),
+            vec![
+                "--interactive",
+                "--tty",
+                "--user",
+                "2450:100",
+                "--workdir",
+                "/home/alice/project",
+                "--env",
+                "PATH=/tmp/bad",
+                "ubuntu-dev",
+                "/usr/bin/bash",
+                "-lc",
+                "id -u",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn apple_exec_quiet_uses_apple_exec_renderer() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-runtime");
+        let log = dir.path().join("runtime.log");
+        std::fs::write(
+            &runtime_program,
+            format!("#!/bin/sh\necho \"$@\" > \"{}\"\nexit 7\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::AppleContainer,
+            program: runtime_program.display().to_string(),
+            env: BTreeMap::new(),
+        };
+
+        let code = runtime
+            .exec_quiet("aw-local", "alice", ["pgrep", "-x", "sshd"])
+            .await
+            .unwrap();
+
+        assert_eq!(code, 7);
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "exec --user alice aw-local pgrep -x sshd\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn apple_list_managed_containers_fails_closed_when_labels_are_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-runtime");
+        std::fs::write(
+            &runtime_program,
+            r#"#!/bin/sh
+case "$1" in
+  list)
+    cat <<'JSON'
+[{"status":"running","configuration":{"id":"aw-ubuntu"}}]
+JSON
+    ;;
+esac
+exit 0
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::AppleContainer,
+            program: runtime_program.display().to_string(),
+            env: BTreeMap::new(),
+        };
+
+        let err = runtime
+            .list_managed_containers("alice", 2450, &RuntimeContext::empty())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("omitted labels"), "{err:#}");
     }
 
     #[test]
@@ -2795,6 +3317,7 @@ exit 0
             env: BTreeMap::new(),
             labels: BTreeMap::new(),
             publish_ssh: true,
+            published_ssh_host_port: None,
             extra_run_args: Vec::new(),
             command: vec!["aw-container-agent".into(), "run".into()],
         };
@@ -2822,6 +3345,7 @@ exit 0
             env: BTreeMap::new(),
             labels: BTreeMap::new(),
             publish_ssh: false,
+            published_ssh_host_port: None,
             extra_run_args: vec![
                 "--cap-add".into(),
                 "SYS_ADMIN".into(),

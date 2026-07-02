@@ -169,6 +169,7 @@ impl GatewayConfig {
         self.validate_required_context_fixed_targets(&effective_targets)?;
         self.validate_launch_definitions(&effective_targets)?;
         self.validate_target_agent_compatibility(&effective_targets)?;
+        self.validate_runtime_target_compatibility(&effective_targets)?;
         self.ssh_dispatch.validate()?;
         Ok(())
     }
@@ -265,6 +266,31 @@ impl GatewayConfig {
                 anyhow::bail!(
                     "target {name:?} uses local_ssh.backend = \"published_port\" but container_agent.enabled = false; agent-disabled targets run sleep infinity and do not provide container SSH"
                 );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_runtime_target_compatibility(
+        &self,
+        targets: &BTreeMap<String, TargetConfig>,
+    ) -> anyhow::Result<()> {
+        if self.runtime.runtime_type != ContainerRuntimeType::AppleContainer {
+            return Ok(());
+        }
+        for (name, target) in targets {
+            match &target.local_ssh {
+                Some(local_ssh) if local_ssh.backend == LocalSshBackend::PublishedPort => {}
+                Some(_) => {
+                    anyhow::bail!(
+                        "target {name:?} uses local_ssh.backend = \"socket\" but runtime type \"apple_container\" only supports local_ssh.backend = \"published_port\""
+                    );
+                }
+                None => {
+                    anyhow::bail!(
+                        "target {name:?} must configure local_ssh.backend = \"published_port\" when runtime type is \"apple_container\""
+                    );
+                }
             }
         }
         Ok(())
@@ -422,6 +448,7 @@ pub enum ContainerRuntimeType {
     Podman,
     Docker,
     Colima,
+    AppleContainer,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

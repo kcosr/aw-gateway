@@ -1044,6 +1044,110 @@ host = "127.0.0.1"
 }
 
 #[test]
+fn apple_container_runtime_validates_without_host_preflight() {
+    let cfg = r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+backend = "published_port"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    cfg.validate().unwrap();
+    assert_eq!(
+        cfg.runtime.runtime_type,
+        ContainerRuntimeType::AppleContainer
+    );
+}
+
+#[test]
+fn apple_container_rejects_docker_and_colima_runtime_fields() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+docker_host = "unix:///tmp/docker.sock"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("runtime.docker_host"), "{err}");
+
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+profile = "default"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("runtime.profile"), "{err}");
+}
+
+#[test]
+fn apple_container_rejects_socket_ssh_backend() {
+    let cfg = r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+backend = "socket"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("apple_container"), "{err}");
+    assert!(err.contains("published_port"), "{err}");
+}
+
+#[test]
+fn apple_container_requires_explicit_published_port_ssh_backend() {
+    let cfg = r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("local_ssh.backend"), "{err}");
+    assert!(err.contains("published_port"), "{err}");
+}
+
+#[test]
 fn local_ssh_rejects_ssh_only_with_socket_backend() {
     let cfg = r#"
 schema_version = "1"

@@ -42,9 +42,9 @@ impl Runtime {
         }
     }
 
-    pub(super) async fn run_host_steps(&self, container_pid: &str) -> anyhow::Result<()> {
+    pub(super) async fn run_host_steps(&self, container_pid: Option<&str>) -> anyhow::Result<()> {
         for step in &self.target.host_steps {
-            let vars = self.vars(Some(container_pid));
+            let vars = self.vars(container_pid);
             let command = template::render_argv(&step.command, &vars)?;
             let timeout = host_hook_timeout(step.timeout.as_deref())?;
             let command_result = run_argv_with_timeout(&command, timeout).await;

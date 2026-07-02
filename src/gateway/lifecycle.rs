@@ -25,6 +25,7 @@ impl FailedStartCleanup {
     pub(super) async fn run_if_needed(self, runtime: &Runtime) {
         if self.runtime_start_attempted {
             runtime.cleanup_failed_start().await;
+            runtime.cleanup_published_ssh_port_state();
             runtime.cleanup_control_socket_dir();
         }
     }
@@ -142,8 +143,8 @@ impl Runtime {
         inspect: &ContainerInspect,
     ) -> anyhow::Result<()> {
         self.validate_labels(inspect)?;
-        let container_pid = inspect.state.pid.to_string();
-        self.run_lifecycle_phase(LifecyclePhase::PreStop, Some(&container_pid))
+        let container_pid = inspect.state.pid.map(|pid| pid.to_string());
+        self.run_lifecycle_phase(LifecyclePhase::PreStop, container_pid.as_deref())
             .await?;
         if self.agent_control_enabled() {
             let _ = self.agent_shutdown().await;
@@ -158,18 +159,20 @@ impl Runtime {
                 .stop(&self.identity.container_name)
                 .await?;
         }
-        if self.target.remove_on_stop
-            && let Some(current) = self
+        if self.target.remove_on_stop {
+            if let Some(current) = self
                 .container_runtime
                 .inspect(&self.identity.container_name)
                 .await?
-        {
-            self.validate_labels(&current)?;
-            self.container_runtime
-                .rm(&self.identity.container_name)
-                .await?;
+            {
+                self.validate_labels(&current)?;
+                self.container_runtime
+                    .rm(&self.identity.container_name)
+                    .await?;
+            }
+            self.cleanup_published_ssh_port_state();
         }
-        self.run_lifecycle_phase(LifecyclePhase::PostStop, Some(&container_pid))
+        self.run_lifecycle_phase(LifecyclePhase::PostStop, container_pid.as_deref())
             .await?;
         self.cleanup_control_socket_dir();
         Ok(())
@@ -207,11 +210,13 @@ impl Runtime {
     }
 
     async fn has_preserve_process(&self, cleanup: &IdleCleanupConfig) -> anyhow::Result<bool> {
+        let exec_user = self.exec_identity();
         for process in &cleanup.preserve_processes {
             let code = self
                 .container_runtime
                 .exec_quiet(
                     &self.identity.container_name,
+                    &exec_user,
                     ["pgrep", "-x", process.as_str()],
                 )
                 .await?;

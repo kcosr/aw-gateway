@@ -63,6 +63,7 @@ mod lifecycle_hooks;
 mod listener;
 mod model;
 mod ops;
+mod published_port;
 mod render;
 mod session;
 mod status_view;
@@ -1766,13 +1767,13 @@ impl Runtime {
                 .await?;
             self.validate_labels(&inspect)?;
             self.sweep_stale_cancel_markers().await;
-            let container_pid = inspect.state.pid.to_string();
-            self.run_lifecycle_phase(LifecyclePhase::PostStartHost, Some(&container_pid))
+            let container_pid = inspect.state.pid.map(|pid| pid.to_string());
+            self.run_lifecycle_phase(LifecyclePhase::PostStartHost, container_pid.as_deref())
                 .await?;
             if self.requires_agent_control() {
                 self.wait_agent_ready().await?;
             }
-            self.run_host_steps(&container_pid).await?;
+            self.run_host_steps(container_pid.as_deref()).await?;
             if self.requires_agent_control() {
                 self.validate_agent_socket().await?;
             }
@@ -1849,7 +1850,7 @@ impl Runtime {
                 .as_ref()
                 .map(|_| self.identity.container_name.clone()),
             context: self.context.as_map().clone(),
-            container_pid: inspect.as_ref().map(|value| value.state.pid),
+            container_pid: inspect.as_ref().and_then(|value| value.state.pid),
             active_sessions: sessions.len(),
             sessions,
             agent_ready,
@@ -1933,6 +1934,9 @@ impl Runtime {
     async fn published_ssh_endpoint(&self) -> anyhow::Result<Option<TcpEndpoint>> {
         if self.ssh_backend() != LocalSshBackend::PublishedPort {
             return Ok(None);
+        }
+        if self.container_runtime.kind() == ContainerRuntimeType::AppleContainer {
+            return self.apple_published_ssh_endpoint().await;
         }
         Ok(self
             .container_runtime

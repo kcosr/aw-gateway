@@ -491,6 +491,7 @@ async fn operation_remove(
         .inspect(&runtime.identity.container_name)
         .await?
     else {
+        runtime.cleanup_published_ssh_port_state();
         runtime.cleanup_control_socket_dir();
         if runtime.should_cleanup_absent_container_workspace() {
             runtime.apply_explicit_remove_workspace_cleanup().await;
@@ -519,6 +520,7 @@ async fn operation_remove(
     if !was_running {
         runtime.cleanup_control_socket_dir();
     }
+    runtime.cleanup_published_ssh_port_state();
     runtime.apply_explicit_remove_workspace_cleanup().await;
     Ok(RemoveResult {
         container: runtime.identity.container_name,

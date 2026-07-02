@@ -19,7 +19,7 @@ pub(super) struct ReadyStatus {
     pub(super) container: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub(super) context: BTreeMap<String, String>,
-    pub(super) container_pid: i64,
+    pub(super) container_pid: Option<i64>,
     pub(super) ssh_socket: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) ssh_tcp: Option<TcpEndpoint>,

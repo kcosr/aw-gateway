@@ -527,8 +527,8 @@ impl OperationBody {
                 resolved_vars,
                 args,
             } => {
-                let container_pid = ready.container_pid.to_string();
-                let vars = launch_template_vars(runtime, &resolved_vars, Some(&container_pid));
+                let container_pid = ready.container_pid.map(|pid| pid.to_string());
+                let vars = launch_template_vars(runtime, &resolved_vars, container_pid.as_deref());
                 let launch_env = render_template_map(&launch.env, &vars)?;
                 run_launch_steps(runtime, &launch, &vars, &launch_env).await?;
                 let env = launch_final_env(&runtime.session_env()?, &launch_env);

@@ -59,6 +59,8 @@ impl Runtime {
                 error = %err,
                 "workspace cleanup failed"
             );
+        } else {
+            self.cleanup_published_ssh_port_state();
         }
     }
 
@@ -88,6 +90,8 @@ impl Runtime {
                 error = %err,
                 "explicit remove workspace cleanup failed"
             );
+        } else {
+            self.cleanup_published_ssh_port_state();
         }
     }
 

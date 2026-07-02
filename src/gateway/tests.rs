@@ -318,6 +318,24 @@ fn enable_default_agent_services(cfg: &mut GatewayConfig) {
     });
 }
 
+fn configure_apple_published_port_target(cfg: &mut GatewayConfig) {
+    cfg.runtime.runtime_type = ContainerRuntimeType::AppleContainer;
+    cfg.target_defaults.lifecycle_steps.clear();
+    cfg.target_defaults.host_steps.clear();
+    cfg.target_defaults.container_agent = Some(crate::config::ContainerAgentConfigInput {
+        enabled: Some(true),
+        services: Vec::new(),
+        ssh_bridge: None,
+        control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
+        idle_cleanup: None,
+    });
+    cfg.targets.get_mut("default").unwrap().local_ssh = Some(crate::config::LocalSshConfigInput {
+        backend: Some(LocalSshBackend::PublishedPort),
+        readiness: Some(LocalSshReadiness::SshOnly),
+        ..Default::default()
+    });
+}
+
 fn test_runtime(
     dir: &tempfile::TempDir,
     program: PathBuf,
@@ -1013,7 +1031,10 @@ fn inspect_with_running(running: bool) -> ContainerInspect {
     ContainerInspect {
         id: "id".into(),
         name: "container".into(),
-        state: runtime::ContainerState { running, pid: 123 },
+        state: runtime::ContainerState {
+            running,
+            pid: Some(123),
+        },
         config: runtime::ContainerConfig {
             labels: BTreeMap::new(),
         },
@@ -2814,6 +2835,219 @@ exit 0
 }
 
 #[tokio::test]
+async fn apple_start_container_promotes_preallocated_published_ssh_port() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("run.log");
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  run)
+    echo "$@" > "{log}"
+    ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, configure_apple_published_port_target);
+    runtime.prepare_control_socket_dir().unwrap();
+
+    runtime.start_container().await.unwrap();
+
+    let stable = runtime.paths.container_state_dir.join("published-ssh-port");
+    let pending = runtime
+        .paths
+        .container_state_dir
+        .join("published-ssh-port.pending");
+    let port = std::fs::read_to_string(&stable)
+        .unwrap()
+        .trim()
+        .parse::<u16>()
+        .unwrap();
+    let argv = std::fs::read_to_string(log).unwrap();
+    assert!(
+        argv.contains(&format!("--publish 127.0.0.1:{port}:22/tcp")),
+        "{argv}"
+    );
+    assert!(!pending.exists());
+}
+
+#[tokio::test]
+async fn apple_start_container_removes_pending_published_ssh_port_after_failed_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    write_fake_runtime(
+        &fake_runtime,
+        r#"#!/bin/sh
+case "$1" in
+  run)
+    echo "bind failed" >&2
+    exit 42
+    ;;
+esac
+exit 0
+"#,
+    );
+    let runtime = test_runtime(&dir, fake_runtime, configure_apple_published_port_target);
+    runtime.prepare_control_socket_dir().unwrap();
+
+    let err = runtime.start_container().await.unwrap_err();
+
+    assert!(err.to_string().contains("run"), "{err:#}");
+    assert!(
+        !runtime
+            .paths
+            .container_state_dir
+            .join("published-ssh-port")
+            .exists()
+    );
+    assert!(
+        !runtime
+            .paths
+            .container_state_dir
+            .join("published-ssh-port.pending")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn apple_start_container_retries_bind_conflict_after_deleting_labeled_leftover() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("runtime.log");
+    let leftover = dir.path().join("leftover");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  run)
+    echo "$@" >> "{log}"
+    if [ ! -f "{leftover}" ]; then
+      touch "{leftover}"
+      echo "bind: address already in use" >&2
+      exit 42
+    fi
+    ;;
+  inspect)
+    if [ -f "{leftover}" ]; then
+      cat <<JSON
+[{{"status":"stopped","configuration":{{"id":"ubuntu-dev","hostname":"ubuntu-dev","labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    else
+      echo "container not found" >&2
+      exit 1
+    fi
+    ;;
+  delete)
+    echo "$@" >> "{log}"
+    rm -f "{leftover}"
+    touch "{leftover}"
+    ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            leftover = leftover.display(),
+            user = user.user,
+            uid = user.uid,
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, configure_apple_published_port_target);
+    runtime.prepare_control_socket_dir().unwrap();
+
+    runtime.start_container().await.unwrap();
+
+    let log = std::fs::read_to_string(log).unwrap();
+    assert_eq!(log.matches("run ").count(), 2, "{log}");
+    assert!(log.contains("delete --force ubuntu-dev"), "{log}");
+    assert!(
+        runtime
+            .paths
+            .container_state_dir
+            .join("published-ssh-port")
+            .exists()
+    );
+    assert!(
+        !runtime
+            .paths
+            .container_state_dir
+            .join("published-ssh-port.pending")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn apple_published_ssh_endpoint_reads_persisted_port_after_label_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<JSON
+[{{"status":"running","configuration":{{"id":"ubuntu-dev","hostname":"ubuntu-dev","labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, configure_apple_published_port_target);
+    paths::ensure_private_dir(&runtime.paths.container_state_dir).unwrap();
+    std::fs::write(
+        runtime.paths.container_state_dir.join("published-ssh-port"),
+        "40222\n",
+    )
+    .unwrap();
+
+    let endpoint = runtime.published_ssh_endpoint().await.unwrap().unwrap();
+
+    assert_eq!(endpoint.host, "127.0.0.1");
+    assert_eq!(endpoint.port, 40222);
+}
+
+#[tokio::test]
+async fn apple_published_ssh_endpoint_fails_when_running_container_lacks_port_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<JSON
+[{{"status":"running","pid":123,"configuration":{{"id":"ubuntu-dev","hostname":"ubuntu-dev","labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, configure_apple_published_port_target);
+
+    let err = runtime.published_ssh_endpoint().await.unwrap_err();
+
+    assert!(err.to_string().contains("remove and recreate"), "{err:#}");
+}
+
+#[tokio::test]
 async fn runtime_load_rejects_rendered_passwd_delimiters() {
     for (field, identity_line) in [
         ("session_user", r#"session_user = "bad:user""#),
@@ -3437,7 +3671,7 @@ fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
             name: "ubuntu-dev".into(),
             state: runtime::ContainerState {
                 running: true,
-                pid: 123,
+                pid: Some(123),
             },
             config: runtime::ContainerConfig { labels: old_labels },
         })
@@ -3535,7 +3769,7 @@ fn context_labels_are_validation_labels_and_enforced() {
             name: "ubuntu-dev".into(),
             state: runtime::ContainerState {
                 running: true,
-                pid: 123,
+                pid: Some(123),
             },
             config: runtime::ContainerConfig { labels },
         })
@@ -3554,7 +3788,7 @@ fn context_labels_are_validation_labels_and_enforced() {
             name: "ubuntu-dev".into(),
             state: runtime::ContainerState {
                 running: true,
-                pid: 123,
+                pid: Some(123),
             },
             config: runtime::ContainerConfig {
                 labels: scoped_labels,
