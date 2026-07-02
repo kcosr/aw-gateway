@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Added experimental `apple_container` runtime support for Apple silicon macOS
+  26+ hosts, including Apple container CLI/system preflight checks and
+  published-port SSH endpoint handling.
 
 ## [0.7.0] - 2026-06-25
 

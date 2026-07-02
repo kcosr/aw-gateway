@@ -3,6 +3,8 @@ use crate::context::{RuntimeContext, context_from_labels, context_label_key};
 use crate::template::{self, Vars};
 use anyhow::Context;
 use serde::Deserialize;
+#[cfg(test)]
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -12,7 +14,7 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
+use std::process::{Command as StdCommand, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::AsyncReadExt;
@@ -429,6 +431,75 @@ impl Drop for ContainerPtySession {
 
 static NEXT_CANCEL_MARKER_ID: AtomicU64 = AtomicU64::new(1);
 static CANCEL_MARKER_SWEEP_KEYS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+static APPLE_PREFLIGHT_CACHE: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+const APPLE_CONTAINER_MIN_MACOS_MAJOR: u64 = 26;
+const APPLE_CONTAINER_MIN_VERSION: (u64, u64, u64) = (1, 0, 0);
+
+#[cfg(test)]
+thread_local! {
+    static APPLE_PREFLIGHT_TEST_BYPASS: Cell<bool> = const { Cell::new(false) };
+    static APPLE_PREFLIGHT_TEST_HOST: RefCell<Option<AppleHostInfo>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ApplePreflightBypassGuard {
+    previous: bool,
+}
+
+#[cfg(test)]
+impl Drop for ApplePreflightBypassGuard {
+    fn drop(&mut self) {
+        APPLE_PREFLIGHT_TEST_BYPASS.with(|bypass| bypass.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn disable_apple_preflight_for_tests() -> ApplePreflightBypassGuard {
+    let previous = APPLE_PREFLIGHT_TEST_BYPASS.with(|bypass| {
+        let previous = bypass.get();
+        bypass.set(true);
+        previous
+    });
+    ApplePreflightBypassGuard { previous }
+}
+
+#[cfg(test)]
+struct ApplePreflightHostGuard {
+    previous: Option<AppleHostInfo>,
+}
+
+#[cfg(test)]
+impl Drop for ApplePreflightHostGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        APPLE_PREFLIGHT_TEST_HOST.with(|host| {
+            *host.borrow_mut() = previous;
+        });
+    }
+}
+
+#[cfg(test)]
+fn override_apple_preflight_host_for_tests(host: AppleHostInfo) -> ApplePreflightHostGuard {
+    let previous = APPLE_PREFLIGHT_TEST_HOST.with(|current| current.replace(Some(host)));
+    ApplePreflightHostGuard { previous }
+}
+
+#[cfg(test)]
+fn apple_preflight_test_bypassed() -> bool {
+    APPLE_PREFLIGHT_TEST_BYPASS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn apple_preflight_test_host() -> Option<AppleHostInfo> {
+    APPLE_PREFLIGHT_TEST_HOST.with(|host| host.borrow().clone())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppleHostInfo {
+    os: String,
+    arch: String,
+    macos_version: Option<String>,
+}
 
 #[cfg(unix)]
 fn terminate_process_group(child_pid: u32) {
@@ -625,6 +696,268 @@ pub struct ContainerConfig {
     pub labels: BTreeMap<String, String>,
 }
 
+fn current_apple_host_info() -> anyhow::Result<AppleHostInfo> {
+    let os = std::env::consts::OS.to_string();
+    let macos_version = if os == "macos" {
+        Some(read_macos_product_version()?)
+    } else {
+        None
+    };
+    Ok(AppleHostInfo {
+        os,
+        arch: std::env::consts::ARCH.to_string(),
+        macos_version,
+    })
+}
+
+fn read_macos_product_version() -> anyhow::Result<String> {
+    let output = StdCommand::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .context("run sw_vers -productVersion to determine macOS version")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "sw_vers -productVersion failed while checking Apple container prerequisites: {}",
+            command_output_text(&output)
+        );
+    }
+    let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if version.is_empty() {
+        anyhow::bail!(
+            "sw_vers -productVersion returned an empty macOS version while checking Apple container prerequisites"
+        );
+    }
+    Ok(version)
+}
+
+fn run_apple_preflight_checks(
+    program: &str,
+    env: &BTreeMap<String, String>,
+    host: &AppleHostInfo,
+) -> anyhow::Result<()> {
+    validate_apple_host(host)?;
+
+    let version_output = run_apple_system_json_command(program, env, "version")?;
+    validate_apple_cli_version_json(&version_output.stdout)?;
+
+    let status_output = run_apple_system_json_command(program, env, "status")?;
+    serde_json::from_slice::<serde_json::Value>(&status_output.stdout)
+        .context("parse `container system status --format json` output as JSON")?;
+
+    Ok(())
+}
+
+fn validate_apple_host(host: &AppleHostInfo) -> anyhow::Result<()> {
+    if host.os != "macos" {
+        anyhow::bail!(
+            "apple container runtime requires Apple silicon macOS {APPLE_CONTAINER_MIN_MACOS_MAJOR} or newer; current host OS is {}",
+            host.os
+        );
+    }
+    if !matches!(host.arch.as_str(), "aarch64" | "arm64") {
+        anyhow::bail!(
+            "apple container runtime requires Apple silicon (aarch64/arm64); current host architecture is {}",
+            host.arch
+        );
+    }
+    let version = host.macos_version.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "apple container runtime requires macOS {APPLE_CONTAINER_MIN_MACOS_MAJOR} or newer, but macOS product version was unavailable"
+        )
+    })?;
+    let major = parse_major_version(version).ok_or_else(|| {
+        anyhow::anyhow!(
+            "apple container runtime requires macOS {APPLE_CONTAINER_MIN_MACOS_MAJOR} or newer, but could not parse macOS product version {version:?}"
+        )
+    })?;
+    if major < APPLE_CONTAINER_MIN_MACOS_MAJOR {
+        anyhow::bail!(
+            "apple container runtime requires macOS {APPLE_CONTAINER_MIN_MACOS_MAJOR} or newer; current macOS version is {version}"
+        );
+    }
+    Ok(())
+}
+
+fn run_apple_system_json_command(
+    program: &str,
+    env: &BTreeMap<String, String>,
+    subcommand: &str,
+) -> anyhow::Result<std::process::Output> {
+    let mut command = StdCommand::new(program);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let command_label = format!("{program} system {subcommand} --format json");
+    let output = command
+        .args(["system", subcommand, "--format", "json"])
+        .output()
+        .with_context(|| {
+            format!(
+                "run Apple container preflight command `{command_label}`; install the Apple container CLI or set [runtime].program to its path"
+            )
+        })?;
+    if !output.status.success() {
+        let output_text = command_output_text(&output);
+        if subcommand == "status" {
+            anyhow::bail!(
+                "apple container preflight command `{command_label}` failed: {output_text}; run `{program} system start` and retry"
+            );
+        }
+        anyhow::bail!(
+            "apple container preflight command `{command_label}` failed: {output_text}; install or upgrade Apple container CLI 1.0.0 or newer"
+        );
+    }
+    Ok(output)
+}
+
+fn validate_apple_cli_version_json(stdout: &[u8]) -> anyhow::Result<()> {
+    let value = serde_json::from_slice::<serde_json::Value>(stdout)
+        .context("parse `container system version --format json` output as JSON")?;
+    let Some((raw, version)) = apple_cli_version_candidate(&value) else {
+        return Ok(());
+    };
+    if version < APPLE_CONTAINER_MIN_VERSION {
+        anyhow::bail!(
+            "apple container runtime requires Apple container CLI 1.0.0 or newer; `container system version --format json` reported {raw}"
+        );
+    }
+    Ok(())
+}
+
+fn apple_cli_version_candidate(value: &serde_json::Value) -> Option<(&str, (u64, u64, u64))> {
+    if let Some(version) = documented_apple_cli_version(value) {
+        return version.and_then(|raw| parse_semver_triplet(raw).map(|version| (raw, version)));
+    }
+    first_parseable_version_string(value)
+}
+
+fn documented_apple_cli_version(value: &serde_json::Value) -> Option<Option<&str>> {
+    let rows = match value {
+        serde_json::Value::Array(rows) => Some(rows.as_slice()),
+        serde_json::Value::Object(map) => map
+            .get("components")
+            .or_else(|| map.get("Components"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice),
+        _ => None,
+    }?;
+
+    let mut saw_component_row = false;
+    for row in rows {
+        let Some(map) = row.as_object() else {
+            continue;
+        };
+        let Some(app_name) = map
+            .get("appName")
+            .or_else(|| map.get("AppName"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        let Some(version) = map
+            .get("version")
+            .or_else(|| map.get("Version"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        saw_component_row = true;
+        if app_name == "container" {
+            return Some(Some(version));
+        }
+    }
+
+    saw_component_row.then_some(None)
+}
+
+fn first_parseable_version_string(value: &serde_json::Value) -> Option<(&str, (u64, u64, u64))> {
+    let mut candidates = Vec::new();
+    collect_version_strings(value, None, &mut candidates);
+    candidates.sort_by_key(|(rank, _)| *rank);
+    candidates
+        .into_iter()
+        .find_map(|(_, raw)| parse_semver_triplet(raw).map(|version| (raw, version)))
+}
+
+fn collect_version_strings<'a>(
+    value: &'a serde_json::Value,
+    inherited_rank: Option<u8>,
+    candidates: &mut Vec<(u8, &'a str)>,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_version_strings(item, inherited_rank, candidates);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                let rank = version_key_rank(key).or(inherited_rank);
+                match value {
+                    serde_json::Value::String(raw) => {
+                        if let Some(rank) = rank {
+                            candidates.push((rank, raw));
+                        }
+                    }
+                    _ => collect_version_strings(value, rank, candidates),
+                }
+            }
+        }
+        serde_json::Value::String(raw) => {
+            if let Some(rank) = inherited_rank {
+                candidates.push((rank, raw));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn version_key_rank(key: &str) -> Option<u8> {
+    let lower = key.to_ascii_lowercase();
+    if lower == "version" {
+        Some(0)
+    } else if (lower.contains("cli") || lower.contains("client") || lower.contains("container"))
+        && lower.contains("version")
+    {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+fn parse_major_version(raw: &str) -> Option<u64> {
+    raw.trim().split('.').next()?.parse().ok()
+}
+
+fn parse_semver_triplet(raw: &str) -> Option<(u64, u64, u64)> {
+    let core = raw
+        .trim()
+        .trim_start_matches('v')
+        .split(['-', '+'])
+        .next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+fn command_output_text(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        format!("exited with status {}", output.status)
+    } else {
+        stdout
+    }
+}
+
 impl ContainerRuntime {
     pub fn from_config(cfg: &RuntimeConfig, user: &str, home: &Path) -> anyhow::Result<Self> {
         let program = cfg
@@ -738,8 +1071,8 @@ impl ContainerRuntime {
     }
 
     pub async fn inspect(&self, name: &str) -> anyhow::Result<Option<ContainerInspect>> {
-        let output = self
-            .command()
+        let mut command = self.command()?;
+        let output = command
             .args(["inspect", name])
             .output()
             .await
@@ -809,7 +1142,7 @@ impl ContainerRuntime {
         spec: &ContainerExecSpec,
         timeout_duration: Option<Duration>,
     ) -> anyhow::Result<i32> {
-        let mut command = self.command();
+        let mut command = self.command()?;
         apply_command_env(&mut command, self.exec_env(spec));
         command
             .arg("exec")
@@ -844,7 +1177,7 @@ impl ContainerRuntime {
         spec: &ContainerExecSpec,
         timeout_duration: Option<Duration>,
     ) -> anyhow::Result<ContainerExecOutput> {
-        let mut command = self.command();
+        let mut command = self.command()?;
         apply_command_env(&mut command, self.exec_env(spec));
         command
             .arg("exec")
@@ -919,7 +1252,7 @@ impl ContainerRuntime {
         let cleanup_spec = cancel_cleanup_spec(spec, &marker, "aw-gateway-exec-cleanup");
         let remove_spec = cancel_marker_remove_spec(spec, &marker, "aw-gateway-exec-rm");
 
-        let mut command = self.command();
+        let mut command = self.command()?;
         apply_command_env(&mut command, self.exec_env(&exec_spec));
         command
             .arg("exec")
@@ -1001,7 +1334,7 @@ impl ContainerRuntime {
         let cleanup_spec = cancel_cleanup_spec(spec, &marker, "aw-gateway-exec-cleanup");
         let remove_spec = cancel_marker_remove_spec(spec, &marker, "aw-gateway-exec-rm");
 
-        let mut command = self.command();
+        let mut command = self.command()?;
         apply_command_env(&mut command, self.exec_env(&exec_spec));
         command
             .arg("exec")
@@ -1057,7 +1390,7 @@ impl ContainerRuntime {
         spec: &ContainerExecSpec,
         timeout_duration: Option<Duration>,
     ) -> anyhow::Result<i32> {
-        let mut command = self.command();
+        let mut command = self.command()?;
         apply_command_env(&mut command, self.exec_env(spec));
         command
             .arg("exec")
@@ -1101,6 +1434,7 @@ impl ContainerRuntime {
 
         let pty_system = portable_pty::native_pty_system();
         let pair = pty_system.openpty(pty_size(size))?;
+        self.preflight()?;
         let mut command = portable_pty::CommandBuilder::new(&self.program);
         command.arg("exec");
         command.args(self.exec_args(&pty_spec));
@@ -1165,8 +1499,8 @@ impl ContainerRuntime {
                     .map(|arg| arg.as_ref().to_string_lossy().into_owned())
                     .collect(),
             };
-            let output = self
-                .command()
+            let mut command = self.command()?;
+            let output = command
                 .arg("exec")
                 .args(self.exec_args(&spec))
                 .output()
@@ -1174,8 +1508,8 @@ impl ContainerRuntime {
                 .with_context(|| format!("run {} exec {name}", self.runtime_label()))?;
             return Ok(output.status.code().unwrap_or(1));
         }
-        let output = self
-            .command()
+        let mut command = self.command()?;
+        let output = command
             .arg("exec")
             .arg(name)
             .args(args)
@@ -1193,8 +1527,8 @@ impl ContainerRuntime {
         if self.kind == ContainerRuntimeType::AppleContainer {
             return Ok(None);
         }
-        let output = self
-            .command()
+        let mut command = self.command()?;
+        let output = command
             .args(["port", name, &format!("{container_port}/tcp")])
             .output()
             .await
@@ -1212,8 +1546,8 @@ impl ContainerRuntime {
         context: &RuntimeContext,
     ) -> anyhow::Result<Vec<ManagedContainer>> {
         let command_label = self.list_command_label();
-        let output = self
-            .command()
+        let mut command = self.command()?;
+        let output = command
             .args(self.list_managed_args(user, uid, context))
             .output()
             .await
@@ -1495,12 +1829,58 @@ impl ContainerRuntime {
         }
     }
 
-    fn command(&self) -> Command {
+    fn command(&self) -> anyhow::Result<Command> {
+        self.preflight()?;
+        Ok(self.command_without_preflight())
+    }
+
+    fn command_without_preflight(&self) -> Command {
         let mut command = Command::new(&self.program);
         for (key, value) in &self.env {
             command.env(key, value);
         }
         command
+    }
+
+    fn preflight(&self) -> anyhow::Result<()> {
+        if self.kind != ContainerRuntimeType::AppleContainer {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if apple_preflight_test_bypassed() {
+            return Ok(());
+        }
+
+        let key = self.apple_preflight_cache_key();
+        let cache = APPLE_PREFLIGHT_CACHE.get_or_init(|| Mutex::new(BTreeSet::new()));
+        if cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apple container preflight cache lock poisoned"))?
+            .contains(&key)
+        {
+            return Ok(());
+        }
+
+        let host = Self::apple_preflight_host_info()?;
+        run_apple_preflight_checks(&self.program, &self.env, &host)?;
+
+        cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("apple container preflight cache lock poisoned"))?
+            .insert(key);
+        Ok(())
+    }
+
+    fn apple_preflight_cache_key(&self) -> String {
+        self.program.clone()
+    }
+
+    fn apple_preflight_host_info() -> anyhow::Result<AppleHostInfo> {
+        #[cfg(test)]
+        if let Some(host) = apple_preflight_test_host() {
+            return Ok(host);
+        }
+        current_apple_host_info()
     }
 
     async fn run_status<I, S>(&self, subcommand: &str, args: I) -> anyhow::Result<()>
@@ -1522,7 +1902,7 @@ impl ContainerRuntime {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut command = self.command();
+        let mut command = self.command()?;
         apply_command_env(&mut command, env);
         let output = command
             .arg(subcommand)
@@ -2351,6 +2731,332 @@ exit 0
         assert!(runtime.env().is_empty());
     }
 
+    fn valid_apple_preflight_host() -> AppleHostInfo {
+        AppleHostInfo {
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            macos_version: Some("26.0".into()),
+        }
+    }
+
+    #[test]
+    fn apple_preflight_host_validation_rejects_non_macos() {
+        let host = AppleHostInfo {
+            os: "linux".into(),
+            arch: "aarch64".into(),
+            macos_version: None,
+        };
+
+        let err = validate_apple_host(&host).unwrap_err();
+
+        assert!(err.to_string().contains("current host OS is linux"));
+    }
+
+    #[test]
+    fn apple_preflight_host_validation_rejects_intel_macos() {
+        let host = AppleHostInfo {
+            os: "macos".into(),
+            arch: "x86_64".into(),
+            macos_version: Some("26.0".into()),
+        };
+
+        let err = validate_apple_host(&host).unwrap_err();
+
+        assert!(err.to_string().contains("requires Apple silicon"));
+    }
+
+    #[test]
+    fn apple_preflight_host_validation_rejects_old_macos() {
+        let host = AppleHostInfo {
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            macos_version: Some("25.6".into()),
+        };
+
+        let err = validate_apple_host(&host).unwrap_err();
+
+        assert!(err.to_string().contains("current macOS version is 25.6"));
+    }
+
+    #[test]
+    fn apple_preflight_host_validation_accepts_apple_silicon_macos_26() {
+        validate_apple_host(&valid_apple_preflight_host()).unwrap();
+    }
+
+    #[test]
+    fn apple_preflight_rejects_missing_runtime_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("missing-container");
+
+        let err = run_apple_preflight_checks(
+            &program.display().to_string(),
+            &BTreeMap::new(),
+            &valid_apple_preflight_host(),
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("install the Apple container CLI"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn apple_preflight_accepts_successful_system_version_and_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-container");
+        std::fs::write(
+            &runtime_program,
+            r#"#!/bin/sh
+case "$*" in
+  "system version --format json")
+    echo '{"version":"1.0.0"}'
+    ;;
+  "system status --format json")
+    echo '{"status":"running"}'
+    ;;
+  *)
+    echo "unexpected args: $*" >&2
+    exit 64
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        run_apple_preflight_checks(
+            &runtime_program.display().to_string(),
+            &BTreeMap::new(),
+            &valid_apple_preflight_host(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn apple_preflight_rejects_old_cli_semver() {
+        let err = validate_apple_cli_version_json(br#"{"version":"0.9.0"}"#).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("requires Apple container CLI 1.0.0")
+        );
+    }
+
+    #[test]
+    fn apple_preflight_accepts_unknown_cli_version_shape_after_json_parse() {
+        validate_apple_cli_version_json(br#"{"build":"2026A42"}"#).unwrap();
+    }
+
+    #[test]
+    fn apple_preflight_prefers_client_version_over_api_version() {
+        validate_apple_cli_version_json(br#"{"apiVersion":"0.1.0","clientVersion":"1.0.0"}"#)
+            .unwrap();
+    }
+
+    #[test]
+    fn apple_preflight_uses_documented_container_component_version() {
+        validate_apple_cli_version_json(
+            br#"[
+  {"appName":"container-apiserver","version":"0.1.0"},
+  {"appName":"container","version":"1.0.0"}
+]"#,
+        )
+        .unwrap();
+
+        let err = validate_apple_cli_version_json(
+            br#"[
+  {"appName":"container-apiserver","version":"1.0.0"},
+  {"appName":"container","version":"0.9.0"}
+]"#,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires Apple container CLI 1.0.0"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn apple_preflight_rejects_non_json_version_output() {
+        let err = validate_apple_cli_version_json(b"not json").unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("system version --format json"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn apple_preflight_rejects_system_status_failure_with_start_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-container");
+        std::fs::write(
+            &runtime_program,
+            r#"#!/bin/sh
+case "$*" in
+  "system version --format json")
+    echo '{"version":"1.0.0"}'
+    ;;
+  "system status --format json")
+    echo "system is stopped" >&2
+    exit 42
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = run_apple_preflight_checks(
+            &runtime_program.display().to_string(),
+            &BTreeMap::new(),
+            &valid_apple_preflight_host(),
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("system start"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn apple_preflight_caches_successful_command_path_by_program() {
+        let _host = override_apple_preflight_host_for_tests(valid_apple_preflight_host());
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-container");
+        let preflight_log = dir.path().join("preflight.log");
+        let list_log = dir.path().join("list.log");
+        std::fs::write(
+            &runtime_program,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  "system version --format json")
+    echo "$*" >> "{preflight_log}"
+    echo '[{{"appName":"container-apiserver","version":"0.1.0"}},{{"appName":"container","version":"1.0.0"}}]'
+    ;;
+  "system status --format json")
+    echo "$*" >> "{preflight_log}"
+    echo '{{"status":"running"}}'
+    ;;
+  "list --all --format json")
+    echo "$*" >> "{list_log}"
+    echo '[]'
+    ;;
+  *)
+    echo "unexpected args: $*" >&2
+    exit 64
+    ;;
+esac
+"#,
+                preflight_log = preflight_log.display(),
+                list_log = list_log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::AppleContainer,
+            program: runtime_program.display().to_string(),
+            env: BTreeMap::new(),
+        };
+
+        runtime
+            .list_managed_containers("alice", 2450, &RuntimeContext::empty())
+            .await
+            .unwrap();
+        runtime
+            .list_managed_containers("alice", 2450, &RuntimeContext::empty())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(preflight_log)
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        assert_eq!(
+            std::fs::read_to_string(list_log).unwrap().lines().count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn apple_preflight_retries_after_failed_command_path_preflight() {
+        let _host = override_apple_preflight_host_for_tests(valid_apple_preflight_host());
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-container");
+        let preflight_log = dir.path().join("preflight.log");
+        let list_log = dir.path().join("list.log");
+        let fail_status = dir.path().join("fail-status");
+        std::fs::write(&fail_status, "").unwrap();
+        std::fs::write(
+            &runtime_program,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  "system version --format json")
+    echo "$*" >> "{preflight_log}"
+    echo '[{{"appName":"container","version":"1.0.0"}}]'
+    ;;
+  "system status --format json")
+    echo "$*" >> "{preflight_log}"
+    if [ -f "{fail_status}" ]; then
+      rm -f "{fail_status}"
+      echo "system is stopped" >&2
+      exit 42
+    fi
+    echo '{{"status":"running"}}'
+    ;;
+  "list --all --format json")
+    echo "$*" >> "{list_log}"
+    echo '[]'
+    ;;
+  *)
+    echo "unexpected args: $*" >&2
+    exit 64
+    ;;
+esac
+"#,
+                preflight_log = preflight_log.display(),
+                list_log = list_log.display(),
+                fail_status = fail_status.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::AppleContainer,
+            program: runtime_program.display().to_string(),
+            env: BTreeMap::new(),
+        };
+
+        let err = runtime
+            .list_managed_containers("alice", 2450, &RuntimeContext::empty())
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("system start"), "{err:#}");
+
+        runtime
+            .list_managed_containers("alice", 2450, &RuntimeContext::empty())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(preflight_log)
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
+        assert_eq!(
+            std::fs::read_to_string(list_log).unwrap().lines().count(),
+            1
+        );
+    }
+
     #[test]
     fn list_managed_args_filter_by_gateway_user_and_uid() {
         let runtime = ContainerRuntime {
@@ -2969,6 +3675,7 @@ exit 0
 
     #[tokio::test]
     async fn apple_exec_quiet_uses_apple_exec_renderer() {
+        let _apple_preflight_bypass = disable_apple_preflight_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
         let log = dir.path().join("runtime.log");
@@ -2998,6 +3705,7 @@ exit 0
 
     #[tokio::test]
     async fn apple_list_managed_containers_fails_closed_when_labels_are_missing() {
+        let _apple_preflight_bypass = disable_apple_preflight_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
         std::fs::write(

@@ -1,10 +1,10 @@
 # Agent Workspaces Gateway
 
 `aw-gateway` is a configuration, orchestration, and access layer for
-disposable or reusable container workspaces. It wraps Podman, Docker, or Colima
-with validated target definitions, lifecycle hooks, readiness checks,
-in-container service supervision, generated SSH client config, and an optional
-JSON HTTP API.
+disposable or reusable container workspaces. It wraps Podman, Docker, Colima,
+or Apple container with validated target definitions, lifecycle hooks,
+readiness checks, in-container service supervision, generated SSH client
+config, and an optional JSON HTTP API.
 
 Users connect with familiar tools such as OpenSSH, SCP, SFTP, VS Code, the
 host CLI, or HTTP automation. The gateway starts or reuses the configured
@@ -42,9 +42,9 @@ access behind explicit gateway paths and policy hooks.
 
 Container runtimes already provide the isolation and process model. The purpose
 of `aw-gateway` is to make those containers easier to configure, prepare,
-access, and reuse as workspaces. It wraps Podman, Docker, or Colima with a
-validated config model, lifecycle hooks, readiness checks, service supervision,
-generated SSH client config, and optional HTTP automation.
+access, and reuse as workspaces. It wraps Podman, Docker, Colima, or Apple
+container with a validated config model, lifecycle hooks, readiness checks,
+service supervision, generated SSH client config, and optional HTTP automation.
 
 The main value is operational convenience and consistent access. Operators can
 describe targets, launches, identity, mounts, cleanup, and policy once in TOML
@@ -69,7 +69,7 @@ gateway binary.
 - Optional JSON HTTP API for status, targets, readiness, launch, and run
   automation.
 - Container lifecycle management for fixed and ephemeral targets.
-- Runtime support for Podman, Docker, and Colima.
+- Runtime support for Podman, Docker, Colima, and Apple container.
 - Config-driven lifecycle steps before container start and host steps after
   start, including health checks.
 - Named launches for validated, discoverable command templates that prepare a
@@ -171,7 +171,7 @@ flowchart LR
     subgraph host["Managed host or local workstation"]
         hostssh["Host sshd (managed deployments)"]
         gw["aw-gateway: CLI, SSH dispatch, HTTP listener, client-config generation"]
-        runtime["Podman / Docker / Colima"]
+        runtime["Podman / Docker / Colima / Apple container"]
         wsdir["Host workspace and state directory"]
     end
 
@@ -559,7 +559,7 @@ Minimal runtime selection:
 
 ```toml
 [runtime]
-type = "podman" # podman, docker, or colima
+type = "podman" # podman, docker, colima, or apple_container
 ```
 
 Docker can use a specific Docker socket:
@@ -579,8 +579,15 @@ type = "colima"
 profile = "default"
 ```
 
+Apple container support is for Apple silicon macOS 26 or newer with Apple
+container CLI 1.0.0 or newer. Before Apple runtime operations, the gateway
+checks `container system version --format json` and
+`container system status --format json`; if the system is stopped, run
+`container system start`. Apple container targets use the `published_port`
+local SSH backend.
+
 Set `runtime.program` to use a specific runtime executable instead of looking
-up the default `podman`, `docker`, or `colima` binary on `PATH`:
+up the default `podman`, `docker`, `colima`, or `container` binary on `PATH`:
 
 ```toml
 [runtime]
@@ -856,9 +863,9 @@ intentionally want host-process values to override the container-oriented
 defaults. Inherited values must be valid UTF-8; values that are present but not
 valid UTF-8 are skipped with a warning.
 
-Runtime exec env values are normally supplied through the spawned Podman,
-Docker, or Colima process environment while only the env names appear on runtime
-argv. Env names that can alter the host-side runtime client itself, such as
+Runtime exec env values are normally supplied through the spawned container
+runtime process environment while only the env names appear on runtime argv.
+Env names that can alter the host-side runtime client itself, such as
 `PATH`, `LD_PRELOAD`, `DOCKER_HOST`, and related loader/runtime configuration
 keys, are passed as explicit `KEY=value` runtime arguments instead of being set
 on the client process environment. Avoid using those host-sensitive names for
@@ -1972,7 +1979,7 @@ flowchart TD
     D -- yes, running --> I[Validate labels]
     E --> F[Create identity/control tokens when needed]
     F --> G[Render container-agent config when enabled]
-    G --> H[Run container through Podman, Docker, or Colima]
+    G --> H[Run container through configured runtime]
     H --> I
     I --> J[Run configured post_start host steps]
     J --> K{Container agent enabled?}
@@ -2022,7 +2029,7 @@ sequenceDiagram
     autonumber
     participant U as User
     participant G as aw-gateway up
-    participant R as Podman/Docker/Colima
+    participant R as Container runtime
     participant A as aw-container-agent
     participant T as Local SSH tool
 
@@ -2155,8 +2162,8 @@ gh release upload "$RELEASE_TAG" \
 - `src/config/` - focused config support modules for targets, launches,
   includes, root inheritance, steps, agent config, validation, and template
   resolution.
-- `src/runtime.rs` and `src/runtime/` - Podman, Docker, and Colima command
-  construction and runtime support.
+- `src/runtime.rs` and `src/runtime/` - Podman, Docker, Colima, and Apple
+  container command construction and runtime support.
 - `src/ssh_dispatch.rs` - `SSH_ORIGINAL_COMMAND` parsing and restricted SSH
   dispatch.
 - `src/logging.rs` - tracing setup and rotating log files.

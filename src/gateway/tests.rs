@@ -2836,6 +2836,7 @@ exit 0
 
 #[tokio::test]
 async fn apple_start_container_promotes_preallocated_published_ssh_port() {
+    let _apple_preflight_bypass = crate::runtime::disable_apple_preflight_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let fake_runtime = dir.path().join("runtime");
     let log = dir.path().join("run.log");
@@ -2878,6 +2879,7 @@ exit 0
 
 #[tokio::test]
 async fn apple_start_container_removes_pending_published_ssh_port_after_failed_run() {
+    let _apple_preflight_bypass = crate::runtime::disable_apple_preflight_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let fake_runtime = dir.path().join("runtime");
     write_fake_runtime(
@@ -2916,6 +2918,7 @@ exit 0
 
 #[tokio::test]
 async fn apple_start_container_retries_bind_conflict_after_deleting_labeled_leftover() {
+    let _apple_preflight_bypass = crate::runtime::disable_apple_preflight_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let fake_runtime = dir.path().join("runtime");
     let log = dir.path().join("runtime.log");
@@ -2984,6 +2987,7 @@ exit 0
 
 #[tokio::test]
 async fn apple_published_ssh_endpoint_reads_persisted_port_after_label_validation() {
+    let _apple_preflight_bypass = crate::runtime::disable_apple_preflight_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let fake_runtime = dir.path().join("runtime");
     let user = UserContext::current().unwrap();
@@ -3020,6 +3024,7 @@ exit 0
 
 #[tokio::test]
 async fn apple_published_ssh_endpoint_fails_when_running_container_lacks_port_state() {
+    let _apple_preflight_bypass = crate::runtime::disable_apple_preflight_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let fake_runtime = dir.path().join("runtime");
     let user = UserContext::current().unwrap();
