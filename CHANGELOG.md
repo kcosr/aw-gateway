@@ -6,8 +6,9 @@
 
 - Added experimental `apple_container` runtime support for Apple silicon macOS
   26+ hosts, including Apple container CLI/system preflight checks and
-  published-port SSH endpoint handling, plus a local Apple container deployment
-  guide and sample config.
+  published-port SSH endpoint handling, object-shaped Apple `status` and
+  `configuration.image` JSON parsing, validated bare-key exec env inheritance,
+  plus a local Apple container deployment guide and sample config.
 
 ## [0.7.0] - 2026-06-25
 

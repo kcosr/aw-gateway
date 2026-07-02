@@ -1855,7 +1855,7 @@ impl ContainerRuntime {
         }
         for (key, value) in &spec.env {
             args.push("--env".into());
-            args.push(explicit_env_arg(key, value));
+            args.push(runtime_env_arg(key, value));
         }
         args.push(spec.container_name.clone());
         args.extend(spec.command.clone());
@@ -2143,6 +2143,8 @@ fn runtime_client_sensitive_env_key(key: &str) -> bool {
             | "CONTAINER_HOST"
             | "CONTAINER_CONNECTION"
             | "CONTAINER_SSHKEY"
+            | "CONTAINER_DEBUG"
+            | "CONTAINER_DEFAULT_PLATFORM"
             | "CONTAINERS_CONF"
             | "CONTAINERS_REGISTRIES_CONF"
             | "CONTAINERS_STORAGE_CONF"
@@ -3394,6 +3396,47 @@ esac
     }
 
     #[test]
+    fn apple_parse_container_inspect_accepts_fixture_object_shape() {
+        let inspect = parse::parse_apple_container_inspect(
+            br#"[{
+  "configuration": {
+    "id": "aw-default",
+    "image": {
+      "reference": "docker.io/library/alpine:latest"
+    },
+    "labels": {
+      "io.aw-gateway.gateway": "true",
+      "io.aw-gateway.user": "alice",
+      "io.aw-gateway.uid": "2450"
+    }
+  },
+  "id": "aw-default",
+  "status": {
+    "networks": [],
+    "startedDate": "2026-07-02T12:00:25Z",
+    "state": "running"
+  }
+}]"#,
+            "apple container",
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(inspect.id, "aw-default");
+        assert_eq!(inspect.name, "aw-default");
+        assert!(inspect.state.running);
+        assert_eq!(inspect.state.pid, None);
+        assert_eq!(
+            inspect
+                .config
+                .labels
+                .get("io.aw-gateway.uid")
+                .map(String::as_str),
+            Some("2450")
+        );
+    }
+
+    #[test]
     fn apple_parse_container_inspect_requires_zero_or_one_result() {
         let empty = parse::parse_apple_container_inspect(b"[]", "apple container").unwrap();
         assert!(empty.is_none());
@@ -3458,6 +3501,60 @@ esac
             "alice",
             2450
         ));
+    }
+
+    #[test]
+    fn apple_parse_container_list_accepts_fixture_object_shape() {
+        let raw = br#"
+[
+  {
+    "configuration": {
+      "id": "aw-default",
+      "image": {
+        "reference": "docker.io/library/alpine:latest"
+      },
+      "labels": {
+        "io.aw-gateway.gateway": "true",
+        "io.aw-gateway.user": "alice",
+        "io.aw-gateway.uid": "2450"
+      }
+    },
+    "id": "aw-default",
+    "status": {
+      "networks": [],
+      "state": "running"
+    }
+  },
+  {
+    "configuration": {
+      "id": "aw-stopped",
+      "image": {
+        "reference": "docker.io/library/busybox:latest"
+      },
+      "labels": {
+        "io.aw-gateway.gateway": "true",
+        "io.aw-gateway.user": "alice",
+        "io.aw-gateway.uid": "2450"
+      }
+    },
+    "id": "aw-stopped",
+    "status": {
+      "networks": [],
+      "state": "stopped"
+    }
+  }
+]
+"#;
+
+        let containers = parse::parse_apple_container_list(raw).unwrap();
+
+        assert_eq!(containers.len(), 2);
+        assert_eq!(containers[0].name, "aw-default");
+        assert_eq!(containers[0].image, "docker.io/library/alpine:latest");
+        assert!(containers[0].running);
+        assert_eq!(containers[1].name, "aw-stopped");
+        assert_eq!(containers[1].image, "docker.io/library/busybox:latest");
+        assert!(!containers[1].running);
     }
 
     #[test]
@@ -3772,6 +3869,7 @@ esac
             user: "2450:100".into(),
             cwd: Some(PathBuf::from("/home/alice/project")),
             env: BTreeMap::from([
+                ("AW_IDENTITY_TOKEN".into(), "token-secret".into()),
                 ("CODEX_HOME".into(), "/var/lib/codex".into()),
                 ("PATH".into(), "/tmp/bad".into()),
             ]),
@@ -3789,7 +3887,9 @@ esac
                 "--workdir",
                 "/home/alice/project",
                 "--env",
-                "CODEX_HOME=/var/lib/codex",
+                "AW_IDENTITY_TOKEN",
+                "--env",
+                "CODEX_HOME",
                 "--env",
                 "PATH=/tmp/bad",
                 "ubuntu-dev",
@@ -3797,6 +3897,12 @@ esac
                 "-lc",
                 "id -u",
             ]
+        );
+        assert!(
+            !runtime
+                .exec_args(&spec)
+                .iter()
+                .any(|arg| arg.contains("token-secret"))
         );
     }
 
@@ -3979,6 +4085,8 @@ exit 0
                 ("DOCKER_CERT_PATH".into(), "/tmp/certs".into()),
                 ("CONTAINER_CONNECTION".into(), "attacker".into()),
                 ("CONTAINER_SSHKEY".into(), "/tmp/key".into()),
+                ("CONTAINER_DEBUG".into(), "1".into()),
+                ("CONTAINER_DEFAULT_PLATFORM".into(), "linux/amd64".into()),
             ]),
             container_name: "ubuntu-dev".into(),
             command: vec!["true".into()],
@@ -4029,6 +4137,15 @@ exit 0
             args.windows(2)
                 .any(|pair| pair[0] == "--env" && pair[1] == "CONTAINER_SSHKEY=/tmp/key")
         );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--env" && pair[1] == "CONTAINER_DEBUG=1")
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--env"
+                    && pair[1] == "CONTAINER_DEFAULT_PLATFORM=linux/amd64")
+        );
 
         assert!(runtime_env_can_passthrough_client_process("AW_SAFE"));
         assert!(!runtime_env_can_passthrough_client_process("PATH"));
@@ -4050,6 +4167,12 @@ exit 0
         ));
         assert!(!runtime_env_can_passthrough_client_process(
             "CONTAINER_SSHKEY"
+        ));
+        assert!(!runtime_env_can_passthrough_client_process(
+            "CONTAINER_DEBUG"
+        ));
+        assert!(!runtime_env_can_passthrough_client_process(
+            "CONTAINER_DEFAULT_PLATFORM"
         ));
     }
 

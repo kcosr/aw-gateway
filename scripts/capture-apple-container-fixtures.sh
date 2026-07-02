@@ -282,9 +282,14 @@ capture_required_stdout list_with_labeled_running_json "$CONTAINER_CLI" list --a
 capture_required_stdout exec_env_explicit "$CONTAINER_CLI" exec \
 	--env AWGW_FIXTURE_EXEC_EXPLICIT=exec-fixture \
 	"$RUNNING_NAME" sh -c 'printf "%s\n" "$AWGW_FIXTURE_EXEC_EXPLICIT"'
-capture exec_env_inherit env AWGW_FIXTURE_EXEC_INHERIT=exec-inherit \
+EXEC_ENV_INHERIT_VALUE="aw-gateway-exec-env-$TIMESTAMP"
+capture_required_stdout exec_env_inherit env "AWGW_FIXTURE_EXEC_INHERIT=$EXEC_ENV_INHERIT_VALUE" \
 	"$CONTAINER_CLI" exec --env AWGW_FIXTURE_EXEC_INHERIT \
 	"$RUNNING_NAME" sh -c 'printf "%s\n" "$AWGW_FIXTURE_EXEC_INHERIT"'
+if [[ "$(tr -d '\r' <"$OUT_DIR/exec_env_inherit/stdout.txt")" != "$EXEC_ENV_INHERIT_VALUE" ]]; then
+	log "container exec did not inherit bare --env key from host environment"
+	FAILURES=$((FAILURES + 1))
+fi
 capture_required stop_labeled "$CONTAINER_CLI" stop "$RUNNING_NAME"
 capture_required_stdout inspect_labeled_stopped_json "$CONTAINER_CLI" inspect "$RUNNING_NAME"
 capture_required delete_labeled "$CONTAINER_CLI" delete --force "$RUNNING_NAME"

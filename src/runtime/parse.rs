@@ -37,7 +37,7 @@ struct AppleContainerConfigurationRaw {
     #[serde(default)]
     hostname: Option<String>,
     #[serde(default)]
-    image: Option<String>,
+    image: Option<AppleImageField>,
     #[serde(default)]
     labels: LabelField,
     #[serde(default, alias = "Pid", alias = "processID", alias = "process_id")]
@@ -49,7 +49,7 @@ struct AppleContainerInspectRaw {
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
-    status: String,
+    status: AppleStatusField,
     #[serde(default, alias = "Pid", alias = "processID", alias = "process_id")]
     pid: Option<i64>,
     #[serde(default)]
@@ -65,9 +65,9 @@ struct AppleManagedContainerRaw {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    image: Option<String>,
+    image: Option<AppleImageField>,
     #[serde(default)]
-    status: String,
+    status: AppleStatusField,
     #[serde(default)]
     labels: LabelField,
     #[serde(default)]
@@ -88,6 +88,30 @@ enum ContainerNames {
 enum LabelField {
     Map(BTreeMap<String, String>),
     Text(String),
+    #[default]
+    Empty,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(untagged)]
+enum AppleImageField {
+    Text(String),
+    Object {
+        #[serde(default)]
+        reference: Option<String>,
+    },
+    #[default]
+    Empty,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(untagged)]
+enum AppleStatusField {
+    Text(String),
+    Object {
+        #[serde(default)]
+        state: Option<String>,
+    },
     #[default]
     Empty,
 }
@@ -126,8 +150,16 @@ impl ManagedContainer {
             .or(raw.configuration.id)
             .map(normalize_container_name)
             .filter(|value| !value.is_empty())?;
-        let image = raw.image.or(raw.configuration.image).unwrap_or_default();
-        let status = raw.status.to_ascii_lowercase();
+        let image = raw
+            .image
+            .and_then(AppleImageField::into_reference)
+            .or_else(|| {
+                raw.configuration
+                    .image
+                    .and_then(AppleImageField::into_reference)
+            })
+            .unwrap_or_default();
+        let status = raw.status.state().to_ascii_lowercase();
         Some(Self {
             name,
             image,
@@ -163,6 +195,28 @@ impl LabelField {
                 .filter(|(key, _)| !key.is_empty())
                 .collect(),
             LabelField::Empty => BTreeMap::new(),
+        }
+    }
+}
+
+impl AppleImageField {
+    fn into_reference(self) -> Option<String> {
+        match self {
+            AppleImageField::Text(value) => Some(value),
+            AppleImageField::Object { reference } => reference,
+            AppleImageField::Empty => None,
+        }
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    }
+}
+
+impl AppleStatusField {
+    fn state(&self) -> &str {
+        match self {
+            AppleStatusField::Text(value) => value,
+            AppleStatusField::Object { state } => state.as_deref().unwrap_or(""),
+            AppleStatusField::Empty => "",
         }
     }
 }
@@ -281,7 +335,7 @@ fn container_inspect_from_apple_raw(
             .filter(|value| !value.is_empty())
             .unwrap_or(id),
         state: ContainerState {
-            running: value.status.eq_ignore_ascii_case("running"),
+            running: value.status.state().eq_ignore_ascii_case("running"),
             pid,
         },
         config: ContainerConfig { labels },
