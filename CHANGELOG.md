@@ -9,6 +9,8 @@
   status, run, launch, and the new local `shell` command without exposing
   container SSH, and Apple container targets can now use this mode without a
   published SSH port.
+- Added runtime-exec sample configs for local Podman, Docker, and Colima
+  deployments.
 
 ### Changed
 
@@ -16,6 +18,11 @@
   target access mode. Existing configs default to `access.method = "ssh"`;
   target-specific container reuse now fails closed when a labeled container's
   access mode differs from the effective target config.
+
+### Fixed
+
+- Published-port SSH targets now report only `ssh_tcp` in status JSON instead
+  of also exposing a Unix `ssh_socket` path.
 
 ## [0.8.0] - 2026-07-02
 

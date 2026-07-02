@@ -421,6 +421,48 @@ fn write_gateway_config(dir: &tempfile::TempDir, body: &str) -> PathBuf {
     config
 }
 
+fn write_runtime_exec_gateway_config(dir: &tempfile::TempDir) -> PathBuf {
+    write_gateway_config(
+        dir,
+        &format!(
+            r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+program = "{program}"
+
+[target_defaults.workspace]
+path = "{workspace}"
+state_dir = ".aw-gateway"
+
+[target_defaults.container_agent]
+enabled = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+container_user = "root"
+container_home = "/root"
+
+[targets.default.access]
+method = "runtime_exec"
+
+[targets.default.identity]
+bootstrap_user = "root"
+session_user = "root"
+session_uid = "0"
+session_gid = "0"
+session_home = "/root"
+session_shell = "/bin/bash"
+"#,
+            program = dir.path().join("runtime").display(),
+            workspace = dir.path().join("workspace").display(),
+        ),
+    )
+}
+
 fn assert_invalid_launch_variable(err: OperationError, expected: &str) {
     let OperationError::InvalidLaunchVariable { message } = err else {
         panic!("expected invalid launch variable error, got {err:?}");
@@ -1312,6 +1354,95 @@ fn runtime_exec_rejects_ssh_only_operations_before_side_effects() {
         .to_string();
     assert!(err.contains("client-config"), "{err}");
     assert!(err.contains("runtime_exec"), "{err}");
+}
+
+#[tokio::test]
+async fn runtime_exec_ssh_only_operations_fail_before_writes_or_key_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_runtime_exec_gateway_config(&dir);
+    let missing_key = dir.path().join("missing.pub");
+
+    let err = execute_gateway_operation(
+        Some(config.clone()),
+        GatewayOperation::ClientConfig {
+            target: Some("default".into()),
+            identity_file: None,
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("client-config"), "{err}");
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(
+        !dir.path().join("workspace/.aw-gateway").exists(),
+        "client-config should fail before writing container-state SSH files"
+    );
+
+    let err = client::client_bundle(
+        Some(config.clone()),
+        ClientBundleArgs {
+            target: Some("default".into()),
+            identity_file: None,
+            rotate_key: false,
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("client-bundle"), "{err}");
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(
+        !dir.path().join("workspace/.aw-gateway").exists(),
+        "client-bundle should fail before writing key or bundle state"
+    );
+
+    let err = client::add_key(
+        Some(config.clone()),
+        AddKeyArgs {
+            target: Some("default".into()),
+            public_key: Some(missing_key.clone()),
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("add-key"), "{err}");
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(
+        !err.contains("open public key"),
+        "add-key should reject runtime_exec before reading key input: {err}"
+    );
+
+    let err = client::add_container_key(
+        Some(config),
+        AddContainerKeyArgs {
+            target: Some("default".into()),
+            public_key: Some(missing_key),
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("add-container-key"), "{err}");
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(
+        !err.contains("open public key"),
+        "add-container-key should reject runtime_exec before reading key input: {err}"
+    );
+}
+
+#[test]
+fn shell_command_uses_configured_session_shell_and_passthrough_args() {
+    assert_eq!(
+        shell_command("/usr/bin/zsh", vec!["-l".into(), "-c".into(), "pwd".into()]),
+        vec![
+            "/usr/bin/zsh".to_string(),
+            "-l".to_string(),
+            "-c".to_string(),
+            "pwd".to_string()
+        ]
+    );
 }
 
 #[test]
@@ -2605,6 +2736,56 @@ action = "exit_container"
     assert!(!runtime_log.exists());
 }
 
+#[tokio::test]
+async fn published_port_status_reports_tcp_endpoint_without_socket_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev","io.aw-gateway.access":"ssh","io.aw-gateway.mode":"fixed"}}}}}}]
+JSON
+    ;;
+  port)
+    echo "0.0.0.0:4022"
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        cfg.target_defaults.container_agent = Some(crate::config::ContainerAgentConfigInput {
+            enabled: Some(true),
+            services: Vec::new(),
+            ssh_bridge: None,
+            control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
+            idle_cleanup: None,
+        });
+        cfg.targets.get_mut("default").unwrap().local_ssh =
+            Some(crate::config::LocalSshConfigInput {
+                backend: Some(LocalSshBackend::PublishedPort),
+                readiness: Some(LocalSshReadiness::SshOnly),
+                ..Default::default()
+            });
+    });
+
+    let status = runtime.status().await.unwrap();
+
+    assert_eq!(status.access, "ssh");
+    assert!(status.ssh_socket.is_none());
+    let endpoint = status.ssh_tcp.unwrap();
+    assert_eq!(endpoint.host, "127.0.0.1");
+    assert_eq!(endpoint.port, 4022);
+}
+
 #[test]
 fn status_json_serializes_nullable_launch_fields() {
     let status = GatewayStatus {
@@ -2654,6 +2835,34 @@ fn status_json_serializes_nullable_launch_fields() {
     };
     let value = serde_json::to_value(&all).unwrap();
     assert!(value.get("launch").unwrap().is_null());
+}
+
+#[test]
+fn status_result_text_includes_access_method() {
+    let status = GatewayStatus {
+        target: "default".into(),
+        session_id: None,
+        launch: None,
+        mode: "fixed".into(),
+        user: "alice".into(),
+        image: "ubuntu/dev".into(),
+        access: "runtime_exec".into(),
+        container: Some("ubuntu-dev".into()),
+        context: BTreeMap::new(),
+        container_pid: Some(123),
+        active_sessions: 0,
+        sessions: Vec::new(),
+        agent_ready: false,
+        ssh_socket: None,
+        ssh_tcp: None,
+        status: "container-running".into(),
+        agent: None,
+    };
+
+    assert_eq!(
+        status_result_text(&status),
+        "default: container-running [runtime_exec] (ubuntu-dev)"
+    );
 }
 
 #[test]
@@ -4121,6 +4330,111 @@ fn runtime_exec_rejects_existing_container_without_access_label() {
 }
 
 #[test]
+fn runtime_exec_rejects_existing_container_with_mismatched_access_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+        cfg.targets.get_mut("default").unwrap().access =
+            Some(crate::config::TargetAccessConfigInput {
+                method: Some(crate::config::TargetAccessMethod::RuntimeExec),
+            });
+    });
+    let mut labels = runtime.validation_labels();
+    labels.insert("io.aw-gateway.access".into(), "ssh".into());
+
+    let err = runtime
+        .validate_labels(&ContainerInspect {
+            id: "old-id".into(),
+            name: "ubuntu-dev".into(),
+            state: runtime::ContainerState {
+                running: true,
+                pid: Some(123),
+            },
+            config: runtime::ContainerConfig { labels },
+        })
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("access label \"ssh\""), "{err}");
+    assert!(err.contains("runtime_exec"), "{err}");
+}
+
+#[tokio::test]
+async fn explicit_remove_allows_access_label_mismatch_for_container_remediation() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let runtime_log = dir.path().join("runtime.log");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev","io.aw-gateway.access":"ssh","io.aw-gateway.mode":"fixed"}}}}}}]
+JSON
+    ;;
+  stop|rm)
+    echo "$@" >> "{runtime_log}"
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+            runtime_log = runtime_log.display(),
+        ),
+    );
+    let config = write_gateway_config(
+        &dir,
+        &format!(
+            r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+program = "{program}"
+
+[target_defaults.workspace]
+path = "{workspace}"
+state_dir = ".aw-gateway"
+
+[target_defaults.container_agent]
+enabled = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+
+[targets.default.access]
+method = "runtime_exec"
+"#,
+            program = fake_runtime.display(),
+            workspace = dir.path().join("workspace").display(),
+        ),
+    );
+
+    let result = execute_gateway_operation(
+        Some(config),
+        GatewayOperation::Remove {
+            target: Some("default".into()),
+            session_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    let GatewayOperationResult::Remove(result) = result else {
+        panic!("expected remove result");
+    };
+
+    assert!(result.removed);
+    let log = std::fs::read_to_string(runtime_log).unwrap();
+    assert!(log.contains("stop ubuntu-dev"), "{log}");
+    assert!(log.contains("rm ubuntu-dev"), "{log}");
+}
+
+#[test]
 fn context_labels_are_validation_labels_and_enforced() {
     let dir = tempfile::tempdir().unwrap();
     let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
@@ -4999,7 +5313,7 @@ fn runtime_exec_without_agent_control_omits_control_socket_mount() {
     assert!(
         mounts
             .iter()
-            .all(|mount| mount.target != PathBuf::from("/run/aw-gateway/bad:image"))
+            .all(|mount| mount.target.as_path() != Path::new("/run/aw-gateway/bad:image"))
     );
 }
 

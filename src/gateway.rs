@@ -127,7 +127,7 @@ use ops::OutputSelection;
 #[cfg(test)]
 use ops::{RemoveResult, StopResult};
 #[cfg(test)]
-use render::{remove_result_text, stop_result_text};
+use render::{remove_result_text, status_result_text, stop_result_text};
 #[cfg(test)]
 use session::{
     local_listener_is_active, parse_process_start_time, process_start_time,
@@ -650,9 +650,7 @@ async fn shell_container(
         context,
     )
     .await?;
-    let mut command = Vec::with_capacity(args.args.len() + 1);
-    command.push(runtime.identity.session_shell.clone());
-    command.extend(args.args);
+    let command = shell_command(&runtime.identity.session_shell, args.args);
     let outcome = run_container_command_with_runtime(
         runtime,
         args.cwd,
@@ -661,6 +659,13 @@ async fn shell_container(
     )
     .await?;
     exit_with_execution_outcome(outcome)
+}
+
+fn shell_command(session_shell: &str, args: Vec<String>) -> Vec<String> {
+    let mut command = Vec::with_capacity(args.len() + 1);
+    command.push(session_shell.to_string());
+    command.extend(args);
+    command
 }
 
 fn exit_with_execution_outcome(outcome: ExecutionOutcome) -> ! {
@@ -1879,7 +1884,7 @@ impl Runtime {
             access: self.access_name(),
             context: self.context.as_map().clone(),
             container_pid: inspect.state.pid,
-            ssh_socket: self.ssh_endpoint_configured().then(|| self.ssh_socket()),
+            ssh_socket: self.ssh_socket_endpoint(),
             ssh_tcp: self.published_ssh_endpoint().await?,
             status: status.status,
             local_ssh: None,
@@ -1927,7 +1932,7 @@ impl Runtime {
             active_sessions: sessions.len(),
             sessions,
             agent_ready,
-            ssh_socket: self.ssh_endpoint_configured().then(|| self.ssh_socket()),
+            ssh_socket: self.ssh_socket_endpoint(),
             ssh_tcp: self.published_ssh_endpoint().await?,
             status: gateway_status_name(
                 inspect.as_ref().is_some_and(|value| value.state.running),
@@ -1998,6 +2003,11 @@ impl Runtime {
                 .is_some_and(|bridge| self.agent_enabled() && bridge.enabled),
             LocalSshBackend::PublishedPort => true,
         }
+    }
+
+    fn ssh_socket_endpoint(&self) -> Option<PathBuf> {
+        (self.ssh_endpoint_configured() && self.ssh_backend() == LocalSshBackend::Socket)
+            .then(|| self.ssh_socket())
     }
 
     fn ensure_ssh_endpoint_configured(&self) -> anyhow::Result<()> {

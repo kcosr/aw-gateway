@@ -42,17 +42,22 @@ pub(super) fn render_status_result(result: GatewayStatus, json: bool) -> anyhow:
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
-        println!(
-            "{}: {} ({})",
-            result.target,
-            result.status,
-            result.container.unwrap_or_else(|| "not-created".into())
-        );
+        println!("{}", status_result_text(&result));
         if let Some(launch) = &result.launch {
             println!("launch: {launch}");
         }
     }
     Ok(())
+}
+
+pub(super) fn status_result_text(result: &GatewayStatus) -> String {
+    format!(
+        "{}: {} [{}] ({})",
+        result.target,
+        result.status,
+        result.access,
+        result.container.as_deref().unwrap_or("not-created")
+    )
 }
 
 pub(super) fn render_status_all(summaries: Vec<AllStatusEntry>, json: bool) -> anyhow::Result<()> {

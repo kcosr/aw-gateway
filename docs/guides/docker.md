@@ -5,6 +5,8 @@ Linux Docker in two modes:
 
 - **Local Docker workstation**: the gateway runs on the same Linux workstation
   as the SSH client and exposes a loopback-only local SSH listener.
+- **Local Docker runtime-exec**: the gateway runs on the same Linux workstation
+  and attaches with `docker exec` instead of starting container `sshd`.
 - **Remote Docker host over SSH**: the gateway runs on a remote Linux host.
   Host SSH authenticates the user, and generated SSH config connects clients to
   container SSH through `ProxyCommand`.
@@ -28,6 +30,7 @@ Copyable examples live under:
 examples/docker/
   Containerfile.ubuntu
   gateway-local.toml
+  gateway-runtime-exec.toml
   gateway-remote.toml
   sshd_config_agent
   sshd-match-restricted.conf
@@ -36,6 +39,13 @@ examples/docker/
 
 Full-file code blocks below match files in `examples/docker/` unless the block
 is explicitly labeled as an excerpt.
+
+Use `gateway-runtime-exec.toml` for local-only no-SSH work. It starts the
+container without `sshd`, does not publish port 22, and uses `aw-gateway shell
+ubuntu` or `aw-gateway run ubuntu -- <command>` through `docker exec`. OpenSSH
+client config, SCP, SFTP, and VS Code Remote-SSH require one of the SSH-backed
+examples instead. Docker workspace file ownership follows the configured
+container user and Docker's normal bind-mount behavior.
 
 ## Host Layout
 

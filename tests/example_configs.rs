@@ -10,10 +10,13 @@ fn example_gateway_configs_validate() {
     for config in [
         "aw-gateway.sample.toml",
         "examples/podman/gateway-local.toml",
+        "examples/podman/gateway-runtime-exec.toml",
         "examples/podman/gateway-remote.toml",
         "examples/docker/gateway-local.toml",
+        "examples/docker/gateway-runtime-exec.toml",
         "examples/docker/gateway-remote.toml",
         "examples/colima/gateway-local.toml",
+        "examples/colima/gateway-runtime-exec.toml",
         "examples/apple-container/gateway-local.toml",
         "examples/apple-container/gateway-runtime-exec.toml",
     ] {
