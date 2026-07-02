@@ -893,14 +893,15 @@ impl TargetConfig {
             if let Some(cleanup) = &self.idle_cleanup
                 && cleanup.owner == IdleCleanupOwner::Agent
                 && cleanup.action != IdleCleanupAction::None
-                && !self
-                    .container_agent
-                    .control_socket
-                    .as_ref()
-                    .is_none_or(super::ControlSocketConfig::is_enabled)
+                && (!self.container_agent.enabled
+                    || !self
+                        .container_agent
+                        .control_socket
+                        .as_ref()
+                        .is_none_or(super::ControlSocketConfig::is_enabled))
             {
                 anyhow::bail!(
-                    "target {target_name:?} access.method = \"runtime_exec\" with agent-owned idle_cleanup requires container_agent.control_socket to be enabled"
+                    "target {target_name:?} access.method = \"runtime_exec\" with agent-owned idle_cleanup requires container_agent.enabled = true and container_agent.control_socket to be enabled"
                 );
             }
         }

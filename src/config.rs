@@ -318,11 +318,12 @@ impl GatewayConfig {
                     }
                 }
                 TargetAccessMethod::RuntimeExec => {
-                    if target
-                        .container_agent
-                        .control_socket
-                        .as_ref()
-                        .is_none_or(ControlSocketConfig::is_enabled)
+                    if target.container_agent.enabled
+                        && target
+                            .container_agent
+                            .control_socket
+                            .as_ref()
+                            .is_none_or(ControlSocketConfig::is_enabled)
                     {
                         anyhow::bail!(
                             "target {name:?} uses runtime type \"apple_container\" with access.method = \"runtime_exec\" but container_agent.control_socket is enabled; Apple container runtime-exec targets require container_agent.control_socket = false"

@@ -1210,6 +1210,35 @@ backend = "socket"
 }
 
 #[test]
+fn runtime_exec_agent_owned_cleanup_requires_agent_control() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[target_defaults.container_agent]
+enabled = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+
+[targets.default.idle_cleanup]
+owner = "agent"
+action = "exit_container"
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(err.contains("container_agent.enabled"), "{err}");
+}
+
+#[test]
 fn apple_container_runtime_exec_validates_without_ssh_endpoint() {
     let cfg = r#"
 schema_version = "1"
@@ -1233,6 +1262,29 @@ method = "runtime_exec"
     let target = cfg.effective_target("default").unwrap();
     assert_eq!(target.access.method, TargetAccessMethod::RuntimeExec);
     assert!(target.local_ssh.is_none());
+}
+
+#[test]
+fn apple_container_runtime_exec_allows_disabled_agent_without_control_socket_field() {
+    let cfg = r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+
+[target_defaults.container_agent]
+enabled = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    cfg.validate().unwrap();
 }
 
 #[test]

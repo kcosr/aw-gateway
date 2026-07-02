@@ -173,6 +173,14 @@ impl Runtime {
         else {
             return Ok(());
         };
+        if let Err(err) = self.validate_labels(&inspect) {
+            tracing::warn!(
+                container = self.identity.container_name,
+                error = %err,
+                "gateway-owned idle cleanup skipped container because access validation failed"
+            );
+            return Ok(());
+        }
         self.stop_inspected_container(&inspect).await
     }
 
