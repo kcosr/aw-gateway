@@ -1111,7 +1111,7 @@ impl ContainerRuntime {
     }
 
     pub async fn inspect(&self, name: &str) -> anyhow::Result<Option<ContainerInspect>> {
-        let mut command = self.command()?;
+        let mut command = self.async_command().await?;
         let output = command
             .args(["inspect", name])
             .output()
@@ -1182,7 +1182,7 @@ impl ContainerRuntime {
         spec: &ContainerExecSpec,
         timeout_duration: Option<Duration>,
     ) -> anyhow::Result<i32> {
-        let mut command = self.command()?;
+        let mut command = self.async_command().await?;
         apply_command_env(&mut command, self.exec_env(spec));
         command
             .arg("exec")
@@ -1217,7 +1217,7 @@ impl ContainerRuntime {
         spec: &ContainerExecSpec,
         timeout_duration: Option<Duration>,
     ) -> anyhow::Result<ContainerExecOutput> {
-        let mut command = self.command()?;
+        let mut command = self.async_command().await?;
         apply_command_env(&mut command, self.exec_env(spec));
         command
             .arg("exec")
@@ -1292,7 +1292,7 @@ impl ContainerRuntime {
         let cleanup_spec = cancel_cleanup_spec(spec, &marker, "aw-gateway-exec-cleanup");
         let remove_spec = cancel_marker_remove_spec(spec, &marker, "aw-gateway-exec-rm");
 
-        let mut command = self.command()?;
+        let mut command = self.async_command().await?;
         apply_command_env(&mut command, self.exec_env(&exec_spec));
         command
             .arg("exec")
@@ -1374,7 +1374,7 @@ impl ContainerRuntime {
         let cleanup_spec = cancel_cleanup_spec(spec, &marker, "aw-gateway-exec-cleanup");
         let remove_spec = cancel_marker_remove_spec(spec, &marker, "aw-gateway-exec-rm");
 
-        let mut command = self.command()?;
+        let mut command = self.async_command().await?;
         apply_command_env(&mut command, self.exec_env(&exec_spec));
         command
             .arg("exec")
@@ -1430,7 +1430,7 @@ impl ContainerRuntime {
         spec: &ContainerExecSpec,
         timeout_duration: Option<Duration>,
     ) -> anyhow::Result<i32> {
-        let mut command = self.command()?;
+        let mut command = self.async_command().await?;
         apply_command_env(&mut command, self.exec_env(spec));
         command
             .arg("exec")
@@ -1539,7 +1539,7 @@ impl ContainerRuntime {
                     .map(|arg| arg.as_ref().to_string_lossy().into_owned())
                     .collect(),
             };
-            let mut command = self.command()?;
+            let mut command = self.async_command().await?;
             let output = command
                 .arg("exec")
                 .args(self.exec_args(&spec))
@@ -1548,7 +1548,7 @@ impl ContainerRuntime {
                 .with_context(|| format!("run {} exec {name}", self.runtime_label()))?;
             return Ok(output.status.code().unwrap_or(1));
         }
-        let mut command = self.command()?;
+        let mut command = self.async_command().await?;
         let output = command
             .arg("exec")
             .arg(name)
@@ -1567,7 +1567,7 @@ impl ContainerRuntime {
         if self.kind == ContainerRuntimeType::AppleContainer {
             return Ok(None);
         }
-        let mut command = self.command()?;
+        let mut command = self.async_command().await?;
         let output = command
             .args(["port", name, &format!("{container_port}/tcp")])
             .output()
@@ -1587,7 +1587,7 @@ impl ContainerRuntime {
         apple_name_candidates: Option<&AppleContainerNameCandidates>,
     ) -> anyhow::Result<Vec<ManagedContainer>> {
         let command_label = self.list_command_label();
-        let mut command = self.command()?;
+        let mut command = self.async_command().await?;
         let output = command
             .args(self.list_managed_args(user, uid, context))
             .output()
@@ -1828,7 +1828,7 @@ impl ContainerRuntime {
         ));
         for (key, value) in &spec.env {
             args.push("--env".into());
-            args.push(explicit_env_arg(key, value));
+            args.push(runtime_env_arg(key, value));
         }
         for (key, value) in &spec.labels {
             args.push("--label".into());
@@ -1929,8 +1929,20 @@ impl ContainerRuntime {
         }
     }
 
-    fn command(&self) -> anyhow::Result<Command> {
-        self.preflight()?;
+    async fn async_command(&self) -> anyhow::Result<Command> {
+        if self.kind != ContainerRuntimeType::AppleContainer {
+            self.preflight()?;
+            return Ok(self.command_without_preflight());
+        }
+        #[cfg(test)]
+        if apple_preflight_test_bypassed() || apple_preflight_test_host().is_some() {
+            self.preflight()?;
+            return Ok(self.command_without_preflight());
+        }
+        let runtime = self.clone();
+        tokio::task::spawn_blocking(move || runtime.preflight())
+            .await
+            .context("join Apple container preflight task")??;
         Ok(self.command_without_preflight())
     }
 
@@ -2002,7 +2014,7 @@ impl ContainerRuntime {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut command = self.command()?;
+        let mut command = self.async_command().await?;
         apply_command_env(&mut command, env);
         let output = command
             .arg(subcommand)
@@ -3603,6 +3615,7 @@ esac
                 },
             ],
             env: BTreeMap::from([
+                ("AW_IDENTITY_TOKEN".into(), "token-secret".into()),
                 ("AW_SAFE".into(), "1".into()),
                 ("PATH".into(), "/tmp/bad".into()),
             ]),
@@ -3651,11 +3664,16 @@ esac
                 "--env",
                 "AW_CONTAINER_STATE_DIR=/home/alice/.aw-gateway/containers/aw-local"
             ]));
-        assert!(args.windows(2).any(|pair| pair == ["--env", "AW_SAFE=1"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--env", "AW_IDENTITY_TOKEN"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--env", "AW_SAFE"]));
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--env", "PATH=/tmp/bad"])
         );
+        assert!(!args.iter().any(|arg| arg.contains("token-secret")));
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--label", "io.aw-gateway.gateway=true"])

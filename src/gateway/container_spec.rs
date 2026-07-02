@@ -1,6 +1,8 @@
 use super::Runtime;
 use super::published_port::apple_published_port_bind_conflict;
-use crate::config::{ContainerMountConfig, ContainerMountMode, LocalSshBackend, TargetMode};
+use crate::config::{
+    ContainerMountConfig, ContainerMountMode, ContainerRuntimeType, LocalSshBackend, TargetMode,
+};
 use crate::context::{context_from_labels, context_label_key};
 use crate::runtime::{self, ContainerInspect, ContainerMountSpec, ContainerRunSpec};
 use crate::template::{self, Vars};
@@ -313,6 +315,56 @@ impl Runtime {
             vars.insert("container_pid".into(), container_pid.to_string());
         }
         vars
+    }
+
+    pub(super) fn render_runtime_value(
+        &self,
+        value: &str,
+        vars: &Vars,
+        container_pid: Option<&str>,
+    ) -> anyhow::Result<String> {
+        self.ensure_runtime_template_value_supported(value, container_pid)?;
+        template::render(value, vars)
+    }
+
+    pub(super) fn render_runtime_argv(
+        &self,
+        command: &[String],
+        vars: &Vars,
+        container_pid: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        command
+            .iter()
+            .map(|arg| self.render_runtime_value(arg, vars, container_pid))
+            .collect()
+    }
+
+    pub(super) fn ensure_runtime_template_values_supported<'a>(
+        &self,
+        values: impl IntoIterator<Item = &'a str>,
+        container_pid: Option<&str>,
+    ) -> anyhow::Result<()> {
+        for value in values {
+            self.ensure_runtime_template_value_supported(value, container_pid)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_runtime_template_value_supported(
+        &self,
+        value: &str,
+        container_pid: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if container_pid.is_none()
+            && self.container_runtime.kind() == ContainerRuntimeType::AppleContainer
+            && template::referenced_keys(value)?.contains(&"container_pid")
+        {
+            anyhow::bail!(
+                "apple_container runtime did not report a container PID; {{container_pid}} is not available for target {:?}",
+                self.identity.target_name
+            );
+        }
+        Ok(())
     }
 
     fn passwd_entry(&self) -> String {

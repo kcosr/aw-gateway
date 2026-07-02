@@ -302,6 +302,12 @@ For VS Code Remote SSH, select the generated `aw-ubuntu` host alias.
 - Do not configure Docker/Colima-specific `target.runtime.extra_run_args`.
   Runtime extra args are passed directly to `container run` and are not
   portable across runtimes.
+- Container creation uses Apple `container run --env KEY` host inheritance for
+  gateway-provisioned run environment where Apple documents that form, so
+  values such as identity tokens are not placed in the runtime argv. Apple
+  `container exec` currently documents only `KEY=value` env entries; avoid
+  putting secrets in Apple `session_env`, launch env, or launch step env until
+  an env-file exec path is validated.
 - Apple `inspect` output may not expose a host PID. Gateway templates that
   require `{container_pid}` fail clearly when the runtime does not provide it.
 - Fixed-target stop/start reuse depends on Apple preserving the published host

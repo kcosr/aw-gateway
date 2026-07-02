@@ -33,6 +33,7 @@ pub use steps::{
     ContainerBootstrapStep, HostStep, LifecyclePhase, LifecycleStep, RawContainerBootstrapStep,
     RawHostStep, RawLifecycleStep, RenderedContainerBootstrapStep,
 };
+pub(crate) use target::DEFAULT_EPHEMERAL_NAME_PATTERN;
 pub use target::{
     ContainerBootstrapConfig, ContainerMountConfig, ContainerMountMode, ContainerSshConfig,
     ContainerSshTransferConfig, ControlSocketsConfig, IdleCleanupAction, IdleCleanupConfig,

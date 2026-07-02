@@ -259,6 +259,15 @@ capture_required image_pull "$CONTAINER_CLI" image pull "$IMAGE"
 
 capture_required_stdout list_initial_json "$CONTAINER_CLI" list --all --format json
 
+RUN_ENV_INHERIT_VALUE="aw-gateway-run-env-$TIMESTAMP"
+capture_required_stdout run_env_inherit env "AWGW_FIXTURE_RUN_INHERIT=$RUN_ENV_INHERIT_VALUE" \
+	"$CONTAINER_CLI" run --rm --env AWGW_FIXTURE_RUN_INHERIT "$IMAGE" sh -c \
+	'printf "%s\n" "$AWGW_FIXTURE_RUN_INHERIT"'
+if [[ "$(tr -d '\r' <"$OUT_DIR/run_env_inherit/stdout.txt")" != "$RUN_ENV_INHERIT_VALUE" ]]; then
+	log "container run did not inherit bare --env key from host environment"
+	FAILURES=$((FAILURES + 1))
+fi
+
 remember_container "$RUNNING_NAME"
 capture_required run_labeled_detached "$CONTAINER_CLI" run --detach --init \
 	--name "$RUNNING_NAME" \
@@ -270,6 +279,12 @@ capture_required run_labeled_detached "$CONTAINER_CLI" run --detach --init \
 	"$IMAGE" sleep 3600
 capture_required_stdout inspect_labeled_running_json "$CONTAINER_CLI" inspect "$RUNNING_NAME"
 capture_required_stdout list_with_labeled_running_json "$CONTAINER_CLI" list --all --format json
+capture_required_stdout exec_env_explicit "$CONTAINER_CLI" exec \
+	--env AWGW_FIXTURE_EXEC_EXPLICIT=exec-fixture \
+	"$RUNNING_NAME" sh -c 'printf "%s\n" "$AWGW_FIXTURE_EXEC_EXPLICIT"'
+capture exec_env_inherit env AWGW_FIXTURE_EXEC_INHERIT=exec-inherit \
+	"$CONTAINER_CLI" exec --env AWGW_FIXTURE_EXEC_INHERIT \
+	"$RUNNING_NAME" sh -c 'printf "%s\n" "$AWGW_FIXTURE_EXEC_INHERIT"'
 capture_required stop_labeled "$CONTAINER_CLI" stop "$RUNNING_NAME"
 capture_required_stdout inspect_labeled_stopped_json "$CONTAINER_CLI" inspect "$RUNNING_NAME"
 capture_required delete_labeled "$CONTAINER_CLI" delete --force "$RUNNING_NAME"

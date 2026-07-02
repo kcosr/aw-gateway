@@ -1292,6 +1292,42 @@ fn render_template_map(
         .collect()
 }
 
+fn ensure_launch_templates_supported(
+    runtime: &Runtime,
+    launch: &LaunchConfig,
+    container_pid: Option<&str>,
+) -> anyhow::Result<()> {
+    runtime.ensure_runtime_template_values_supported(
+        launch
+            .command
+            .iter()
+            .filter(|arg| arg.as_str() != "{args}")
+            .map(String::as_str),
+        container_pid,
+    )?;
+    runtime.ensure_runtime_template_values_supported(
+        launch.env.values().map(String::as_str),
+        container_pid,
+    )?;
+    if let Some(cwd) = launch.cwd.as_deref() {
+        runtime.ensure_runtime_template_values_supported([cwd], container_pid)?;
+    }
+    for step in &launch.steps {
+        runtime.ensure_runtime_template_values_supported(
+            step.command.iter().map(String::as_str),
+            container_pid,
+        )?;
+        runtime.ensure_runtime_template_values_supported(
+            step.env.values().map(String::as_str),
+            container_pid,
+        )?;
+        if let Some(cwd) = step.cwd.as_deref() {
+            runtime.ensure_runtime_template_values_supported([cwd], container_pid)?;
+        }
+    }
+    Ok(())
+}
+
 fn render_launch_cwd(
     cwd: Option<&str>,
     vars: &Vars,

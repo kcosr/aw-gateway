@@ -1,7 +1,6 @@
 use super::Runtime;
 use super::health::{run_argv_with_timeout, run_health_check};
-use crate::config::{LifecyclePhase, LifecycleStep};
-use crate::template;
+use crate::config::{HealthCheck, LifecyclePhase, LifecycleStep};
 use anyhow::Context;
 use tokio::time::Duration;
 
@@ -30,7 +29,7 @@ impl Runtime {
         container_pid: Option<&str>,
     ) -> anyhow::Result<()> {
         let vars = self.vars(container_pid);
-        let command = template::render_argv(&step.command, &vars)?;
+        let command = self.render_runtime_argv(&step.command, &vars, container_pid)?;
         let timeout = host_hook_timeout(step.timeout.as_deref())?;
         match run_argv_with_timeout(&command, timeout).await {
             Ok(()) => Ok(()),
@@ -45,7 +44,7 @@ impl Runtime {
     pub(super) async fn run_host_steps(&self, container_pid: Option<&str>) -> anyhow::Result<()> {
         for step in &self.target.host_steps {
             let vars = self.vars(container_pid);
-            let command = template::render_argv(&step.command, &vars)?;
+            let command = self.render_runtime_argv(&step.command, &vars, container_pid)?;
             let timeout = host_hook_timeout(step.timeout.as_deref())?;
             let command_result = run_argv_with_timeout(&command, timeout).await;
             if let Err(err) = command_result {
@@ -56,6 +55,7 @@ impl Runtime {
                 continue;
             }
             if let Some(health_check) = &step.health_check {
+                self.ensure_host_health_check_templates_supported(health_check, container_pid)?;
                 let health_result = run_health_check(health_check, &vars).await;
                 if let Err(err) = health_result {
                     if step.required {
@@ -67,6 +67,23 @@ impl Runtime {
             }
         }
         Ok(())
+    }
+
+    fn ensure_host_health_check_templates_supported(
+        &self,
+        health_check: &HealthCheck,
+        container_pid: Option<&str>,
+    ) -> anyhow::Result<()> {
+        match health_check {
+            HealthCheck::Command { command, .. } => self.ensure_runtime_template_values_supported(
+                command.iter().map(String::as_str),
+                container_pid,
+            ),
+            HealthCheck::Http { url, .. } => {
+                self.ensure_runtime_template_values_supported([url.as_str()], container_pid)
+            }
+            HealthCheck::Process | HealthCheck::Tcp { .. } => Ok(()),
+        }
     }
 }
 

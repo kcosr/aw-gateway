@@ -25,8 +25,12 @@ impl FailedStartCleanup {
 
     pub(super) async fn run_if_needed(self, runtime: &Runtime) {
         if self.runtime_start_attempted {
-            runtime.cleanup_failed_start().await;
-            runtime.cleanup_published_ssh_port_state();
+            let container_removed_or_absent = runtime.cleanup_failed_start().await;
+            if container_removed_or_absent {
+                runtime.cleanup_published_ssh_port_state();
+            } else {
+                runtime.remove_pending_published_ssh_port();
+            }
             runtime.cleanup_control_socket_dir();
         }
     }
@@ -298,7 +302,7 @@ impl Runtime {
         }
     }
 
-    async fn cleanup_failed_start(&self) {
+    async fn cleanup_failed_start(&self) -> bool {
         match self
             .container_runtime
             .inspect(&self.identity.container_name)
@@ -311,7 +315,7 @@ impl Runtime {
                         error = %err,
                         "not cleaning failed start because labels did not match"
                     );
-                    return;
+                    return false;
                 }
                 if let Err(err) = self
                     .container_runtime
@@ -324,26 +328,31 @@ impl Runtime {
                         "failed to stop container after startup failure"
                     );
                 }
-                if self.target.remove_on_stop
-                    && let Err(err) = self
+                if self.target.remove_on_stop {
+                    if let Err(err) = self
                         .container_runtime
                         .rm(&self.identity.container_name)
                         .await
-                {
-                    tracing::warn!(
-                        container = self.identity.container_name,
-                        error = %err,
-                        "failed to remove container after startup failure"
-                    );
+                    {
+                        tracing::warn!(
+                            container = self.identity.container_name,
+                            error = %err,
+                            "failed to remove container after startup failure"
+                        );
+                        return false;
+                    }
+                    return true;
                 }
+                false
             }
-            Ok(None) => {}
+            Ok(None) => true,
             Err(err) => {
                 tracing::warn!(
                     container = self.identity.container_name,
                     error = %err,
                     "failed to inspect container after startup failure"
                 );
+                false
             }
         }
     }

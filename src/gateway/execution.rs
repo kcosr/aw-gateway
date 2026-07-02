@@ -1,7 +1,8 @@
 use super::{
-    OperationSessionGuard, Runtime, SessionOutcome, exec_container_command_with_cancel,
-    exec_container_command_with_options, final_container_exec_spec, launch_final_env,
-    launch_template_vars, render_launch_cwd, render_template_map, run_launch_steps,
+    OperationSessionGuard, Runtime, SessionOutcome, ensure_launch_templates_supported,
+    exec_container_command_with_cancel, exec_container_command_with_options,
+    final_container_exec_spec, launch_final_env, launch_template_vars, render_launch_cwd,
+    render_template_map, run_launch_steps,
 };
 use crate::config::LaunchConfig;
 use crate::gateway::model::ReadyStatus;
@@ -529,6 +530,7 @@ impl OperationBody {
             } => {
                 let container_pid = ready.container_pid.map(|pid| pid.to_string());
                 let vars = launch_template_vars(runtime, &resolved_vars, container_pid.as_deref());
+                ensure_launch_templates_supported(runtime, &launch, container_pid.as_deref())?;
                 let launch_env = render_template_map(&launch.env, &vars)?;
                 run_launch_steps(runtime, &launch, &vars, &launch_env).await?;
                 let env = launch_final_env(&runtime.session_env()?, &launch_env);

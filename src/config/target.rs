@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+pub(crate) const DEFAULT_EPHEMERAL_NAME_PATTERN: &str = "{image_slug}-{session_id}";
+
 mod container_ssh;
 mod idle_cleanup;
 mod local_ssh;
@@ -778,7 +780,7 @@ impl TargetConfig {
             TargetMode::Ephemeral => self
                 .ephemeral_name
                 .as_deref()
-                .unwrap_or("{image_slug}-{session_id}"),
+                .unwrap_or(DEFAULT_EPHEMERAL_NAME_PATTERN),
         };
         let rendered = template::render(pattern, &vars)?;
         validate_container_name(&rendered)?;

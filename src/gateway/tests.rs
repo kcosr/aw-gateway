@@ -2986,6 +2986,174 @@ exit 0
 }
 
 #[tokio::test]
+async fn apple_failed_post_start_keeps_stable_published_port_for_fixed_target() {
+    let _apple_preflight_bypass = crate::runtime::disable_apple_preflight_for_tests();
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let running = dir.path().join("running");
+    let stopped = dir.path().join("stopped");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  run)
+    rm -f "{stopped}"
+    touch "{running}"
+    ;;
+  inspect)
+    if [ -f "{running}" ]; then
+      status=running
+    elif [ -f "{stopped}" ]; then
+      status=stopped
+    else
+      echo "container not found" >&2
+      exit 1
+    fi
+    cat <<JSON
+[{{"status":"$status","configuration":{{"id":"ubuntu-dev","hostname":"ubuntu-dev","labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  stop)
+    rm -f "{running}"
+    touch "{stopped}"
+    ;;
+esac
+exit 0
+"#,
+            running = running.display(),
+            stopped = stopped.display(),
+            user = user.user,
+            uid = user.uid,
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        configure_apple_published_port_target(cfg);
+        cfg.targets
+            .get_mut("default")
+            .unwrap()
+            .lifecycle_steps
+            .push(crate::config::RawLifecycleStep {
+                phase: crate::config::LifecyclePhase::PostStartHost,
+                name: "fail-after-start".into(),
+                enabled: true,
+                before: None,
+                after: None,
+                required: Some(true),
+                command: Some(vec!["/bin/sh".into(), "-c".into(), "exit 7".into()]),
+                timeout: None,
+            });
+    });
+
+    let err = runtime.ensure_ready().await.unwrap_err();
+
+    assert!(format!("{err:#}").contains("fail-after-start"), "{err:#}");
+    assert!(
+        runtime
+            .paths
+            .container_state_dir
+            .join("published-ssh-port")
+            .exists()
+    );
+    assert!(
+        !runtime
+            .paths
+            .container_state_dir
+            .join("published-ssh-port.pending")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn apple_post_start_container_pid_template_reports_runtime_error_when_pid_missing() {
+    let _apple_preflight_bypass = crate::runtime::disable_apple_preflight_for_tests();
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<JSON
+[{{"status":"running","configuration":{{"id":"ubuntu-dev","hostname":"ubuntu-dev","labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  exec)
+    case "$*" in
+      *aw-gateway-marker-list*|*aw-gateway-marker-sweep*)
+        exit 0
+        ;;
+    esac
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        configure_apple_published_port_target(cfg);
+        cfg.targets
+            .get_mut("default")
+            .unwrap()
+            .lifecycle_steps
+            .push(crate::config::RawLifecycleStep {
+                phase: crate::config::LifecyclePhase::PostStartHost,
+                name: "needs-pid".into(),
+                enabled: true,
+                before: None,
+                after: None,
+                required: Some(true),
+                command: Some(vec!["echo".into(), "{container_pid}".into()]),
+                timeout: None,
+            });
+    });
+
+    let err = runtime.ensure_ready().await.unwrap_err();
+    let err = format!("{err:#}");
+
+    assert!(
+        err.contains("apple_container runtime did not report a container PID"),
+        "{err}"
+    );
+    assert!(err.contains("{container_pid}"), "{err}");
+    assert!(err.contains("default"), "{err}");
+}
+
+#[test]
+fn apple_launch_container_pid_template_reports_runtime_error_when_pid_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = test_runtime(
+        &dir,
+        dir.path().join("runtime"),
+        configure_apple_published_port_target,
+    );
+    let launch = crate::config::LaunchConfig {
+        target: "default".into(),
+        description: None,
+        allow_args: false,
+        cwd: None,
+        env: BTreeMap::new(),
+        command: vec!["echo".into(), "{container_pid}".into()],
+        vars: BTreeMap::new(),
+        steps: Vec::new(),
+    };
+
+    let err = ensure_launch_templates_supported(&runtime, &launch, None).unwrap_err();
+    let err = format!("{err:#}");
+
+    assert!(
+        err.contains("apple_container runtime did not report a container PID"),
+        "{err}"
+    );
+    assert!(err.contains("{container_pid}"), "{err}");
+}
+
+#[tokio::test]
 async fn apple_published_ssh_endpoint_reads_persisted_port_after_label_validation() {
     let _apple_preflight_bypass = crate::runtime::disable_apple_preflight_for_tests();
     let dir = tempfile::tempdir().unwrap();
@@ -3095,6 +3263,20 @@ exit 0
     assert!(err.contains("persisted published SSH port 40222"), "{err}");
     assert!(err.contains("free it"), "{err}");
     assert!(err.contains("remove and recreate"), "{err}");
+    assert!(
+        runtime
+            .paths
+            .container_state_dir
+            .join("published-ssh-port")
+            .exists()
+    );
+    assert!(
+        !runtime
+            .paths
+            .container_state_dir
+            .join("published-ssh-port.pending")
+            .exists()
+    );
 }
 
 #[test]

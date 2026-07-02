@@ -91,12 +91,41 @@ readiness = "ssh_only"
     let context = RuntimeContext::from_map(BTreeMap::from([("tenant".into(), "team-a".into())]));
 
     let candidates = apple_container_name_candidates(&cfg, &context).unwrap();
+    let targets = cfg.effective_targets().unwrap();
+    let fixed_name = targets
+        .get("dev")
+        .unwrap()
+        .container_name_with_context(None, &context)
+        .unwrap();
+    let explicit_ephemeral_name = targets
+        .get("job")
+        .unwrap()
+        .container_name_with_context(Some("abc123"), &context)
+        .unwrap();
 
-    assert!(candidates.matches("ubuntu-dev-team-a"));
-    assert!(candidates.matches("worker-team-a-abc123"));
+    assert!(candidates.matches(&fixed_name));
+    assert!(candidates.matches(&explicit_ephemeral_name));
     assert!(!candidates.matches("worker-team-b-abc123"));
     assert!(!candidates.matches("ubuntu-optional-us-east"));
     assert!(!candidates.matches("unrelated"));
+
+    let mut default_target = targets.get("job").unwrap().clone();
+    default_target.image = "ubuntu/default-job".into();
+    default_target.ephemeral_name = None;
+    let default_ephemeral_name = default_target
+        .container_name_with_context(Some("xyz789"), &context)
+        .unwrap();
+    let mut default_candidates = AppleContainerNameCandidates::default();
+    insert_ephemeral_apple_container_candidate(
+        &mut default_candidates,
+        "default_job",
+        &default_target,
+        &context,
+    )
+    .unwrap();
+    assert!(default_candidates.matches(&default_ephemeral_name));
+    assert!(!default_candidates.matches("ubuntu-default-job"));
+    assert!(!default_candidates.matches("ubuntu-default-job-"));
 }
 
 #[test]

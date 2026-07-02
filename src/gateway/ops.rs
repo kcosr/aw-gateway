@@ -10,7 +10,10 @@ use crate::cli::{
     ClientConfigArgs, LaunchShowArgs, LaunchesArgs, RemoveArgs, RunArgs, SetDefaultArgs, StatusArg,
     StopArgs, TargetsArgs,
 };
-use crate::config::{ContainerRuntimeType, GatewayConfig, LaunchConfig, LocalSshMode, TargetMode};
+use crate::config::{
+    ContainerRuntimeType, DEFAULT_EPHEMERAL_NAME_PATTERN, GatewayConfig, LaunchConfig,
+    LocalSshMode, TargetMode,
+};
 use crate::context::{RuntimeContext, validate_runtime_context};
 use crate::paths::{self, UserContext};
 use crate::runtime::{AppleContainerNameCandidates, ContainerRuntime};
@@ -612,7 +615,7 @@ fn insert_ephemeral_apple_container_candidate(
     let pattern = target
         .ephemeral_name
         .as_deref()
-        .unwrap_or("{image_slug}-{session_id}");
+        .unwrap_or(DEFAULT_EPHEMERAL_NAME_PATTERN);
     let rendered = match template::render(pattern, &vars) {
         Ok(rendered) => rendered,
         Err(err) if missing_context_render_error(&err) => return Ok(()),
