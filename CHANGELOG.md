@@ -12,20 +12,23 @@ _No unreleased changes._
   26+ hosts, including Apple container CLI/system preflight checks and
   published-port SSH endpoint handling, object-shaped Apple `status` and
   `configuration.image` JSON parsing, validated bare-key exec env inheritance,
-  plus a local Apple container deployment guide and sample config.
+  plus a local Apple container deployment guide and sample config
+  ([direct commits](https://github.com/kcosr/aw-gateway/compare/a53dfa9...03ae7d5)).
 
 ### Changed
 
 - Bumped the internal container bootstrap config `schema_version` to `2`.
   `aw-gateway` and the bind-mounted `aw-container-bootstrap` binary must be
   upgraded together; mismatches fail container startup with an unsupported
-  bootstrap schema error.
+  bootstrap schema error
+  ([ecb40f7](https://github.com/kcosr/aw-gateway/commit/ecb40f7064e427203a09e008024ac6ec372435bb)).
 
 ### Fixed
 
 - Fixed Apple container bootstrap identity preparation so pre-existing session
   home and state directories are not chowned, which avoids Apple virtiofs
-  bind-mount `EPERM` failures during Apple container startup.
+  bind-mount `EPERM` failures during Apple container startup
+  ([ecb40f7](https://github.com/kcosr/aw-gateway/commit/ecb40f7064e427203a09e008024ac6ec372435bb)).
 - Fixed container SSHD helpers so generated `session_env` values are merged
   with base `SHELL`/`PATH` defaults into a single `SetEnv` directive, allowing
   variables such as `CODEX_HOME` to reach SSH sessions. Runtime example helpers
