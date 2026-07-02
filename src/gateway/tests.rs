@@ -3053,6 +3053,73 @@ exit 0
 }
 
 #[tokio::test]
+async fn apple_start_stopped_reports_persisted_port_on_start_failure() {
+    let _apple_preflight_bypass = crate::runtime::disable_apple_preflight_for_tests();
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<JSON
+[{{"status":"stopped","configuration":{{"id":"ubuntu-dev","hostname":"ubuntu-dev","labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev"}}}}}}]
+JSON
+    ;;
+  start)
+    echo "bind: address already in use" >&2
+    exit 42
+    ;;
+  stop)
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, configure_apple_published_port_target);
+    paths::ensure_private_dir(&runtime.paths.container_state_dir).unwrap();
+    std::fs::write(
+        runtime.paths.container_state_dir.join("published-ssh-port"),
+        "40222\n",
+    )
+    .unwrap();
+
+    let err = runtime.ensure_ready().await.unwrap_err();
+    let err = format!("{err:#}");
+
+    assert!(err.contains("persisted published SSH port 40222"), "{err}");
+    assert!(err.contains("free it"), "{err}");
+    assert!(err.contains("remove and recreate"), "{err}");
+}
+
+#[test]
+fn apple_published_ssh_readiness_timeout_names_restart_remediation() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = test_runtime(
+        &dir,
+        dir.path().join("runtime"),
+        configure_apple_published_port_target,
+    );
+    paths::ensure_private_dir(&runtime.paths.container_state_dir).unwrap();
+    std::fs::write(
+        runtime.paths.container_state_dir.join("published-ssh-port"),
+        "40222\n",
+    )
+    .unwrap();
+
+    let err = runtime.published_ssh_readiness_timeout_error().to_string();
+
+    assert!(err.contains("persisted published SSH port 40222"), "{err}");
+    assert!(err.contains("publish mapping"), "{err}");
+    assert!(err.contains("Remove and recreate"), "{err}");
+}
+
+#[tokio::test]
 async fn runtime_load_rejects_rendered_passwd_delimiters() {
     for (field, identity_line) in [
         ("session_user", r#"session_user = "bad:user""#),

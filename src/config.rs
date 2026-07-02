@@ -280,7 +280,13 @@ impl GatewayConfig {
         }
         for (name, target) in targets {
             match &target.local_ssh {
-                Some(local_ssh) if local_ssh.backend == LocalSshBackend::PublishedPort => {}
+                Some(local_ssh) if local_ssh.backend == LocalSshBackend::PublishedPort => {
+                    if local_ssh.readiness != LocalSshReadiness::SshOnly {
+                        anyhow::bail!(
+                            "target {name:?} uses runtime type \"apple_container\" but local_ssh.readiness is not \"ssh_only\"; Apple container phase-one support requires local_ssh.readiness = \"ssh_only\""
+                        );
+                    }
+                }
                 Some(_) => {
                     anyhow::bail!(
                         "target {name:?} uses local_ssh.backend = \"socket\" but runtime type \"apple_container\" only supports local_ssh.backend = \"published_port\""
@@ -291,6 +297,16 @@ impl GatewayConfig {
                         "target {name:?} must configure local_ssh.backend = \"published_port\" when runtime type is \"apple_container\""
                     );
                 }
+            }
+            if target
+                .container_agent
+                .control_socket
+                .as_ref()
+                .is_none_or(ControlSocketConfig::is_enabled)
+            {
+                anyhow::bail!(
+                    "target {name:?} uses runtime type \"apple_container\" but container_agent.control_socket is enabled; Apple container phase-one support requires container_agent.control_socket = false"
+                );
             }
         }
         Ok(())

@@ -682,6 +682,46 @@ pub struct ManagedContainer {
     pub labels: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct AppleContainerNameCandidates {
+    exact: BTreeSet<String>,
+    patterns: Vec<AppleContainerNamePattern>,
+}
+
+#[derive(Debug, Clone)]
+struct AppleContainerNamePattern {
+    prefix: String,
+    suffix: String,
+}
+
+impl AppleContainerNameCandidates {
+    pub fn insert_exact(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        if !name.is_empty() {
+            self.exact.insert(name);
+        }
+    }
+
+    pub fn insert_pattern(&mut self, prefix: impl Into<String>, suffix: impl Into<String>) {
+        self.patterns.push(AppleContainerNamePattern {
+            prefix: prefix.into(),
+            suffix: suffix.into(),
+        });
+    }
+
+    pub fn matches(&self, name: &str) -> bool {
+        self.exact.contains(name) || self.patterns.iter().any(|pattern| pattern.matches(name))
+    }
+}
+
+impl AppleContainerNamePattern {
+    fn matches(&self, name: &str) -> bool {
+        name.starts_with(&self.prefix)
+            && name.ends_with(&self.suffix)
+            && name.len() > self.prefix.len() + self.suffix.len()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContainerState {
     #[serde(rename = "Running")]
@@ -1544,6 +1584,7 @@ impl ContainerRuntime {
         user: &str,
         uid: u32,
         context: &RuntimeContext,
+        apple_name_candidates: Option<&AppleContainerNameCandidates>,
     ) -> anyhow::Result<Vec<ManagedContainer>> {
         let command_label = self.list_command_label();
         let mut command = self.command()?;
@@ -1565,14 +1606,16 @@ impl ContainerRuntime {
             parse_managed_containers(&output.stdout)
         }
         .with_context(|| format!("parse {} managed container list JSON", self.runtime_label()))?;
-        if self.kind == ContainerRuntimeType::AppleContainer
-            && containers
-                .iter()
-                .any(|container| container.labels.is_empty())
-        {
-            anyhow::bail!(
-                "apple container list output omitted labels; managed container listing cannot safely identify aw-gateway ownership"
-            );
+        if self.kind == ContainerRuntimeType::AppleContainer {
+            return self
+                .filter_apple_managed_containers(
+                    containers,
+                    user,
+                    uid,
+                    context,
+                    apple_name_candidates,
+                )
+                .await;
         }
         Ok(containers
             .into_iter()
@@ -1581,6 +1624,63 @@ impl ContainerRuntime {
                     && context.matches_stored(&context_from_labels(&container.labels))
             })
             .collect())
+    }
+
+    async fn filter_apple_managed_containers(
+        &self,
+        containers: Vec<ManagedContainer>,
+        user: &str,
+        uid: u32,
+        context: &RuntimeContext,
+        apple_name_candidates: Option<&AppleContainerNameCandidates>,
+    ) -> anyhow::Result<Vec<ManagedContainer>> {
+        let mut managed = Vec::new();
+        for container in containers {
+            let container = if container.labels.is_empty() {
+                let Some(candidates) = apple_name_candidates else {
+                    continue;
+                };
+                if !candidates.matches(&container.name) {
+                    continue;
+                }
+                let Some(inspect) = self.inspect(&container.name).await? else {
+                    anyhow::bail!(
+                        "apple container list row {:?} matched an aw-gateway candidate name but inspect returned no container; managed container listing cannot safely identify ownership",
+                        container.name
+                    );
+                };
+                if inspect.config.labels.is_empty() {
+                    anyhow::bail!(
+                        "apple container inspect output for candidate {:?} omitted labels; managed container listing cannot safely identify aw-gateway ownership",
+                        container.name
+                    );
+                }
+                let image = if container.image.is_empty() {
+                    inspect
+                        .config
+                        .labels
+                        .get("io.aw-gateway.image")
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    container.image
+                };
+                ManagedContainer {
+                    name: container.name,
+                    image,
+                    running: inspect.state.running,
+                    labels: inspect.config.labels,
+                }
+            } else {
+                container
+            };
+            if parse::is_aw_gateway_managed_container_for(&container, user, uid)
+                && context.matches_stored(&context_from_labels(&container.labels))
+            {
+                managed.push(container);
+            }
+        }
+        Ok(managed)
     }
 
     pub fn run_args(&self, spec: &ContainerRunSpec) -> Vec<String> {
@@ -1728,7 +1828,7 @@ impl ContainerRuntime {
         ));
         for (key, value) in &spec.env {
             args.push("--env".into());
-            args.push(runtime_env_arg(key, value));
+            args.push(explicit_env_arg(key, value));
         }
         for (key, value) in &spec.labels {
             args.push("--label".into());
@@ -1755,7 +1855,7 @@ impl ContainerRuntime {
         }
         for (key, value) in &spec.env {
             args.push("--env".into());
-            args.push(runtime_env_arg(key, value));
+            args.push(explicit_env_arg(key, value));
         }
         args.push(spec.container_name.clone());
         args.extend(spec.command.clone());
@@ -1991,8 +2091,12 @@ fn runtime_env_arg(key: &str, value: &str) -> String {
     if runtime_env_can_passthrough_client_process(key) {
         key.to_string()
     } else {
-        format!("{key}={value}")
+        explicit_env_arg(key, value)
     }
+}
+
+fn explicit_env_arg(key: &str, value: &str) -> String {
+    format!("{key}={value}")
 }
 
 fn runtime_env_can_passthrough_client_process(key: &str) -> bool {
@@ -2962,11 +3066,11 @@ esac
         };
 
         runtime
-            .list_managed_containers("alice", 2450, &RuntimeContext::empty())
+            .list_managed_containers("alice", 2450, &RuntimeContext::empty(), None)
             .await
             .unwrap();
         runtime
-            .list_managed_containers("alice", 2450, &RuntimeContext::empty())
+            .list_managed_containers("alice", 2450, &RuntimeContext::empty(), None)
             .await
             .unwrap();
 
@@ -3034,13 +3138,13 @@ esac
         };
 
         let err = runtime
-            .list_managed_containers("alice", 2450, &RuntimeContext::empty())
+            .list_managed_containers("alice", 2450, &RuntimeContext::empty(), None)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("system start"), "{err:#}");
 
         runtime
-            .list_managed_containers("alice", 2450, &RuntimeContext::empty())
+            .list_managed_containers("alice", 2450, &RuntimeContext::empty(), None)
             .await
             .unwrap();
 
@@ -3547,7 +3651,7 @@ esac
                 "--env",
                 "AW_CONTAINER_STATE_DIR=/home/alice/.aw-gateway/containers/aw-local"
             ]));
-        assert!(args.windows(2).any(|pair| pair == ["--env", "AW_SAFE"]));
+        assert!(args.windows(2).any(|pair| pair == ["--env", "AW_SAFE=1"]));
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--env", "PATH=/tmp/bad"])
@@ -3649,7 +3753,10 @@ esac
             stdout_tty: true,
             user: "2450:100".into(),
             cwd: Some(PathBuf::from("/home/alice/project")),
-            env: BTreeMap::from([("PATH".into(), "/tmp/bad".into())]),
+            env: BTreeMap::from([
+                ("CODEX_HOME".into(), "/var/lib/codex".into()),
+                ("PATH".into(), "/tmp/bad".into()),
+            ]),
             container_name: "ubuntu-dev".into(),
             command: vec!["/usr/bin/bash".into(), "-lc".into(), "id -u".into()],
         };
@@ -3663,6 +3770,8 @@ esac
                 "2450:100",
                 "--workdir",
                 "/home/alice/project",
+                "--env",
+                "CODEX_HOME=/var/lib/codex",
                 "--env",
                 "PATH=/tmp/bad",
                 "ubuntu-dev",
@@ -3704,7 +3813,7 @@ esac
     }
 
     #[tokio::test]
-    async fn apple_list_managed_containers_fails_closed_when_labels_are_missing() {
+    async fn apple_list_managed_containers_ignores_unlabeled_non_candidates() {
         let _apple_preflight_bypass = disable_apple_preflight_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
@@ -3714,7 +3823,7 @@ esac
 case "$1" in
   list)
     cat <<'JSON'
-[{"status":"running","configuration":{"id":"aw-ubuntu"}}]
+[{"status":"running","configuration":{"id":"unrelated"}}]
 JSON
     ;;
 esac
@@ -3728,9 +3837,100 @@ exit 0
             program: runtime_program.display().to_string(),
             env: BTreeMap::new(),
         };
+        let mut candidates = AppleContainerNameCandidates::default();
+        candidates.insert_exact("aw-ubuntu");
+
+        let containers = runtime
+            .list_managed_containers("alice", 2450, &RuntimeContext::empty(), Some(&candidates))
+            .await
+            .unwrap();
+
+        assert!(containers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apple_list_managed_containers_inspects_unlabeled_candidates() {
+        let _apple_preflight_bypass = disable_apple_preflight_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-runtime");
+        let user = "alice";
+        std::fs::write(
+            &runtime_program,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  list)
+    cat <<'JSON'
+[{{"status":"running","configuration":{{"id":"aw-ubuntu"}}}}]
+JSON
+    ;;
+  inspect)
+    cat <<'JSON'
+[{{"status":"running","configuration":{{"id":"aw-ubuntu","hostname":"aw-ubuntu","labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"2450","io.aw-gateway.target":"default","io.aw-gateway.container_id":"aw-ubuntu","io.aw-gateway.image":"ubuntu/dev"}}}}}}]
+JSON
+    ;;
+esac
+exit 0
+"#,
+                user = user,
+            )
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::AppleContainer,
+            program: runtime_program.display().to_string(),
+            env: BTreeMap::new(),
+        };
+        let mut candidates = AppleContainerNameCandidates::default();
+        candidates.insert_exact("aw-ubuntu");
+
+        let containers = runtime
+            .list_managed_containers("alice", 2450, &RuntimeContext::empty(), Some(&candidates))
+            .await
+            .unwrap();
+
+        assert_eq!(containers.len(), 1);
+        assert_eq!(containers[0].name, "aw-ubuntu");
+        assert_eq!(containers[0].image, "ubuntu/dev");
+        assert!(containers[0].running);
+    }
+
+    #[tokio::test]
+    async fn apple_list_managed_containers_fails_closed_when_candidate_inspect_lacks_labels() {
+        let _apple_preflight_bypass = disable_apple_preflight_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_program = dir.path().join("fake-runtime");
+        std::fs::write(
+            &runtime_program,
+            r#"#!/bin/sh
+case "$1" in
+  list)
+    cat <<'JSON'
+[{"status":"running","configuration":{"id":"aw-ubuntu"}}]
+JSON
+    ;;
+  inspect)
+    cat <<'JSON'
+[{"status":"running","configuration":{"id":"aw-ubuntu","hostname":"aw-ubuntu"}}]
+JSON
+    ;;
+esac
+exit 0
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::AppleContainer,
+            program: runtime_program.display().to_string(),
+            env: BTreeMap::new(),
+        };
+        let mut candidates = AppleContainerNameCandidates::default();
+        candidates.insert_exact("aw-ubuntu");
 
         let err = runtime
-            .list_managed_containers("alice", 2450, &RuntimeContext::empty())
+            .list_managed_containers("alice", 2450, &RuntimeContext::empty(), Some(&candidates))
             .await
             .unwrap_err();
 

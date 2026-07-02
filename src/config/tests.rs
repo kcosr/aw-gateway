@@ -1058,6 +1058,10 @@ name = "{image_slug}"
 
 [targets.default.local_ssh]
 backend = "published_port"
+readiness = "ssh_only"
+
+[target_defaults.container_agent]
+control_socket = false
 "#;
     let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
     cfg.validate().unwrap();
@@ -1065,6 +1069,54 @@ backend = "published_port"
         cfg.runtime.runtime_type,
         ContainerRuntimeType::AppleContainer
     );
+}
+
+#[test]
+fn apple_container_rejects_agent_control_readiness() {
+    let cfg = r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+
+[target_defaults.container_agent]
+control_socket = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+backend = "published_port"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("local_ssh.readiness"), "{err}");
+    assert!(err.contains("ssh_only"), "{err}");
+}
+
+#[test]
+fn apple_container_rejects_enabled_control_socket() {
+    let cfg = r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+backend = "published_port"
+readiness = "ssh_only"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("container_agent.control_socket"), "{err}");
+    assert!(err.contains("false"), "{err}");
 }
 
 #[test]

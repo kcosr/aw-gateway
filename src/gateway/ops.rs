@@ -10,10 +10,11 @@ use crate::cli::{
     ClientConfigArgs, LaunchShowArgs, LaunchesArgs, RemoveArgs, RunArgs, SetDefaultArgs, StatusArg,
     StopArgs, TargetsArgs,
 };
-use crate::config::{GatewayConfig, LaunchConfig, LocalSshMode};
+use crate::config::{ContainerRuntimeType, GatewayConfig, LaunchConfig, LocalSshMode, TargetMode};
 use crate::context::{RuntimeContext, validate_runtime_context};
 use crate::paths::{self, UserContext};
-use crate::runtime::ContainerRuntime;
+use crate::runtime::{AppleContainerNameCandidates, ContainerRuntime};
+use crate::template::{self, Vars};
 use anyhow::Context;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
@@ -551,10 +552,94 @@ async fn operation_status_all(
     validate_runtime_context(&cfg.context_vars, &context)?;
     let user = UserContext::current()?;
     let container_runtime = ContainerRuntime::from_config(&cfg.runtime, &user.user, &user.home)?;
+    let apple_name_candidates = if cfg.runtime.runtime_type == ContainerRuntimeType::AppleContainer
+    {
+        Some(apple_container_name_candidates(&cfg, &context)?)
+    } else {
+        None
+    };
     let containers = container_runtime
-        .list_managed_containers(&user.user, user.uid, &context)
+        .list_managed_containers(
+            &user.user,
+            user.uid,
+            &context,
+            apple_name_candidates.as_ref(),
+        )
         .await?;
     Ok(status_all_entries(&cfg, containers))
+}
+
+fn apple_container_name_candidates(
+    cfg: &GatewayConfig,
+    context: &RuntimeContext,
+) -> anyhow::Result<AppleContainerNameCandidates> {
+    let mut candidates = AppleContainerNameCandidates::default();
+    for (name, target) in cfg.effective_targets()? {
+        match target.mode {
+            TargetMode::Fixed => match target.container_name_with_context(None, context) {
+                Ok(container_name) => candidates.insert_exact(container_name),
+                Err(err) if missing_context_render_error(&err) => {}
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("render fixed target {name:?} container name"));
+                }
+            },
+            TargetMode::Ephemeral => {
+                insert_ephemeral_apple_container_candidate(
+                    &mut candidates,
+                    &name,
+                    &target,
+                    context,
+                )?;
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+fn insert_ephemeral_apple_container_candidate(
+    candidates: &mut AppleContainerNameCandidates,
+    target_name: &str,
+    target: &crate::config::TargetConfig,
+    context: &RuntimeContext,
+) -> anyhow::Result<()> {
+    const SESSION_ID_SENTINEL: &str = "__AW_GATEWAY_SESSION_ID__";
+
+    let mut vars = Vars::new();
+    vars.insert("image_slug".into(), template::image_slug(&target.image));
+    vars.insert("session_id".into(), SESSION_ID_SENTINEL.into());
+    context.insert_template_vars(&mut vars);
+    let pattern = target
+        .ephemeral_name
+        .as_deref()
+        .unwrap_or("{image_slug}-{session_id}");
+    let rendered = match template::render(pattern, &vars) {
+        Ok(rendered) => rendered,
+        Err(err) if missing_context_render_error(&err) => return Ok(()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("render ephemeral target {target_name:?} container name pattern")
+            });
+        }
+    };
+    let parts = rendered.split(SESSION_ID_SENTINEL).collect::<Vec<_>>();
+    match parts.as_slice() {
+        [exact] => candidates.insert_exact((*exact).to_string()),
+        [prefix, suffix] => {
+            candidates.insert_pattern((*prefix).to_string(), (*suffix).to_string());
+        }
+        _ => {
+            anyhow::bail!(
+                "ephemeral target {target_name:?} container name pattern references {{session_id}} more than once; Apple container status --all cannot safely inspect unlabeled list candidates"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn missing_context_render_error(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains("unknown interpolation variable {context.")
 }
 
 #[cfg(test)]

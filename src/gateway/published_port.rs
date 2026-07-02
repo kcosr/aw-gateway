@@ -113,7 +113,7 @@ impl Runtime {
         }))
     }
 
-    fn read_published_ssh_port(&self) -> anyhow::Result<Option<u16>> {
+    pub(super) fn read_published_ssh_port(&self) -> anyhow::Result<Option<u16>> {
         let path = self.published_ssh_port_path();
         let raw = match std::fs::read_to_string(&path) {
             Ok(raw) => raw,

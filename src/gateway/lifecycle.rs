@@ -2,6 +2,7 @@ use super::Runtime;
 use super::failures::ContainerNotFound;
 use crate::config::{IdleCleanupAction, IdleCleanupConfig, IdleCleanupOwner, LifecyclePhase};
 use crate::runtime::ContainerInspect;
+use anyhow::Context;
 use tokio::net::TcpStream;
 use tokio::time::{Duration, Instant, sleep};
 
@@ -44,12 +45,12 @@ impl Runtime {
             }
             ContainerReadinessPlan::StartStopped(existing) => {
                 self.validate_labels(&existing)?;
+                let apple_published_ssh_port = self.apple_restart_published_ssh_port()?;
                 self.run_lifecycle_phase(LifecyclePhase::PreStart, None)
                     .await?;
                 self.remove_stale_control_socket_files()?;
                 failed_start_cleanup.mark_runtime_start_attempted();
-                self.container_runtime
-                    .start(&self.identity.container_name)
+                self.start_existing_container(apple_published_ssh_port)
                     .await?;
                 self.inspect_container_after_start().await
             }
@@ -69,6 +70,39 @@ impl Runtime {
             .inspect(&self.identity.container_name)
             .await?
             .ok_or_else(|| ContainerNotFound::after_start().into())
+    }
+
+    fn apple_restart_published_ssh_port(&self) -> anyhow::Result<Option<u16>> {
+        if self.needs_explicit_published_ssh_port() {
+            let port = self.read_published_ssh_port()?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Apple container target {:?} is stopped but published SSH port state is missing; remove and recreate the target to allocate a published SSH port",
+                    self.identity.target_name
+                )
+            })?;
+            Ok(Some(port))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn start_existing_container(
+        &self,
+        apple_published_ssh_port: Option<u16>,
+    ) -> anyhow::Result<()> {
+        self.container_runtime
+            .start(&self.identity.container_name)
+            .await
+            .with_context(|| {
+                if let Some(port) = apple_published_ssh_port {
+                    format!(
+                        "start Apple container target {:?} with persisted published SSH port {port}; if the port is occupied, free it or remove and recreate the target",
+                        self.identity.target_name
+                    )
+                } else {
+                    format!("start container {:?}", self.identity.container_name)
+                }
+            })
     }
 
     pub(super) async fn apply_gateway_idle_cleanup(&self) -> anyhow::Result<()> {
@@ -238,9 +272,29 @@ impl Runtime {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                anyhow::bail!("published container SSH port did not become ready");
+                return Err(self.published_ssh_readiness_timeout_error());
             }
             sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    pub(super) fn published_ssh_readiness_timeout_error(&self) -> anyhow::Error {
+        if self.needs_explicit_published_ssh_port() {
+            match self.read_published_ssh_port() {
+                Ok(Some(port)) => anyhow::anyhow!(
+                    "Apple container target {:?} persisted published SSH port {port} did not become ready; Apple may not have restored the publish mapping after container start, or the port may be occupied. Remove and recreate the target, or free the port and retry.",
+                    self.identity.target_name
+                ),
+                Ok(None) => anyhow::anyhow!(
+                    "Apple container target {:?} published SSH port did not become ready because published port state is missing; remove and recreate the target to allocate a published SSH port",
+                    self.identity.target_name
+                ),
+                Err(err) => anyhow::anyhow!(
+                    "published container SSH port did not become ready and published port state could not be read: {err:#}"
+                ),
+            }
+        } else {
+            anyhow::anyhow!("published container SSH port did not become ready")
         }
     }
 

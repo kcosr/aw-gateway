@@ -1,10 +1,12 @@
 use super::*;
 use crate::cli::{LaunchShowArgs, LaunchesArgs, RunArgs, StatusArg, TargetsArgs};
-use crate::config::{LaunchVarConfig, LaunchVarType, LaunchVarValue};
+use crate::config::{GatewayConfig, LaunchVarConfig, LaunchVarType, LaunchVarValue};
+use crate::context::RuntimeContext;
 use crate::ssh_dispatch::{
     ClientBundleAction, ClientConfigAction, GatewayAction, KeyAction, KeySourceAction, RunAction,
     StatusAction, TargetSessionAction,
 };
+use std::collections::BTreeMap;
 
 fn launch_var_config(var_type: LaunchVarType, values: Option<Vec<&str>>) -> LaunchVarConfig {
     LaunchVarConfig {
@@ -37,6 +39,64 @@ fn assert_coercion_error(
         err.to_string().contains(expected),
         "expected {expected:?} in {err}"
     );
+}
+
+#[test]
+fn apple_container_name_candidates_match_configured_fixed_and_ephemeral_names() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+default_target = "dev"
+
+[runtime]
+type = "apple_container"
+
+[context_vars.tenant]
+
+[context_vars.region]
+
+[target_defaults.container_agent]
+control_socket = false
+
+[targets.dev]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}-{context.tenant}"
+
+[targets.dev.local_ssh]
+backend = "published_port"
+readiness = "ssh_only"
+
+[targets.job]
+image = "ubuntu/job"
+mode = "ephemeral"
+ephemeral_name = "worker-{context.tenant}-{session_id}"
+stop_when_idle = true
+
+[targets.job.local_ssh]
+backend = "published_port"
+readiness = "ssh_only"
+
+[targets.optional]
+image = "ubuntu/optional"
+mode = "fixed"
+name = "{image_slug}-{context.region}"
+
+[targets.optional.local_ssh]
+backend = "published_port"
+readiness = "ssh_only"
+"#,
+    )
+    .unwrap();
+    let context = RuntimeContext::from_map(BTreeMap::from([("tenant".into(), "team-a".into())]));
+
+    let candidates = apple_container_name_candidates(&cfg, &context).unwrap();
+
+    assert!(candidates.matches("ubuntu-dev-team-a"));
+    assert!(candidates.matches("worker-team-a-abc123"));
+    assert!(!candidates.matches("worker-team-b-abc123"));
+    assert!(!candidates.matches("ubuntu-optional-us-east"));
+    assert!(!candidates.matches("unrelated"));
 }
 
 #[test]
