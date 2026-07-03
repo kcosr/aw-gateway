@@ -38,6 +38,15 @@ def deploy_host(inventory: Inventory, host: Host, options: DeployOptions) -> Non
         config_example=host.local_config_example,
         output_name="gateway-local.toml",
     )
+    rendered_runtime_exec_config = render_gateway_config(
+        inventory,
+        host,
+        generated_host_dir,
+        config_example=host.runtime_exec_config_example,
+        output_name="gateway-runtime-exec.toml",
+        configure_ssh_dispatch=False,
+        configure_client_config=False,
+    )
     rendered_limited_http_config = render_gateway_config(
         inventory,
         host,
@@ -72,6 +81,7 @@ def deploy_host(inventory: Inventory, host: Host, options: DeployOptions) -> Non
         scp_to(host.ssh, helper_dir / helper, f"{remote_tmp}/{helper}").assert_success()
     scp_to(host.ssh, rendered_config, f"{remote_tmp}/gateway.toml").assert_success()
     scp_to(host.ssh, rendered_local_config, f"{remote_tmp}/gateway-local.toml").assert_success()
+    scp_to(host.ssh, rendered_runtime_exec_config, f"{remote_tmp}/gateway-runtime-exec.toml").assert_success()
     scp_to(host.ssh, rendered_limited_http_config, f"{remote_tmp}/gateway-http-limited.toml").assert_success()
 
     install_remote_files(host, remote_tmp)
@@ -184,6 +194,8 @@ def render_gateway_config(
     config_example: str | None = None,
     output_name: str = "gateway.toml",
     http_actions: list[str] | None = None,
+    configure_ssh_dispatch: bool = True,
+    configure_client_config: bool = True,
 ) -> Path:
     source = inventory.repo_root / (config_example or host.config_example)
     root = install_root or host.install_root
@@ -198,12 +210,14 @@ def render_gateway_config(
         text = text.replace('mode = "fixed"', 'mode = "ephemeral"', 1)
         text = text.replace('name = "{image_slug}"', 'ephemeral_name = "{image_slug}-{session_id}"', 1)
         text = text.replace("remove_on_stop = false", "remove_on_stop = true", 1)
-    text = ensure_enabled_action(text, "run")
-    text = ensure_ssh_command_filter_env(text)
+    if configure_ssh_dispatch:
+        text = ensure_enabled_action(text, "run")
+        text = ensure_ssh_command_filter_env(text)
     text = append_http_smoke_config(text, host, http_actions=http_actions)
     text = append_smoke_launch(text, host)
-    text = replace_toml_string(text, "host", host.ssh, section="client_config")
-    text = replace_toml_string(text, "gateway_path", f"{root}/bin/aw-gateway", section="client_config")
+    if configure_client_config:
+        text = replace_toml_string(text, "host", host.ssh, section="client_config")
+        text = replace_toml_string(text, "gateway_path", f"{root}/bin/aw-gateway", section="client_config")
     output = output_dir / output_name
     output.write_text(text)
     return output
@@ -447,6 +461,7 @@ set -euo pipefail
 {prefix}install -m 0644 {tmp}/sshd_config_agent {root}/runtime/linux/sshd_config_agent
 {prefix}install -m 0644 {tmp}/gateway.toml {root}/etc/gateway.toml
 {prefix}install -m 0644 {tmp}/gateway-local.toml {root}/etc/gateway-local.toml
+{prefix}install -m 0644 {tmp}/gateway-runtime-exec.toml {root}/etc/gateway-runtime-exec.toml
 {prefix}install -m 0644 {tmp}/gateway-http-limited.toml {root}/etc/gateway-http-limited.toml
 """
     remote_check(host.ssh, command, timeout=120)

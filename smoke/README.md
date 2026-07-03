@@ -119,6 +119,7 @@ Linux operator layout:
   bin/aw-gateway
   etc/gateway.toml
   etc/gateway-local.toml
+  etc/gateway-runtime-exec.toml
   etc/gateway-http-limited.toml
   runtime/linux/
     aw-container-agent
@@ -181,6 +182,8 @@ The current suite covers:
 - Config validation.
 - Target listing.
 - Clean fixed-target lifecycle.
+- Runtime-exec access for config validation, command execution, shell
+  execution, status access labels, and SSH-only operation rejection.
 - Host-local container SSH through generated client bundles.
 - Container SSH transfer policy for `sftp`, default `scp`, and legacy
   `scp -O` upload/download paths.
