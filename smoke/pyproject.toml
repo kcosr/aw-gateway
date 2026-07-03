@@ -2,9 +2,10 @@
 name = "aw-gateway-smoke"
 version = "0.1.0"
 description = "Controller-driven live smoke harness for aw-gateway remote hosts"
-requires-python = ">=3.11"
+requires-python = ">=3.9"
 dependencies = [
   "pytest>=8.0",
+  "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.scripts]

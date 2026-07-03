@@ -3,7 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised by Python < 3.11
+    import tomli as tomllib
 
 from .command import CommandResult, HostRunner, LocalRunner, SshRunner
 

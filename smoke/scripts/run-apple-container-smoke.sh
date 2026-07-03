@@ -47,7 +47,7 @@ select_python() {
     command -v "$candidate" >/dev/null 2>&1 || continue
     if "$candidate" - <<'PY' >/dev/null 2>&1
 import sys
-raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
+raise SystemExit(0 if sys.version_info >= (3, 9) else 1)
 PY
     then
       printf '%s\n' "$candidate"
@@ -55,7 +55,7 @@ PY
     fi
   done
 
-  fail "Python 3.11+ is required for the smoke harness; install python3.11, python3.12, or python3.13"
+  fail "Python 3.9+ is required for the smoke harness"
 }
 
 log_command() {
