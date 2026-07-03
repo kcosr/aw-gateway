@@ -256,7 +256,7 @@ run_step 04_upgrade_pip "$VENV/bin/python" -m pip install --upgrade pip
 run_step 05_install_smoke "$VENV/bin/python" -m pip install -e "${REPO_ROOT}/smoke"
 run_step 06_awsmoke_hosts "$VENV/bin/awsmoke" --inventory "$INVENTORY" hosts
 run_step 07_awsmoke_deploy "$VENV/bin/awsmoke" --inventory "$INVENTORY" deploy "$HOST_NAME"
-run_step 08_pytest "$VENV/bin/python" -m pytest --inventory "$INVENTORY" --host "$HOST_NAME" -q "${REPO_ROOT}/smoke/tests"
+run_step 08_pytest env AWSMOKE_INVENTORY="$INVENTORY" AWSMOKE_HOST="$HOST_NAME" "$VENV/bin/python" -m pytest -q "${REPO_ROOT}/smoke/tests"
 
 SMOKE_STATUS="passed"
 note "smoke_passed"
