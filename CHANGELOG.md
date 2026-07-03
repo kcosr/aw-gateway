@@ -2,7 +2,29 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Added explicit target access modes with `access.method = "runtime_exec"` for
+  no-SSH runtime execution targets. Runtime-exec targets support lifecycle,
+  status, run, launch, and the new local `shell` command without exposing
+  container SSH, and Apple container targets can now use this mode without a
+  published SSH port ([#60](https://github.com/kcosr/aw-gateway/pull/60)).
+- Added runtime-exec sample configs for local Podman, Docker, and Colima
+  deployments ([#60](https://github.com/kcosr/aw-gateway/pull/60)).
+
+### Changed
+
+- Gateway status, target listing, and runtime labels now include the effective
+  target access mode. Existing configs default to `access.method = "ssh"`;
+  target-specific container reuse now fails closed when a labeled container's
+  access mode differs from the effective target config
+  ([#60](https://github.com/kcosr/aw-gateway/pull/60)).
+
+### Fixed
+
+- Published-port SSH targets now report only `ssh_tcp` in status JSON instead
+  of also exposing a Unix `ssh_socket` path
+  ([#60](https://github.com/kcosr/aw-gateway/pull/60)).
 
 ## [0.8.0] - 2026-07-02
 

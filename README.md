@@ -435,8 +435,33 @@ bridge.
 
 ## Local Workstation Mode
 
-Local profiles can use the same gateway binary without host SSHD. A target can
-enable a loopback-only listener:
+Local profiles can use the same gateway binary without host SSHD. For local
+workflows that do not need OpenSSH-compatible tools, configure no-SSH runtime
+execution:
+
+```toml
+[targets.default.access]
+method = "runtime_exec"
+```
+
+Runtime-exec targets do not expose container SSH, do not generate SSH client
+config, and do not support SCP, SFTP, VS Code Remote-SSH, `connect`,
+`add-key`, `add-container-key`, `client-config`, or `client-bundle`.
+`add-host-key` remains available because it only mutates the host user's SSH
+configuration. Runtime-exec targets do support `up`, `run`, `shell`, `launch`,
+`launches`, `status`, `status --all`, `targets`, `stop`, and `remove` through
+the host container runtime.
+
+Start a no-SSH target and open an interactive shell with the configured
+`identity.session_shell`:
+
+```bash
+aw-gateway --config ./gateway.local.toml up default --json
+aw-gateway --config ./gateway.local.toml shell default
+```
+
+SSH-compatible local profiles remain available. A target can enable a
+loopback-only listener:
 
 ```toml
 [targets.default.local_ssh]
@@ -465,7 +490,9 @@ Use `control_socket = false` when the host gateway only needs the published
 SSH port. This lets `aw-container-agent` supervise services without creating an
 unused Unix socket on a Docker/Colima bind mount or Apple container guest bind
 mount. Docker and Colima ask the runtime for the mapped port after startup;
-Apple Container uses an explicit preallocated loopback port.
+Apple Container uses an explicit preallocated loopback port. Apple Container
+targets can alternatively use `access.method = "runtime_exec"` to avoid
+publishing an SSH port entirely.
 
 On macOS, non-interactive SSH sessions may not include user-local package
 manager paths. If the Docker CLI used for Colima is not on the SSH session
@@ -594,8 +621,9 @@ Apple container support is for Apple silicon macOS 26 or newer with Apple
 container CLI 1.0.0 or newer. Before Apple runtime operations, the gateway
 checks `container system version --format json` and
 `container system status --format json`; if the system is stopped, run
-`container system start`. Apple container targets use the `published_port`
-local SSH backend.
+`container system start`. Apple container targets can use no-SSH
+`access.method = "runtime_exec"` for local runtime execution, or
+`local_ssh.backend = "published_port"` when SSH-compatible clients are needed.
 
 Set `runtime.program` to use a specific runtime executable instead of looking
 up the default `podman`, `docker`, `colima`, or `container` binary on `PATH`:
@@ -750,9 +778,14 @@ Gateway configs commonly include:
   hyphens only, with no leading, trailing, or consecutive hyphens.
 - `[client_config]`: generated SSH alias templates, host name, gateway path,
   and default identity directory.
-- `[targets.<name>]`: container image, naming mode, container user/home,
-  idle and workspace cleanup behavior, optional runtime args, environment, and
-  local-listen settings.
+- `[targets.<name>]`: container image, naming mode, access method, container
+  user/home, idle and workspace cleanup behavior, optional runtime args,
+  environment, and local-listen settings.
+- `[targets.<name>.access]`: target transport contract. `method = "ssh"` is
+  the default and allows SSH-compatible operations when an SSH endpoint is
+  configured. `method = "runtime_exec"` disables AW Gateway-managed container
+  SSH and uses the runtime exec path for lifecycle, shell, run, and launch
+  operations.
 - `[targets.<name>.identity]`: container bootstrap and session identity
   fields.
 - `[[target_defaults.lifecycle_steps]]`: phase-keyed host hooks for `pre_start`,
@@ -1356,6 +1389,7 @@ config paths [--json]
 connect [--session-id ID] [target]
 up [target] [--json] [--session-id ID]
 run [--session-id ID] [target] [--cwd DIR] -- <command> [args...]
+shell [--session-id ID] [target] [--cwd DIR] [-- <shell-args>...]
 launches [--json]
 launch show <name> [--json]
 launch <name> [--session-id ID] [--var key=value]... [-- <args...>]
@@ -1400,6 +1434,10 @@ Gateway command behavior:
   Foreground runs interrupted by `SIGINT`, `SIGTERM`, or `SIGHUP` are canceled
   with in-container process cleanup and then routed through normal session
   cleanup.
+- `shell [--session-id ID] [target] [--cwd DIR] [-- <shell-args>...]`: start or
+  reuse a target and run the target's configured `identity.session_shell`
+  through the runtime exec path. This is local CLI/API behavior, not an
+  OpenSSH endpoint.
 - `launches [--json]`: list configured launches.
 - `launch show <name> [--json]`: show one configured launch's variables, steps,
   and final command.

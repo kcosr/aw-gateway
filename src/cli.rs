@@ -33,6 +33,7 @@ pub enum GatewayCommand {
     Connect(ConnectArgs),
     Up(UpArgs),
     Run(RunArgs),
+    Shell(ShellArgs),
     #[command(subcommand)]
     Launch(LaunchCommand),
     Launches(LaunchesArgs),
@@ -180,6 +181,20 @@ pub struct RunArgs {
 
     #[arg(last = true)]
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ShellArgs {
+    pub target: Option<String>,
+
+    #[arg(long)]
+    pub session_id: Option<String>,
+
+    #[arg(long)]
+    pub cwd: Option<String>,
+
+    #[arg(last = true)]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Args)]

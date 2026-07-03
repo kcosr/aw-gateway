@@ -5,6 +5,8 @@ deployment modes:
 
 - **Local Podman workstation**: the gateway runs on the same Linux workstation
   as the SSH client and exposes a loopback-only local SSH listener.
+- **Local Podman runtime-exec**: the gateway runs on the same Linux workstation
+  and attaches with `podman exec` instead of starting container `sshd`.
 - **Remote Podman host over SSH**: the gateway runs on a remote Linux host.
   Host SSH authenticates the user, and generated SSH config connects clients to
   container SSH through `ProxyCommand`.
@@ -20,8 +22,8 @@ recommended for managed-host deployments.
 
 ## What This Provides
 
-The setup gives users a standard SSH endpoint for a Podman-managed development
-container:
+The default local and remote setup gives users a standard SSH endpoint for a
+Podman-managed development container:
 
 - `aw-gateway` starts or reuses a configured container.
 - `aw-container-bootstrap` is mounted into the container and prepares runtime
@@ -33,6 +35,12 @@ container:
 - Remote hosts can optionally restrict selected users with OpenSSH
   `ForceCommand`.
 
+For local-only use, `examples/podman/gateway-runtime-exec.toml` is the no-SSH
+variant. It starts the container without `sshd`, does not publish port 22, and
+uses `aw-gateway shell ubuntu` or `aw-gateway run ubuntu -- <command>` through
+`podman exec`. OpenSSH client config, SCP, SFTP, and VS Code Remote-SSH require
+the SSH-backed examples instead.
+
 ## Example Files
 
 Copyable examples live under:
@@ -41,6 +49,7 @@ Copyable examples live under:
 examples/podman/
   Containerfile.ubuntu
   gateway-local.toml
+  gateway-runtime-exec.toml
   gateway-remote.toml
   sshd_config_agent
   sshd-match-restricted.conf
@@ -50,6 +59,11 @@ examples/podman/
 Full-file code blocks below match the files in `examples/podman/` unless the
 block is explicitly labeled as an excerpt. Adjust paths, hostname, target
 names, and image names for your environment.
+
+Use `gateway-runtime-exec.toml` when the gateway and Podman runtime are on the
+same machine and you do not need OpenSSH-compatible access. That example uses a
+root shell in the container and intentionally omits container-agent, SSH bridge,
+and `container-sshd` service configuration.
 
 ## Host Layout
 

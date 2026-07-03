@@ -1,0 +1,44 @@
+schema_version = "1"
+default_target = "ubuntu"
+
+[runtime]
+type = "colima"
+profile = "aw-gateway"
+
+[logging]
+level = "info"
+console = true
+
+[target_defaults.workspace]
+path = "/Users/example/aw-gateway/workspace"
+state_dir = ".aw-gateway"
+
+[target_defaults.container_agent]
+enabled = false
+
+[targets.ubuntu]
+image = "aw-gateway/ubuntu-base"
+mode = "fixed"
+name = "{image_slug}"
+container_user = "root"
+container_home = "/root"
+stop_when_idle = false
+remove_on_stop = false
+
+[targets.ubuntu.access]
+method = "runtime_exec"
+
+[targets.ubuntu.identity]
+bootstrap_user = "root"
+session_user = "root"
+session_uid = "0"
+session_gid = "0"
+session_home = "/root"
+session_shell = "/bin/bash"
+
+[[target_defaults.lifecycle_steps]]
+phase = "pre_start"
+name = "ensure-workspace"
+required = true
+timeout = "60s"
+command = ["/bin/mkdir", "-p", "{workspace}"]

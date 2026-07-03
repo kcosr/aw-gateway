@@ -17,10 +17,12 @@ pub(super) struct ReadyStatus {
     pub(super) user: String,
     pub(super) image: String,
     pub(super) container: String,
+    pub(super) access: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub(super) context: BTreeMap<String, String>,
     pub(super) container_pid: Option<i64>,
-    pub(super) ssh_socket: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ssh_socket: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) ssh_tcp: Option<TcpEndpoint>,
     pub(super) status: String,
@@ -31,11 +33,18 @@ pub(super) struct ReadyStatus {
 }
 
 impl ReadyStatus {
-    pub(super) fn ssh_target(&self) -> SshTarget {
-        self.ssh_tcp
-            .clone()
-            .map(SshTarget::Tcp)
-            .unwrap_or_else(|| SshTarget::Unix(self.ssh_socket.clone()))
+    pub(super) fn ssh_target(&self) -> anyhow::Result<SshTarget> {
+        if let Some(endpoint) = self.ssh_tcp.clone() {
+            return Ok(SshTarget::Tcp(endpoint));
+        }
+        if let Some(socket) = self.ssh_socket.clone() {
+            return Ok(SshTarget::Unix(socket));
+        }
+        anyhow::bail!(
+            "target {:?} uses access.method = {:?} and does not expose an SSH endpoint",
+            self.target,
+            self.access
+        )
     }
 }
 
@@ -59,6 +68,7 @@ pub(super) struct GatewayStatus {
     pub(super) mode: String,
     pub(super) user: String,
     pub(super) image: String,
+    pub(super) access: String,
     pub(super) container: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub(super) context: BTreeMap<String, String>,
@@ -66,7 +76,10 @@ pub(super) struct GatewayStatus {
     pub(super) active_sessions: usize,
     pub(super) sessions: Vec<SessionStatus>,
     pub(super) agent_ready: bool,
-    pub(super) ssh_socket: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ssh_socket: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ssh_tcp: Option<TcpEndpoint>,
     pub(super) status: String,
     pub(super) agent: Option<Box<AgentStatus>>,
 }
@@ -82,6 +95,7 @@ where
 pub(super) struct TargetEntry {
     pub(super) target: String,
     pub(super) image: String,
+    pub(super) access: String,
     pub(super) mode: String,
     pub(super) container: String,
     pub(super) default: bool,
@@ -154,6 +168,7 @@ pub(super) struct AllStatusEntry {
     pub(super) uid: String,
     pub(super) image: String,
     pub(super) container: String,
+    pub(super) access: String,
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub(super) context: BTreeMap<String, String>,
     pub(super) status: String,

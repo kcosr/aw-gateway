@@ -472,7 +472,7 @@ async fn operation_stop(
             stopped: false,
         });
     };
-    runtime.validate_labels(&inspect)?;
+    runtime.validate_stable_labels(&inspect)?;
     runtime.stop_inspected_container(&inspect).await?;
     Ok(StopResult {
         container: runtime.identity.container_name,
@@ -505,7 +505,7 @@ async fn operation_remove(
             removed: false,
         });
     };
-    runtime.validate_labels(&inspect)?;
+    runtime.validate_stable_labels(&inspect)?;
     let was_running = inspect.state.running;
     if inspect.state.running {
         runtime.stop_inspected_container(&inspect).await?;
@@ -515,7 +515,7 @@ async fn operation_remove(
         .inspect(&runtime.identity.container_name)
         .await?
     {
-        runtime.validate_labels(&current)?;
+        runtime.validate_stable_labels(&current)?;
         runtime
             .container_runtime
             .rm(&runtime.identity.container_name)

@@ -39,7 +39,8 @@ pub use target::{
     ContainerSshTransferConfig, ControlSocketsConfig, IdleCleanupAction, IdleCleanupConfig,
     IdleCleanupConfigInput, IdleCleanupOwner, LegacyScpTransferMode, LocalSshBackend,
     LocalSshConfig, LocalSshConfigInput, LocalSshMode, LocalSshReadiness, SftpTransferMode,
-    TargetConfig, TargetConfigInput, TargetContainerBootstrapConfig, TargetContainerSshConfig,
+    TargetAccessConfig, TargetAccessConfigInput, TargetAccessMethod, TargetConfig,
+    TargetConfigInput, TargetContainerBootstrapConfig, TargetContainerSshConfig,
     TargetContainerSshTransferConfig, TargetControlSocketsConfig, TargetIdentityConfig, TargetMode,
     TargetRuntimeConfig, TargetRuntimeConfigInput, WorkspaceCleanup, WorkspaceConfig,
     WorkspaceConfigInput,
@@ -260,6 +261,9 @@ impl GatewayConfig {
             if target.container_agent.enabled {
                 continue;
             }
+            if target.access.method != TargetAccessMethod::Ssh {
+                continue;
+            }
             if target
                 .local_ssh
                 .as_ref()
@@ -281,34 +285,59 @@ impl GatewayConfig {
             return Ok(());
         }
         for (name, target) in targets {
-            match &target.local_ssh {
-                Some(local_ssh) if local_ssh.backend == LocalSshBackend::PublishedPort => {
-                    if local_ssh.readiness != LocalSshReadiness::SshOnly {
+            match target.access.method {
+                TargetAccessMethod::Ssh => {
+                    match &target.local_ssh {
+                        Some(local_ssh) if local_ssh.backend == LocalSshBackend::PublishedPort => {
+                            if local_ssh.readiness != LocalSshReadiness::SshOnly {
+                                anyhow::bail!(
+                                    "target {name:?} uses runtime type \"apple_container\" with access.method = \"ssh\" but local_ssh.readiness is not \"ssh_only\"; Apple container SSH support requires local_ssh.readiness = \"ssh_only\""
+                                );
+                            }
+                        }
+                        Some(_) => {
+                            anyhow::bail!(
+                                "target {name:?} uses local_ssh.backend = \"socket\" but runtime type \"apple_container\" only supports local_ssh.backend = \"published_port\" for SSH targets"
+                            );
+                        }
+                        None => {
+                            anyhow::bail!(
+                                "target {name:?} must configure local_ssh.backend = \"published_port\" when runtime type is \"apple_container\" and access.method = \"ssh\""
+                            );
+                        }
+                    }
+                    if target
+                        .container_agent
+                        .control_socket
+                        .as_ref()
+                        .is_none_or(ControlSocketConfig::is_enabled)
+                    {
                         anyhow::bail!(
-                            "target {name:?} uses runtime type \"apple_container\" but local_ssh.readiness is not \"ssh_only\"; Apple container phase-one support requires local_ssh.readiness = \"ssh_only\""
+                            "target {name:?} uses runtime type \"apple_container\" with access.method = \"ssh\" but container_agent.control_socket is enabled; Apple container SSH support requires container_agent.control_socket = false"
                         );
                     }
                 }
-                Some(_) => {
-                    anyhow::bail!(
-                        "target {name:?} uses local_ssh.backend = \"socket\" but runtime type \"apple_container\" only supports local_ssh.backend = \"published_port\""
-                    );
+                TargetAccessMethod::RuntimeExec => {
+                    if target.container_agent.enabled
+                        && target
+                            .container_agent
+                            .control_socket
+                            .as_ref()
+                            .is_none_or(ControlSocketConfig::is_enabled)
+                    {
+                        anyhow::bail!(
+                            "target {name:?} uses runtime type \"apple_container\" with access.method = \"runtime_exec\" but container_agent.control_socket is enabled; Apple container runtime-exec targets require container_agent.control_socket = false"
+                        );
+                    }
+                    if let Some(cleanup) = &target.idle_cleanup
+                        && cleanup.owner == IdleCleanupOwner::Agent
+                        && cleanup.action != IdleCleanupAction::None
+                    {
+                        anyhow::bail!(
+                            "target {name:?} uses runtime type \"apple_container\" with access.method = \"runtime_exec\" but agent-owned idle_cleanup requires an agent control socket"
+                        );
+                    }
                 }
-                None => {
-                    anyhow::bail!(
-                        "target {name:?} must configure local_ssh.backend = \"published_port\" when runtime type is \"apple_container\""
-                    );
-                }
-            }
-            if target
-                .container_agent
-                .control_socket
-                .as_ref()
-                .is_none_or(ControlSocketConfig::is_enabled)
-            {
-                anyhow::bail!(
-                    "target {name:?} uses runtime type \"apple_container\" but container_agent.control_socket is enabled; Apple container phase-one support requires container_agent.control_socket = false"
-                );
             }
         }
         Ok(())

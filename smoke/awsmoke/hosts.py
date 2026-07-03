@@ -38,6 +38,10 @@ class Host:
         return f"{self.install_root}/etc/gateway-local.toml"
 
     @property
+    def runtime_exec_config_path(self) -> str:
+        return f"{self.install_root}/etc/gateway-runtime-exec.toml"
+
+    @property
     def http_limited_config_path(self) -> str:
         return f"{self.install_root}/etc/gateway-http-limited.toml"
 
@@ -53,6 +57,16 @@ class Host:
             return "examples/podman/gateway-local.toml"
         if self.runtime == "colima":
             return "examples/colima/gateway-local.toml"
+        raise ValueError(f"unsupported runtime {self.runtime!r}")
+
+    @property
+    def runtime_exec_config_example(self) -> str:
+        if self.runtime == "docker":
+            return "examples/docker/gateway-runtime-exec.toml"
+        if self.runtime == "podman":
+            return "examples/podman/gateway-runtime-exec.toml"
+        if self.runtime == "colima":
+            return "examples/colima/gateway-runtime-exec.toml"
         raise ValueError(f"unsupported runtime {self.runtime!r}")
 
     @property

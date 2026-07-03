@@ -8,12 +8,11 @@ This guide shows a generic local macOS Colima setup for `aw-gateway`.
 > point and validate the target profile, architecture, SSH path, and any site
 > policy hooks before relying on it operationally.
 
-Colima runs Docker inside a Linux VM. Because the VM boundary makes
-host-visible Unix sockets awkward, this guide uses `local_ssh.backend =
-"published_port"` and `readiness = "ssh_only"` so the gateway connects to a
-loopback-published container SSH port. The container agent still supervises the
-inner SSH service, but its control socket is disabled because the host gateway
-does not use agent control in this mode.
+Colima runs Docker inside a Linux VM. The SSH-backed example uses
+`local_ssh.backend = "published_port"` and `readiness = "ssh_only"` so the
+gateway connects to a loopback-published container SSH port. The no-SSH
+runtime-exec example uses the Colima Docker socket and `docker exec` instead,
+so it does not need a local SSH listener or a published container SSH port.
 
 This guide intentionally does not configure traffic interception, custom CA
 trust, command-policy wrappers, or proxy services. Those are site policy
@@ -28,12 +27,19 @@ Copyable examples live under:
 examples/colima/
   Containerfile.ubuntu
   gateway-local.toml
+  gateway-runtime-exec.toml
   sshd_config_agent
   start-container-sshd
 ```
 
 Full-file code blocks below match files in `examples/colima/` unless the block
 is explicitly labeled as an excerpt.
+
+Use `gateway-runtime-exec.toml` for local-only no-SSH work. It starts the
+container without `sshd`, does not publish port 22, and uses `aw-gateway shell
+ubuntu` or `aw-gateway run ubuntu -- <command>` through the Colima Docker
+socket. OpenSSH client config, SCP, SFTP, and VS Code Remote-SSH require the
+published-port SSH example instead.
 
 ## Install Colima And Docker CLI
 

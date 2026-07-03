@@ -42,17 +42,22 @@ pub(super) fn render_status_result(result: GatewayStatus, json: bool) -> anyhow:
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
-        println!(
-            "{}: {} ({})",
-            result.target,
-            result.status,
-            result.container.unwrap_or_else(|| "not-created".into())
-        );
+        println!("{}", status_result_text(&result));
         if let Some(launch) = &result.launch {
             println!("launch: {launch}");
         }
     }
     Ok(())
+}
+
+pub(super) fn status_result_text(result: &GatewayStatus) -> String {
+    format!(
+        "{}: {} [{}] ({})",
+        result.target,
+        result.status,
+        result.access,
+        result.container.as_deref().unwrap_or("not-created")
+    )
 }
 
 pub(super) fn render_status_all(summaries: Vec<AllStatusEntry>, json: bool) -> anyhow::Result<()> {
@@ -62,15 +67,16 @@ pub(super) fn render_status_all(summaries: Vec<AllStatusEntry>, json: bool) -> a
         println!("No aw-gateway-managed containers found for this user.");
     } else {
         println!(
-            "{:<15} {:<11} {:<16} {:<11} {:<22} STATUS",
-            "TARGET", "SESSION", "LAUNCH", "MODE", "CONTAINER"
+            "{:<15} {:<11} {:<16} {:<13} {:<11} {:<22} STATUS",
+            "TARGET", "SESSION", "LAUNCH", "ACCESS", "MODE", "CONTAINER"
         );
         for entry in summaries {
             println!(
-                "{:<15} {:<11} {:<16} {:<11} {:<22} {}",
+                "{:<15} {:<11} {:<16} {:<13} {:<11} {:<22} {}",
                 entry.target,
                 entry.session_id.as_deref().unwrap_or("-"),
                 entry.launch.as_deref().unwrap_or("-"),
+                entry.access,
                 entry.mode,
                 entry.container,
                 entry.status
@@ -84,12 +90,20 @@ pub(super) fn render_targets(entries: Vec<TargetEntry>, json: bool) -> anyhow::R
     if json {
         println!("{}", serde_json::to_string_pretty(&entries)?);
     } else {
-        println!("{:<24} {:<24} {:<10} CONTAINER", "TARGET", "IMAGE", "MODE");
+        println!(
+            "{:<24} {:<24} {:<13} {:<10} CONTAINER",
+            "TARGET", "IMAGE", "ACCESS", "MODE"
+        );
         for entry in entries {
             let default_marker = if entry.default { " *" } else { "" };
             println!(
-                "{:<24} {:<24} {:<10} {}{}",
-                entry.target, entry.image, entry.mode, entry.container, default_marker
+                "{:<24} {:<24} {:<13} {:<10} {}{}",
+                entry.target,
+                entry.image,
+                entry.access,
+                entry.mode,
+                entry.container,
+                default_marker
             );
         }
     }

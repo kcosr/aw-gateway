@@ -1100,6 +1100,324 @@ control_socket = false
 }
 
 #[test]
+fn target_access_defaults_to_ssh() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#,
+    )
+    .unwrap();
+
+    cfg.validate().unwrap();
+    let target = cfg.effective_target("default").unwrap();
+    assert_eq!(target.access.method, TargetAccessMethod::Ssh);
+}
+
+#[test]
+fn runtime_exec_access_clears_inherited_ssh_transport() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[target_defaults.local_ssh]
+backend = "socket"
+
+[target_defaults.container_agent.ssh_bridge]
+enabled = true
+
+[[target_defaults.container_agent.services]]
+name = "container-sshd"
+command = ["/opt/aw-gateway/bin/start-container-sshd"]
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+"#,
+    )
+    .unwrap();
+
+    cfg.validate().unwrap();
+    let target = cfg.effective_target("default").unwrap();
+    assert_eq!(target.access.method, TargetAccessMethod::RuntimeExec);
+    assert!(target.local_ssh.is_none());
+    assert!(target.container_agent.ssh_bridge.is_none());
+    assert!(
+        target
+            .container_agent
+            .services
+            .iter()
+            .all(|service| service.name != "container-sshd")
+    );
+}
+
+#[test]
+fn runtime_exec_access_rejects_same_layer_local_ssh() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+
+[targets.default.local_ssh]
+backend = "socket"
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(err.contains("local_ssh"), "{err}");
+}
+
+#[test]
+fn runtime_exec_access_rejects_same_layer_enabled_ssh_bridge() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+
+[targets.default.container_agent.ssh_bridge]
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(err.contains("ssh_bridge"), "{err}");
+}
+
+#[test]
+fn runtime_exec_access_rejects_same_layer_container_sshd_service() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+
+[[targets.default.container_agent.services]]
+name = "container-sshd"
+command = ["/opt/aw-gateway/bin/start-container-sshd"]
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(err.contains("container-sshd"), "{err}");
+}
+
+#[test]
+fn runtime_exec_access_rejects_later_ssh_transport_without_access_switch() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[target_defaults.access]
+method = "runtime_exec"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+backend = "socket"
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(err.contains("local_ssh"), "{err}");
+}
+
+#[test]
+fn runtime_exec_bootstrap_requires_enabled_agent() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[target_defaults.container_agent]
+enabled = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+
+[targets.default.container_bootstrap]
+enabled = true
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(err.contains("container_agent.enabled = true"), "{err}");
+}
+
+#[test]
+fn runtime_exec_agent_owned_cleanup_requires_agent_control() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[target_defaults.container_agent]
+enabled = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+
+[targets.default.idle_cleanup]
+owner = "agent"
+action = "exit_container"
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(err.contains("container_agent.enabled"), "{err}");
+}
+
+#[test]
+fn apple_container_runtime_exec_validates_without_ssh_endpoint() {
+    let cfg = r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+
+[target_defaults.container_agent]
+control_socket = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    cfg.validate().unwrap();
+    let target = cfg.effective_target("default").unwrap();
+    assert_eq!(target.access.method, TargetAccessMethod::RuntimeExec);
+    assert!(target.local_ssh.is_none());
+}
+
+#[test]
+fn apple_container_runtime_exec_allows_disabled_agent_without_control_socket_field() {
+    let cfg = r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+
+[target_defaults.container_agent]
+enabled = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    cfg.validate().unwrap();
+}
+
+#[test]
+fn apple_container_runtime_exec_rejects_enabled_control_socket() {
+    let cfg = r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(err.contains("container_agent.control_socket"), "{err}");
+}
+
+#[test]
+fn apple_container_runtime_exec_rejects_agent_owned_idle_cleanup() {
+    let cfg = r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+
+[target_defaults.container_agent]
+control_socket = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+
+[targets.default.idle_cleanup]
+owner = "agent"
+action = "exit_container"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(err.contains("agent-owned idle_cleanup"), "{err}");
+}
+
+#[test]
 fn apple_container_rejects_agent_control_readiness() {
     let cfg = r#"
 schema_version = "1"
