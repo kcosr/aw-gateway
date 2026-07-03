@@ -11,6 +11,11 @@
   published SSH port ([#60](https://github.com/kcosr/aw-gateway/pull/60)).
 - Added runtime-exec sample configs for local Podman, Docker, and Colima
   deployments ([#60](https://github.com/kcosr/aw-gateway/pull/60)).
+- Added local-transport smoke harness support and Apple Container smoke
+  automation, including a repo-owned macOS runner, Python 3.9-compatible smoke
+  packaging, env-driven pytest host selection, and reusable Apple smoke
+  `--skip-build` / `--skip-image` modes
+  ([#61](https://github.com/kcosr/aw-gateway/pull/61)).
 
 ### Changed
 
