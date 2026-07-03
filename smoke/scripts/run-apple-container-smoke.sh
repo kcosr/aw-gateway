@@ -35,6 +35,29 @@ need() {
   command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
 }
 
+select_python() {
+  local candidates=()
+  if [[ -n "${AWGATEWAY_PYTHON:-}" ]]; then
+    candidates+=("$AWGATEWAY_PYTHON")
+  fi
+  candidates+=(python3.13 python3.12 python3.11 python3)
+
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 11) else 1)
+PY
+    then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  fail "Python 3.11+ is required for the smoke harness; install python3.11, python3.12, or python3.13"
+}
+
 log_command() {
   local path=$1
   shift
@@ -213,10 +236,10 @@ need cargo
 need container
 need git
 need perl
-need python3
 need ssh
 need scp
 need tar
+PYTHON_BIN="$(select_python)"
 
 if command -v xcrun >/dev/null 2>&1; then
   xcrun --find cc >/dev/null 2>&1 || fail "Xcode command-line tools are required; run: xcode-select --install"
@@ -227,11 +250,13 @@ write_metadata
 
 run_step 00_container_system_version container system version --format json
 run_step 01_container_system_status container system status --format json
-run_step 02_create_venv python3 -m venv "$VENV"
-run_step 03_install_smoke "$VENV/bin/python" -m pip install -e "${REPO_ROOT}/smoke"
-run_step 04_awsmoke_hosts "$VENV/bin/awsmoke" --inventory "$INVENTORY" hosts
-run_step 05_awsmoke_deploy "$VENV/bin/awsmoke" --inventory "$INVENTORY" deploy "$HOST_NAME"
-run_step 06_pytest "$VENV/bin/python" -m pytest --inventory "$INVENTORY" --host "$HOST_NAME" -q "${REPO_ROOT}/smoke/tests"
+run_step 02_python_version "$PYTHON_BIN" --version
+run_step 03_create_venv "$PYTHON_BIN" -m venv "$VENV"
+run_step 04_upgrade_pip "$VENV/bin/python" -m pip install --upgrade pip
+run_step 05_install_smoke "$VENV/bin/python" -m pip install -e "${REPO_ROOT}/smoke"
+run_step 06_awsmoke_hosts "$VENV/bin/awsmoke" --inventory "$INVENTORY" hosts
+run_step 07_awsmoke_deploy "$VENV/bin/awsmoke" --inventory "$INVENTORY" deploy "$HOST_NAME"
+run_step 08_pytest "$VENV/bin/python" -m pytest --inventory "$INVENTORY" --host "$HOST_NAME" -q "${REPO_ROOT}/smoke/tests"
 
 SMOKE_STATUS="passed"
 note "smoke_passed"

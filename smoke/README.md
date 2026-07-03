@@ -65,7 +65,7 @@ Run these commands from `smoke/`.
 Create and use the virtualenv:
 
 ```bash
-python3 -m venv .venv
+python3 -m venv .venv  # Python 3.11+ is required
 .venv/bin/python -m pip install -e .
 ```
 
