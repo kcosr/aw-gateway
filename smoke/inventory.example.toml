@@ -6,6 +6,7 @@ gateway_config = "etc/gateway.toml"
 
 [hosts.ubuntu]
 enabled = true
+transport = "ssh"
 ssh = "ubuntu"
 runtime = "docker"
 install_root = "/opt/aw-gateway"
@@ -19,6 +20,7 @@ restricted_install_root = "/home/awsmoke/aw-gateway"
 
 [hosts.rocky10]
 enabled = true
+transport = "ssh"
 ssh = "rocky10"
 runtime = "podman"
 install_root = "/home/kevin/aw-gateway"
@@ -32,6 +34,7 @@ restricted_install_root = "/home/awsmoke/aw-gateway"
 
 [hosts.macos-colima]
 enabled = true
+transport = "ssh"
 ssh = "mac"
 runtime = "colima"
 install_root = "/Users/kevin/aw-gateway"
@@ -42,3 +45,16 @@ image_context = "examples/colima"
 image = "aw-gateway/ubuntu-base:latest"
 restricted_user = "awsmoke"
 restricted_install_root = "/Users/kevin/aw-gateway"
+
+[hosts.macos-apple-container]
+enabled = false
+transport = "local"
+runtime = "apple_container"
+install_root = "/Users/example/aw-gateway-apple-smoke/install"
+install_mode = "user"
+requires_sudo = false
+config_example = "examples/apple-container/gateway-local.toml"
+image_context = "examples/apple-container"
+image = "aw-gateway/ubuntu-base:latest"
+restricted_user = "awsmoke"
+restricted_install_root = "/Users/example/aw-gateway-apple-smoke/restricted"

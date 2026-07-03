@@ -4,7 +4,6 @@ import shlex
 
 from awsmoke.gateway import local_gateway, local_gateway_command
 from awsmoke.hosts import Host
-from awsmoke.ssh import remote
 
 
 def test_local_gateway_config_validates(host: Host) -> None:
@@ -60,6 +59,6 @@ cat "${{tmp}}/up.err" >&2 || true
 cat "${{tmp}}/bundle.err" >&2 || true
 exit 1
 """
-    result = remote(host.ssh, script, timeout=420)
+    result = host.run(script, timeout=420)
     result.assert_success()
     assert "uid=" in result.stdout

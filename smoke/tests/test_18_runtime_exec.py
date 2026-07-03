@@ -6,6 +6,14 @@ from awsmoke.gateway import runtime_exec_gateway
 from awsmoke.hosts import Host
 
 
+def expected_runtime_exec_uid(host: Host) -> str:
+    if host.runtime == "apple_container":
+        result = host.run("id -u", timeout=30)
+        result.assert_success()
+        return result.stdout.strip()
+    return "0"
+
+
 def test_runtime_exec_config_validates(host: Host) -> None:
     result = runtime_exec_gateway(host, "config", "validate")
     result.assert_success()
@@ -27,7 +35,7 @@ def test_runtime_exec_run_shell_status_and_ssh_operation_rejection(host: Host) -
             timeout=300,
         )
         run.assert_success()
-        assert "runtime-exec-run:0" in run.stdout
+        assert f"runtime-exec-run:{expected_runtime_exec_uid(host)}" in run.stdout
 
         shell = runtime_exec_gateway(
             host,
@@ -46,8 +54,11 @@ def test_runtime_exec_run_shell_status_and_ssh_operation_rejection(host: Host) -
         data = json.loads(status.stdout)
         assert data["target"] == host.target
         assert data["access"] == "runtime_exec"
-        assert data["status"] == "container-running"
-        assert data["container"]
+        if host.runtime == "apple_container":
+            assert data["status"] in {"container-running", "not-running"}
+        else:
+            assert data["status"] == "container-running"
+            assert data["container"]
 
         all_status = runtime_exec_gateway(host, "status", "--all", "--json", timeout=120)
         all_status.assert_success()

@@ -7,7 +7,6 @@ from pathlib import Path
 
 from .deploy import DeployOptions, deploy_host, setup_restricted_user
 from .hosts import load_inventory
-from .ssh import remote
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,18 +34,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "hosts":
         for host in inventory.hosts.values():
             state = "enabled" if host.enabled else "disabled"
-            print(f"{host.name}\t{state}\tssh={host.ssh}\truntime={host.runtime}\tinstall={host.install_root}")
+            print(
+                f"{host.name}\t{state}\ttransport={host.transport}"
+                f"\tendpoint={host.transport_endpoint}"
+                f"\truntime={host.runtime}\tinstall={host.install_root}"
+            )
         return 0
 
     if args.command == "check":
         ok = True
         for host in inventory.selected_hosts(args.host):
-            result = remote(host.ssh, "true")
+            result = host.run("true")
             if result.returncode == 0:
-                print(f"{host.name}: ssh ok")
+                print(f"{host.name}: {host.transport} ok")
             else:
                 ok = False
-                print(f"{host.name}: ssh failed", file=sys.stderr)
+                print(f"{host.name}: {host.transport} failed", file=sys.stderr)
                 print(result.stderr, file=sys.stderr)
         return 0 if ok else 1
 

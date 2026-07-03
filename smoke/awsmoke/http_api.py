@@ -16,7 +16,6 @@ from urllib.request import Request, urlopen
 
 from .gateway import gateway_command_for_config
 from .hosts import Host
-from .ssh import remote
 
 
 @dataclass(frozen=True)
@@ -72,8 +71,12 @@ class HttpDaemon:
     def __init__(self, host: Host, *, config_path: str | None = None):
         self.host = host
         self.config_path = config_path or host.config_path
-        self.local_port = _free_local_port()
-        self.remote_port = random.randint(20000, 60999)
+        if host.transport == "local":
+            self.remote_port = _free_local_port()
+            self.local_port = self.remote_port
+        else:
+            self.local_port = _free_local_port()
+            self.remote_port = random.randint(20000, 60999)
         self.remote_config_path = (
             f"/tmp/aw-gateway-smoke-http-{host.name}-{os.getpid()}-{self.remote_port}.toml"
         )
@@ -86,24 +89,11 @@ class HttpDaemon:
             self._write_remote_config()
             remote_command = gateway_command_for_config(self.host, self.remote_config_path, "http")
             self.stderr_file = tempfile.TemporaryFile()
-            self.process = subprocess.Popen(
-                [
-                    "ssh",
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "ConnectTimeout=10",
-                    "-o",
-                    "ExitOnForwardFailure=yes",
-                    "-L",
-                    f"127.0.0.1:{self.local_port}:127.0.0.1:{self.remote_port}",
-                    self.host.ssh,
-                    remote_command,
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=self.stderr_file,
-                text=True,
+            self.process = self.host.runner.http_process(
+                remote_command,
+                local_port=self.local_port,
+                remote_port=self.remote_port,
+                stderr_file=self.stderr_file,
             )
             self._wait_ready()
         except Exception:
@@ -114,14 +104,14 @@ class HttpDaemon:
     def __exit__(self, exc_type, exc, tb) -> None:
         self._cleanup()
 
-    def signal_remote(self, signal: str) -> None:
+    def signal_host(self, signal: str) -> None:
         command = f"""
 set -eu
 pids="$({_listener_pids_script(self.remote_port)})"
 test -n "$pids"
 kill -{shlex.quote(signal)} $pids
 """
-        remote(self.host.ssh, command, timeout=30).assert_success()
+        self.host.check(command, timeout=30)
 
     def wait_exited(self, timeout: int = 20) -> None:
         if self.process is None:
@@ -133,10 +123,10 @@ kill -{shlex.quote(signal)} $pids
                 f"http daemon did not exit within {timeout}s{self._stderr_tail()}"
             ) from err
 
-    def wait_remote_stopped(self, timeout: int = 20) -> None:
+    def wait_host_stopped(self, timeout: int = 20) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            result = remote(self.host.ssh, _listener_pids_script(self.remote_port), timeout=30)
+            result = self.host.run(_listener_pids_script(self.remote_port), timeout=30)
             if not result.stdout.strip():
                 return
             time.sleep(0.25)
@@ -203,7 +193,7 @@ kill -{shlex.quote(signal)} $pids
             )
             + f" {shlex.quote(self.config_path)} > {shlex.quote(self.remote_config_path)}"
         )
-        result = remote(self.host.ssh, command, timeout=30)
+        result = self.host.run(command, timeout=30)
         result.assert_success()
 
     def _stop_remote_http(self) -> None:
@@ -222,7 +212,7 @@ rm -f {shlex.quote(self.remote_config_path)}
 true
 """
         try:
-            remote(self.host.ssh, command, timeout=30)
+            self.host.run(command, timeout=30)
         except subprocess.TimeoutExpired:
             pass
 

@@ -2,31 +2,40 @@
 
 This directory contains live, controller-driven smoke tests for `aw-gateway`.
 These tests are intentionally separate from `cargo test`: they deploy the
-current checkout to real remote hosts over SSH, build or refresh target images,
-and then exercise the gateway against Docker, rootless Podman, and Colima.
+current checkout to real hosts, build or refresh target images, and then
+exercise the gateway against Docker, rootless Podman, and Colima. A host can be
+driven through SSH or through local process execution on the machine running the
+harness.
 
 Scenario coverage: [SCENARIOS.md](SCENARIOS.md).
 
 ## Scope
 
-The controller is this machine. Tests run from here and drive remote hosts over
-SSH, then exercise `aw-gateway` on each host.
+The controller is this machine. Tests run from here and drive each configured
+host through its inventory `transport`, then exercise `aw-gateway` on that
+host.
 
 Current hosts:
 
-| Inventory host | SSH alias | Runtime | Primary install |
+| Inventory host | Transport | Runtime | Primary install |
 | --- | --- | --- | --- |
-| `ubuntu` | `ubuntu` | Docker | `/opt/aw-gateway` |
-| `rocky10` | `rocky10` | rootless Podman | `/home/kevin/aw-gateway` |
-| `macos-colima` | `mac` | Colima/Docker | `/Users/kevin/aw-gateway` |
+| `ubuntu` | SSH alias `ubuntu` | Docker | `/opt/aw-gateway` |
+| `rocky10` | SSH alias `rocky10` | rootless Podman | `/home/kevin/aw-gateway` |
+| `macos-colima` | SSH alias `mac` | Colima/Docker | `/Users/kevin/aw-gateway` |
+| `macos-apple-container` | local process | Apple Container | generated temp install |
 
 ## Access Modes
 
 The shared baseline is host-local gateway behavior on every platform:
 
-1. The harness SSHes into the host.
+1. The harness runs a shell command through the configured host transport.
 2. It runs that host's installed `aw-gateway`.
 3. It verifies container lifecycle and SSH into the container from that host.
+
+For `transport = "local"` hosts, step 1 is replaced with a local shell command
+on the same machine. This is intended for environments where another launcher,
+such as a build service, has already arranged to execute the smoke harness on
+the target host.
 
 Linux hosts also cover restricted OpenSSH `ForceCommand` users:
 
@@ -36,16 +45,18 @@ ssh awsmoke@rocky10 ...
 ```
 
 Mac restricted `sshd` gateway behavior is intentionally not the primary case;
-Mac coverage focuses on Colima and a home-directory install.
+Mac coverage focuses on Colima over SSH and Apple Container through a local
+process transport on the Mac host.
 
 The HTTP API smoke path keeps the gateway listener loopback-only on each host.
 For every HTTP test, the harness:
 
 1. Copies the deployed config to a temporary host config with a unique
    `127.0.0.1:<port>` HTTP listener.
-2. Starts `aw-gateway --config <temp> http` over SSH.
-3. Opens an SSH local forward from the controller to that host-local port.
-4. Sends JSON HTTP requests from the controller to the forwarded local port.
+2. Starts `aw-gateway --config <temp> http` on the host.
+3. For SSH hosts, opens an SSH local forward from the controller to that
+   host-local port. Local hosts connect directly to the loopback listener.
+4. Sends JSON HTTP requests from the controller to the selected local port.
 
 ## Harness Commands
 
@@ -54,7 +65,7 @@ Run these commands from `smoke/`.
 Create and use the virtualenv:
 
 ```bash
-python3 -m venv .venv
+python3 -m venv .venv  # Python 3.9+ is required
 .venv/bin/python -m pip install -e .
 ```
 
@@ -66,7 +77,9 @@ cp inventory.example.toml inventory.toml
 
 `inventory.toml` is ignored because it contains local host aliases and install
 paths. The committed example expects SSH aliases named `ubuntu`, `rocky10`, and
-`mac`.
+`mac`. Hosts default to `transport = "ssh"`; set `transport = "local"` for a
+host whose smoke commands should run directly on the same machine as the
+harness.
 
 List hosts:
 
@@ -133,7 +146,7 @@ Restricted Linux users use separate home installs under
 `/home/awsmoke/aw-gateway` so their ephemeral test configs do not overwrite the
 operator config.
 
-Mac uses:
+Mac Colima uses:
 
 ```text
 /Users/kevin/aw-gateway
@@ -143,6 +156,16 @@ Mac uses:
 ```
 
 No Mac files are installed under `/opt`.
+
+Apple Container smoke uses a generated local-transport inventory on the Mac.
+The harness builds the native macOS `aw-gateway` binary, builds Linux arm64
+container helper binaries inside an Apple Container Rust image, installs all
+files under a temporary smoke install root, builds the Apple Container Ubuntu
+image, and then runs the same pytest smoke scenarios against that host entry.
+For direct repeated Mac runs, `smoke/scripts/run-apple-container-smoke.sh`
+accepts `--skip-build` to reuse existing `target/release` and
+`target/apple-linux-arm64` artifacts in the current checkout, and `--skip-image`
+to reuse an already-built Apple Container image.
 
 ## Host-Specific Notes
 
@@ -173,6 +196,11 @@ program = "/Users/kevin/.local/bin/docker"
 host_dir = "/Users/kevin/.cache/aw-gateway/sockets/{runtime_id}"
 ```
 
+`macos-apple-container` requires Apple silicon macOS with Apple Container
+installed and `container system start` already completed. It runs through
+`transport = "local"` because the smoke harness is expected to execute on the
+Mac itself, either directly or through a local build-service command.
+
 ## Current Coverage
 
 The current suite covers:
@@ -183,7 +211,8 @@ The current suite covers:
 - Target listing.
 - Clean fixed-target lifecycle.
 - Runtime-exec access for config validation, command execution, shell
-  execution, status access labels, and SSH-only operation rejection.
+  execution, status access labels, and SSH-only operation rejection, including
+  Apple Container runtime-exec when run on an Apple Container host.
 - Host-local container SSH through generated client bundles.
 - Container SSH transfer policy for `sftp`, default `scp`, and legacy
   `scp -O` upload/download paths.
