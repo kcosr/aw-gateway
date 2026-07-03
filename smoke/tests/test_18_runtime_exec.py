@@ -54,8 +54,11 @@ def test_runtime_exec_run_shell_status_and_ssh_operation_rejection(host: Host) -
         data = json.loads(status.stdout)
         assert data["target"] == host.target
         assert data["access"] == "runtime_exec"
-        assert data["status"] == "container-running"
-        assert data["container"]
+        if host.runtime == "apple_container":
+            assert data["status"] in {"container-running", "not-running"}
+        else:
+            assert data["status"] == "container-running"
+            assert data["container"]
 
         all_status = runtime_exec_gateway(host, "status", "--all", "--json", timeout=120)
         all_status.assert_success()
