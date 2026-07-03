@@ -5,7 +5,6 @@ import uuid
 
 from awsmoke.gateway import gateway_command_for_config
 from awsmoke.hosts import Host
-from awsmoke.ssh import remote, remote_check
 
 
 SESSION_ENV_KEY = "AW_GATEWAY_SMOKE_SESSION_ENV"
@@ -119,7 +118,7 @@ text += "\\n"
 output.write_text(text + "\\n")
 PY
 """
-    remote_check(host.ssh, script, timeout=60)
+    host.check(script, timeout=60)
     return config
 
 
@@ -132,7 +131,7 @@ def _pipe_to_gateway(
 ):
     gateway = gateway_command_for_config(host, config, *args)
     command = f"printf %s {shlex.quote(stdin_text)} | {gateway}"
-    return remote(host.ssh, command, timeout=timeout)
+    return host.run(command, timeout=timeout)
 
 
 def _remote_gateway(
@@ -143,7 +142,7 @@ def _remote_gateway(
     timeout: int,
 ):
     command = f"{_env_assignments(env or {})} {gateway_command_for_config(host, config, *args)}"
-    return remote(host.ssh, command.strip(), timeout=timeout)
+    return host.run(command.strip(), timeout=timeout)
 
 
 def _env_assignments(env: dict[str, str]) -> str:
@@ -155,4 +154,4 @@ def _remove_fixed_target(host: Host, config: str) -> None:
 
 
 def _rm(host: Host, path: str) -> None:
-    remote(host.ssh, f"rm -f {shlex.quote(path)}", timeout=30)
+    host.run(f"rm -f {shlex.quote(path)}", timeout=30)

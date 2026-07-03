@@ -5,13 +5,17 @@ from pathlib import Path
 import re
 import tomllib
 
+from .command import CommandResult, HostRunner, LocalRunner, SshRunner
+
 SAFE_RESTRICTED_USER = re.compile(r"^[A-Za-z0-9_-]+$")
+TRANSPORTS = {"local", "ssh"}
 
 
 @dataclass(frozen=True)
 class Host:
     name: str
     ssh: str
+    transport: str
     runtime: str
     install_root: str
     install_mode: str
@@ -28,6 +32,44 @@ class Host:
     @property
     def gateway_path(self) -> str:
         return f"{self.install_root}/bin/aw-gateway"
+
+    @property
+    def runner(self) -> HostRunner:
+        if self.transport == "local":
+            return LocalRunner()
+        if self.transport == "ssh":
+            return SshRunner(self.ssh)
+        raise ValueError(f"unsupported transport {self.transport!r}")
+
+    @property
+    def transport_endpoint(self) -> str:
+        if self.transport == "ssh":
+            return self.ssh
+        return "local"
+
+    def run(self, command: str, *, timeout: int = 60) -> CommandResult:
+        return self.runner.run(command, timeout=timeout)
+
+    def check(self, command: str, *, timeout: int = 60) -> CommandResult:
+        return self.runner.check(command, timeout=timeout)
+
+    def copy_to(self, source: Path, destination: str, *, timeout: int = 60) -> CommandResult:
+        return self.runner.copy_to(source, destination, timeout=timeout)
+
+    def tar_to_command(
+        self,
+        source_dir: Path,
+        command: str,
+        *,
+        excludes: list[str] | None = None,
+        timeout: int = 60,
+    ) -> CommandResult:
+        return self.runner.tar_to_command(
+            source_dir,
+            command,
+            excludes=excludes,
+            timeout=timeout,
+        )
 
     @property
     def config_path(self) -> str:
@@ -57,6 +99,8 @@ class Host:
             return "examples/podman/gateway-local.toml"
         if self.runtime == "colima":
             return "examples/colima/gateway-local.toml"
+        if self.runtime == "apple_container":
+            return "examples/apple-container/gateway-local.toml"
         raise ValueError(f"unsupported runtime {self.runtime!r}")
 
     @property
@@ -67,6 +111,8 @@ class Host:
             return "examples/podman/gateway-runtime-exec.toml"
         if self.runtime == "colima":
             return "examples/colima/gateway-runtime-exec.toml"
+        if self.runtime == "apple_container":
+            return "examples/apple-container/gateway-runtime-exec.toml"
         raise ValueError(f"unsupported runtime {self.runtime!r}")
 
     @property
@@ -128,6 +174,11 @@ def load_inventory(path: str | Path = "inventory.toml") -> Inventory:
 
     hosts: dict[str, Host] = {}
     for name, raw in data.get("hosts", {}).items():
+        transport = raw.get("transport", "ssh")
+        if transport not in TRANSPORTS:
+            raise ValueError(
+                f"hosts.{name}.transport must be one of: {', '.join(sorted(TRANSPORTS))}"
+            )
         restricted_user = raw.get("restricted_user", "awsmoke")
         if not SAFE_RESTRICTED_USER.fullmatch(restricted_user):
             raise ValueError(
@@ -135,7 +186,8 @@ def load_inventory(path: str | Path = "inventory.toml") -> Inventory:
             )
         hosts[name] = Host(
             name=name,
-            ssh=raw["ssh"],
+            ssh=raw.get("ssh", name),
+            transport=transport,
             runtime=raw["runtime"],
             install_root=raw["install_root"],
             install_mode=raw.get("install_mode", "sudo"),

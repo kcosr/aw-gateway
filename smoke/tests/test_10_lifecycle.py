@@ -5,7 +5,6 @@ import shlex
 
 from awsmoke.gateway import gateway
 from awsmoke.hosts import Host
-from awsmoke.ssh import remote
 
 
 def test_gateway_config_validates(host: Host) -> None:
@@ -43,7 +42,7 @@ mkdir -p "$tmp/aw-gateway"
 cp {shlex.quote(host.config_path)} "$tmp/aw-gateway/gateway.toml"
 AW_GATEWAY_CONFIG_HOME="$tmp" {shlex.quote(host.gateway_path)} config paths --json
 """
-    result = remote(host.ssh, command)
+    result = host.run(command)
     result.assert_success()
     data = json.loads(result.stdout)
     candidates = data["candidates"]
@@ -72,7 +71,7 @@ EOF
 {shlex.quote(host.gateway_path)} --config "$tmp/child.toml" config validate >/dev/null
 {shlex.quote(host.gateway_path)} --config "$tmp/child.toml" launch show smoke-extends --json
 """
-    result = remote(host.ssh, command)
+    result = host.run(command)
     result.assert_success()
     data = json.loads(result.stdout)
     assert data["name"] == "smoke-extends"
@@ -99,7 +98,7 @@ command = ["sleep", "infinity"]
 EOF
 {shlex.quote(host.gateway_path)} --config "$tmp/child.toml" config validate
 """
-    result = remote(host.ssh, command)
+    result = host.run(command)
     result.assert_success()
     assert "ok" in result.stdout.lower()
 

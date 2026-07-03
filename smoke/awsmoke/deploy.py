@@ -6,8 +6,8 @@ import base64
 import json
 import shlex
 
+from .command import check
 from .hosts import Host, Inventory
-from .ssh import check, remote_check, run, scp_to
 
 
 BINARIES = [
@@ -26,7 +26,11 @@ class DeployOptions:
 
 def deploy_host(inventory: Inventory, host: Host, options: DeployOptions) -> None:
     if options.build:
-        build_release(inventory)
+        if host.runtime == "apple_container":
+            build_apple_macos_gateway(inventory)
+            build_apple_linux_helpers(inventory, host)
+        else:
+            build_release(inventory)
 
     generated_host_dir = inventory.generated_dir / host.name
     generated_host_dir.mkdir(parents=True, exist_ok=True)
@@ -56,17 +60,18 @@ def deploy_host(inventory: Inventory, host: Host, options: DeployOptions) -> Non
     )
 
     remote_tmp = f"/tmp/aw-gateway-smoke-{host.name}"
-    remote_check(host.ssh, f"rm -rf {shlex.quote(remote_tmp)} && mkdir -p {shlex.quote(remote_tmp)}")
+    host.check(f"rm -rf {shlex.quote(remote_tmp)} && mkdir -p {shlex.quote(remote_tmp)}")
 
     if host.runtime == "colima":
         if options.build:
             build_remote_macos_gateway(inventory, host, remote_tmp)
         else:
-            remote_check(
-                host.ssh,
+            host.check(
                 f"cp {shlex.quote(host.gateway_path)} {shlex.quote(remote_tmp)}/aw-gateway",
             )
         runtime_binaries = [binary for binary in BINARIES if binary != "aw-gateway"]
+    elif host.runtime == "apple_container":
+        runtime_binaries = ["aw-gateway"]
     else:
         runtime_binaries = BINARIES
 
@@ -74,15 +79,22 @@ def deploy_host(inventory: Inventory, host: Host, options: DeployOptions) -> Non
         source = inventory.repo_root / "target" / "release" / binary
         if not source.exists():
             raise FileNotFoundError(f"missing built binary: {source}")
-        scp_to(host.ssh, source, f"{remote_tmp}/{binary}").assert_success()
+        host.copy_to(source, f"{remote_tmp}/{binary}").assert_success()
+
+    if host.runtime == "apple_container":
+        for binary in [item for item in BINARIES if item != "aw-gateway"]:
+            source = apple_linux_helper_path(inventory, binary)
+            if not source.exists():
+                raise FileNotFoundError(f"missing built Apple Linux helper binary: {source}")
+            host.copy_to(source, f"{remote_tmp}/{binary}").assert_success()
 
     helper_dir = inventory.repo_root / host.image_context
     for helper in ["start-container-sshd", "sshd_config_agent"]:
-        scp_to(host.ssh, helper_dir / helper, f"{remote_tmp}/{helper}").assert_success()
-    scp_to(host.ssh, rendered_config, f"{remote_tmp}/gateway.toml").assert_success()
-    scp_to(host.ssh, rendered_local_config, f"{remote_tmp}/gateway-local.toml").assert_success()
-    scp_to(host.ssh, rendered_runtime_exec_config, f"{remote_tmp}/gateway-runtime-exec.toml").assert_success()
-    scp_to(host.ssh, rendered_limited_http_config, f"{remote_tmp}/gateway-http-limited.toml").assert_success()
+        host.copy_to(helper_dir / helper, f"{remote_tmp}/{helper}").assert_success()
+    host.copy_to(rendered_config, f"{remote_tmp}/gateway.toml").assert_success()
+    host.copy_to(rendered_local_config, f"{remote_tmp}/gateway-local.toml").assert_success()
+    host.copy_to(rendered_runtime_exec_config, f"{remote_tmp}/gateway-runtime-exec.toml").assert_success()
+    host.copy_to(rendered_limited_http_config, f"{remote_tmp}/gateway-http-limited.toml").assert_success()
 
     install_remote_files(host, remote_tmp)
 
@@ -131,22 +143,22 @@ if ! sudo test -f /home/{user_q}/.ssh/authorized_keys || ! sudo cmp -s "${{key_t
   sudo install -m 0600 -o {user_q} -g {user_q} "${{key_tmp}}" /home/{user_q}/.ssh/authorized_keys
 fi
 """
-    remote_check(host.ssh, create_user, timeout=120)
+    host.check(create_user, timeout=120)
 
     remote_tmp = f"/tmp/aw-gateway-smoke-{host.name}-restricted"
-    remote_check(host.ssh, f"rm -rf {shlex.quote(remote_tmp)} && mkdir -p {shlex.quote(remote_tmp)}")
+    host.check(f"rm -rf {shlex.quote(remote_tmp)} && mkdir -p {shlex.quote(remote_tmp)}")
     match_config_name = f"99-aw-gateway-smoke-{user}.conf"
     match_config_remote = f"{remote_tmp}/{match_config_name}"
     match_config_remote_q = shlex.quote(match_config_remote)
     sshd_config_q = shlex.quote(f"/etc/ssh/sshd_config.d/{match_config_name}")
 
     for binary in BINARIES:
-        scp_to(host.ssh, inventory.repo_root / "target" / "release" / binary, f"{remote_tmp}/{binary}").assert_success()
+        host.copy_to(inventory.repo_root / "target" / "release" / binary, f"{remote_tmp}/{binary}").assert_success()
     helper_dir = inventory.repo_root / host.image_context
     for helper in ["start-container-sshd", "sshd_config_agent"]:
-        scp_to(host.ssh, helper_dir / helper, f"{remote_tmp}/{helper}").assert_success()
-    scp_to(host.ssh, rendered_config, f"{remote_tmp}/gateway.toml").assert_success()
-    scp_to(host.ssh, match_config, match_config_remote).assert_success()
+        host.copy_to(helper_dir / helper, f"{remote_tmp}/{helper}").assert_success()
+    host.copy_to(rendered_config, f"{remote_tmp}/gateway.toml").assert_success()
+    host.copy_to(match_config, match_config_remote).assert_success()
 
     if install_root.startswith(f"/home/{user}/"):
         owner_args = f"-o {user_q} -g {user_q}"
@@ -173,7 +185,7 @@ if [ "${{sshd_config_changed}}" = "1" ]; then
   sudo systemctl reload sshd 2>/dev/null || sudo systemctl reload ssh 2>/dev/null || sudo service sshd reload 2>/dev/null || sudo service ssh reload
 fi
 """
-    remote_check(host.ssh, install, timeout=120)
+    host.check(install, timeout=120)
 
     if host.runtime == "podman":
         configure_restricted_podman_user(host, user)
@@ -182,6 +194,46 @@ fi
 
 def build_release(inventory: Inventory) -> None:
     check(["cargo", "build", "--release"], cwd=inventory.repo_root, timeout=1200)
+
+
+def build_apple_macos_gateway(inventory: Inventory) -> None:
+    check(
+        ["cargo", "build", "--release", "--bin", "aw-gateway"],
+        cwd=inventory.repo_root,
+        timeout=1200,
+    )
+
+
+def build_apple_linux_helpers(inventory: Inventory, host: Host) -> None:
+    cpus = shlex.quote(apple_build_env("AWGATEWAY_BUILD_CPUS", "6"))
+    memory = shlex.quote(apple_build_env("AWGATEWAY_BUILD_MEMORY", "16G"))
+    jobs = shlex.quote(apple_build_env("AWGATEWAY_BUILD_JOBS", "4"))
+    repo = shlex.quote(str(inventory.repo_root))
+    command = f"""
+set -euo pipefail
+container run --rm \
+  --cpus {cpus} \
+  --memory {memory} \
+  --volume {repo}:/work \
+  --workdir /work \
+  --env CARGO_TARGET_DIR=/work/target/apple-linux-arm64 \
+  --env CARGO_BUILD_JOBS={jobs} \
+  --env CARGO_INCREMENTAL=0 \
+  --env CARGO_PROFILE_DEV_DEBUG=0 \
+  rust:1-bookworm \
+  sh -lc 'export PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; cargo build --bin aw-container-agent --bin aw-container-bootstrap --bin aw-ssh-command-filter'
+"""
+    host.check(command, timeout=7200)
+
+
+def apple_build_env(name: str, default: str) -> str:
+    import os
+
+    return os.environ.get(name, default)
+
+
+def apple_linux_helper_path(inventory: Inventory, binary: str) -> Path:
+    return inventory.repo_root / "target" / "apple-linux-arm64" / "debug" / binary
 
 
 def render_gateway_config(
@@ -200,11 +252,12 @@ def render_gateway_config(
     source = inventory.repo_root / (config_example or host.config_example)
     root = install_root or host.install_root
     text = source.read_text()
-    if host.runtime == "colima":
+    if host.runtime in {"apple_container", "colima"}:
         text = text.replace("/Users/example/aw-gateway", root)
+    if host.runtime == "colima":
         text = set_toml_string(text, "program", host.docker_program, section="runtime")
         text = append_control_socket_override(text, host)
-    else:
+    elif host.runtime not in {"apple_container"}:
         text = replace_mount_sources(text, "/opt/aw-gateway", root)
     if ephemeral_target:
         text = text.replace('mode = "fixed"', 'mode = "ephemeral"', 1)
@@ -233,13 +286,12 @@ def build_remote_macos_gateway(inventory: Inventory, host: Host, remote_tmp: str
         f"cargo build --release --bin aw-gateway && "
         f"cp target/release/aw-gateway {shlex.quote(remote_tmp)}/aw-gateway"
     )
-    command = (
-        f"tar -C {shlex.quote(str(inventory.repo_root))} "
-        "--exclude ./.git --exclude ./target -cf - . | "
-        f"ssh -o BatchMode=yes -o ConnectTimeout=10 {shlex.quote(host.ssh)} "
-        f"{shlex.quote(remote_command)}"
+    result = host.tar_to_command(
+        inventory.repo_root,
+        remote_command,
+        excludes=["./.git", "./target"],
+        timeout=1800,
     )
-    result = run(["bash", "-lc", command], timeout=1800)
     result.assert_success()
 
 
@@ -464,7 +516,7 @@ set -euo pipefail
 {prefix}install -m 0644 {tmp}/gateway-runtime-exec.toml {root}/etc/gateway-runtime-exec.toml
 {prefix}install -m 0644 {tmp}/gateway-http-limited.toml {root}/etc/gateway-http-limited.toml
 """
-    remote_check(host.ssh, command, timeout=120)
+    host.check(command, timeout=120)
 
 
 def build_remote_image(inventory: Inventory, host: Host) -> None:
@@ -480,12 +532,7 @@ def build_remote_image(inventory: Inventory, host: Host) -> None:
         f"tar -C {remote_context} -xf - && "
         f"{env}{runtime} build -t {host.image} -f {remote_context}/Containerfile.ubuntu {remote_context}"
     )
-    command = (
-        f"tar -C {shlex.quote(str(context))} -cf - . | "
-        f"ssh -o BatchMode=yes -o ConnectTimeout=10 {shlex.quote(host.ssh)} "
-        f"{shlex.quote(remote_command)}"
-    )
-    result = run(["bash", "-lc", command], timeout=1800)
+    result = host.tar_to_command(context, remote_command, timeout=1800)
     result.assert_success()
 
 
@@ -499,12 +546,7 @@ def build_remote_image_for_user(inventory: Inventory, host: Host, user: str) -> 
         f"sudo -H -u {user} bash -lc "
         f"{shlex.quote(f'cd /tmp && podman build -t {host.image} -f {remote_context}/Containerfile.ubuntu {remote_context}')}"
     )
-    command = (
-        f"tar -C {shlex.quote(str(context))} -cf - . | "
-        f"ssh -o BatchMode=yes -o ConnectTimeout=10 {shlex.quote(host.ssh)} "
-        f"{shlex.quote(remote_command)}"
-    )
-    result = run(["bash", "-lc", command], timeout=1800)
+    result = host.tar_to_command(context, remote_command, timeout=1800)
     result.assert_success()
 
 
@@ -516,7 +558,7 @@ if command -v loginctl >/dev/null 2>&1; then
 fi
 sudo -H -u {shlex.quote(user)} bash -lc 'cd /tmp && podman info >/dev/null'
 """
-    remote_check(host.ssh, command, timeout=120)
+    host.check(command, timeout=120)
 
 
 def runtime_program(host: Host) -> str:
@@ -526,4 +568,6 @@ def runtime_program(host: Host) -> str:
         return "docker"
     if host.runtime == "podman":
         return "podman"
+    if host.runtime == "apple_container":
+        return "container"
     raise ValueError(f"unsupported runtime {host.runtime!r}")

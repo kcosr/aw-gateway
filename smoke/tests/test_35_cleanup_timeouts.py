@@ -11,7 +11,6 @@ import pytest
 
 from awsmoke.gateway import gateway_command_for_config
 from awsmoke.hosts import Host
-from awsmoke.ssh import remote, remote_check
 
 
 def test_gateway_owned_idle_cleanup_stops_after_short_grace(host: Host) -> None:
@@ -218,7 +217,7 @@ def test_ephemeral_workspace_cleanup_removes_session_workspace(host: Host) -> No
         )
         run.assert_success()
 
-        missing = remote_check(host.ssh, f"test ! -e {shlex.quote(workspace)}", timeout=30)
+        missing = host.check(f"test ! -e {shlex.quote(workspace)}", timeout=30)
         assert missing.returncode == 0
     finally:
         _cleanup_ephemeral(host, config, session_id, workspace)
@@ -248,8 +247,7 @@ def test_interrupted_ephemeral_launch_cleans_session_workspace(host: Host) -> No
         _wait_for_remote_path(host, marker, *background)
 
         pidfile, _, _ = background
-        remote_check(
-            host.ssh,
+        host.check(
             f"kill -HUP $(cat {shlex.quote(pidfile)})",
             timeout=30,
         )
@@ -282,8 +280,7 @@ def test_explicit_ephemeral_remove_cleans_session_workspace(host: Host) -> None:
         _stop_background(host, background)
         background = None
 
-        marker = remote_check(
-            host.ssh,
+        marker = host.check(
             f"test -d {shlex.quote(workspace)} && printf explicit-remove > {shlex.quote(workspace)}/explicit-remove.txt",
             timeout=30,
         )
@@ -300,7 +297,7 @@ def test_explicit_ephemeral_remove_cleans_session_workspace(host: Host) -> None:
         )
         remove.assert_success()
 
-        missing = remote_check(host.ssh, f"test ! -e {shlex.quote(workspace)}", timeout=30)
+        missing = host.check(f"test ! -e {shlex.quote(workspace)}", timeout=30)
         assert missing.returncode == 0
     finally:
         if background is not None:
@@ -329,22 +326,20 @@ def test_ssh_dispatch_ephemeral_remove_cleans_session_workspace(host: Host) -> N
         _stop_background(host, background)
         background = None
 
-        marker = remote_check(
-            host.ssh,
+        marker = host.check(
             f"test -d {shlex.quote(workspace)} && printf ssh-remove > {shlex.quote(workspace)}/ssh-remove.txt",
             timeout=30,
         )
         assert marker.returncode == 0
 
         original_command = f"remove {host.target} --session-id={session_id}"
-        dispatched = remote(
-            host.ssh,
+        dispatched = host.run(
             f"SSH_ORIGINAL_COMMAND={shlex.quote(original_command)} {gateway_command_for_config(host, config)}",
             timeout=180,
         )
         dispatched.assert_success()
 
-        missing = remote_check(host.ssh, f"test ! -e {shlex.quote(workspace)}", timeout=30)
+        missing = host.check(f"test ! -e {shlex.quote(workspace)}", timeout=30)
         assert missing.returncode == 0
     finally:
         if background is not None:
@@ -354,14 +349,14 @@ def test_ssh_dispatch_ephemeral_remove_cleans_session_workspace(host: Host) -> N
 
 
 def _skip_without_agent_control(host: Host) -> None:
-    if host.runtime == "colima":
-        pytest.skip("Colima smoke config uses gateway-owned cleanup and disables agent control")
+    if host.runtime in {"apple_container", "colima"}:
+        pytest.skip(f"{host.runtime} smoke config uses gateway-owned cleanup and disables agent control")
 
 
 def _ephemeral_workspace(host: Host, session_id: str) -> str:
     home = host.home_dir
     if home == "~":
-        home = remote_check(host.ssh, 'printf "%s" "$HOME"', timeout=30).stdout
+        home = host.check('printf "%s" "$HOME"', timeout=30).stdout
     return f"{home}/.cache/aw-gateway/workspaces/{host.target}-{session_id}"
 
 
@@ -527,7 +522,7 @@ if os.environ["LONG_LAUNCH_MARKER"]:
 output.write_text("\\n".join(lines) + "\\n")
 PY
 """
-    remote_check(host.ssh, script, timeout=60)
+    host.check(script, timeout=60)
     return config
 
 
@@ -581,7 +576,7 @@ def _start_ephemeral_up_background(
         f"> {shlex.quote(stdout)} 2> {shlex.quote(stderr)} < /dev/null & "
         f"echo $! > {shlex.quote(pidfile)}"
     )
-    remote_check(host.ssh, command, timeout=30)
+    host.check(command, timeout=30)
     _wait_for_remote_path(host, workspace, pidfile, stdout, stderr)
     return pidfile, stdout, stderr
 
@@ -601,7 +596,7 @@ def _start_ephemeral_launch_background(
         f"> {shlex.quote(stdout)} 2> {shlex.quote(stderr)} < /dev/null & "
         f"echo $! > {shlex.quote(pidfile)}"
     )
-    remote_check(host.ssh, command, timeout=30)
+    host.check(command, timeout=30)
     return pidfile, stdout, stderr
 
 
@@ -618,8 +613,7 @@ def _wait_for_remote_path(
     quoted_path = shlex.quote(path)
     quoted_pidfile = shlex.quote(pidfile)
     while time.monotonic() < deadline:
-        check = remote(
-            host.ssh,
+        check = host.run(
             f"test -e {quoted_path} && exit 0; "
             f"if ! kill -0 $(cat {quoted_pidfile}) 2>/dev/null; then exit 2; fi; "
             "exit 1",
@@ -628,16 +622,14 @@ def _wait_for_remote_path(
         if check.returncode == 0:
             return
         if check.returncode == 2:
-            logs = remote(
-                host.ssh,
+            logs = host.run(
                 f"printf 'stdout:\\n'; cat {shlex.quote(stdout)} 2>/dev/null; "
                 f"printf '\\nstderr:\\n'; cat {shlex.quote(stderr)} 2>/dev/null",
                 timeout=30,
             )
             raise AssertionError(f"background up exited before workspace existed:\n{logs.stdout}")
         time.sleep(1.0)
-    logs = remote(
-        host.ssh,
+    logs = host.run(
         f"printf 'stdout:\\n'; cat {shlex.quote(stdout)} 2>/dev/null; "
         f"printf '\\nstderr:\\n'; cat {shlex.quote(stderr)} 2>/dev/null",
         timeout=30,
@@ -649,7 +641,7 @@ def _wait_for_remote_absent(host: Host, path: str, *, timeout: float = 60.0) -> 
     deadline = time.monotonic() + timeout
     quoted_path = shlex.quote(path)
     while time.monotonic() < deadline:
-        check = remote(host.ssh, f"test ! -e {quoted_path}", timeout=30)
+        check = host.run(f"test ! -e {quoted_path}", timeout=30)
         if check.returncode == 0:
             return
         time.sleep(1.0)
@@ -658,8 +650,7 @@ def _wait_for_remote_absent(host: Host, path: str, *, timeout: float = 60.0) -> 
 
 def _stop_background(host: Host, background: tuple[str, str, str]) -> None:
     pidfile, stdout, stderr = background
-    remote(
-        host.ssh,
+    host.run(
         f"if [ -s {shlex.quote(pidfile)} ]; then kill $(cat {shlex.quote(pidfile)}) 2>/dev/null || true; fi; "
         f"rm -f {shlex.quote(pidfile)} {shlex.quote(stdout)} {shlex.quote(stderr)}",
         timeout=30,
@@ -673,7 +664,7 @@ def _gateway_json(host: Host, config: str, *args: str, timeout: int = 60) -> dic
 
 
 def _gateway(host: Host, config: str, *args: str, timeout: int = 60):
-    return remote(host.ssh, gateway_command_for_config(host, config, *args), timeout=timeout)
+    return host.run(gateway_command_for_config(host, config, *args), timeout=timeout)
 
 
 def _remove_fixed_target(host: Host, config: str) -> None:
@@ -683,12 +674,11 @@ def _remove_fixed_target(host: Host, config: str) -> None:
 def _cleanup_ephemeral(host: Host, config: str, session_id: str, workspace: str) -> None:
     _gateway(host, config, "stop", host.target, "--session-id", session_id, timeout=120)
     quoted_workspace = shlex.quote(workspace)
-    remote(
-        host.ssh,
+    host.run(
         f"rm -rf {quoted_workspace} 2>/dev/null || sudo -n rm -rf {quoted_workspace}",
         timeout=30,
     )
 
 
 def _rm(host: Host, path: str) -> None:
-    remote(host.ssh, f"rm -f {shlex.quote(path)}", timeout=30)
+    host.run(f"rm -f {shlex.quote(path)}", timeout=30)

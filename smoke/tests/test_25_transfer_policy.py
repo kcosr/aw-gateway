@@ -7,7 +7,6 @@ import pytest
 
 from awsmoke.gateway import gateway_command_for_config
 from awsmoke.hosts import Host
-from awsmoke.ssh import remote
 
 
 @dataclass(frozen=True)
@@ -253,5 +252,5 @@ if [ {"yes" if policy.expect_legacy_download else "no"} = "yes" ]; then
   verify_downloaded legacy-scp-download "${{legacy_download}}"
 fi
 """
-    result = remote(host.ssh, script, timeout=600)
+    result = host.run(script, timeout=600)
     result.assert_success()

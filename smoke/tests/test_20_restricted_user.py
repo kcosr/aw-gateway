@@ -7,6 +7,8 @@ from awsmoke.ssh import remote
 
 
 def restricted_host(host: Host) -> str:
+    if host.transport != "ssh":
+        pytest.skip("restricted ForceCommand coverage requires an SSH smoke transport")
     if host.runtime == "colima":
         pytest.skip("restricted ForceCommand coverage is Linux-only for now")
     return f"{host.restricted_user}@{host.ssh}"

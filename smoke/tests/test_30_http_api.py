@@ -270,8 +270,8 @@ def test_http_shutdown_signal_terminates_active_pty_process(host: Host) -> None:
             assert ready["type"] == "ready"
             _wait_for_http_command(http, host, f"test -s {pidfile}")
             _wait_for_http_command(http, host, f"test -s {child_pidfile}")
-            daemon.signal_remote("INT")
-            daemon.wait_remote_stopped(timeout=20)
+            daemon.signal_host("INT")
+            daemon.wait_host_stopped(timeout=20)
             _wait_for_gateway_command(
                 host,
                 _process_absent_or_reused_command(pidfile),
@@ -518,7 +518,7 @@ def _wait_for_http_command(
 
 
 def _close_termination_timeout(host: Host) -> float:
-    if host.runtime == "colima":
+    if host.runtime in {"apple_container", "colima"}:
         return 90
     return 20
 
