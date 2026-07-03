@@ -21,6 +21,31 @@ CONFIG="${INSTALL_ROOT}/etc/gateway.toml"
 GATEWAY="${INSTALL_ROOT}/bin/aw-gateway"
 ARCHIVE=""
 SMOKE_STATUS="failed"
+SKIP_BUILD=0
+SKIP_IMAGE=0
+
+usage() {
+  cat <<'EOF'
+Usage:
+  run-apple-container-smoke.sh [options]
+
+Options:
+  --skip-build  Reuse existing target build artifacts instead of compiling.
+                Requires target/release/aw-gateway and target/apple-linux-arm64
+                helper binaries to already exist in this checkout.
+  --skip-image  Reuse the existing Apple Container image instead of rebuilding it.
+  --help        Show this help.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skip-build) SKIP_BUILD=1; shift ;;
+    --skip-image) SKIP_IMAGE=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
 
 note() {
   printf '\n== %s\n' "$*"
@@ -122,6 +147,8 @@ write_metadata() {
     printf 'host=%s\n' "$HOST_NAME"
     printf 'target=%s\n' "$TARGET"
     printf 'image=%s\n' "$IMAGE"
+    printf 'skip_build=%s\n' "$SKIP_BUILD"
+    printf 'skip_image=%s\n' "$SKIP_IMAGE"
     if [[ -d "${REPO_ROOT}/.git" ]]; then
       printf 'commit=%s\n' "$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
       printf 'branch=%s\n' "$(git -C "$REPO_ROOT" branch --show-current 2>/dev/null || true)"
@@ -255,7 +282,14 @@ run_step 03_create_venv "$PYTHON_BIN" -m venv "$VENV"
 run_step 04_upgrade_pip "$VENV/bin/python" -m pip install --upgrade pip
 run_step 05_install_smoke "$VENV/bin/python" -m pip install -e "${REPO_ROOT}/smoke"
 run_step 06_awsmoke_hosts "$VENV/bin/awsmoke" --inventory "$INVENTORY" hosts
-run_step 07_awsmoke_deploy "$VENV/bin/awsmoke" --inventory "$INVENTORY" deploy "$HOST_NAME"
+deploy_args=("$VENV/bin/awsmoke" --inventory "$INVENTORY" deploy "$HOST_NAME")
+if [[ "$SKIP_BUILD" == "1" ]]; then
+  deploy_args+=(--skip-build)
+fi
+if [[ "$SKIP_IMAGE" == "1" ]]; then
+  deploy_args+=(--skip-image)
+fi
+run_step 07_awsmoke_deploy "${deploy_args[@]}"
 run_step 08_pytest env AWSMOKE_INVENTORY="$INVENTORY" AWSMOKE_HOST="$HOST_NAME" "$VENV/bin/python" -m pytest -q "${REPO_ROOT}/smoke/tests"
 
 SMOKE_STATUS="passed"

@@ -162,6 +162,10 @@ The harness builds the native macOS `aw-gateway` binary, builds Linux arm64
 container helper binaries inside an Apple Container Rust image, installs all
 files under a temporary smoke install root, builds the Apple Container Ubuntu
 image, and then runs the same pytest smoke scenarios against that host entry.
+For direct repeated Mac runs, `smoke/scripts/run-apple-container-smoke.sh`
+accepts `--skip-build` to reuse existing `target/release` and
+`target/apple-linux-arm64` artifacts in the current checkout, and `--skip-image`
+to reuse an already-built Apple Container image.
 
 ## Host-Specific Notes
 
