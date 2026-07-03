@@ -252,6 +252,7 @@ def render_gateway_config(
     source = inventory.repo_root / (config_example or host.config_example)
     root = install_root or host.install_root
     text = source.read_text()
+    text = apply_inventory_target(text, host)
     if host.runtime in {"apple_container", "colima"}:
         text = text.replace("/Users/example/aw-gateway", root)
     if host.runtime == "colima":
@@ -274,6 +275,14 @@ def render_gateway_config(
     output = output_dir / output_name
     output.write_text(text)
     return output
+
+
+def apply_inventory_target(text: str, host: Host) -> str:
+    text = replace_top_level_toml_string(text, "default_target", host.target)
+    text = replace_toml_string(text, "image", host.image, section="targets.ubuntu")
+    if host.target != "ubuntu":
+        text = replace_target_table_names(text, "ubuntu", host.target)
+    return text
 
 
 def build_remote_macos_gateway(inventory: Inventory, host: Host, remote_tmp: str) -> None:
@@ -321,6 +330,36 @@ def replace_mount_sources(text: str, old_root: str, new_root: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def replace_top_level_toml_string(text: str, key: str, value: str) -> str:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            break
+        if stripped.startswith(f"{key} "):
+            prefix = line[: len(line) - len(line.lstrip())]
+            lines[index] = f"{prefix}{key} = {json.dumps(value)}"
+            return "\n".join(lines) + "\n"
+    raise ValueError(f"did not find top-level key {key!r}")
+
+
+def replace_target_table_names(text: str, old_target: str, new_target: str) -> str:
+    old_prefix = f"targets.{old_target}"
+    new_prefix = f"targets.{json.dumps(new_target)}"
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("[") or not stripped.endswith("]"):
+            continue
+        inner = stripped[1:-1]
+        if inner == old_prefix:
+            lines[index] = f"[{new_prefix}]"
+        elif inner.startswith(f"{old_prefix}."):
+            suffix = inner[len(old_prefix) :]
+            lines[index] = f"[{new_prefix}{suffix}]"
+    return "\n".join(lines) + "\n"
+
+
 def replace_toml_string(text: str, key: str, value: str, *, section: str) -> str:
     lines = text.splitlines()
     in_section = False
@@ -332,7 +371,7 @@ def replace_toml_string(text: str, key: str, value: str, *, section: str) -> str
             in_section = stripped == header
         if in_section and stripped.startswith(f"{key} "):
             prefix = line[: len(line) - len(line.lstrip())]
-            lines[index] = f'{prefix}{key} = "{value}"'
+            lines[index] = f"{prefix}{key} = {json.dumps(value)}"
             replaced = True
     if not replaced:
         raise ValueError(f"did not find {key!r} in section {section!r}")

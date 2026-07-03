@@ -16,7 +16,7 @@ VENV="${RUN_ROOT}/venv"
 HOST_NAME="${AWGATEWAY_APPLE_SMOKE_HOST:-macos-apple-container}"
 TARGET="${AWGATEWAY_APPLE_SMOKE_TARGET:-ubuntu}"
 IMAGE="${AWGATEWAY_APPLE_SMOKE_IMAGE:-aw-gateway/ubuntu-base:latest}"
-CONTAINER_NAME="aw-gateway-ubuntu-base"
+CONTAINER_NAME=""
 CONFIG="${INSTALL_ROOT}/etc/gateway.toml"
 GATEWAY="${INSTALL_ROOT}/bin/aw-gateway"
 ARCHIVE=""
@@ -147,6 +147,7 @@ write_metadata() {
     printf 'host=%s\n' "$HOST_NAME"
     printf 'target=%s\n' "$TARGET"
     printf 'image=%s\n' "$IMAGE"
+    printf 'container_name=%s\n' "$CONTAINER_NAME"
     printf 'skip_build=%s\n' "$SKIP_BUILD"
     printf 'skip_image=%s\n' "$SKIP_IMAGE"
     if [[ -d "${REPO_ROOT}/.git" ]]; then
@@ -259,14 +260,20 @@ note "preflight"
 [[ "$(uname -s)" == "Darwin" ]] || fail "this smoke script must run on macOS"
 [[ "$(uname -m)" == "arm64" ]] || fail "Apple container requires Apple silicon arm64"
 
-need cargo
+if [[ "$SKIP_BUILD" != "1" ]]; then
+  need cargo
+fi
 need container
 need git
 need perl
+need sed
 need ssh
 need scp
 need tar
 PYTHON_BIN="$(select_python)"
+IMAGE_SLUG_SOURCE="${IMAGE#localhost/}"
+IMAGE_SLUG_SOURCE="${IMAGE_SLUG_SOURCE%:latest}"
+CONTAINER_NAME="$(printf '%s' "$IMAGE_SLUG_SOURCE" | sed 's#[/:]#-#g; s#[^A-Za-z0-9_.-]#-#g')"
 
 if command -v xcrun >/dev/null 2>&1; then
   xcrun --find cc >/dev/null 2>&1 || fail "Xcode command-line tools are required; run: xcode-select --install"

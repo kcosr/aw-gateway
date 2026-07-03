@@ -56,7 +56,11 @@ def test_http_up_route(host: Host) -> None:
 
     with HttpDaemon(host) as http:
         response = http.post("/api/v1/up", {"target": host.target})
-        if host.runtime in {"apple_container", "colima"}:
+        if host.runtime == "colima":
+            assert_error(response, HTTPStatus.INTERNAL_SERVER_ERROR, "operation_failed")
+            assert "local_ssh.mode = \"listen\"" in response.body["error"]["message"]
+            return
+        if host.runtime == "apple_container":
             assert_error(response, HTTPStatus.INTERNAL_SERVER_ERROR, "operation_failed")
             return
 
