@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 
 const MAX_PUBLIC_KEY_BYTES: u64 = 16 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClientConfigOrigin {
+    LocalCli,
+    SshDispatch,
+}
+
 pub(super) fn configured_default_display(cfg: &GatewayConfig) -> String {
     cfg.default_target.clone()
 }
@@ -124,14 +130,32 @@ pub(super) async fn client_bundle(
     config_path: Option<PathBuf>,
     args: ClientBundleArgs,
 ) -> anyhow::Result<()> {
+    client_bundle_with_origin(config_path, args, ClientConfigOrigin::LocalCli).await
+}
+
+pub(super) async fn client_bundle_from_ssh_dispatch(
+    config_path: Option<PathBuf>,
+    args: ClientBundleArgs,
+) -> anyhow::Result<()> {
+    client_bundle_with_origin(config_path, args, ClientConfigOrigin::SshDispatch).await
+}
+
+async fn client_bundle_with_origin(
+    config_path: Option<PathBuf>,
+    args: ClientBundleArgs,
+    origin: ClientConfigOrigin,
+) -> anyhow::Result<()> {
     let runtime = Runtime::load(config_path, args.target.as_deref(), None, false).await?;
     runtime.ensure_ssh_operation_supported("client-bundle")?;
+    runtime.ensure_client_config_origin_supported(origin)?;
     let keypair = runtime.ensure_inner_keypair(args.rotate_key).await?;
     let identity = match args.identity_file {
         Some(identity_file) => identity_file,
         None => runtime.default_client_identity_file()?,
     };
-    let config = runtime.render_client_config(Some(&identity))?;
+    let config = runtime
+        .render_client_config(Some(&identity), origin)
+        .await?;
     runtime.write_inner_config(&config)?;
     let bundle = runtime.write_client_bundle(&keypair, &config)?;
     println!("{}", bundle.display());
@@ -180,11 +204,13 @@ impl Runtime {
         Ok(PathBuf::from(dir).join(self.client_private_key_name()))
     }
 
-    pub(super) fn render_client_config(
+    pub(super) async fn render_client_config(
         &self,
         identity_file: Option<&Path>,
+        origin: ClientConfigOrigin,
     ) -> anyhow::Result<String> {
         self.ensure_ssh_operation_supported("client-config")?;
+        self.ensure_client_config_origin_supported(origin)?;
         let vars = self.client_vars();
         let alias = template::render(&self.cfg.client_config.inner_alias_template, &vars)?;
         let host_name = template::render(&self.cfg.client_config.container_host_template, &vars)?;
@@ -203,6 +229,29 @@ impl Runtime {
                 alias = alias,
                 host = local_ssh.host,
                 port = port,
+                identity_lines = identity_lines,
+            ));
+        }
+        if let Some(local_ssh) = &self.target.local_ssh
+            && local_ssh.mode == LocalSshMode::Direct
+        {
+            let endpoint = self.direct_client_ssh_endpoint().await?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "target {:?} has no direct published SSH endpoint yet; run `aw-gateway up {}` first or configure local_ssh.port",
+                    self.identity.target_name,
+                    self.identity.target_name
+                )
+            })?;
+            return Ok(format!(
+                r#"Host {alias}
+    HostName {host}
+    Port {port}
+{identity_lines}    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+"#,
+                alias = alias,
+                host = endpoint.host,
+                port = endpoint.port,
                 identity_lines = identity_lines,
             ));
         }
@@ -244,6 +293,24 @@ impl Runtime {
         vars.insert("target".into(), self.identity.target_name.clone());
         vars.insert("host".into(), self.cfg.client_config.host.clone());
         vars
+    }
+
+    fn ensure_client_config_origin_supported(
+        &self,
+        origin: ClientConfigOrigin,
+    ) -> anyhow::Result<()> {
+        if origin == ClientConfigOrigin::SshDispatch
+            && self
+                .target
+                .local_ssh
+                .as_ref()
+                .is_some_and(|local_ssh| local_ssh.mode == LocalSshMode::Direct)
+        {
+            anyhow::bail!(
+                "direct client config generation over SSH is not supported for local_ssh.mode = \"direct\" targets; run aw-gateway client-config locally on the gateway host"
+            );
+        }
+        Ok(())
     }
 }
 

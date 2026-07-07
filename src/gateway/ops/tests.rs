@@ -641,6 +641,7 @@ fn constructs_operation_requests_from_ssh_actions() {
         GatewayOperation::ClientConfig {
             target: Some("dev".into()),
             identity_file: Some(PathBuf::from("/tmp/id")),
+            origin: client::ClientConfigOrigin::SshDispatch,
         },
         SshRenderOptions::default(),
     );

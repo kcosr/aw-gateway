@@ -48,13 +48,13 @@ impl ReadyStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(super) struct LocalSshReady {
     pub(super) host: String,
     pub(super) port: u16,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(super) struct TcpEndpoint {
     pub(super) host: String,
     pub(super) port: u16,
@@ -80,6 +80,8 @@ pub(super) struct GatewayStatus {
     pub(super) ssh_socket: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) ssh_tcp: Option<TcpEndpoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) local_ssh: Option<LocalSshReady>,
     pub(super) status: String,
     pub(super) agent: Option<Box<AgentStatus>>,
 }

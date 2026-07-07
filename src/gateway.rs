@@ -83,8 +83,8 @@ use health::run_health_check;
 use lifecycle::{FailedStartCleanup, readiness_plan};
 use lifecycle_hooks::host_hook_timeout;
 use model::{
-    GatewayStatus, LaunchDetail, LaunchStepDetail, LaunchSummary, LaunchVarMetadata, ReadyStatus,
-    TargetEntry, TcpEndpoint, gateway_status_name,
+    GatewayStatus, LaunchDetail, LaunchStepDetail, LaunchSummary, LaunchVarMetadata, LocalSshReady,
+    ReadyStatus, TargetEntry, TcpEndpoint, gateway_status_name,
 };
 use ops::{
     CanonicalLaunchVarValue, CapturedStream, ExecutionOutcome, GatewayOperation,
@@ -394,7 +394,7 @@ async fn run_gateway_action(
         }
         GatewayAction::Help => gateway_help(config_path).await,
         GatewayAction::ClientBundle(action) => {
-            client::client_bundle(
+            client::client_bundle_from_ssh_dispatch(
                 config_path,
                 ClientBundleArgs {
                     target: action.target,
@@ -606,7 +606,9 @@ async fn up(
             let mut ready = ready_result?;
             let bound = listener::bind_local_ssh(&runtime).await?;
             ready.local_ssh = Some(bound.ready.clone());
-            let config = runtime.render_client_config(None)?;
+            let config = runtime
+                .render_client_config(None, client::ClientConfigOrigin::LocalCli)
+                .await?;
             ready.client_config = Some(runtime.write_inner_config(&config)?);
             println!("{}", serde_json::to_string_pretty(&ready)?);
             let target = ready.ssh_target()?;
@@ -1887,7 +1889,7 @@ impl Runtime {
             ssh_socket: self.ssh_socket_endpoint(),
             ssh_tcp: self.published_ssh_endpoint().await?,
             status: status.status,
-            local_ssh: None,
+            local_ssh: status.local_ssh,
             client_config: None,
         })
     }
@@ -1916,6 +1918,24 @@ impl Runtime {
         let sessions = self.active_session_markers_async().await?;
         let launch = status_launch(self.identity.session_id.as_deref(), &sessions);
         let agent_ready = agent.as_ref().is_some_and(|status| status.ready);
+        let local_ssh = if self.direct_published_ssh_enabled() {
+            self.direct_status_ssh_endpoint()
+                .await?
+                .map(|endpoint| LocalSshReady {
+                    host: endpoint.host,
+                    port: endpoint.port,
+                })
+        } else {
+            None
+        };
+        let ssh_tcp = if self.direct_published_ssh_enabled() {
+            self.direct_live_ssh_tcp_endpoint(
+                inspect.as_ref().is_some_and(|value| value.state.running),
+            )
+            .await?
+        } else {
+            self.published_ssh_endpoint().await?
+        };
         Ok(GatewayStatus {
             target: self.identity.target_name.clone(),
             session_id: self.identity.session_id.clone(),
@@ -1933,7 +1953,8 @@ impl Runtime {
             sessions,
             agent_ready,
             ssh_socket: self.ssh_socket_endpoint(),
-            ssh_tcp: self.published_ssh_endpoint().await?,
+            ssh_tcp,
+            local_ssh,
             status: gateway_status_name(
                 inspect.as_ref().is_some_and(|value| value.state.running),
                 self.requires_agent_control(),
@@ -2061,9 +2082,9 @@ impl Runtime {
             .container_runtime
             .published_port(&self.identity.container_name, 22)
             .await?
-            .map(|port| TcpEndpoint {
-                host: "127.0.0.1".into(),
-                port,
+            .map(|endpoint| TcpEndpoint {
+                host: endpoint.host,
+                port: endpoint.port,
             }))
     }
 }

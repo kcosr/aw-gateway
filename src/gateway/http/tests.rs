@@ -1914,6 +1914,7 @@ async fn status_shape_can_be_wrapped_in_data_envelope() {
         agent_ready: true,
         ssh_socket: Some(PathBuf::from("/tmp/ssh.sock")),
         ssh_tcp: None,
+        local_ssh: None,
         status: "ready".into(),
         agent: Some(Box::new(crate::agent_control::AgentStatus {
             ready: true,

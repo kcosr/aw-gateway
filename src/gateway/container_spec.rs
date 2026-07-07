@@ -1,5 +1,5 @@
 use super::Runtime;
-use super::published_port::apple_published_port_bind_conflict;
+use super::published_port::published_port_bind_conflict;
 use crate::config::{
     ContainerMountConfig, ContainerMountMode, ContainerRuntimeType, LocalSshBackend, TargetMode,
 };
@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub(super) const DEFAULT_SESSION_SHELL_ENV: &str = "/usr/bin/bash";
-const APPLE_PUBLISHED_SSH_RUN_ATTEMPTS: usize = 3;
+const PUBLISHED_SSH_RUN_ATTEMPTS: usize = 3;
 
 impl Runtime {
     pub(super) fn labels(&self) -> BTreeMap<String, String> {
@@ -232,9 +232,9 @@ impl Runtime {
         control_token: Option<&str>,
         mounts: Vec<ContainerMountSpec>,
     ) -> anyhow::Result<()> {
-        for attempt in 1..=APPLE_PUBLISHED_SSH_RUN_ATTEMPTS {
+        for attempt in 1..=PUBLISHED_SSH_RUN_ATTEMPTS {
             let pending = self
-                .prepare_pending_published_ssh_port()?
+                .prepare_published_ssh_host_port_for_create()?
                 .expect("explicit published SSH port should allocate pending state");
             let run_spec = self.container_run_spec_with_mounts(
                 identity_token,
@@ -250,11 +250,11 @@ impl Runtime {
                     return Ok(());
                 }
                 Err(err)
-                    if attempt < APPLE_PUBLISHED_SSH_RUN_ATTEMPTS
-                        && apple_published_port_bind_conflict(&err) =>
+                    if attempt < PUBLISHED_SSH_RUN_ATTEMPTS
+                        && published_port_bind_conflict(&err) =>
                 {
                     self.remove_pending_published_ssh_port();
-                    self.remove_label_validated_leftover_after_failed_apple_run()
+                    self.remove_label_validated_leftover_after_failed_published_port_run()
                         .await?;
                 }
                 Err(err) => {
@@ -263,10 +263,12 @@ impl Runtime {
                 }
             }
         }
-        unreachable!("Apple published SSH run attempts loop must return");
+        unreachable!("published SSH run attempts loop must return");
     }
 
-    async fn remove_label_validated_leftover_after_failed_apple_run(&self) -> anyhow::Result<()> {
+    async fn remove_label_validated_leftover_after_failed_published_port_run(
+        &self,
+    ) -> anyhow::Result<()> {
         let Some(inspect) = self
             .container_runtime
             .inspect(&self.identity.container_name)
@@ -277,7 +279,7 @@ impl Runtime {
         self.validate_labels(&inspect)
             .with_context(|| {
                 format!(
-                    "not deleting leftover Apple container {:?} after failed start because labels did not match",
+                    "not deleting leftover container {:?} after failed published SSH port start because labels did not match",
                     self.identity.container_name
                 )
             })?;

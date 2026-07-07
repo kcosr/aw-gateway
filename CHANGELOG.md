@@ -2,7 +2,14 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Added `local_ssh.mode = "direct"` for fixed SSH targets using
+  `local_ssh.backend = "published_port"`. Direct mode starts or reuses the
+  target, waits for the runtime-published loopback SSH endpoint, persists the
+  endpoint across stops, renders local client config without a `ProxyCommand`,
+  and rejects SSH-dispatched direct client config where loopback would point at
+  the wrong machine.
 
 ## [0.8.1] - 2026-07-03
 

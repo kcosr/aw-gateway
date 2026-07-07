@@ -857,6 +857,23 @@ impl TargetConfig {
         }
         if let Some(local_ssh) = &self.local_ssh {
             local_ssh.validate()?;
+            if local_ssh.mode == LocalSshMode::Direct {
+                if self.access.method != TargetAccessMethod::Ssh {
+                    anyhow::bail!(
+                        "target {target_name:?} local_ssh.mode = \"direct\" requires access.method = \"ssh\""
+                    );
+                }
+                if self.mode != TargetMode::Fixed {
+                    anyhow::bail!(
+                        "target {target_name:?} local_ssh.mode = \"direct\" requires mode = \"fixed\""
+                    );
+                }
+                if self.stop_when_idle {
+                    anyhow::bail!(
+                        "target {target_name:?} local_ssh.mode = \"direct\" cannot be used with stop_when_idle = true"
+                    );
+                }
+            }
         }
         self.container_ssh.validate()?;
         if self.access.method == TargetAccessMethod::RuntimeExec {

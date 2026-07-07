@@ -54,6 +54,12 @@ pub struct ContainerRunSpec {
     pub command: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedPort {
+    pub host: String,
+    pub port: u16,
+}
+
 #[derive(Debug, Clone)]
 pub struct ContainerMountSpec {
     pub source: PathBuf,
@@ -1563,7 +1569,7 @@ impl ContainerRuntime {
         &self,
         name: &str,
         container_port: u16,
-    ) -> anyhow::Result<Option<u16>> {
+    ) -> anyhow::Result<Option<PublishedPort>> {
         if self.kind == ContainerRuntimeType::AppleContainer {
             return Ok(None);
         }
@@ -1576,7 +1582,7 @@ impl ContainerRuntime {
         if !output.status.success() {
             return Ok(None);
         }
-        Ok(parse_published_port(&output.stdout))
+        Ok(parse_published_port_endpoint(&output.stdout))
     }
 
     pub async fn list_managed_containers(
@@ -1865,7 +1871,11 @@ impl ContainerRuntime {
     fn push_publish_ssh_args(&self, args: &mut Vec<String>, spec: &ContainerRunSpec) {
         if spec.publish_ssh {
             args.push("-p".into());
-            args.push("127.0.0.1::22".into());
+            let publish = match spec.published_ssh_host_port {
+                Some(port) => format!("127.0.0.1:{port}:22"),
+                None => "127.0.0.1::22".into(),
+            };
+            args.push(publish);
         }
     }
 
@@ -2441,13 +2451,28 @@ fn exit_code(status: ExitStatus) -> i32 {
 }
 
 pub fn parse_published_port(stdout: &[u8]) -> Option<u16> {
+    parse_published_port_endpoint(stdout).map(|endpoint| endpoint.port)
+}
+
+pub fn parse_published_port_endpoint(stdout: &[u8]) -> Option<PublishedPort> {
     let stdout = String::from_utf8_lossy(stdout);
     let line = stdout
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())?;
+    if let Some(rest) = line.strip_prefix('[') {
+        let (host, port) = rest.rsplit_once("]:")?;
+        return Some(PublishedPort {
+            host: host.into(),
+            port: port.parse().ok()?,
+        });
+    }
     let (_, port) = line.rsplit_once(':')?;
-    port.parse().ok()
+    let (host, _) = line.rsplit_once(':')?;
+    Some(PublishedPort {
+        host: host.into(),
+        port: port.parse().ok()?,
+    })
 }
 
 #[cfg(test)]
@@ -4375,6 +4400,38 @@ exit 0
     }
 
     #[test]
+    fn run_args_publish_ssh_honors_explicit_loopback_host_port() {
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::Docker,
+            program: "docker".into(),
+            env: BTreeMap::new(),
+        };
+        let spec = ContainerRunSpec {
+            name: "aw-local".into(),
+            hostname: "aw-local".into(),
+            image: "aw-gateway/ubuntu-dev-local".into(),
+            workspace: PathBuf::from("/workspace"),
+            container_home: PathBuf::from("/root"),
+            container_user: "root".into(),
+            passwd_entry: None,
+            state_dir_in_container: PathBuf::from("/root/.aw-gateway/containers/aw-local"),
+            mounts: Vec::new(),
+            env: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            publish_ssh: true,
+            published_ssh_host_port: Some(40222),
+            extra_run_args: Vec::new(),
+            command: vec!["aw-container-agent".into(), "run".into()],
+        };
+        let args = runtime.run_args(&spec);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-p", "127.0.0.1:40222:22"])
+        );
+        assert!(!args.windows(2).any(|pair| pair == ["-p", "127.0.0.1::22"]));
+    }
+
+    #[test]
     fn docker_run_args_include_configured_extra_args() {
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::Docker,
@@ -4418,6 +4475,27 @@ exit 0
     fn parses_docker_published_port_output() {
         assert_eq!(parse_published_port(b"127.0.0.1:49153\n"), Some(49153));
         assert_eq!(parse_published_port(b"0.0.0.0:2222\n"), Some(2222));
+        assert_eq!(
+            parse_published_port_endpoint(b"127.0.0.1:49153\n"),
+            Some(PublishedPort {
+                host: "127.0.0.1".into(),
+                port: 49153,
+            })
+        );
+        assert_eq!(
+            parse_published_port_endpoint(b"0.0.0.0:2222\n"),
+            Some(PublishedPort {
+                host: "0.0.0.0".into(),
+                port: 2222,
+            })
+        );
+        assert_eq!(
+            parse_published_port_endpoint(b"[::1]:49154\n"),
+            Some(PublishedPort {
+                host: "::1".into(),
+                port: 49154,
+            })
+        );
         assert_eq!(
             parse_published_port(b"127.0.0.1:49153\n[::1]:49154\n"),
             Some(49153)
