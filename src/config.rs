@@ -329,10 +329,7 @@ impl GatewayConfig {
                             "target {name:?} uses runtime type \"apple_container\" with access.method = \"runtime_exec\" but container_agent.control_socket is enabled; Apple container runtime-exec targets require container_agent.control_socket = false"
                         );
                     }
-                    if let Some(cleanup) = &target.idle_cleanup
-                        && cleanup.owner == IdleCleanupOwner::Agent
-                        && cleanup.action != IdleCleanupAction::None
-                    {
+                    if target.uses_agent_idle_cleanup() {
                         anyhow::bail!(
                             "target {name:?} uses runtime type \"apple_container\" with access.method = \"runtime_exec\" but agent-owned idle_cleanup requires an agent control socket"
                         );

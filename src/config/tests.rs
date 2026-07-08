@@ -1486,6 +1486,35 @@ action = "exit_container"
 }
 
 #[test]
+fn runtime_exec_container_agent_owned_cleanup_requires_agent_control() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[target_defaults.container_agent]
+control_socket = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+
+[targets.default.container_agent.idle_cleanup]
+owner = "agent"
+action = "exit_container"
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(err.contains("container_agent.control_socket"), "{err}");
+}
+
+#[test]
 fn apple_container_runtime_exec_validates_without_ssh_endpoint() {
     let cfg = r#"
 schema_version = "1"
@@ -1576,6 +1605,35 @@ name = "{image_slug}"
 method = "runtime_exec"
 
 [targets.default.idle_cleanup]
+owner = "agent"
+action = "exit_container"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(err.contains("agent-owned idle_cleanup"), "{err}");
+}
+
+#[test]
+fn apple_container_runtime_exec_rejects_container_agent_owned_idle_cleanup() {
+    let cfg = r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+
+[target_defaults.container_agent]
+control_socket = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+
+[targets.default.container_agent.idle_cleanup]
 owner = "agent"
 action = "exit_container"
 "#;
