@@ -1217,6 +1217,29 @@ action = "exit_container"
 }
 
 #[test]
+fn local_ssh_direct_rejects_container_agent_owned_idle_cleanup() {
+    let cfg = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "published_port"
+
+[targets.default.container_agent.idle_cleanup]
+owner = "agent"
+action = "exit_container"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("agent-owned idle_cleanup"), "{err}");
+}
+
+#[test]
 fn apple_container_runtime_validates_without_host_preflight() {
     let cfg = r#"
 schema_version = "1"

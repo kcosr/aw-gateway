@@ -3459,7 +3459,7 @@ readiness = "ssh_only"
 }
 
 #[tokio::test]
-async fn apple_direct_status_rejects_endpoint_state_port_disagreement() {
+async fn apple_direct_status_self_heals_running_endpoint_state_port_disagreement() {
     let _apple_preflight_bypass = crate::runtime::disable_apple_preflight_for_tests();
     let dir = tempfile::tempdir().unwrap();
     let fake_runtime = dir.path().join("runtime");
@@ -3491,16 +3491,21 @@ exit 0
     )
     .unwrap();
 
-    let err = runtime.status().await.unwrap_err().to_string();
+    let status = runtime.status().await.unwrap();
 
-    assert!(
-        err.contains("saved direct SSH endpoint port 40222"),
-        "{err}"
-    );
-    assert!(
-        err.contains("authoritative published SSH port 40223"),
-        "{err}"
-    );
+    let local_ssh = status.local_ssh.unwrap();
+    assert_eq!(local_ssh.port, 40223);
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            runtime
+                .paths
+                .container_state_dir
+                .join("published-ssh-endpoint.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["port"], serde_json::json!(40223));
 }
 
 #[tokio::test]

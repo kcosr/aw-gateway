@@ -304,7 +304,8 @@ impl Runtime {
         let Some(endpoint) = endpoint else {
             return Ok(None);
         };
-        if self.uses_apple_published_ssh_port_state()
+        if !container_running
+            && self.uses_apple_published_ssh_port_state()
             && let Some(saved) = self.read_matching_published_ssh_endpoint_state()?
         {
             self.validate_direct_endpoint_matches_runtime_state(&saved)?;

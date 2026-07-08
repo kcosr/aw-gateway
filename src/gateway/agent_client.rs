@@ -4,7 +4,6 @@ use crate::agent_control::{
     AgentStatus, ControlEnvelope, ControlFailure, ControlSuccess, SessionHoldParams,
     SessionHoldResult, ShutdownParams, ShutdownResult,
 };
-use crate::config::{IdleCleanupAction, IdleCleanupOwner};
 use anyhow::Context;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -141,11 +140,7 @@ impl Runtime {
     }
 
     fn uses_agent_idle_cleanup(&self) -> bool {
-        self.agent_control_enabled()
-            && self.target.idle_cleanup.as_ref().is_some_and(|cleanup| {
-                cleanup.owner == IdleCleanupOwner::Agent
-                    && cleanup.action != IdleCleanupAction::None
-            })
+        self.agent_control_enabled() && self.target.uses_agent_idle_cleanup()
     }
 }
 
