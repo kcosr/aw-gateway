@@ -1918,21 +1918,21 @@ impl Runtime {
         let sessions = self.active_session_markers_async().await?;
         let launch = status_launch(self.identity.session_id.as_deref(), &sessions);
         let agent_ready = agent.as_ref().is_some_and(|status| status.ready);
-        let local_ssh = if self.direct_published_ssh_enabled() {
-            self.direct_status_ssh_endpoint()
-                .await?
-                .map(|endpoint| LocalSshReady {
-                    host: endpoint.host,
-                    port: endpoint.port,
-                })
+        let direct_endpoint = if self.direct_published_ssh_enabled() {
+            self.direct_status_ssh_endpoint(inspect.as_ref()).await?
         } else {
             None
         };
+        let local_ssh = direct_endpoint.clone().map(|endpoint| LocalSshReady {
+            host: endpoint.host,
+            port: endpoint.port,
+        });
         let ssh_tcp = if self.direct_published_ssh_enabled() {
-            self.direct_live_ssh_tcp_endpoint(
-                inspect.as_ref().is_some_and(|value| value.state.running),
-            )
-            .await?
+            inspect
+                .as_ref()
+                .is_some_and(|value| value.state.running)
+                .then_some(direct_endpoint)
+                .flatten()
         } else {
             self.published_ssh_endpoint().await?
         };

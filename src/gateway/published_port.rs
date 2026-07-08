@@ -169,17 +169,44 @@ impl Runtime {
     pub(super) fn read_matching_published_ssh_endpoint_state(
         &self,
     ) -> anyhow::Result<Option<TcpEndpoint>> {
+        let Some(state) = self.read_published_ssh_endpoint_state()? else {
+            return Ok(None);
+        };
+        if !state.matches_runtime(self) {
+            return Ok(None);
+        }
+        Ok(Some(TcpEndpoint {
+            host: state.host,
+            port: state.port,
+        }))
+    }
+
+    fn read_published_ssh_endpoint_state(
+        &self,
+    ) -> anyhow::Result<Option<PublishedSshEndpointState>> {
         let path = self.published_ssh_endpoint_path();
         let raw = match std::fs::read(&path) {
             Ok(raw) => raw,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err).with_context(|| format!("read {}", path.display())),
         };
-        let state: PublishedSshEndpointState =
-            serde_json::from_slice(&raw).with_context(|| format!("parse {}", path.display()))?;
-        if !state.matches_runtime(self) {
+        serde_json::from_slice(&raw)
+            .with_context(|| format!("parse {}", path.display()))
+            .map(Some)
+    }
+
+    fn configured_port_mismatch_published_ssh_endpoint_state(
+        &self,
+    ) -> anyhow::Result<Option<TcpEndpoint>> {
+        let Some(configured_port) = self.configured_direct_published_ssh_port() else {
             return Ok(None);
-        }
+        };
+        let Some(state) = self.read_published_ssh_endpoint_state()? else {
+            return Ok(None);
+        };
+        if !state.matches_runtime_except_configured_port(self) || state.port == configured_port {
+            return Ok(None);
+        };
         Ok(Some(TcpEndpoint {
             host: state.host,
             port: state.port,
@@ -214,6 +241,10 @@ impl Runtime {
                 self.validate_direct_endpoint_matches_config(&endpoint)?;
                 return Ok(Some(endpoint));
             }
+            if let Some(endpoint) = self.configured_port_mismatch_published_ssh_endpoint_state()? {
+                self.validate_direct_endpoint_matches_runtime_state(&endpoint)?;
+                self.validate_direct_endpoint_matches_config(&endpoint)?;
+            }
             anyhow::bail!(
                 "target {:?} has a stopped container but no matching published SSH endpoint state; run `aw-gateway up {}` first",
                 self.identity.target_name,
@@ -229,18 +260,17 @@ impl Runtime {
         Ok(None)
     }
 
-    pub(super) async fn direct_status_ssh_endpoint(&self) -> anyhow::Result<Option<TcpEndpoint>> {
+    pub(super) async fn direct_status_ssh_endpoint(
+        &self,
+        inspect: Option<&crate::runtime::ContainerInspect>,
+    ) -> anyhow::Result<Option<TcpEndpoint>> {
         if !self.direct_published_ssh_enabled() {
             return Ok(None);
         }
-        let Some(inspect) = self
-            .container_runtime
-            .inspect(&self.identity.container_name)
-            .await?
-        else {
+        let Some(inspect) = inspect else {
             return Ok(None);
         };
-        self.validate_labels(&inspect)?;
+        self.validate_labels(inspect)?;
         if let Some(endpoint) = self
             .direct_authoritative_published_ssh_endpoint(inspect.state.running)
             .await?
@@ -256,16 +286,6 @@ impl Runtime {
             return Ok(Some(endpoint));
         }
         Ok(None)
-    }
-
-    pub(super) async fn direct_live_ssh_tcp_endpoint(
-        &self,
-        container_running: bool,
-    ) -> anyhow::Result<Option<TcpEndpoint>> {
-        if !self.direct_published_ssh_enabled() || !container_running {
-            return Ok(None);
-        }
-        self.direct_authoritative_published_ssh_endpoint(true).await
     }
 
     async fn direct_authoritative_published_ssh_endpoint(
@@ -284,6 +304,11 @@ impl Runtime {
         let Some(endpoint) = endpoint else {
             return Ok(None);
         };
+        if self.uses_apple_published_ssh_port_state()
+            && let Some(saved) = self.read_matching_published_ssh_endpoint_state()?
+        {
+            self.validate_direct_endpoint_matches_runtime_state(&saved)?;
+        }
         self.validate_direct_endpoint_matches_config(&endpoint)?;
         self.write_published_ssh_endpoint_state(&endpoint)?;
         Ok(Some(endpoint))
@@ -454,6 +479,11 @@ struct PublishedSshEndpointState {
 
 impl PublishedSshEndpointState {
     fn matches_runtime(&self, runtime: &Runtime) -> bool {
+        self.matches_runtime_except_configured_port(runtime)
+            && self.configured_port == runtime.configured_direct_published_ssh_port()
+    }
+
+    fn matches_runtime_except_configured_port(&self, runtime: &Runtime) -> bool {
         self.container == runtime.identity.container_name
             && self.target == runtime.identity.target_name
             && self.target_mode == target_mode_name(runtime.target.mode)
@@ -461,7 +491,6 @@ impl PublishedSshEndpointState {
             && self.access == runtime.target.access.method.as_str()
             && self.local_ssh_mode == "direct"
             && self.local_ssh_backend == "published_port"
-            && self.configured_port == runtime.configured_direct_published_ssh_port()
             && self.session_id == runtime.identity.session_id
             && self.context == *runtime.context.as_map()
     }
