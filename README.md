@@ -520,6 +520,17 @@ published port, without a `ProxyCommand`. SSH-dispatched `client-config` and
 client workstation, not the gateway host. `stop` preserves the endpoint state
 for the fixed container; `remove` deletes it.
 
+The container SSH server must listen on the container network interface for
+runtime port publishing to work. The Docker and Podman examples keep sshd bound
+to container loopback by default for bridge-only deployments; direct published
+port configs that use `start-container-sshd` can opt in by adding this env value
+to the existing `container-sshd` service entry:
+
+```toml
+[target_defaults.container_agent.services.env.AW_SSHD_LISTEN_ADDRESS]
+value = "0.0.0.0"
+```
+
 On macOS, non-interactive SSH sessions may not include user-local package
 manager paths. If the Docker CLI used for Colima is not on the SSH session
 `PATH`, set `[runtime].program` to an absolute path.

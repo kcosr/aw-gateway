@@ -214,6 +214,8 @@ The current suite covers:
   execution, status access labels, and SSH-only operation rejection, including
   Apple Container runtime-exec when run on an Apple Container host.
 - Host-local container SSH through generated client bundles.
+- Direct published-port SSH mode through generated host-local client bundles,
+  including `up`, running/stopped status shape, and direct OpenSSH access.
 - Container SSH transfer policy for `sftp`, default `scp`, and legacy
   `scp -O` upload/download paths.
 - Linux restricted `ForceCommand` help, target listing, and `run`.

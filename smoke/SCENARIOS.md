@@ -77,6 +77,23 @@ covered on the Linux hosts.
 | `client-config` generates a usable host-local SSH bundle | all enabled hosts |
 | Host-local `ssh -F <bundle> aw-<target> id` executes inside the container | all enabled hosts |
 
+## Direct Published-Port SSH
+
+Implemented in `tests/test_16_direct_published_ssh.py`.
+
+These tests derive a temporary config from the deployed host-local config,
+switch the fixed target to `local_ssh.mode = "direct"` with
+`backend = "published_port"`, and keep the direct target alive independently of
+the gateway process.
+
+| Scenario | Hosts |
+| --- | --- |
+| Direct published-port config validates | all enabled hosts |
+| `up --json` returns after the direct SSH endpoint is ready | all enabled hosts |
+| Generated direct client bundle uses `HostName 127.0.0.1` and no `ProxyCommand` | all enabled hosts |
+| Host-local `ssh -F <bundle> aw-<target>` connects directly to the published container SSH port | all enabled hosts |
+| Running status reports matching `local_ssh` and live `ssh_tcp`; stopped status preserves `local_ssh` but omits `ssh_tcp` | all enabled hosts |
+
 ## Container SSH Transfer Policy
 
 Implemented in `tests/test_25_transfer_policy.py`.

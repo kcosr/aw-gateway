@@ -10,6 +10,10 @@
   endpoint across stops, renders local client config without a `ProxyCommand`,
   and rejects SSH-dispatched direct client config where loopback would point at
   the wrong machine.
+- Added direct published-port smoke coverage and an `AW_SSHD_LISTEN_ADDRESS`
+  override for `start-container-sshd`, allowing configs that publish container
+  port 22 to make sshd listen on the container network interface while leaving
+  the default Docker/Podman loopback-only examples unchanged.
 
 ## [0.8.1] - 2026-07-03
 

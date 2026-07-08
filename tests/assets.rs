@@ -201,11 +201,84 @@ fn start_container_sshd_uses_agent_config() {
     assert!(script.contains("ssh-keygen -A"));
     assert!(script.contains("AW_SSHD_POLICY_CONFIG"));
     assert!(script.contains("AW_SSHD_SETENV_CONFIG"));
+    assert!(script.contains("AW_SSHD_LISTEN_ADDRESS"));
+    assert!(script.contains("set_listen_address"));
     assert!(script.contains("merge_setenv_config"));
     assert!(script.contains("sed -i '/^[[:space:]]*Subsystem"));
     assert!(script.contains("ForceCommand"));
     assert!(script.contains("/usr/sbin/sshd -t -f \"$config\""));
     assert!(script.contains("exec /usr/sbin/sshd -e -D -f \"$config\""));
+}
+
+#[test]
+fn start_container_sshd_dry_run_rewrites_listen_address_before_match_blocks() {
+    for (label, script) in start_container_sshd_scripts() {
+        let dir = tempdir().unwrap();
+        let base_config = dir.path().join("sshd_config_agent");
+        let runtime_config = dir.path().join("runtime_sshd_config");
+        let run_dir = dir.path().join("run");
+        std::fs::write(
+            &base_config,
+            "Port 22\nListenAddress 127.0.0.1\nMatch User nobody\n    ListenAddress 127.0.0.1\n",
+        )
+        .unwrap();
+
+        let output = StdCommand::new(&script)
+            .env("AW_SSHD_BASE_CONFIG", &base_config)
+            .env("AW_SSHD_RUNTIME_CONFIG", &runtime_config)
+            .env("AW_SSHD_RUN_DIR", &run_dir)
+            .env("AW_SSHD_LISTEN_ADDRESS", "0.0.0.0")
+            .env("AW_SSHD_DRY_RUN_CONFIG", "1")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let listen_lines = stdout
+            .lines()
+            .filter(|line| line.trim_start().starts_with("ListenAddress "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listen_lines,
+            vec!["ListenAddress 0.0.0.0", "    ListenAddress 127.0.0.1"],
+            "{label}"
+        );
+        assert!(
+            stdout.find("ListenAddress 0.0.0.0").unwrap()
+                < stdout.find("Match User nobody").unwrap(),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn start_container_sshd_rejects_invalid_listen_address_override() {
+    for (label, script) in start_container_sshd_scripts() {
+        let dir = tempdir().unwrap();
+        let base_config = dir.path().join("sshd_config_agent");
+        let runtime_config = dir.path().join("runtime_sshd_config");
+        let run_dir = dir.path().join("run");
+        std::fs::write(&base_config, "Port 22\nListenAddress 127.0.0.1\n").unwrap();
+
+        let output = StdCommand::new(&script)
+            .env("AW_SSHD_BASE_CONFIG", &base_config)
+            .env("AW_SSHD_RUNTIME_CONFIG", &runtime_config)
+            .env("AW_SSHD_RUN_DIR", &run_dir)
+            .env("AW_SSHD_LISTEN_ADDRESS", "192.0.2.10")
+            .env("AW_SSHD_DRY_RUN_CONFIG", "1")
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success(), "{label}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("invalid AW_SSHD_LISTEN_ADDRESS"),
+            "{label}"
+        );
+    }
 }
 
 #[test]
