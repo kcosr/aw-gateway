@@ -510,6 +510,10 @@ host = "127.0.0.1"
 # Optional. If omitted, aw-gateway allocates and persists an explicit
 # loopback host port when the container is created.
 # port = 40222
+
+[targets.default.idle_cleanup]
+owner = "none"
+action = "none"
 ```
 
 Direct mode starts or reuses the fixed target with `up`, waits for SSH
@@ -519,6 +523,12 @@ published port, without a `ProxyCommand`. SSH-dispatched `client-config` and
 `client-bundle` reject direct mode because `127.0.0.1` would refer to the
 client workstation, not the gateway host. `stop` preserves the endpoint state
 for the fixed container; `remove` deletes it.
+
+Direct SSH sessions bypass the gateway listener and the agent SSH bridge, so
+agent-owned idle cleanup cannot observe active SSH/SCP/SFTP sessions. Direct
+mode rejects `stop_when_idle = true` and agent-owned idle cleanup. If a base
+config or target default enables agent cleanup, override it with
+`owner = "none"` and `action = "none"` for the direct target.
 
 The container SSH server must listen on the container network interface for
 runtime port publishing to work. The Docker and Podman examples keep sshd bound

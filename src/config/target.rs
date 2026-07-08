@@ -873,6 +873,14 @@ impl TargetConfig {
                         "target {target_name:?} local_ssh.mode = \"direct\" cannot be used with stop_when_idle = true"
                     );
                 }
+                if let Some(cleanup) = &self.idle_cleanup
+                    && cleanup.owner == IdleCleanupOwner::Agent
+                    && cleanup.action != IdleCleanupAction::None
+                {
+                    anyhow::bail!(
+                        "target {target_name:?} local_ssh.mode = \"direct\" cannot be used with agent-owned idle_cleanup"
+                    );
+                }
             }
         }
         self.container_ssh.validate()?;

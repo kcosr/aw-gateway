@@ -84,7 +84,7 @@ Implemented in `tests/test_16_direct_published_ssh.py`.
 These tests derive a temporary config from the deployed host-local config,
 switch the fixed target to `local_ssh.mode = "direct"` with
 `backend = "published_port"`, and keep the direct target alive independently of
-the gateway process.
+the gateway process by disabling inherited idle cleanup.
 
 | Scenario | Hosts |
 | --- | --- |

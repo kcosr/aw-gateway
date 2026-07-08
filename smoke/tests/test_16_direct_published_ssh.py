@@ -127,6 +127,9 @@ text += 'mode = "direct"\\n'
 text += 'backend = "published_port"\\n'
 text += 'readiness = "ssh_only"\\n'
 text += 'host = "127.0.0.1"\\n'
+text += f"\\n[targets.{{target}}.idle_cleanup]\\n"
+text += 'owner = "none"\\n'
+text += 'action = "none"\\n'
 text += f"\\n[[targets.{{target}}.container_agent.services]]\\n"
 text += 'name = "container-sshd"\\n'
 text += "required = true\\n"
