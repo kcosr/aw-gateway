@@ -11,10 +11,12 @@
   and rejects SSH-dispatched direct client config where loopback would point at
   the wrong machine. Direct mode also rejects agent-owned idle cleanup because
   direct SSH sessions bypass the gateway and agent session counters.
+  ([#62](https://github.com/kcosr/aw-gateway/pull/62)).
 - Added direct published-port smoke coverage and an `AW_SSHD_LISTEN_ADDRESS`
   override for `start-container-sshd`, allowing configs that publish container
   port 22 to make sshd listen on the container network interface while leaving
-  the default Docker/Podman loopback-only examples unchanged.
+  the default Docker/Podman loopback-only examples unchanged
+  ([#62](https://github.com/kcosr/aw-gateway/pull/62)).
 
 ## [0.8.1] - 2026-07-03
 
