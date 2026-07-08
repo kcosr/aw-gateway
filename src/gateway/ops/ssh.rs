@@ -1,4 +1,5 @@
 use super::{GatewayOperation, LaunchPassthroughArgs, OperationResult, SuppliedLaunchVars};
+use crate::gateway::client::ClientConfigOrigin;
 use crate::ssh_dispatch::{GatewayAction, RunAction, StatusAction};
 use std::path::PathBuf;
 
@@ -93,6 +94,7 @@ impl SshGatewayOperation {
                 operation: GatewayOperation::ClientConfig {
                     target: action.target.clone(),
                     identity_file: action.identity_file.clone().map(PathBuf::from),
+                    origin: ClientConfigOrigin::SshDispatch,
                 },
                 render: SshRenderOptions::default(),
             }),

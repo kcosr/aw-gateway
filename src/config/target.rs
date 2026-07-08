@@ -857,6 +857,28 @@ impl TargetConfig {
         }
         if let Some(local_ssh) = &self.local_ssh {
             local_ssh.validate()?;
+            if local_ssh.mode == LocalSshMode::Direct {
+                if self.access.method != TargetAccessMethod::Ssh {
+                    anyhow::bail!(
+                        "target {target_name:?} local_ssh.mode = \"direct\" requires access.method = \"ssh\""
+                    );
+                }
+                if self.mode != TargetMode::Fixed {
+                    anyhow::bail!(
+                        "target {target_name:?} local_ssh.mode = \"direct\" requires mode = \"fixed\""
+                    );
+                }
+                if self.stop_when_idle {
+                    anyhow::bail!(
+                        "target {target_name:?} local_ssh.mode = \"direct\" cannot be used with stop_when_idle = true"
+                    );
+                }
+                if self.uses_agent_idle_cleanup() {
+                    anyhow::bail!(
+                        "target {target_name:?} local_ssh.mode = \"direct\" cannot be used with agent-owned idle_cleanup"
+                    );
+                }
+            }
         }
         self.container_ssh.validate()?;
         if self.access.method == TargetAccessMethod::RuntimeExec {
@@ -890,9 +912,7 @@ impl TargetConfig {
                     "target {target_name:?} access.method = \"runtime_exec\" requires container_agent.enabled = true when container_bootstrap.enabled = true"
                 );
             }
-            if let Some(cleanup) = &self.idle_cleanup
-                && cleanup.owner == IdleCleanupOwner::Agent
-                && cleanup.action != IdleCleanupAction::None
+            if self.uses_agent_idle_cleanup()
                 && (!self.container_agent.enabled
                     || !self
                         .container_agent
@@ -985,6 +1005,24 @@ impl TargetConfig {
             .validate_context_templates(&format!("{field}.control_sockets"), context_vars)?;
         Ok(())
     }
+
+    pub(crate) fn uses_agent_idle_cleanup(&self) -> bool {
+        self.effective_agent_idle_cleanup().is_some()
+    }
+
+    fn effective_agent_idle_cleanup(&self) -> Option<&IdleCleanupConfig> {
+        if let Some(cleanup) = &self.idle_cleanup {
+            return is_active_agent_idle_cleanup(cleanup).then_some(cleanup);
+        }
+        self.container_agent
+            .idle_cleanup
+            .as_ref()
+            .filter(|cleanup| is_active_agent_idle_cleanup(cleanup))
+    }
+}
+
+fn is_active_agent_idle_cleanup(cleanup: &IdleCleanupConfig) -> bool {
+    cleanup.owner == IdleCleanupOwner::Agent && cleanup.action != IdleCleanupAction::None
 }
 
 fn validate_container_home(target_name: &str, container_home: &Path) -> anyhow::Result<()> {

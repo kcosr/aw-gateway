@@ -19,6 +19,7 @@ use crate::paths::{self, UserContext};
 use crate::runtime::{AppleContainerNameCandidates, ContainerRuntime};
 use crate::template::{self, Vars};
 use anyhow::Context;
+use client::ClientConfigOrigin;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
@@ -78,6 +79,7 @@ pub(super) enum GatewayOperation {
     ClientConfig {
         target: Option<String>,
         identity_file: Option<PathBuf>,
+        origin: ClientConfigOrigin,
     },
 }
 
@@ -192,6 +194,7 @@ impl GatewayOperation {
         Self::ClientConfig {
             target: args.target,
             identity_file: args.identity_file,
+            origin: ClientConfigOrigin::LocalCli,
         }
     }
 }
@@ -286,9 +289,10 @@ pub(super) async fn execute_gateway_operation_with_context(
         GatewayOperation::ClientConfig {
             target,
             identity_file,
+            origin,
         } => {
             let (rendered, written_path) =
-                operation_client_config(config_path, target, identity_file).await?;
+                operation_client_config(config_path, target, identity_file, origin).await?;
             Ok(GatewayOperationResult::ClientConfig {
                 rendered,
                 written_path: Some(written_path),
@@ -420,9 +424,12 @@ async fn operation_client_config(
     config_path: Option<PathBuf>,
     target: Option<String>,
     identity_file: Option<PathBuf>,
+    origin: ClientConfigOrigin,
 ) -> OperationResult<(String, PathBuf)> {
     let runtime = Runtime::load(config_path, target.as_deref(), None, false).await?;
-    let config = runtime.render_client_config(identity_file.as_deref())?;
+    let config = runtime
+        .render_client_config(identity_file.as_deref(), origin)
+        .await?;
     let written_path = runtime.write_inner_config(&config)?;
     Ok((config, written_path))
 }

@@ -63,9 +63,15 @@ def test_runtime_exec_run_shell_status_and_ssh_operation_rejection(host: Host) -
         all_status = runtime_exec_gateway(host, "status", "--all", "--json", timeout=120)
         all_status.assert_success()
         entries = json.loads(all_status.stdout)
-        matching = [entry for entry in entries if entry["target"] == host.target]
-        assert matching
-        assert matching[0]["access"] == "runtime_exec"
+        if data["status"] == "container-running":
+            matching = [
+                entry
+                for entry in entries
+                if entry["target"] == host.target
+                and entry["container"] == data["container"]
+                and entry["access"] == "runtime_exec"
+            ]
+            assert matching
 
         client_config = runtime_exec_gateway(host, "client-config", host.target)
         assert client_config.returncode != 0

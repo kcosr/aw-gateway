@@ -77,7 +77,7 @@ impl Runtime {
     }
 
     fn apple_restart_published_ssh_port(&self) -> anyhow::Result<Option<u16>> {
-        if self.needs_explicit_published_ssh_port() {
+        if self.uses_apple_published_ssh_port_state() {
             let port = self.read_published_ssh_port()?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "Apple container target {:?} is stopped but published SSH port state is missing; remove and recreate the target to allocate a published SSH port",
@@ -291,7 +291,7 @@ impl Runtime {
     }
 
     pub(super) fn published_ssh_readiness_timeout_error(&self) -> anyhow::Error {
-        if self.needs_explicit_published_ssh_port() {
+        if self.uses_apple_published_ssh_port_state() {
             match self.read_published_ssh_port() {
                 Ok(Some(port)) => anyhow::anyhow!(
                     "Apple container target {:?} persisted published SSH port {port} did not become ready; Apple may not have restored the publish mapping after container start, or the port may be occupied. Remove and recreate the target, or free the port and retry.",

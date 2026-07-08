@@ -1072,6 +1072,174 @@ host = "127.0.0.1"
 }
 
 #[test]
+fn local_ssh_allows_direct_published_port_backend_for_fixed_ssh_targets() {
+    let cfg = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "published_port"
+readiness = "ssh_only"
+host = "127.0.0.1"
+port = 40222
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    cfg.validate().unwrap();
+}
+
+#[test]
+fn local_ssh_direct_allows_agent_control_readiness_on_non_apple_runtimes() {
+    let cfg = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "published_port"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    cfg.validate().unwrap();
+}
+
+#[test]
+fn local_ssh_direct_requires_published_port_backend() {
+    let cfg = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "socket"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("published_port"), "{err}");
+}
+
+#[test]
+fn local_ssh_direct_rejects_non_127_hosts() {
+    for host in ["::1", "0.0.0.0"] {
+        let cfg = format!(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "published_port"
+host = "{host}"
+"#
+        );
+        let cfg: GatewayConfig = toml::from_str(&cfg).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("direct host must be 127.0.0.1"), "{err}");
+    }
+}
+
+#[test]
+fn local_ssh_direct_rejects_ephemeral_targets() {
+    let cfg = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "ephemeral"
+ephemeral_name = "{image_slug}-{session_id}"
+stop_when_idle = true
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "published_port"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("mode = \"fixed\""), "{err}");
+}
+
+#[test]
+fn local_ssh_direct_rejects_stop_when_idle() {
+    let cfg = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+stop_when_idle = true
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "published_port"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("stop_when_idle"), "{err}");
+}
+
+#[test]
+fn local_ssh_direct_rejects_agent_owned_idle_cleanup() {
+    let cfg = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "published_port"
+
+[targets.default.idle_cleanup]
+owner = "agent"
+action = "exit_container"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("agent-owned idle_cleanup"), "{err}");
+}
+
+#[test]
+fn local_ssh_direct_rejects_container_agent_owned_idle_cleanup() {
+    let cfg = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "published_port"
+
+[targets.default.container_agent.idle_cleanup]
+owner = "agent"
+action = "exit_container"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("agent-owned idle_cleanup"), "{err}");
+}
+
+#[test]
 fn apple_container_runtime_validates_without_host_preflight() {
     let cfg = r#"
 schema_version = "1"
@@ -1318,6 +1486,35 @@ action = "exit_container"
 }
 
 #[test]
+fn runtime_exec_container_agent_owned_cleanup_requires_agent_control() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[target_defaults.container_agent]
+control_socket = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+
+[targets.default.container_agent.idle_cleanup]
+owner = "agent"
+action = "exit_container"
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(err.contains("container_agent.control_socket"), "{err}");
+}
+
+#[test]
 fn apple_container_runtime_exec_validates_without_ssh_endpoint() {
     let cfg = r#"
 schema_version = "1"
@@ -1408,6 +1605,35 @@ name = "{image_slug}"
 method = "runtime_exec"
 
 [targets.default.idle_cleanup]
+owner = "agent"
+action = "exit_container"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("runtime_exec"), "{err}");
+    assert!(err.contains("agent-owned idle_cleanup"), "{err}");
+}
+
+#[test]
+fn apple_container_runtime_exec_rejects_container_agent_owned_idle_cleanup() {
+    let cfg = r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+
+[target_defaults.container_agent]
+control_socket = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.access]
+method = "runtime_exec"
+
+[targets.default.container_agent.idle_cleanup]
 owner = "agent"
 action = "exit_container"
 "#;
@@ -1566,7 +1792,7 @@ host = "127.0.0.1"
 }
 
 #[test]
-fn local_ssh_non_loopback_host_is_only_rejected_for_listen_mode() {
+fn local_ssh_non_loopback_host_is_rejected_for_local_client_modes() {
     let cfg = r#"
 schema_version = "1"
 
@@ -1597,6 +1823,23 @@ host = "0.0.0.0"
     let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
     let err = format!("{:#}", cfg.validate().unwrap_err());
     assert!(err.contains("loopback-only"), "{err}");
+
+    let cfg = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "published_port"
+host = "0.0.0.0"
+"#;
+    let cfg: GatewayConfig = toml::from_str(cfg).unwrap();
+    let err = format!("{:#}", cfg.validate().unwrap_err());
+    assert!(err.contains("127.0.0.1"), "{err}");
 }
 
 #[test]

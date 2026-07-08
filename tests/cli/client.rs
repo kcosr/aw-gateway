@@ -2,7 +2,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
-use crate::helpers::gateway_sample_for_test;
+use crate::helpers::{gateway_sample_for_test, write_executable};
 
 #[test]
 fn client_config_honors_local_listen_mode() {
@@ -33,6 +33,72 @@ port = 40222
         .stdout(predicate::str::contains("IdentityFile"))
         .stdout(predicate::str::contains("StrictHostKeyChecking no"))
         .stdout(predicate::str::contains("UserKnownHostsFile /dev/null"));
+}
+
+#[test]
+fn client_config_honors_local_direct_published_port_mode() {
+    let dir = tempdir().unwrap();
+    let runtime = dir.path().join("runtime");
+    write_executable(
+        &runtime,
+        r#"#!/bin/sh
+case "$1" in
+  inspect)
+    echo '[]'
+    ;;
+esac
+exit 0
+"#,
+    );
+    let config = dir.path().join("gateway.toml");
+    let workspace = dir.path().join("workspace");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+default_target = "default"
+
+[runtime]
+type = "docker"
+program = "{runtime}"
+
+[target_defaults.workspace]
+path = "{workspace}"
+state_dir = ".aw-gateway"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "published_port"
+readiness = "ssh_only"
+host = "127.0.0.1"
+port = 40222
+"#,
+            runtime = runtime.display(),
+            workspace = workspace.display()
+        ),
+    )
+    .unwrap();
+
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["client-config", "default"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("HostName 127.0.0.1"))
+        .stdout(predicate::str::contains("Port 40222"))
+        .stdout(predicate::str::contains("ProxyCommand").not())
+        .stdout(predicate::str::contains("IdentityFile").not());
+
+    let inner_config = std::fs::read_to_string(workspace.join(".aw-gateway/ssh/config")).unwrap();
+    assert!(inner_config.contains("Port 40222"));
 }
 
 #[test]

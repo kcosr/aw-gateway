@@ -20,6 +20,12 @@ impl LocalSshConfig {
         if self.mode == LocalSshMode::Listen && self.host != "127.0.0.1" && self.host != "::1" {
             anyhow::bail!("local_ssh listen host must be loopback-only");
         }
+        if self.mode == LocalSshMode::Direct && self.host != "127.0.0.1" {
+            anyhow::bail!("local_ssh direct host must be 127.0.0.1");
+        }
+        if self.mode == LocalSshMode::Direct && self.backend != LocalSshBackend::PublishedPort {
+            anyhow::bail!("local_ssh mode \"direct\" requires backend = \"published_port\"");
+        }
         if self.readiness == LocalSshReadiness::SshOnly
             && self.backend != LocalSshBackend::PublishedPort
         {
@@ -77,6 +83,18 @@ impl LocalSshConfigInput {
         {
             anyhow::bail!("local_ssh listen host must be loopback-only");
         }
+        if self.mode == Some(LocalSshMode::Direct)
+            && let Some(host) = &self.host
+            && host != "127.0.0.1"
+        {
+            anyhow::bail!("local_ssh direct host must be 127.0.0.1");
+        }
+        if self.mode == Some(LocalSshMode::Direct)
+            && let Some(backend) = self.backend
+            && backend != LocalSshBackend::PublishedPort
+        {
+            anyhow::bail!("local_ssh mode \"direct\" requires backend = \"published_port\"");
+        }
         Ok(())
     }
 }
@@ -87,6 +105,7 @@ pub enum LocalSshMode {
     #[default]
     ProxyCommand,
     Listen,
+    Direct,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]

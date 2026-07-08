@@ -355,6 +355,63 @@ fn configure_apple_published_port_target(cfg: &mut GatewayConfig) {
     });
 }
 
+fn configure_direct_published_port_target(
+    cfg: &mut GatewayConfig,
+    runtime_type: ContainerRuntimeType,
+    port: Option<u16>,
+) {
+    cfg.runtime.runtime_type = runtime_type;
+    cfg.target_defaults.container_agent = Some(crate::config::ContainerAgentConfigInput {
+        enabled: Some(true),
+        services: Vec::new(),
+        ssh_bridge: None,
+        control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
+        idle_cleanup: None,
+    });
+    cfg.targets.get_mut("default").unwrap().local_ssh = Some(crate::config::LocalSshConfigInput {
+        mode: Some(LocalSshMode::Direct),
+        backend: Some(LocalSshBackend::PublishedPort),
+        readiness: Some(LocalSshReadiness::SshOnly),
+        port,
+        ..Default::default()
+    });
+    cfg.targets.get_mut("default").unwrap().stop_when_idle = Some(false);
+}
+
+fn write_direct_endpoint_state(
+    runtime: &Runtime,
+    port: u16,
+    configured_port: Option<u16>,
+    runtime_type: &str,
+) -> PathBuf {
+    paths::ensure_private_dir(&runtime.paths.container_state_dir).unwrap();
+    let path = runtime
+        .paths
+        .container_state_dir
+        .join("published-ssh-endpoint.json");
+    std::fs::write(
+        &path,
+        serde_json::json!({
+            "host": "127.0.0.1",
+            "port": port,
+            "container": runtime.identity.container_name.clone(),
+            "target": runtime.identity.target_name.clone(),
+            "target_mode": "fixed",
+            "runtime_type": runtime_type,
+            "access": "ssh",
+            "local_ssh_mode": "direct",
+            "local_ssh_backend": "published_port",
+            "configured_port": configured_port,
+            "session_id": runtime.identity.session_id.clone(),
+            "context": {},
+            "updated_at_ms": 1
+        })
+        .to_string(),
+    )
+    .unwrap();
+    path
+}
+
 fn test_runtime(
     dir: &tempfile::TempDir,
     program: PathBuf,
@@ -1386,6 +1443,7 @@ async fn runtime_exec_ssh_only_operations_fail_before_writes_or_key_reads() {
         GatewayOperation::ClientConfig {
             target: Some("default".into()),
             identity_file: None,
+            origin: client::ClientConfigOrigin::LocalCli,
         },
     )
     .await
@@ -1448,6 +1506,137 @@ async fn runtime_exec_ssh_only_operations_fail_before_writes_or_key_reads() {
     assert!(
         !err.contains("open public key"),
         "add-container-key should reject runtime_exec before reading key input: {err}"
+    );
+}
+
+#[tokio::test]
+async fn direct_client_config_is_rejected_from_ssh_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = dir.path().join("runtime");
+    write_fake_runtime(
+        &runtime,
+        r#"#!/bin/sh
+case "$1" in
+  inspect)
+    echo '[]'
+    ;;
+esac
+exit 0
+"#,
+    );
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+default_target = "default"
+
+[runtime]
+type = "docker"
+program = "{runtime}"
+
+[target_defaults.workspace]
+path = "{workspace}"
+state_dir = ".aw-gateway"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "published_port"
+readiness = "ssh_only"
+port = 40222
+"#,
+            runtime = runtime.display(),
+            workspace = dir.path().join("workspace").display(),
+        ),
+    )
+    .unwrap();
+
+    let err = execute_gateway_operation(
+        Some(config),
+        GatewayOperation::ClientConfig {
+            target: Some("default".into()),
+            identity_file: None,
+            origin: client::ClientConfigOrigin::SshDispatch,
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("client config generation over SSH"), "{err}");
+    assert!(err.contains("direct"), "{err}");
+}
+
+#[tokio::test]
+async fn direct_client_bundle_is_rejected_from_ssh_dispatch_before_key_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = dir.path().join("runtime");
+    write_fake_runtime(
+        &runtime,
+        r#"#!/bin/sh
+case "$1" in
+  inspect)
+    echo '[]'
+    ;;
+esac
+exit 0
+"#,
+    );
+    let workspace = dir.path().join("workspace");
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+default_target = "default"
+
+[runtime]
+type = "docker"
+program = "{runtime}"
+
+[target_defaults.workspace]
+path = "{workspace}"
+state_dir = ".aw-gateway"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "published_port"
+readiness = "ssh_only"
+port = 40222
+"#,
+            runtime = runtime.display(),
+            workspace = workspace.display(),
+        ),
+    )
+    .unwrap();
+
+    let err = client::client_bundle_from_ssh_dispatch(
+        Some(config),
+        ClientBundleArgs {
+            target: Some("default".into()),
+            identity_file: None,
+            rotate_key: false,
+        },
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("client config generation over SSH"), "{err}");
+    assert!(err.contains("direct"), "{err}");
+    assert!(
+        !workspace.join(".aw-gateway").exists(),
+        "client-bundle should reject direct SSH dispatch before writing key state"
     );
 }
 
@@ -2837,7 +3026,7 @@ case "$1" in
 JSON
     ;;
   port)
-    echo "0.0.0.0:4022"
+    echo "127.0.0.1:4022"
     ;;
 esac
 exit 0
@@ -2871,6 +3060,577 @@ exit 0
     assert_eq!(endpoint.port, 4022);
 }
 
+#[tokio::test]
+async fn direct_status_reports_stopped_container_endpoint_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":false,"Pid":null}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev","io.aw-gateway.access":"ssh","io.aw-gateway.mode":"fixed"}}}}}}]
+JSON
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        cfg.runtime.runtime_type = ContainerRuntimeType::Docker;
+        cfg.target_defaults.container_agent = Some(crate::config::ContainerAgentConfigInput {
+            enabled: Some(true),
+            services: Vec::new(),
+            ssh_bridge: None,
+            control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
+            idle_cleanup: None,
+        });
+        cfg.targets.get_mut("default").unwrap().local_ssh =
+            Some(crate::config::LocalSshConfigInput {
+                mode: Some(LocalSshMode::Direct),
+                backend: Some(LocalSshBackend::PublishedPort),
+                readiness: Some(LocalSshReadiness::SshOnly),
+                ..Default::default()
+            });
+        cfg.targets.get_mut("default").unwrap().stop_when_idle = Some(false);
+    });
+    paths::ensure_private_dir(&runtime.paths.container_state_dir).unwrap();
+    std::fs::write(
+        runtime
+            .paths
+            .container_state_dir
+            .join("published-ssh-endpoint.json"),
+        serde_json::json!({
+            "host": "127.0.0.1",
+            "port": 40222,
+            "container": "ubuntu-dev",
+            "target": "default",
+            "target_mode": "fixed",
+            "runtime_type": "docker",
+            "access": "ssh",
+            "local_ssh_mode": "direct",
+            "local_ssh_backend": "published_port",
+            "configured_port": null,
+            "session_id": null,
+            "context": {},
+            "updated_at_ms": 1
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let status = runtime.status().await.unwrap();
+
+    assert_eq!(
+        status.local_ssh,
+        Some(LocalSshReady {
+            host: "127.0.0.1".into(),
+            port: 40222,
+        })
+    );
+    assert!(status.ssh_tcp.is_none());
+}
+
+#[tokio::test]
+async fn direct_status_recovers_stopped_container_runtime_mapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":false,"Pid":null}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev","io.aw-gateway.access":"ssh","io.aw-gateway.mode":"fixed"}}}}}}]
+JSON
+    ;;
+  port)
+    echo "127.0.0.1:40222"
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        cfg.runtime.runtime_type = ContainerRuntimeType::Docker;
+        cfg.target_defaults.container_agent = Some(crate::config::ContainerAgentConfigInput {
+            enabled: Some(true),
+            services: Vec::new(),
+            ssh_bridge: None,
+            control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
+            idle_cleanup: None,
+        });
+        cfg.targets.get_mut("default").unwrap().local_ssh =
+            Some(crate::config::LocalSshConfigInput {
+                mode: Some(LocalSshMode::Direct),
+                backend: Some(LocalSshBackend::PublishedPort),
+                readiness: Some(LocalSshReadiness::SshOnly),
+                ..Default::default()
+            });
+        cfg.targets.get_mut("default").unwrap().stop_when_idle = Some(false);
+    });
+
+    let status = runtime.status().await.unwrap();
+
+    assert_eq!(
+        status.local_ssh,
+        Some(LocalSshReady {
+            host: "127.0.0.1".into(),
+            port: 40222,
+        })
+    );
+    assert!(status.ssh_tcp.is_none());
+    assert!(
+        runtime
+            .paths
+            .container_state_dir
+            .join("published-ssh-endpoint.json")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn direct_status_omits_configured_endpoint_when_container_is_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    write_fake_runtime(
+        &fake_runtime,
+        r#"#!/bin/sh
+case "$1" in
+  inspect)
+    echo '[]'
+    ;;
+esac
+exit 0
+"#,
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        cfg.runtime.runtime_type = ContainerRuntimeType::Docker;
+        cfg.target_defaults.container_agent = Some(crate::config::ContainerAgentConfigInput {
+            enabled: Some(true),
+            services: Vec::new(),
+            ssh_bridge: None,
+            control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
+            idle_cleanup: None,
+        });
+        cfg.targets.get_mut("default").unwrap().local_ssh =
+            Some(crate::config::LocalSshConfigInput {
+                mode: Some(LocalSshMode::Direct),
+                backend: Some(LocalSshBackend::PublishedPort),
+                readiness: Some(LocalSshReadiness::SshOnly),
+                port: Some(40222),
+                ..Default::default()
+            });
+        cfg.targets.get_mut("default").unwrap().stop_when_idle = Some(false);
+    });
+
+    let status = runtime.status().await.unwrap();
+
+    assert!(status.local_ssh.is_none());
+    assert!(status.ssh_tcp.is_none());
+    assert_eq!(status.status, "not-running");
+}
+
+#[tokio::test]
+async fn direct_client_config_fails_when_endpoint_unavailable_and_port_omitted() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    write_fake_runtime(
+        &fake_runtime,
+        r#"#!/bin/sh
+case "$1" in
+  inspect)
+    echo '[]'
+    ;;
+esac
+exit 0
+"#,
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        configure_direct_published_port_target(cfg, ContainerRuntimeType::Docker, None);
+    });
+
+    let err = runtime
+        .render_client_config(None, client::ClientConfigOrigin::LocalCli)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("no direct published SSH endpoint"), "{err}");
+    assert!(err.contains("configure local_ssh.port"), "{err}");
+}
+
+#[tokio::test]
+async fn direct_status_rejects_configured_port_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev","io.aw-gateway.access":"ssh","io.aw-gateway.mode":"fixed"}}}}}}]
+JSON
+    ;;
+  port)
+    echo "127.0.0.1:40222"
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        configure_direct_published_port_target(cfg, ContainerRuntimeType::Docker, Some(40223));
+    });
+
+    let err = runtime.status().await.unwrap_err().to_string();
+
+    assert!(err.contains("uses host port 40222"), "{err}");
+    assert!(err.contains("local_ssh.port is 40223"), "{err}");
+    assert!(err.contains("remove and recreate"), "{err}");
+}
+
+#[tokio::test]
+async fn direct_client_config_reports_stopped_configured_port_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":false,"Pid":null}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev","io.aw-gateway.access":"ssh","io.aw-gateway.mode":"fixed"}}}}}}]
+JSON
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        configure_direct_published_port_target(cfg, ContainerRuntimeType::Docker, Some(40223));
+    });
+    write_direct_endpoint_state(&runtime, 40222, None, "docker");
+
+    let err = runtime
+        .render_client_config(None, client::ClientConfigOrigin::LocalCli)
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("uses host port 40222"), "{err}");
+    assert!(err.contains("local_ssh.port is 40223"), "{err}");
+    assert!(err.contains("remove and recreate"), "{err}");
+}
+
+#[tokio::test]
+async fn direct_stop_preserves_and_remove_deletes_endpoint_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let running = dir.path().join("running");
+    let stopped = dir.path().join("stopped");
+    let workspace = dir.path().join("workspace");
+    let config = dir.path().join("gateway.toml");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    if [ -f "{running}" ]; then
+      running=true
+      pid=123
+    elif [ -f "{stopped}" ]; then
+      running=false
+      pid=null
+    else
+      echo '[]'
+      exit 0
+    fi
+    cat <<JSON
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":${{running}},"Pid":${{pid}}}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev","io.aw-gateway.access":"ssh","io.aw-gateway.mode":"fixed"}}}}}}]
+JSON
+    ;;
+  stop)
+    rm -f "{running}"
+    touch "{stopped}"
+    ;;
+  rm)
+    rm -f "{stopped}"
+    ;;
+esac
+exit 0
+"#,
+            running = running.display(),
+            stopped = stopped.display(),
+            user = user.user,
+            uid = user.uid,
+        ),
+    );
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+default_target = "default"
+
+[runtime]
+type = "docker"
+program = "{runtime}"
+
+[target_defaults.workspace]
+path = "{workspace}"
+state_dir = ".aw-gateway"
+
+[target_defaults.container_agent]
+enabled = true
+control_socket = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+stop_when_idle = false
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "published_port"
+readiness = "ssh_only"
+"#,
+            runtime = fake_runtime.display(),
+            workspace = workspace.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::write(&running, "").unwrap();
+    let runtime = Runtime::load(Some(config.clone()), Some("default"), None, false)
+        .await
+        .unwrap();
+    let endpoint_state = write_direct_endpoint_state(&runtime, 40222, None, "docker");
+
+    execute_gateway_operation(
+        Some(config.clone()),
+        GatewayOperation::Stop {
+            target: Some("default".into()),
+            session_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(endpoint_state.exists());
+    assert!(stopped.exists());
+
+    execute_gateway_operation(
+        Some(config),
+        GatewayOperation::Remove {
+            target: Some("default".into()),
+            session_id: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(!endpoint_state.exists());
+    assert!(!stopped.exists());
+}
+
+#[tokio::test]
+async fn apple_direct_status_self_heals_running_endpoint_state_port_disagreement() {
+    let _apple_preflight_bypass = crate::runtime::disable_apple_preflight_for_tests();
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<JSON
+[{{"status":"running","configuration":{{"id":"ubuntu-dev","hostname":"ubuntu-dev","labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev","io.aw-gateway.access":"ssh","io.aw-gateway.mode":"fixed"}}}}}}]
+JSON
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        configure_direct_published_port_target(cfg, ContainerRuntimeType::AppleContainer, None);
+    });
+    write_direct_endpoint_state(&runtime, 40222, None, "apple_container");
+    std::fs::write(
+        runtime.paths.container_state_dir.join("published-ssh-port"),
+        "40223\n",
+    )
+    .unwrap();
+
+    let status = runtime.status().await.unwrap();
+
+    let local_ssh = status.local_ssh.unwrap();
+    assert_eq!(local_ssh.port, 40223);
+    let state: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            runtime
+                .paths
+                .container_state_dir
+                .join("published-ssh-endpoint.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(state["port"], serde_json::json!(40223));
+}
+
+#[tokio::test]
+async fn direct_status_rejects_non_loopback_runtime_mapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":false,"Pid":null}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev","io.aw-gateway.access":"ssh","io.aw-gateway.mode":"fixed"}}}}}}]
+JSON
+    ;;
+  port)
+    echo "0.0.0.0:40222"
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        cfg.runtime.runtime_type = ContainerRuntimeType::Docker;
+        cfg.target_defaults.container_agent = Some(crate::config::ContainerAgentConfigInput {
+            enabled: Some(true),
+            services: Vec::new(),
+            ssh_bridge: None,
+            control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
+            idle_cleanup: None,
+        });
+        cfg.targets.get_mut("default").unwrap().local_ssh =
+            Some(crate::config::LocalSshConfigInput {
+                mode: Some(LocalSshMode::Direct),
+                backend: Some(LocalSshBackend::PublishedPort),
+                readiness: Some(LocalSshReadiness::SshOnly),
+                ..Default::default()
+            });
+        cfg.targets.get_mut("default").unwrap().stop_when_idle = Some(false);
+    });
+
+    let err = runtime.status().await.unwrap_err().to_string();
+
+    assert!(err.contains("non-loopback"), "{err}");
+    assert!(err.contains("0.0.0.0"), "{err}");
+}
+
+#[tokio::test]
+async fn direct_start_stopped_non_apple_does_not_require_apple_port_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let runtime_log = dir.path().join("runtime.log");
+    let user = UserContext::current().unwrap();
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+  start)
+    echo "$@" >> "{runtime_log}"
+    ;;
+  inspect)
+    cat <<'JSON'
+[{{"Id":"id","Name":"ubuntu-dev","State":{{"Running":true,"Pid":123}},"Config":{{"Labels":{{"io.aw-gateway.gateway":"true","io.aw-gateway.user":"{user}","io.aw-gateway.uid":"{uid}","io.aw-gateway.target":"default","io.aw-gateway.container_id":"ubuntu-dev","io.aw-gateway.access":"ssh","io.aw-gateway.mode":"fixed"}}}}}}]
+JSON
+    ;;
+esac
+exit 0
+"#,
+            user = user.user,
+            uid = user.uid,
+            runtime_log = runtime_log.display(),
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |cfg| {
+        cfg.runtime.runtime_type = ContainerRuntimeType::Docker;
+        cfg.target_defaults.container_agent = Some(crate::config::ContainerAgentConfigInput {
+            enabled: Some(true),
+            services: Vec::new(),
+            ssh_bridge: None,
+            control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
+            idle_cleanup: None,
+        });
+        cfg.targets.get_mut("default").unwrap().local_ssh =
+            Some(crate::config::LocalSshConfigInput {
+                mode: Some(LocalSshMode::Direct),
+                backend: Some(LocalSshBackend::PublishedPort),
+                readiness: Some(LocalSshReadiness::SshOnly),
+                ..Default::default()
+            });
+        cfg.targets.get_mut("default").unwrap().stop_when_idle = Some(false);
+    });
+    let existing = ContainerInspect {
+        id: "id".into(),
+        name: "ubuntu-dev".into(),
+        state: runtime::ContainerState {
+            running: false,
+            pid: None,
+        },
+        config: runtime::ContainerConfig {
+            labels: runtime.labels(),
+        },
+    };
+    let mut cleanup = FailedStartCleanup::default();
+
+    let started = runtime
+        .ensure_container_for_readiness_plan(
+            ContainerReadinessPlan::StartStopped(existing),
+            &mut cleanup,
+        )
+        .await
+        .unwrap();
+
+    assert!(started.state.running);
+    assert_eq!(
+        std::fs::read_to_string(runtime_log).unwrap(),
+        "start ubuntu-dev\n"
+    );
+}
+
 #[test]
 fn status_json_serializes_nullable_launch_fields() {
     let status = GatewayStatus {
@@ -2898,6 +3658,7 @@ fn status_json_serializes_nullable_launch_fields() {
         agent_ready: false,
         ssh_socket: Some(PathBuf::from("/tmp/ssh.sock")),
         ssh_tcp: None,
+        local_ssh: None,
         status: "container-running".into(),
         agent: None,
     };
@@ -2940,6 +3701,7 @@ fn status_result_text_includes_access_method() {
         agent_ready: false,
         ssh_socket: None,
         ssh_tcp: None,
+        local_ssh: None,
         status: "container-running".into(),
         agent: None,
     };
