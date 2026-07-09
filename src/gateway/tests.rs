@@ -451,6 +451,7 @@ fn launch_test_config(
     cfg.target_defaults.host_steps.clear();
     cfg.target_defaults.workspace = Some(crate::config::WorkspaceConfigInput {
         path: Some(dir.path().join("workspace").display().to_string()),
+        container_path: None,
         state_dir: Some(".aw-gateway".into()),
         cleanup: None,
     });
@@ -2231,6 +2232,7 @@ exit 0
     cfg.target_defaults.host_steps.clear();
     cfg.target_defaults.workspace = Some(crate::config::WorkspaceConfigInput {
         path: Some(dir.path().join("workspace").display().to_string()),
+        container_path: None,
         state_dir: Some(".aw-gateway".into()),
         cleanup: None,
     });
@@ -5205,6 +5207,30 @@ fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
         ]
     );
     assert!(args.iter().any(|arg| arg == "aw-container-agent"));
+}
+
+#[test]
+fn run_spec_mounts_workspace_at_configured_container_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = test_runtime(&dir, dir.path().join("podman"), |cfg| {
+        cfg.target_defaults
+            .workspace
+            .as_mut()
+            .unwrap()
+            .container_path = Some("/home/{user}/aw-shared".into());
+    });
+
+    let spec = runtime.container_run_spec(None, None).unwrap();
+    let expected_container_path =
+        PathBuf::from(format!("/home/{}/aw-shared", runtime.identity.user.user));
+    assert_eq!(spec.workspace_container_path, expected_container_path);
+
+    let args = runtime.container_runtime.run_args(&spec);
+    assert!(args.contains(&format!(
+        "{}:{}:Z",
+        runtime.paths.workspace.display(),
+        spec.workspace_container_path.display()
+    )));
 }
 
 #[test]

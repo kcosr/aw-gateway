@@ -86,6 +86,8 @@ impl TargetAccessMethod {
 pub struct WorkspaceConfig {
     #[serde(default = "default_workspace_path")]
     pub path: String,
+    #[serde(default)]
+    pub container_path: Option<String>,
     #[serde(default = "default_workspace_state_dir")]
     pub state_dir: String,
     #[serde(default)]
@@ -96,6 +98,7 @@ impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
             path: default_workspace_path(),
+            container_path: None,
             state_dir: default_workspace_state_dir(),
             cleanup: WorkspaceCleanup::Never,
         }
@@ -106,6 +109,7 @@ impl Default for WorkspaceConfig {
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfigInput {
     pub path: Option<String>,
+    pub container_path: Option<String>,
     pub state_dir: Option<String>,
     pub cleanup: Option<WorkspaceCleanup>,
 }
@@ -114,6 +118,9 @@ impl WorkspaceConfigInput {
     fn overlay(mut self, later: &Self) -> Self {
         if let Some(path) = &later.path {
             self.path = Some(path.clone());
+        }
+        if let Some(container_path) = &later.container_path {
+            self.container_path = Some(container_path.clone());
         }
         if let Some(state_dir) = &later.state_dir {
             self.state_dir = Some(state_dir.clone());
@@ -127,6 +134,7 @@ impl WorkspaceConfigInput {
     pub(super) fn into_effective(self) -> WorkspaceConfig {
         WorkspaceConfig {
             path: self.path.unwrap_or_else(default_workspace_path),
+            container_path: self.container_path,
             state_dir: self.state_dir.unwrap_or_else(default_workspace_state_dir),
             cleanup: self.cleanup.unwrap_or_default(),
         }
@@ -141,6 +149,17 @@ impl WorkspaceConfigInput {
                 "target.workspace.path",
                 path,
                 TARGET_WORKSPACE_TEMPLATE_VARS,
+                TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
+            )?;
+        }
+        if let Some(container_path) = &self.container_path {
+            if container_path.trim().is_empty() {
+                anyhow::bail!("target {target_name:?} workspace.container_path must not be empty");
+            }
+            validate_template_with_policy(
+                "target.workspace.container_path",
+                container_path,
+                GATEWAY_TEMPLATE_VARS_NO_PID,
                 TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
             )?;
         }
@@ -168,6 +187,14 @@ impl WorkspaceConfigInput {
                 &format!("{field}.path"),
                 path,
                 TARGET_WORKSPACE_TEMPLATE_VARS,
+                context_vars.keys(),
+            )?;
+        }
+        if let Some(container_path) = &self.container_path {
+            validate_template_with_context(
+                &format!("{field}.container_path"),
+                container_path,
+                GATEWAY_TEMPLATE_VARS_NO_PID,
                 context_vars.keys(),
             )?;
         }
@@ -289,6 +316,7 @@ impl TargetConfigInput {
             mode: Some(TargetMode::Fixed),
             workspace: Some(WorkspaceConfigInput {
                 path: Some(default_workspace_path()),
+                container_path: None,
                 state_dir: Some(default_workspace_state_dir()),
                 cleanup: Some(WorkspaceCleanup::Never),
             }),
@@ -754,6 +782,17 @@ impl TargetConfig {
             TARGET_WORKSPACE_TEMPLATE_VARS,
             TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
         )?;
+        if let Some(container_path) = &self.workspace.container_path {
+            if container_path.trim().is_empty() {
+                anyhow::bail!("target {target_name:?} workspace.container_path must not be empty");
+            }
+            validate_template_with_policy(
+                "target.workspace.container_path",
+                container_path,
+                GATEWAY_TEMPLATE_VARS_NO_PID,
+                TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
+            )?;
+        }
         if self.workspace.state_dir.trim().is_empty() {
             anyhow::bail!("target {target_name:?} workspace.state_dir must not be empty");
         }
@@ -995,6 +1034,14 @@ impl TargetConfig {
             TARGET_WORKSPACE_TEMPLATE_VARS,
             context_vars.keys(),
         )?;
+        if let Some(container_path) = &self.workspace.container_path {
+            validate_template_with_context(
+                &format!("{field}.workspace.container_path"),
+                container_path,
+                GATEWAY_TEMPLATE_VARS_NO_PID,
+                context_vars.keys(),
+            )?;
+        }
         validate_template_with_context(
             &format!("{field}.workspace.state_dir"),
             &self.workspace.state_dir,

@@ -818,8 +818,8 @@ Gateway configs commonly include:
   target.
 - `[target_templates.<name>]`: reusable partial target-shaped templates that
   targets opt into with ordered `use = [...]`.
-- `[target_defaults.workspace]`: default host workspace path, state directory,
-  and cleanup policy.
+- `[target_defaults.workspace]`: default host workspace path, optional
+  `container_path` mount target, state directory, and cleanup policy.
 - `[target_defaults.control_sockets]`: short runtime directories for gateway-managed Unix
   sockets. Durable config, logs, state, and session metadata remain under the
   workspace state directory.

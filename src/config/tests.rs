@@ -2411,6 +2411,33 @@ path = "{home}/workspace-internal"
 }
 
 #[test]
+fn target_workspace_container_path_template_validates() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+[targets.default.workspace]
+path = "{home}/workspace"
+container_path = "/home/{user}/aw-shared"
+"#,
+    )
+    .unwrap();
+    cfg.validate().unwrap();
+    assert_eq!(
+        cfg.effective_target("default")
+            .unwrap()
+            .workspace
+            .container_path
+            .as_deref(),
+        Some("/home/{user}/aw-shared")
+    );
+}
+
+#[test]
 fn target_container_agent_service_overrides_global_service() {
     let cfg: GatewayConfig = toml::from_str(
         r#"

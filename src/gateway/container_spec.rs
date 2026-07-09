@@ -167,6 +167,18 @@ impl Runtime {
         env.extend(self.render_env_map(&self.target.container_env)?);
         validate_bind_mount_path("workspace path", &self.paths.workspace)?;
         validate_bind_mount_path("container_home", &self.identity.container_home)?;
+        let workspace_container_path = self
+            .target
+            .workspace
+            .container_path
+            .as_deref()
+            .map(|path| self.render_value(path).map(PathBuf::from))
+            .transpose()?
+            .unwrap_or_else(|| self.identity.container_home.clone());
+        if !workspace_container_path.is_absolute() {
+            anyhow::bail!("target.workspace.container_path must render to an absolute path");
+        }
+        validate_bind_mount_path("workspace.container_path", &workspace_container_path)?;
         let command = if self.agent_enabled() {
             if self.target.container_bootstrap.enabled {
                 vec![
@@ -198,6 +210,7 @@ impl Runtime {
             hostname: self.identity.container_name.clone(),
             image: self.target.image.clone(),
             workspace: self.paths.workspace.clone(),
+            workspace_container_path,
             container_home: self.identity.container_home.clone(),
             container_user: if self.target.container_bootstrap.enabled {
                 self.bootstrap_identity()
