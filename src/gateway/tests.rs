@@ -4598,6 +4598,48 @@ container_home = "/srv/{{user}}/{{uid}}"
     );
 }
 
+#[tokio::test]
+async fn runtime_load_places_container_state_under_workspace_container_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+
+[target_defaults.workspace]
+path = "{}"
+container_path = "/home/{{user}}/aw-shared"
+state_dir = ".aw-gateway"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+container_home = "/home/{{user}}"
+"#,
+            dir.path().join("workspace").display(),
+        ),
+    )
+    .unwrap();
+
+    let runtime = Runtime::load(Some(config), Some("default"), None, false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        runtime.paths.container_state_dir_in_container,
+        PathBuf::from(format!(
+            "/home/{}/aw-shared/.aw-gateway/containers/ubuntu-dev",
+            runtime.identity.user.user
+        ))
+    );
+}
+
 #[test]
 fn unix_socket_path_inventory_includes_host_and_container_paths() {
     let dir = tempfile::tempdir().unwrap();

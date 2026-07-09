@@ -1660,6 +1660,12 @@ impl RuntimePaths {
         vars.insert("uid".into(), identity.session_uid.to_string());
         vars.insert("gid".into(), identity.session_gid.to_string());
         vars.insert("home".into(), identity.user.home.display().to_string());
+        vars.insert("container_user".into(), identity.container_user.clone());
+        vars.insert(
+            "container_home".into(),
+            identity.container_home.display().to_string(),
+        );
+        vars.insert("workspace".into(), workspace.display().to_string());
         vars.insert("target".into(), identity.target_name.clone());
         vars.insert("image".into(), target.image.clone());
         vars.insert("image_slug".into(), template::image_slug(&target.image));
@@ -1670,8 +1676,29 @@ impl RuntimePaths {
         context.insert_template_vars(&mut vars);
         let state_dir = template::render(&target.workspace.state_dir, &vars)?;
         let container_state_dir = workspace.join(&state_dir).join(state_kind).join(state_id);
-        let container_state_dir_in_container =
-            resolve_container_path(&identity.container_home, &state_dir, [state_kind, state_id]);
+        vars.insert(
+            "state".into(),
+            workspace.join(&state_dir).display().to_string(),
+        );
+        vars.insert(
+            "state_dir".into(),
+            identity.user.state_dir().display().to_string(),
+        );
+        let workspace_container_path = target
+            .workspace
+            .container_path
+            .as_deref()
+            .map(|path| template::render(path, &vars).map(PathBuf::from))
+            .transpose()?
+            .unwrap_or_else(|| identity.container_home.clone());
+        if !workspace_container_path.is_absolute() {
+            anyhow::bail!("target.workspace.container_path must render to an absolute path");
+        }
+        let container_state_dir_in_container = resolve_container_path(
+            &workspace_container_path,
+            &state_dir,
+            [state_kind, state_id],
+        );
         let control_sockets = render_control_socket_paths(
             &target.control_sockets,
             target,
