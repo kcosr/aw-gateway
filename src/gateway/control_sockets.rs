@@ -39,7 +39,7 @@ impl Runtime {
                     .to_string(),
             );
         }
-        self.inject_container_sshd_env(&mut container_agent);
+        self.inject_container_sshd_env(&mut container_agent)?;
         if let Some(idle_cleanup) = &self.target.idle_cleanup {
             container_agent.idle_cleanup = match (idle_cleanup.owner, idle_cleanup.action) {
                 (IdleCleanupOwner::Agent, action) if action != IdleCleanupAction::None => {
@@ -73,10 +73,25 @@ impl Runtime {
         Ok(())
     }
 
-    fn inject_container_sshd_env(&self, container_agent: &mut crate::config::ContainerAgentConfig) {
+    fn inject_container_sshd_env(
+        &self,
+        container_agent: &mut crate::config::ContainerAgentConfig,
+    ) -> anyhow::Result<()> {
         for service in &mut container_agent.services {
             if service.name != "container-sshd" {
                 continue;
+            }
+            let authorized_keys_file = self
+                .inner_authorized_keys_in_container()
+                .display()
+                .to_string();
+            if authorized_keys_file
+                .chars()
+                .any(|character| character.is_whitespace() || character == '#')
+            {
+                anyhow::bail!(
+                    "managed container authorized-keys path {authorized_keys_file:?} cannot contain whitespace or '#'"
+                );
             }
             service.env.insert(
                 "AW_SSHD_POLICY_CONFIG".into(),
@@ -86,6 +101,16 @@ impl Runtime {
                             .display()
                             .to_string(),
                     ),
+                    file: None,
+                    inherit: None,
+                    interpolate: false,
+                    required: true,
+                },
+            );
+            service.env.insert(
+                "AW_SSHD_AUTHORIZED_KEYS_FILE".into(),
+                crate::config::EnvValue {
+                    value: Some(authorized_keys_file),
                     file: None,
                     inherit: None,
                     interpolate: false,
@@ -107,6 +132,7 @@ impl Runtime {
                     required: true,
                 });
         }
+        Ok(())
     }
 
     pub(super) fn write_ssh_command_filter_policy(&self) -> anyhow::Result<PathBuf> {
@@ -534,17 +560,13 @@ fn validate_control_socket_dir_permissions(
     Ok(())
 }
 
-pub(super) fn resolve_container_path(home: &Path, configured: &str, suffix: [&str; 2]) -> PathBuf {
+pub(super) fn resolve_container_base_path(home: &Path, configured: &str) -> PathBuf {
     let base = paths::expand_home(home, configured);
-    let mut path = if base.is_absolute() {
+    if base.is_absolute() {
         base
     } else {
         home.join(base)
-    };
-    for part in suffix {
-        path.push(part);
     }
-    path
 }
 
 #[allow(clippy::too_many_arguments)]

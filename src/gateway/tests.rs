@@ -211,7 +211,10 @@ fn test_runtime_from_parts(
     dir: &tempfile::TempDir,
     launch_name: Option<String>,
 ) -> Runtime {
-    let container_state_dir_in_container = user.home.join(".aw-gateway/containers/ubuntu-dev");
+    let workspace_container_path = user.home.clone();
+    let workspace_state_dir_in_container = user.home.join(".aw-gateway");
+    let container_state_dir_in_container =
+        workspace_state_dir_in_container.join("containers/ubuntu-dev");
     Runtime {
         cfg,
         context: RuntimeContext::empty(),
@@ -231,6 +234,9 @@ fn test_runtime_from_parts(
         },
         paths: RuntimePaths {
             workspace: dir.path().join("workspace"),
+            workspace_state_dir: dir.path().join("workspace/.aw-gateway"),
+            workspace_container_path,
+            workspace_state_dir_in_container,
             container_state_dir,
             container_state_dir_in_container,
             control_sockets: test_control_socket_paths(dir.path()),
@@ -4614,7 +4620,7 @@ type = "podman"
 [target_defaults.workspace]
 path = "{}"
 container_path = "/home/{{user}}/aw-shared"
-state_dir = ".aw-gateway"
+state_dir = ".aw-{{user}}"
 
 [targets.default]
 image = "ubuntu/dev"
@@ -4632,11 +4638,79 @@ container_home = "/home/{{user}}"
         .unwrap();
 
     assert_eq!(
+        runtime.paths.workspace_state_dir,
+        dir.path()
+            .join(format!("workspace/.aw-{}", runtime.identity.user.user))
+    );
+    assert_eq!(
+        runtime.paths.workspace_container_path,
+        PathBuf::from(format!("/home/{}/aw-shared", runtime.identity.user.user))
+    );
+    assert_eq!(
+        runtime.paths.workspace_state_dir_in_container,
+        PathBuf::from(format!(
+            "/home/{0}/aw-shared/.aw-{0}",
+            runtime.identity.user.user,
+        ))
+    );
+    assert_eq!(
         runtime.paths.container_state_dir_in_container,
         PathBuf::from(format!(
-            "/home/{}/aw-shared/.aw-gateway/containers/ubuntu-dev",
-            runtime.identity.user.user
+            "/home/{0}/aw-shared/.aw-{0}/containers/ubuntu-dev",
+            runtime.identity.user.user,
         ))
+    );
+}
+
+#[tokio::test]
+async fn runtime_load_resolves_root_managed_workspace_authorized_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+
+[target_defaults.workspace]
+path = "{}"
+container_path = "/var/lib/aw-gateway"
+state_dir = "."
+
+[target_defaults.container_agent]
+control_socket = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+container_home = "/home/{{user}}"
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "published_port"
+readiness = "ssh_only"
+host = "127.0.0.1"
+port = 40222
+"#,
+            dir.path().join("managed-workspace").display(),
+        ),
+    )
+    .unwrap();
+
+    let runtime = Runtime::load(Some(config), Some("default"), None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.paths.workspace_state_dir_in_container,
+        PathBuf::from("/var/lib/aw-gateway")
+    );
+    assert_eq!(
+        runtime.inner_authorized_keys_in_container(),
+        PathBuf::from("/var/lib/aw-gateway/ssh/authorized_keys")
     );
 }
 
@@ -5252,19 +5326,14 @@ fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
 }
 
 #[test]
-fn run_spec_mounts_workspace_at_configured_container_path() {
+fn run_spec_mounts_workspace_at_resolved_container_path() {
     let dir = tempfile::tempdir().unwrap();
-    let runtime = test_runtime(&dir, dir.path().join("podman"), |cfg| {
-        cfg.target_defaults
-            .workspace
-            .as_mut()
-            .unwrap()
-            .container_path = Some("/home/{user}/aw-shared".into());
-    });
-
-    let spec = runtime.container_run_spec(None, None).unwrap();
+    let mut runtime = test_runtime(&dir, dir.path().join("podman"), |_| {});
     let expected_container_path =
         PathBuf::from(format!("/home/{}/aw-shared", runtime.identity.user.user));
+    runtime.paths.workspace_container_path = expected_container_path.clone();
+
+    let spec = runtime.container_run_spec(None, None).unwrap();
     assert_eq!(spec.workspace_container_path, expected_container_path);
 
     let args = runtime.container_runtime.run_args(&spec);
@@ -6078,6 +6147,8 @@ fn writes_container_ssh_policy_and_injects_sshd_policy_env() {
     assert_file_mode(&agent_path, 0o600);
     let agent_config = std::fs::read_to_string(agent_path).unwrap();
     assert!(agent_config.contains("AW_SSHD_POLICY_CONFIG"));
+    assert!(agent_config.contains("AW_SSHD_AUTHORIZED_KEYS_FILE"));
+    assert!(agent_config.contains("/home/alice/.aw-gateway/ssh/authorized_keys"));
     assert!(
         agent_config
             .contains("/home/alice/.aw-gateway/containers/ubuntu-dev/ssh-command-filter.toml")

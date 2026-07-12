@@ -195,6 +195,73 @@ merge_setenv_config() {
 
 merge_setenv_config
 
+set_authorized_keys_file() {
+  local path=$1
+  if [[ -z "$path" || "$path" != /* || "$path" =~ [[:space:]#] ]]; then
+    echo "invalid AW_SSHD_AUTHORIZED_KEYS_FILE: must be an absolute path without whitespace or '#'" >&2
+    exit 1
+  fi
+
+  local tmp_config
+  tmp_config=$(mktemp "$run_dir/sshd_config_agent.XXXXXX")
+  AW_SSHD_AUTHORIZED_KEYS_FILE="$path" awk '
+    BEGIN {
+      directive = "AuthorizedKeysFile " ENVIRON["AW_SSHD_AUTHORIZED_KEYS_FILE"]
+    }
+
+    function is_directive(line, expected, trimmed, keyword) {
+      trimmed = line
+      sub(/^[[:space:]]+/, "", trimmed)
+      if (trimmed == "" || substr(trimmed, 1, 1) == "#") {
+        return 0
+      }
+      if (!match(trimmed, /^[^[:space:]=]+/)) {
+        return 0
+      }
+      keyword = substr(trimmed, RSTART, RLENGTH)
+      return tolower(keyword) == expected
+    }
+
+    function print_directive() {
+      if (directive != "") {
+        print directive
+        directive = ""
+      }
+    }
+
+    !inserted && is_directive($0, "match") {
+      print_directive()
+      inserted = 1
+      in_match = 1
+      print
+      next
+    }
+
+    !in_match && is_directive($0, "authorizedkeysfile") {
+      next
+    }
+
+    is_directive($0, "match") {
+      in_match = 1
+    }
+
+    {
+      print
+    }
+
+    END {
+      if (!inserted) {
+        print_directive()
+      }
+    }
+  ' "$config" > "$tmp_config"
+  mv "$tmp_config" "$config"
+}
+
+if [[ -n "${AW_SSHD_AUTHORIZED_KEYS_FILE:-}" ]]; then
+  set_authorized_keys_file "$AW_SSHD_AUTHORIZED_KEYS_FILE"
+fi
+
 set_listen_address() {
   local address=$1
   case "$address" in

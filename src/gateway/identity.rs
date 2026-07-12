@@ -11,7 +11,7 @@ use tokio::process::Command;
 
 impl Runtime {
     pub(super) fn workspace_state_dir(&self) -> PathBuf {
-        self.paths.workspace.join(&self.target.workspace.state_dir)
+        self.paths.workspace_state_dir.clone()
     }
 
     pub(super) fn ssh_dir(&self) -> PathBuf {
@@ -28,6 +28,12 @@ impl Runtime {
 
     fn inner_authorized_keys(&self) -> PathBuf {
         self.ssh_dir().join("authorized_keys")
+    }
+
+    pub(super) fn inner_authorized_keys_in_container(&self) -> PathBuf {
+        self.paths
+            .workspace_state_dir_in_container
+            .join("ssh/authorized_keys")
     }
 
     pub(super) fn client_private_key_name(&self) -> String {

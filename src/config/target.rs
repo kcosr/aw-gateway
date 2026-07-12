@@ -159,7 +159,7 @@ impl WorkspaceConfigInput {
             validate_template_with_policy(
                 "target.workspace.container_path",
                 container_path,
-                GATEWAY_TEMPLATE_VARS_NO_PID,
+                WORKSPACE_RUNTIME_TEMPLATE_VARS,
                 TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
             )?;
         }
@@ -170,7 +170,7 @@ impl WorkspaceConfigInput {
             validate_template_with_policy(
                 "target.workspace.state_dir",
                 state_dir,
-                GATEWAY_TEMPLATE_VARS_NO_PID,
+                WORKSPACE_RUNTIME_TEMPLATE_VARS,
                 TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
             )?;
         }
@@ -194,7 +194,7 @@ impl WorkspaceConfigInput {
             validate_template_with_context(
                 &format!("{field}.container_path"),
                 container_path,
-                GATEWAY_TEMPLATE_VARS_NO_PID,
+                WORKSPACE_RUNTIME_TEMPLATE_VARS,
                 context_vars.keys(),
             )?;
         }
@@ -202,7 +202,7 @@ impl WorkspaceConfigInput {
             validate_template_with_context(
                 &format!("{field}.state_dir"),
                 state_dir,
-                GATEWAY_TEMPLATE_VARS_NO_PID,
+                WORKSPACE_RUNTIME_TEMPLATE_VARS,
                 context_vars.keys(),
             )?;
         }
@@ -789,7 +789,7 @@ impl TargetConfig {
             validate_template_with_policy(
                 "target.workspace.container_path",
                 container_path,
-                GATEWAY_TEMPLATE_VARS_NO_PID,
+                WORKSPACE_RUNTIME_TEMPLATE_VARS,
                 TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
             )?;
         }
@@ -799,7 +799,7 @@ impl TargetConfig {
         validate_template_with_policy(
             "target.workspace.state_dir",
             &self.workspace.state_dir,
-            GATEWAY_TEMPLATE_VARS_NO_PID,
+            WORKSPACE_RUNTIME_TEMPLATE_VARS,
             TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
         )?;
         self.runtime.validate(target_name)?;
@@ -1038,14 +1038,14 @@ impl TargetConfig {
             validate_template_with_context(
                 &format!("{field}.workspace.container_path"),
                 container_path,
-                GATEWAY_TEMPLATE_VARS_NO_PID,
+                WORKSPACE_RUNTIME_TEMPLATE_VARS,
                 context_vars.keys(),
             )?;
         }
         validate_template_with_context(
             &format!("{field}.workspace.state_dir"),
             &self.workspace.state_dir,
-            GATEWAY_TEMPLATE_VARS_NO_PID,
+            WORKSPACE_RUNTIME_TEMPLATE_VARS,
             context_vars.keys(),
         )?;
         self.control_sockets

@@ -105,6 +105,21 @@ pub(super) const TARGET_WORKSPACE_TEMPLATE_VARS: &[&str] = &[
     "session_id",
 ];
 
+pub(super) const WORKSPACE_RUNTIME_TEMPLATE_VARS: &[&str] = &[
+    "user",
+    "uid",
+    "gid",
+    "home",
+    "container_user",
+    "container_home",
+    "workspace",
+    "target",
+    "image",
+    "image_slug",
+    "container_name",
+    "session_id",
+];
+
 pub(super) const CONTROL_SOCKET_TEMPLATE_VARS: &[&str] = &[
     "user",
     "uid",

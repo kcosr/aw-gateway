@@ -35,6 +35,8 @@ console = true
 
 [target_defaults.workspace]
 path = "workspace"
+# Optional: mount the host workspace somewhere other than container_home.
+# container_path = "/home/{user}/shared"
 state_dir = ".aw-gateway"
 cleanup = "never"
 

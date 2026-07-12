@@ -167,17 +167,7 @@ impl Runtime {
         env.extend(self.render_env_map(&self.target.container_env)?);
         validate_bind_mount_path("workspace path", &self.paths.workspace)?;
         validate_bind_mount_path("container_home", &self.identity.container_home)?;
-        let workspace_container_path = self
-            .target
-            .workspace
-            .container_path
-            .as_deref()
-            .map(|path| self.render_value(path).map(PathBuf::from))
-            .transpose()?
-            .unwrap_or_else(|| self.identity.container_home.clone());
-        if !workspace_container_path.is_absolute() {
-            anyhow::bail!("target.workspace.container_path must render to an absolute path");
-        }
+        let workspace_container_path = self.paths.workspace_container_path.clone();
         validate_bind_mount_path("workspace.container_path", &workspace_container_path)?;
         let command = if self.agent_enabled() {
             if self.target.container_bootstrap.enabled {
@@ -321,11 +311,7 @@ impl Runtime {
         );
         vars.insert(
             "state".into(),
-            self.paths
-                .workspace
-                .join(&self.target.workspace.state_dir)
-                .display()
-                .to_string(),
+            self.paths.workspace_state_dir.display().to_string(),
         );
         vars.insert(
             "state_dir".into(),

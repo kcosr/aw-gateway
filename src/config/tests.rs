@@ -2438,6 +2438,43 @@ container_path = "/home/{user}/aw-shared"
 }
 
 #[test]
+fn workspace_runtime_paths_reject_derived_state_templates() {
+    for (field, assignment, variable) in [
+        (
+            "container_path",
+            "container_path = \"/{container_state_dir}\"",
+            "container_state_dir",
+        ),
+        (
+            "state_dir",
+            "state_dir = \"{container_state_dir_in_container}\"",
+            "container_state_dir_in_container",
+        ),
+    ] {
+        let raw = format!(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+[targets.default.workspace]
+path = "{{home}}/workspace"
+{assignment}
+"#
+        );
+        let cfg: GatewayConfig = toml::from_str(&raw).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("derived state variable should fail");
+        let message = format!("{err:#}");
+        assert!(message.contains(field), "{message}");
+        assert!(message.contains(variable), "{message}");
+    }
+}
+
+#[test]
 fn target_container_agent_service_overrides_global_service() {
     let cfg: GatewayConfig = toml::from_str(
         r#"
