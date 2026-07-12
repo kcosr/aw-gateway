@@ -211,6 +211,79 @@ fn start_container_sshd_uses_agent_config() {
 }
 
 #[test]
+fn start_container_sshd_dry_run_sets_managed_authorized_keys_file() {
+    for (label, script) in start_container_sshd_scripts() {
+        let dir = tempdir().unwrap();
+        let base_config = dir.path().join("sshd_config_agent");
+        let runtime_config = dir.path().join("runtime_sshd_config");
+        let run_dir = dir.path().join("run");
+        std::fs::write(
+            &base_config,
+            "Port 22\nAuthorizedKeysFile .aw-gateway/ssh/authorized_keys\nMatch User nobody\n  X11Forwarding no\n",
+        )
+        .unwrap();
+
+        let output = StdCommand::new(&script)
+            .env("AW_SSHD_BASE_CONFIG", &base_config)
+            .env("AW_SSHD_RUNTIME_CONFIG", &runtime_config)
+            .env("AW_SSHD_RUN_DIR", &run_dir)
+            .env(
+                "AW_SSHD_AUTHORIZED_KEYS_FILE",
+                "/var/lib/aw-gateway/ssh/authorized_keys",
+            )
+            .env("AW_SSHD_DRY_RUN_CONFIG", "1")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let managed = "AuthorizedKeysFile /var/lib/aw-gateway/ssh/authorized_keys";
+        assert_eq!(stdout.matches(managed).count(), 1, "{label}");
+        assert!(
+            stdout.find(managed).unwrap() < stdout.find("Match User nobody").unwrap(),
+            "{label}"
+        );
+        assert!(
+            !stdout.contains("AuthorizedKeysFile .aw-gateway"),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn start_container_sshd_rejects_invalid_authorized_keys_override() {
+    for (label, script) in start_container_sshd_scripts() {
+        for invalid in ["relative/path", "/path with spaces/authorized_keys"] {
+            let dir = tempdir().unwrap();
+            let base_config = dir.path().join("sshd_config_agent");
+            let runtime_config = dir.path().join("runtime_sshd_config");
+            let run_dir = dir.path().join("run");
+            std::fs::write(&base_config, "Port 22\n").unwrap();
+
+            let output = StdCommand::new(&script)
+                .env("AW_SSHD_BASE_CONFIG", &base_config)
+                .env("AW_SSHD_RUNTIME_CONFIG", &runtime_config)
+                .env("AW_SSHD_RUN_DIR", &run_dir)
+                .env("AW_SSHD_AUTHORIZED_KEYS_FILE", invalid)
+                .env("AW_SSHD_DRY_RUN_CONFIG", "1")
+                .output()
+                .unwrap();
+
+            assert!(!output.status.success(), "{label}: {invalid}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("invalid AW_SSHD_AUTHORIZED_KEYS_FILE"),
+                "{label}: {invalid}"
+            );
+        }
+    }
+}
+
+#[test]
 fn start_container_sshd_dry_run_rewrites_listen_address_before_match_blocks() {
     for (label, script) in start_container_sshd_scripts() {
         let dir = tempdir().unwrap();

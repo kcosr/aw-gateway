@@ -75,7 +75,7 @@ use agent_client::AgentSessionHold;
 use client::{read_default_selection, resolve_target_selection};
 #[cfg(test)]
 use container_spec::DEFAULT_SESSION_SHELL_ENV;
-use control_sockets::{render_control_socket_paths, resolve_container_path};
+use control_sockets::render_control_socket_paths;
 use execution::{OperationRunner, PreparedExecution, run_container_command_with_runtime};
 use health::run_argv_with_options;
 #[cfg(test)]
@@ -1474,6 +1474,9 @@ struct RuntimeIdentity {
 #[derive(Debug)]
 struct RuntimePaths {
     workspace: PathBuf,
+    workspace_state_dir: PathBuf,
+    workspace_container_path: PathBuf,
+    workspace_state_dir_in_container: PathBuf,
     container_state_dir: PathBuf,
     container_state_dir_in_container: PathBuf,
     control_sockets: ControlSocketPaths,
@@ -1660,6 +1663,12 @@ impl RuntimePaths {
         vars.insert("uid".into(), identity.session_uid.to_string());
         vars.insert("gid".into(), identity.session_gid.to_string());
         vars.insert("home".into(), identity.user.home.display().to_string());
+        vars.insert("container_user".into(), identity.container_user.clone());
+        vars.insert(
+            "container_home".into(),
+            identity.container_home.display().to_string(),
+        );
+        vars.insert("workspace".into(), workspace.display().to_string());
         vars.insert("target".into(), identity.target_name.clone());
         vars.insert("image".into(), target.image.clone());
         vars.insert("image_slug".into(), template::image_slug(&target.image));
@@ -1668,10 +1677,37 @@ impl RuntimePaths {
             vars.insert("session_id".into(), session_id.to_string());
         }
         context.insert_template_vars(&mut vars);
+        let workspace_container_path = target
+            .workspace
+            .container_path
+            .as_deref()
+            .map(|path| template::render(path, &vars).map(PathBuf::from))
+            .transpose()?
+            .unwrap_or_else(|| identity.container_home.clone());
+        if !workspace_container_path.is_absolute() {
+            anyhow::bail!("target.workspace.container_path must render to an absolute path");
+        }
+        if workspace_container_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            anyhow::bail!("target.workspace.container_path must not render with '..' components");
+        }
+        let workspace_container_path: PathBuf = workspace_container_path.components().collect();
         let state_dir = template::render(&target.workspace.state_dir, &vars)?;
-        let container_state_dir = workspace.join(&state_dir).join(state_kind).join(state_id);
-        let container_state_dir_in_container =
-            resolve_container_path(&identity.container_home, &state_dir, [state_kind, state_id]);
+        let workspace_state_dir =
+            control_sockets::resolve_workspace_state_path(&workspace, &state_dir)?;
+        let container_state_dir = workspace_state_dir.join(state_kind).join(state_id);
+        let workspace_state_dir_in_container =
+            control_sockets::resolve_workspace_state_path(&workspace_container_path, &state_dir)?;
+        let container_state_dir_in_container = workspace_state_dir_in_container
+            .join(state_kind)
+            .join(state_id);
+        vars.insert("state".into(), workspace_state_dir.display().to_string());
+        vars.insert(
+            "state_dir".into(),
+            identity.user.state_dir().display().to_string(),
+        );
         let control_sockets = render_control_socket_paths(
             &target.control_sockets,
             target,
@@ -1684,6 +1720,9 @@ impl RuntimePaths {
         )?;
         Ok(Self {
             workspace,
+            workspace_state_dir,
+            workspace_container_path,
+            workspace_state_dir_in_container,
             container_state_dir,
             container_state_dir_in_container,
             control_sockets,

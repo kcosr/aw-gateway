@@ -818,8 +818,8 @@ Gateway configs commonly include:
   target.
 - `[target_templates.<name>]`: reusable partial target-shaped templates that
   targets opt into with ordered `use = [...]`.
-- `[target_defaults.workspace]`: default host workspace path, state directory,
-  and cleanup policy.
+- `[target_defaults.workspace]`: default host workspace path, optional
+  `container_path` mount target, state directory, and cleanup policy.
 - `[target_defaults.control_sockets]`: short runtime directories for gateway-managed Unix
   sockets. Durable config, logs, state, and session metadata remain under the
   workspace state directory.
@@ -835,6 +835,7 @@ Gateway configs commonly include:
 - `[targets.<name>]`: container image, naming mode, access method, container
   user/home, idle and workspace cleanup behavior, optional runtime args,
   environment, and local-listen settings.
+
 - `[targets.<name>.access]`: target transport contract. `method = "ssh"` is
   the default and allows SSH-compatible operations when an SSH endpoint is
   configured. `method = "runtime_exec"` disables AW Gateway-managed container
@@ -885,6 +886,18 @@ Gateway configs commonly include:
   `aw-container-agent`.
 - `[target_defaults.container_agent.ssh_bridge]`: Unix socket bridge to container SSH. In
   gateway config, the socket path is generated from target control sockets.
+
+By default, the host workspace is mounted at `target.container_home`.
+`workspace.container_path` changes that mount target without changing the
+container user's home directory. The configured `workspace.state_dir` is
+resolved under both the host workspace and its container mount, so generated
+agent configuration and managed SSH keys remain reachable at the corresponding
+in-container path. It must be a contained relative path: absolute paths,
+home-relative paths, and `..` components are rejected. Existing containers
+record the resolved workspace layout in labels and are not reused after that
+layout changes. For the conventional `container-sshd` service, AW Gateway
+injects that managed key path as `AW_SSHD_AUTHORIZED_KEYS_FILE`; images using
+`start-container-sshd` apply it automatically.
 
 By default, gateway-managed sockets use a short per-runtime host directory and
 a stable in-container mount point:
@@ -1916,6 +1929,10 @@ private state files:
   without it, reaping reports remain dry-run.
 - `AW_SSHD_POLICY_CONFIG`: generated SSH transfer-policy file consumed by
   container SSHD helper scripts.
+- `AW_SSHD_AUTHORIZED_KEYS_FILE`: absolute in-container path to the
+  gateway-managed authorized-keys file. AW Gateway injects the computed value
+  into the conventional `container-sshd` service, and `start-container-sshd`
+  replaces the global `AuthorizedKeysFile` directive with it.
 - `AW_SSHD_SETENV_CONFIG`: generated SSHD `SetEnv` snippet for configured
   session environment variables. When set, the helper requires this file to be
   readable and merges its values with base `sshd_config_agent` `SetEnv`
@@ -1937,7 +1954,8 @@ merging, and references are deterministic.
 | `target.container_home` | Gateway identity resolution | `{user}`, `{uid}`, `{gid}`, `{home}` |
 | `target.name`, `target.ephemeral_name` | Gateway container identity | `{image_slug}`, `{session_id}` for ephemeral names, and declared `{context.<name>}` keys |
 | `target.workspace.path` | Gateway target resolution | `{user}`, `{uid}`, `{gid}`, `{home}`, `{target}`, `{image}`, `{image_slug}`, `{session_id}`, and declared `{context.<name>}` keys |
-| `target.workspace.state_dir` | Gateway runtime resolution | Gateway vars except `{container_pid}`, plus declared `{context.<name>}` keys |
+| `target.workspace.container_path` | Gateway workspace runtime resolution | `{user}`, `{uid}`, `{gid}`, `{container_user}`, `{container_home}`, `{target}`, `{image}`, `{image_slug}`, `{container_name}`, `{session_id}`, and declared `{context.<name>}` keys |
+| `target.workspace.state_dir` | Gateway workspace runtime resolution | `{user}`, `{uid}`, `{gid}`, `{target}`, `{image}`, `{image_slug}`, `{container_name}`, `{session_id}`, and declared `{context.<name>}` keys |
 | `target.container_env`, `target.session_env`, `target.container_mounts.*`, `target.runtime.extra_run_args`, `target.container_bootstrap.*`, `target.container_bootstrap_steps.*` | Gateway runtime resolution | Gateway vars except `{container_pid}` |
 | `target.session_env_inherit` | Gateway runtime resolution | Env key names only; no template interpolation |
 | `target.lifecycle_steps[].command` | Gateway lifecycle execution | Pre-start supports gateway vars except `{container_pid}`; later phases support all gateway vars |

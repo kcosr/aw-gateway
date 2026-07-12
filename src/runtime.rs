@@ -41,6 +41,7 @@ pub struct ContainerRunSpec {
     pub hostname: String,
     pub image: String,
     pub workspace: PathBuf,
+    pub workspace_container_path: PathBuf,
     pub container_home: PathBuf,
     pub container_user: String,
     pub passwd_entry: Option<String>,
@@ -1811,7 +1812,7 @@ impl ContainerRuntime {
         args.push(format!(
             "{}:{}",
             spec.workspace.display(),
-            spec.container_home.display()
+            spec.workspace_container_path.display()
         ));
         for mount in &spec.mounts {
             args.push("--volume".into());
@@ -1894,7 +1895,7 @@ impl ContainerRuntime {
         args.push(format!(
             "{}:{}{}",
             spec.workspace.display(),
-            spec.container_home.display(),
+            spec.workspace_container_path.display(),
             selinux_suffix
         ));
         for mount in &spec.mounts {
@@ -3687,6 +3688,7 @@ esac
             hostname: "aw-local".into(),
             image: "aw-gateway/ubuntu-dev-local".into(),
             workspace: PathBuf::from("/Users/alice/workspace"),
+            workspace_container_path: PathBuf::from("/root"),
             container_home: PathBuf::from("/root"),
             container_user: "root".into(),
             passwd_entry: None,
@@ -3720,6 +3722,7 @@ esac
             hostname: "aw-local".into(),
             image: "aw-gateway/ubuntu-dev-local".into(),
             workspace: PathBuf::from("/Users/alice/workspace"),
+            workspace_container_path: PathBuf::from("/home/alice/aw-shared"),
             container_home: PathBuf::from("/home/alice"),
             container_user: "alice".into(),
             passwd_entry: Some("ignored:x:2450:2450::/home/alice:/bin/bash".into()),
@@ -3762,7 +3765,7 @@ esac
         );
         assert!(
             args.windows(2)
-                .any(|pair| pair == ["--volume", "/Users/alice/workspace:/home/alice"])
+                .any(|pair| pair == ["--volume", "/Users/alice/workspace:/home/alice/aw-shared"])
         );
         assert!(args.windows(2).any(|pair| pair
             == [
@@ -3822,6 +3825,7 @@ esac
             hostname: "aw-local".into(),
             image: "ubuntu/dev".into(),
             workspace: PathBuf::from("/workspace"),
+            workspace_container_path: PathBuf::from("/root"),
             container_home: PathBuf::from("/root"),
             container_user: "root".into(),
             passwd_entry: None,
@@ -4383,6 +4387,7 @@ exit 0
             hostname: "aw-local".into(),
             image: "aw-gateway/ubuntu-dev-local".into(),
             workspace: PathBuf::from("/workspace"),
+            workspace_container_path: PathBuf::from("/root"),
             container_home: PathBuf::from("/root"),
             container_user: "root".into(),
             passwd_entry: None,
@@ -4411,6 +4416,7 @@ exit 0
             hostname: "aw-local".into(),
             image: "aw-gateway/ubuntu-dev-local".into(),
             workspace: PathBuf::from("/workspace"),
+            workspace_container_path: PathBuf::from("/root"),
             container_home: PathBuf::from("/root"),
             container_user: "root".into(),
             passwd_entry: None,
@@ -4443,6 +4449,7 @@ exit 0
             hostname: "aw-local".into(),
             image: "aw-gateway/ubuntu-base".into(),
             workspace: PathBuf::from("/workspace"),
+            workspace_container_path: PathBuf::from("/home/user"),
             container_home: PathBuf::from("/home/user"),
             container_user: "root".into(),
             passwd_entry: None,

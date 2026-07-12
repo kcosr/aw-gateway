@@ -211,7 +211,10 @@ fn test_runtime_from_parts(
     dir: &tempfile::TempDir,
     launch_name: Option<String>,
 ) -> Runtime {
-    let container_state_dir_in_container = user.home.join(".aw-gateway/containers/ubuntu-dev");
+    let workspace_container_path = user.home.clone();
+    let workspace_state_dir_in_container = user.home.join(".aw-gateway");
+    let container_state_dir_in_container =
+        workspace_state_dir_in_container.join("containers/ubuntu-dev");
     Runtime {
         cfg,
         context: RuntimeContext::empty(),
@@ -231,6 +234,9 @@ fn test_runtime_from_parts(
         },
         paths: RuntimePaths {
             workspace: dir.path().join("workspace"),
+            workspace_state_dir: dir.path().join("workspace/.aw-gateway"),
+            workspace_container_path,
+            workspace_state_dir_in_container,
             container_state_dir,
             container_state_dir_in_container,
             control_sockets: test_control_socket_paths(dir.path()),
@@ -451,6 +457,7 @@ fn launch_test_config(
     cfg.target_defaults.host_steps.clear();
     cfg.target_defaults.workspace = Some(crate::config::WorkspaceConfigInput {
         path: Some(dir.path().join("workspace").display().to_string()),
+        container_path: None,
         state_dir: Some(".aw-gateway".into()),
         cleanup: None,
     });
@@ -2231,6 +2238,7 @@ exit 0
     cfg.target_defaults.host_steps.clear();
     cfg.target_defaults.workspace = Some(crate::config::WorkspaceConfigInput {
         path: Some(dir.path().join("workspace").display().to_string()),
+        container_path: None,
         state_dir: Some(".aw-gateway".into()),
         cleanup: None,
     });
@@ -4596,6 +4604,127 @@ container_home = "/srv/{{user}}/{{uid}}"
     );
 }
 
+#[tokio::test]
+async fn runtime_load_places_container_state_under_workspace_container_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+
+[runtime]
+type = "podman"
+
+[target_defaults.workspace]
+path = "{}"
+container_path = "/home/{{user}}/aw-shared"
+state_dir = ".aw-{{user}}"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+container_home = "/home/{{user}}"
+"#,
+            dir.path().join("workspace").display(),
+        ),
+    )
+    .unwrap();
+
+    let runtime = Runtime::load(Some(config), Some("default"), None, false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        runtime.paths.workspace_state_dir,
+        dir.path()
+            .join(format!("workspace/.aw-{}", runtime.identity.user.user))
+    );
+    assert_eq!(
+        runtime.paths.workspace_container_path,
+        PathBuf::from(format!("/home/{}/aw-shared", runtime.identity.user.user))
+    );
+    assert_eq!(
+        runtime.paths.workspace_state_dir_in_container,
+        PathBuf::from(format!(
+            "/home/{0}/aw-shared/.aw-{0}",
+            runtime.identity.user.user,
+        ))
+    );
+    assert_eq!(
+        runtime.paths.container_state_dir_in_container,
+        PathBuf::from(format!(
+            "/home/{0}/aw-shared/.aw-{0}/containers/ubuntu-dev",
+            runtime.identity.user.user,
+        ))
+    );
+}
+
+#[tokio::test]
+async fn runtime_load_resolves_root_managed_workspace_authorized_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+
+[runtime]
+type = "apple_container"
+
+[target_defaults.workspace]
+path = "{}"
+container_path = "/var/lib/aw-gateway"
+state_dir = "."
+
+[target_defaults.container_agent]
+control_socket = false
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+container_home = "/home/{{user}}"
+
+[targets.default.local_ssh]
+mode = "direct"
+backend = "published_port"
+readiness = "ssh_only"
+host = "127.0.0.1"
+port = 40222
+"#,
+            dir.path().join("managed-workspace").display(),
+        ),
+    )
+    .unwrap();
+
+    let runtime = Runtime::load(Some(config), Some("default"), None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.paths.workspace_state_dir.display().to_string(),
+        dir.path().join("managed-workspace").display().to_string()
+    );
+    assert_eq!(
+        runtime
+            .paths
+            .workspace_state_dir_in_container
+            .display()
+            .to_string(),
+        "/var/lib/aw-gateway"
+    );
+    assert_eq!(
+        runtime
+            .inner_authorized_keys_in_container()
+            .display()
+            .to_string(),
+        "/var/lib/aw-gateway/ssh/authorized_keys"
+    );
+}
+
 #[test]
 fn unix_socket_path_inventory_includes_host_and_container_paths() {
     let dir = tempfile::tempdir().unwrap();
@@ -5205,6 +5334,75 @@ fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
         ]
     );
     assert!(args.iter().any(|arg| arg == "aw-container-agent"));
+}
+
+#[test]
+fn run_spec_mounts_workspace_at_resolved_container_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime = test_runtime(&dir, dir.path().join("podman"), |_| {});
+    let expected_container_path =
+        PathBuf::from(format!("/home/{}/aw-shared", runtime.identity.user.user));
+    runtime.paths.workspace_container_path = expected_container_path.clone();
+
+    let spec = runtime.container_run_spec(None, None).unwrap();
+    assert_eq!(spec.workspace_container_path, expected_container_path);
+
+    let args = runtime.container_runtime.run_args(&spec);
+    assert!(args.contains(&format!(
+        "{}:{}:Z",
+        runtime.paths.workspace.display(),
+        spec.workspace_container_path.display()
+    )));
+}
+
+#[test]
+fn custom_workspace_layout_labels_fail_closed_but_allow_removal_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime = test_runtime(&dir, dir.path().join("podman"), |_| {});
+    runtime.target.workspace.container_path = Some("/var/lib/aw-gateway".into());
+    runtime.paths.workspace_container_path = PathBuf::from("/var/lib/aw-gateway");
+    runtime.paths.workspace_state_dir = runtime.paths.workspace.clone();
+    runtime.paths.workspace_state_dir_in_container = PathBuf::from("/var/lib/aw-gateway");
+
+    let legacy_inspect = ContainerInspect {
+        id: "old-id".into(),
+        name: runtime.identity.container_name.clone(),
+        state: runtime::ContainerState {
+            running: true,
+            pid: Some(123),
+        },
+        config: runtime::ContainerConfig {
+            labels: runtime.validation_labels(),
+        },
+    };
+    runtime
+        .validate_stable_labels(&legacy_inspect)
+        .expect("remove validation should accept stable identity labels");
+    let err = runtime
+        .validate_labels(&legacy_inspect)
+        .expect_err("custom layout should reject an unlabeled old container");
+    assert!(err.to_string().contains("workspace layout"), "{err:#}");
+
+    let labels = runtime.labels();
+    assert_eq!(
+        labels
+            .get("io.aw-gateway.workspace.target")
+            .map(String::as_str),
+        Some("/var/lib/aw-gateway")
+    );
+    assert_eq!(
+        labels
+            .get("io.aw-gateway.workspace.state_container")
+            .map(String::as_str),
+        Some("/var/lib/aw-gateway")
+    );
+    let current_inspect = ContainerInspect {
+        config: runtime::ContainerConfig { labels },
+        ..legacy_inspect
+    };
+    runtime
+        .validate_labels(&current_inspect)
+        .expect("matching workspace layout labels should be reusable");
 }
 
 #[test]
@@ -6010,6 +6208,8 @@ fn writes_container_ssh_policy_and_injects_sshd_policy_env() {
     assert_file_mode(&agent_path, 0o600);
     let agent_config = std::fs::read_to_string(agent_path).unwrap();
     assert!(agent_config.contains("AW_SSHD_POLICY_CONFIG"));
+    assert!(agent_config.contains("AW_SSHD_AUTHORIZED_KEYS_FILE"));
+    assert!(agent_config.contains("/home/alice/.aw-gateway/ssh/authorized_keys"));
     assert!(
         agent_config
             .contains("/home/alice/.aw-gateway/containers/ubuntu-dev/ssh-command-filter.toml")

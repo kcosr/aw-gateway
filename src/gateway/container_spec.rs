@@ -12,6 +12,10 @@ use std::path::PathBuf;
 
 pub(super) const DEFAULT_SESSION_SHELL_ENV: &str = "/usr/bin/bash";
 const PUBLISHED_SSH_RUN_ATTEMPTS: usize = 3;
+const WORKSPACE_SOURCE_LABEL: &str = "io.aw-gateway.workspace.source";
+const WORKSPACE_TARGET_LABEL: &str = "io.aw-gateway.workspace.target";
+const WORKSPACE_STATE_HOST_LABEL: &str = "io.aw-gateway.workspace.state_host";
+const WORKSPACE_STATE_CONTAINER_LABEL: &str = "io.aw-gateway.workspace.state_container";
 
 impl Runtime {
     pub(super) fn labels(&self) -> BTreeMap<String, String> {
@@ -27,6 +31,7 @@ impl Runtime {
                 format!("{:?}", self.target.mode).to_lowercase(),
             ),
         ]);
+        labels.extend(self.workspace_layout_labels());
         if let Some(session_id) = &self.identity.session_id {
             labels.insert("io.aw-gateway.session_id".into(), session_id.clone());
         }
@@ -63,7 +68,8 @@ impl Runtime {
 
     pub(super) fn validate_labels(&self, inspect: &ContainerInspect) -> anyhow::Result<()> {
         self.validate_stable_labels(inspect)?;
-        self.validate_access_label(inspect)
+        self.validate_access_label(inspect)?;
+        self.validate_workspace_layout_labels(inspect)
     }
 
     pub(super) fn validate_stable_labels(&self, inspect: &ContainerInspect) -> anyhow::Result<()> {
@@ -94,6 +100,51 @@ impl Runtime {
                 self.identity.container_name
             ),
         }
+    }
+
+    fn workspace_layout_labels(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                WORKSPACE_SOURCE_LABEL.into(),
+                self.paths.workspace.display().to_string(),
+            ),
+            (
+                WORKSPACE_TARGET_LABEL.into(),
+                self.paths.workspace_container_path.display().to_string(),
+            ),
+            (
+                WORKSPACE_STATE_HOST_LABEL.into(),
+                self.paths.workspace_state_dir.display().to_string(),
+            ),
+            (
+                WORKSPACE_STATE_CONTAINER_LABEL.into(),
+                self.paths
+                    .workspace_state_dir_in_container
+                    .display()
+                    .to_string(),
+            ),
+        ])
+    }
+
+    fn validate_workspace_layout_labels(&self, inspect: &ContainerInspect) -> anyhow::Result<()> {
+        let expected = self.workspace_layout_labels();
+        let has_layout_labels = expected
+            .keys()
+            .any(|key| inspect.config.labels.contains_key(key));
+        let legacy_default_layout = self.paths.workspace_container_path
+            == self.identity.container_home
+            && self.paths.workspace_state_dir_in_container
+                == self.identity.container_home.join(".aw-gateway");
+        if !has_layout_labels && legacy_default_layout {
+            return Ok(());
+        }
+
+        runtime::validate_gateway_labels(inspect, &expected).with_context(|| {
+            format!(
+                "container {:?} workspace layout does not match the configured workspace mount; remove the existing container before using the new layout",
+                self.identity.container_name
+            )
+        })
     }
 
     pub(super) async fn start_container(&self) -> anyhow::Result<()> {
@@ -167,6 +218,8 @@ impl Runtime {
         env.extend(self.render_env_map(&self.target.container_env)?);
         validate_bind_mount_path("workspace path", &self.paths.workspace)?;
         validate_bind_mount_path("container_home", &self.identity.container_home)?;
+        let workspace_container_path = self.paths.workspace_container_path.clone();
+        validate_bind_mount_path("workspace.container_path", &workspace_container_path)?;
         let command = if self.agent_enabled() {
             if self.target.container_bootstrap.enabled {
                 vec![
@@ -198,6 +251,7 @@ impl Runtime {
             hostname: self.identity.container_name.clone(),
             image: self.target.image.clone(),
             workspace: self.paths.workspace.clone(),
+            workspace_container_path,
             container_home: self.identity.container_home.clone(),
             container_user: if self.target.container_bootstrap.enabled {
                 self.bootstrap_identity()
@@ -308,11 +362,7 @@ impl Runtime {
         );
         vars.insert(
             "state".into(),
-            self.paths
-                .workspace
-                .join(&self.target.workspace.state_dir)
-                .display()
-                .to_string(),
+            self.paths.workspace_state_dir.display().to_string(),
         );
         vars.insert(
             "state_dir".into(),

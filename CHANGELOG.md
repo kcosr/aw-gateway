@@ -2,7 +2,28 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Breaking Changes
+
+- `workspace.state_dir` must now remain relative to the workspace mount;
+  absolute, home-relative, and parent-traversing values are rejected. Fixed
+  containers also record their resolved workspace layout and must be removed
+  before reuse after that layout changes
+  ([#63](https://github.com/kcosr/aw-gateway/pull/63)).
+
+### Added
+
+- Added `workspace.container_path` so the host workspace can be mounted at a
+  path separate from `container_home`, including persistent-home deployments
+  that expose only a dedicated shared directory
+  ([#63](https://github.com/kcosr/aw-gateway/pull/63)).
+
+### Fixed
+
+- Managed state and SSH authorized keys now resolve consistently on both sides
+  of custom workspace mounts. The conventional `container-sshd` service
+  receives the resolved key path, and the SSHD helper installs it as a global
+  `AuthorizedKeysFile` directive
+  ([#63](https://github.com/kcosr/aw-gateway/pull/63)).
 
 ## [0.9.0] - 2026-07-08
 

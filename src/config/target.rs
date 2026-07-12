@@ -8,7 +8,7 @@ use crate::context::{ContextVarConfig, RuntimeContext};
 use crate::template;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub(crate) const DEFAULT_EPHEMERAL_NAME_PATTERN: &str = "{image_slug}-{session_id}";
 
@@ -86,6 +86,8 @@ impl TargetAccessMethod {
 pub struct WorkspaceConfig {
     #[serde(default = "default_workspace_path")]
     pub path: String,
+    #[serde(default)]
+    pub container_path: Option<String>,
     #[serde(default = "default_workspace_state_dir")]
     pub state_dir: String,
     #[serde(default)]
@@ -96,6 +98,7 @@ impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
             path: default_workspace_path(),
+            container_path: None,
             state_dir: default_workspace_state_dir(),
             cleanup: WorkspaceCleanup::Never,
         }
@@ -106,6 +109,7 @@ impl Default for WorkspaceConfig {
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceConfigInput {
     pub path: Option<String>,
+    pub container_path: Option<String>,
     pub state_dir: Option<String>,
     pub cleanup: Option<WorkspaceCleanup>,
 }
@@ -114,6 +118,9 @@ impl WorkspaceConfigInput {
     fn overlay(mut self, later: &Self) -> Self {
         if let Some(path) = &later.path {
             self.path = Some(path.clone());
+        }
+        if let Some(container_path) = &later.container_path {
+            self.container_path = Some(container_path.clone());
         }
         if let Some(state_dir) = &later.state_dir {
             self.state_dir = Some(state_dir.clone());
@@ -127,6 +134,7 @@ impl WorkspaceConfigInput {
     pub(super) fn into_effective(self) -> WorkspaceConfig {
         WorkspaceConfig {
             path: self.path.unwrap_or_else(default_workspace_path),
+            container_path: self.container_path,
             state_dir: self.state_dir.unwrap_or_else(default_workspace_state_dir),
             cleanup: self.cleanup.unwrap_or_default(),
         }
@@ -144,14 +152,27 @@ impl WorkspaceConfigInput {
                 TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
             )?;
         }
+        if let Some(container_path) = &self.container_path {
+            if container_path.trim().is_empty() {
+                anyhow::bail!("target {target_name:?} workspace.container_path must not be empty");
+            }
+            validate_workspace_container_path_shape(target_name, container_path)?;
+            validate_template_with_policy(
+                "target.workspace.container_path",
+                container_path,
+                WORKSPACE_CONTAINER_PATH_TEMPLATE_VARS,
+                TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
+            )?;
+        }
         if let Some(state_dir) = &self.state_dir {
             if state_dir.trim().is_empty() {
                 anyhow::bail!("target {target_name:?} workspace.state_dir must not be empty");
             }
+            validate_workspace_state_dir_shape(target_name, state_dir)?;
             validate_template_with_policy(
                 "target.workspace.state_dir",
                 state_dir,
-                GATEWAY_TEMPLATE_VARS_NO_PID,
+                WORKSPACE_STATE_DIR_TEMPLATE_VARS,
                 TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
             )?;
         }
@@ -171,16 +192,65 @@ impl WorkspaceConfigInput {
                 context_vars.keys(),
             )?;
         }
+        if let Some(container_path) = &self.container_path {
+            validate_template_with_context(
+                &format!("{field}.container_path"),
+                container_path,
+                WORKSPACE_CONTAINER_PATH_TEMPLATE_VARS,
+                context_vars.keys(),
+            )?;
+        }
         if let Some(state_dir) = &self.state_dir {
             validate_template_with_context(
                 &format!("{field}.state_dir"),
                 state_dir,
-                GATEWAY_TEMPLATE_VARS_NO_PID,
+                WORKSPACE_STATE_DIR_TEMPLATE_VARS,
                 context_vars.keys(),
             )?;
         }
         Ok(())
     }
+}
+
+fn validate_workspace_container_path_shape(target_name: &str, value: &str) -> anyhow::Result<()> {
+    let path = Path::new(value);
+    let starts_with_container_home = value == "{container_home}"
+        || value
+            .strip_prefix("{container_home}")
+            .is_some_and(|suffix| suffix.starts_with('/'));
+    if !path.is_absolute() && !starts_with_container_home {
+        anyhow::bail!(
+            "target {target_name:?} workspace.container_path must be an absolute path or start with {{container_home}}"
+        );
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        anyhow::bail!(
+            "target {target_name:?} workspace.container_path must not contain '..' components"
+        );
+    }
+    Ok(())
+}
+
+fn validate_workspace_state_dir_shape(target_name: &str, value: &str) -> anyhow::Result<()> {
+    let path = Path::new(value);
+    if value == "~"
+        || value.starts_with("~/")
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        anyhow::bail!(
+            "target {target_name:?} workspace.state_dir must stay within the workspace mount and must not be absolute, home-relative, or contain '..' components"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -289,6 +359,7 @@ impl TargetConfigInput {
             mode: Some(TargetMode::Fixed),
             workspace: Some(WorkspaceConfigInput {
                 path: Some(default_workspace_path()),
+                container_path: None,
                 state_dir: Some(default_workspace_state_dir()),
                 cleanup: Some(WorkspaceCleanup::Never),
             }),
@@ -754,13 +825,26 @@ impl TargetConfig {
             TARGET_WORKSPACE_TEMPLATE_VARS,
             TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
         )?;
+        if let Some(container_path) = &self.workspace.container_path {
+            if container_path.trim().is_empty() {
+                anyhow::bail!("target {target_name:?} workspace.container_path must not be empty");
+            }
+            validate_workspace_container_path_shape(target_name, container_path)?;
+            validate_template_with_policy(
+                "target.workspace.container_path",
+                container_path,
+                WORKSPACE_CONTAINER_PATH_TEMPLATE_VARS,
+                TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
+            )?;
+        }
         if self.workspace.state_dir.trim().is_empty() {
             anyhow::bail!("target {target_name:?} workspace.state_dir must not be empty");
         }
+        validate_workspace_state_dir_shape(target_name, &self.workspace.state_dir)?;
         validate_template_with_policy(
             "target.workspace.state_dir",
             &self.workspace.state_dir,
-            GATEWAY_TEMPLATE_VARS_NO_PID,
+            WORKSPACE_STATE_DIR_TEMPLATE_VARS,
             TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
         )?;
         self.runtime.validate(target_name)?;
@@ -995,10 +1079,18 @@ impl TargetConfig {
             TARGET_WORKSPACE_TEMPLATE_VARS,
             context_vars.keys(),
         )?;
+        if let Some(container_path) = &self.workspace.container_path {
+            validate_template_with_context(
+                &format!("{field}.workspace.container_path"),
+                container_path,
+                WORKSPACE_CONTAINER_PATH_TEMPLATE_VARS,
+                context_vars.keys(),
+            )?;
+        }
         validate_template_with_context(
             &format!("{field}.workspace.state_dir"),
             &self.workspace.state_dir,
-            GATEWAY_TEMPLATE_VARS_NO_PID,
+            WORKSPACE_STATE_DIR_TEMPLATE_VARS,
             context_vars.keys(),
         )?;
         self.control_sockets

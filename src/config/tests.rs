@@ -2411,6 +2411,111 @@ path = "{home}/workspace-internal"
 }
 
 #[test]
+fn target_workspace_container_path_template_validates() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+[targets.default.workspace]
+path = "{home}/workspace"
+container_path = "{container_home}/aw-shared"
+"#,
+    )
+    .unwrap();
+    cfg.validate().unwrap();
+    assert_eq!(
+        cfg.effective_target("default")
+            .unwrap()
+            .workspace
+            .container_path
+            .as_deref(),
+        Some("{container_home}/aw-shared")
+    );
+}
+
+#[test]
+fn workspace_paths_reject_uncontained_shapes() {
+    for (assignment, expected) in [
+        (
+            "container_path = \"relative/path\"",
+            "must be an absolute path",
+        ),
+        (
+            "container_path = \"/var/lib/../escape\"",
+            "must not contain '..' components",
+        ),
+        (
+            "state_dir = \"/absolute/state\"",
+            "must stay within the workspace mount",
+        ),
+        (
+            "state_dir = \"../outside\"",
+            "must stay within the workspace mount",
+        ),
+        ("state_dir = \"{workspace}\"", "workspace"),
+    ] {
+        let raw = format!(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+[targets.default.workspace]
+path = "{{home}}/workspace"
+{assignment}
+"#
+        );
+        let cfg: GatewayConfig = toml::from_str(&raw).unwrap();
+        let err = cfg.validate().expect_err("uncontained path should fail");
+        let message = format!("{err:#}");
+        assert!(message.contains(expected), "{message}");
+    }
+}
+
+#[test]
+fn workspace_runtime_paths_reject_derived_state_templates() {
+    for (field, assignment, variable) in [
+        (
+            "container_path",
+            "container_path = \"/{container_state_dir}\"",
+            "container_state_dir",
+        ),
+        (
+            "state_dir",
+            "state_dir = \"{container_state_dir_in_container}\"",
+            "container_state_dir_in_container",
+        ),
+    ] {
+        let raw = format!(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+[targets.default.workspace]
+path = "{{home}}/workspace"
+{assignment}
+"#
+        );
+        let cfg: GatewayConfig = toml::from_str(&raw).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("derived state variable should fail");
+        let message = format!("{err:#}");
+        assert!(message.contains(field), "{message}");
+        assert!(message.contains(variable), "{message}");
+    }
+}
+
+#[test]
 fn target_container_agent_service_overrides_global_service() {
     let cfg: GatewayConfig = toml::from_str(
         r#"

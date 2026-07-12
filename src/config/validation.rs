@@ -105,6 +105,30 @@ pub(super) const TARGET_WORKSPACE_TEMPLATE_VARS: &[&str] = &[
     "session_id",
 ];
 
+pub(super) const WORKSPACE_CONTAINER_PATH_TEMPLATE_VARS: &[&str] = &[
+    "user",
+    "uid",
+    "gid",
+    "container_user",
+    "container_home",
+    "target",
+    "image",
+    "image_slug",
+    "container_name",
+    "session_id",
+];
+
+pub(super) const WORKSPACE_STATE_DIR_TEMPLATE_VARS: &[&str] = &[
+    "user",
+    "uid",
+    "gid",
+    "target",
+    "image",
+    "image_slug",
+    "container_name",
+    "session_id",
+];
+
 pub(super) const CONTROL_SOCKET_TEMPLATE_VARS: &[&str] = &[
     "user",
     "uid",
