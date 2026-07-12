@@ -5356,6 +5356,56 @@ fn run_spec_mounts_workspace_at_resolved_container_path() {
 }
 
 #[test]
+fn custom_workspace_layout_labels_fail_closed_but_allow_removal_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime = test_runtime(&dir, dir.path().join("podman"), |_| {});
+    runtime.target.workspace.container_path = Some("/var/lib/aw-gateway".into());
+    runtime.paths.workspace_container_path = PathBuf::from("/var/lib/aw-gateway");
+    runtime.paths.workspace_state_dir = runtime.paths.workspace.clone();
+    runtime.paths.workspace_state_dir_in_container = PathBuf::from("/var/lib/aw-gateway");
+
+    let legacy_inspect = ContainerInspect {
+        id: "old-id".into(),
+        name: runtime.identity.container_name.clone(),
+        state: runtime::ContainerState {
+            running: true,
+            pid: Some(123),
+        },
+        config: runtime::ContainerConfig {
+            labels: runtime.validation_labels(),
+        },
+    };
+    runtime
+        .validate_stable_labels(&legacy_inspect)
+        .expect("remove validation should accept stable identity labels");
+    let err = runtime
+        .validate_labels(&legacy_inspect)
+        .expect_err("custom layout should reject an unlabeled old container");
+    assert!(err.to_string().contains("workspace layout"), "{err:#}");
+
+    let labels = runtime.labels();
+    assert_eq!(
+        labels
+            .get("io.aw-gateway.workspace.target")
+            .map(String::as_str),
+        Some("/var/lib/aw-gateway")
+    );
+    assert_eq!(
+        labels
+            .get("io.aw-gateway.workspace.state_container")
+            .map(String::as_str),
+        Some("/var/lib/aw-gateway")
+    );
+    let current_inspect = ContainerInspect {
+        config: runtime::ContainerConfig { labels },
+        ..legacy_inspect
+    };
+    runtime
+        .validate_labels(&current_inspect)
+        .expect("matching workspace layout labels should be reusable");
+}
+
+#[test]
 fn runtime_exec_run_specs_do_not_publish_ssh_for_podman_docker_or_apple() {
     let dir = tempfile::tempdir().unwrap();
     let podman = test_runtime(&dir, dir.path().join("podman"), |cfg| {

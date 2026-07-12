@@ -892,7 +892,10 @@ By default, the host workspace is mounted at `target.container_home`.
 container user's home directory. The configured `workspace.state_dir` is
 resolved under both the host workspace and its container mount, so generated
 agent configuration and managed SSH keys remain reachable at the corresponding
-in-container path. For the conventional `container-sshd` service, AW Gateway
+in-container path. It must be a contained relative path: absolute paths,
+home-relative paths, and `..` components are rejected. Existing containers
+record the resolved workspace layout in labels and are not reused after that
+layout changes. For the conventional `container-sshd` service, AW Gateway
 injects that managed key path as `AW_SSHD_AUTHORIZED_KEYS_FILE`; images using
 `start-container-sshd` apply it automatically.
 
@@ -1951,7 +1954,8 @@ merging, and references are deterministic.
 | `target.container_home` | Gateway identity resolution | `{user}`, `{uid}`, `{gid}`, `{home}` |
 | `target.name`, `target.ephemeral_name` | Gateway container identity | `{image_slug}`, `{session_id}` for ephemeral names, and declared `{context.<name>}` keys |
 | `target.workspace.path` | Gateway target resolution | `{user}`, `{uid}`, `{gid}`, `{home}`, `{target}`, `{image}`, `{image_slug}`, `{session_id}`, and declared `{context.<name>}` keys |
-| `target.workspace.container_path`, `target.workspace.state_dir` | Gateway workspace runtime resolution | `{user}`, `{uid}`, `{gid}`, `{home}`, `{container_user}`, `{container_home}`, `{workspace}`, `{target}`, `{image}`, `{image_slug}`, `{container_name}`, `{session_id}`, and declared `{context.<name>}` keys |
+| `target.workspace.container_path` | Gateway workspace runtime resolution | `{user}`, `{uid}`, `{gid}`, `{container_user}`, `{container_home}`, `{target}`, `{image}`, `{image_slug}`, `{container_name}`, `{session_id}`, and declared `{context.<name>}` keys |
+| `target.workspace.state_dir` | Gateway workspace runtime resolution | `{user}`, `{uid}`, `{gid}`, `{target}`, `{image}`, `{image_slug}`, `{container_name}`, `{session_id}`, and declared `{context.<name>}` keys |
 | `target.container_env`, `target.session_env`, `target.container_mounts.*`, `target.runtime.extra_run_args`, `target.container_bootstrap.*`, `target.container_bootstrap_steps.*` | Gateway runtime resolution | Gateway vars except `{container_pid}` |
 | `target.session_env_inherit` | Gateway runtime resolution | Env key names only; no template interpolation |
 | `target.lifecycle_steps[].command` | Gateway lifecycle execution | Pre-start supports gateway vars except `{container_pid}`; later phases support all gateway vars |

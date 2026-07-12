@@ -2422,7 +2422,7 @@ mode = "fixed"
 name = "{image_slug}"
 [targets.default.workspace]
 path = "{home}/workspace"
-container_path = "/home/{user}/aw-shared"
+container_path = "{container_home}/aw-shared"
 "#,
     )
     .unwrap();
@@ -2433,8 +2433,49 @@ container_path = "/home/{user}/aw-shared"
             .workspace
             .container_path
             .as_deref(),
-        Some("/home/{user}/aw-shared")
+        Some("{container_home}/aw-shared")
     );
+}
+
+#[test]
+fn workspace_paths_reject_uncontained_shapes() {
+    for (assignment, expected) in [
+        (
+            "container_path = \"relative/path\"",
+            "must be an absolute path",
+        ),
+        (
+            "container_path = \"/var/lib/../escape\"",
+            "must not contain '..' components",
+        ),
+        (
+            "state_dir = \"/absolute/state\"",
+            "must stay within the workspace mount",
+        ),
+        (
+            "state_dir = \"../outside\"",
+            "must stay within the workspace mount",
+        ),
+        ("state_dir = \"{workspace}\"", "workspace"),
+    ] {
+        let raw = format!(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+[targets.default.workspace]
+path = "{{home}}/workspace"
+{assignment}
+"#
+        );
+        let cfg: GatewayConfig = toml::from_str(&raw).unwrap();
+        let err = cfg.validate().expect_err("uncontained path should fail");
+        let message = format!("{err:#}");
+        assert!(message.contains(expected), "{message}");
+    }
 }
 
 #[test]

@@ -8,7 +8,7 @@ use crate::context::{ContextVarConfig, RuntimeContext};
 use crate::template;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub(crate) const DEFAULT_EPHEMERAL_NAME_PATTERN: &str = "{image_slug}-{session_id}";
 
@@ -156,10 +156,11 @@ impl WorkspaceConfigInput {
             if container_path.trim().is_empty() {
                 anyhow::bail!("target {target_name:?} workspace.container_path must not be empty");
             }
+            validate_workspace_container_path_shape(target_name, container_path)?;
             validate_template_with_policy(
                 "target.workspace.container_path",
                 container_path,
-                WORKSPACE_RUNTIME_TEMPLATE_VARS,
+                WORKSPACE_CONTAINER_PATH_TEMPLATE_VARS,
                 TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
             )?;
         }
@@ -167,10 +168,11 @@ impl WorkspaceConfigInput {
             if state_dir.trim().is_empty() {
                 anyhow::bail!("target {target_name:?} workspace.state_dir must not be empty");
             }
+            validate_workspace_state_dir_shape(target_name, state_dir)?;
             validate_template_with_policy(
                 "target.workspace.state_dir",
                 state_dir,
-                WORKSPACE_RUNTIME_TEMPLATE_VARS,
+                WORKSPACE_STATE_DIR_TEMPLATE_VARS,
                 TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
             )?;
         }
@@ -194,7 +196,7 @@ impl WorkspaceConfigInput {
             validate_template_with_context(
                 &format!("{field}.container_path"),
                 container_path,
-                WORKSPACE_RUNTIME_TEMPLATE_VARS,
+                WORKSPACE_CONTAINER_PATH_TEMPLATE_VARS,
                 context_vars.keys(),
             )?;
         }
@@ -202,12 +204,53 @@ impl WorkspaceConfigInput {
             validate_template_with_context(
                 &format!("{field}.state_dir"),
                 state_dir,
-                WORKSPACE_RUNTIME_TEMPLATE_VARS,
+                WORKSPACE_STATE_DIR_TEMPLATE_VARS,
                 context_vars.keys(),
             )?;
         }
         Ok(())
     }
+}
+
+fn validate_workspace_container_path_shape(target_name: &str, value: &str) -> anyhow::Result<()> {
+    let path = Path::new(value);
+    let starts_with_container_home = value == "{container_home}"
+        || value
+            .strip_prefix("{container_home}")
+            .is_some_and(|suffix| suffix.starts_with('/'));
+    if !path.is_absolute() && !starts_with_container_home {
+        anyhow::bail!(
+            "target {target_name:?} workspace.container_path must be an absolute path or start with {{container_home}}"
+        );
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        anyhow::bail!(
+            "target {target_name:?} workspace.container_path must not contain '..' components"
+        );
+    }
+    Ok(())
+}
+
+fn validate_workspace_state_dir_shape(target_name: &str, value: &str) -> anyhow::Result<()> {
+    let path = Path::new(value);
+    if value == "~"
+        || value.starts_with("~/")
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        anyhow::bail!(
+            "target {target_name:?} workspace.state_dir must stay within the workspace mount and must not be absolute, home-relative, or contain '..' components"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -786,20 +829,22 @@ impl TargetConfig {
             if container_path.trim().is_empty() {
                 anyhow::bail!("target {target_name:?} workspace.container_path must not be empty");
             }
+            validate_workspace_container_path_shape(target_name, container_path)?;
             validate_template_with_policy(
                 "target.workspace.container_path",
                 container_path,
-                WORKSPACE_RUNTIME_TEMPLATE_VARS,
+                WORKSPACE_CONTAINER_PATH_TEMPLATE_VARS,
                 TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
             )?;
         }
         if self.workspace.state_dir.trim().is_empty() {
             anyhow::bail!("target {target_name:?} workspace.state_dir must not be empty");
         }
+        validate_workspace_state_dir_shape(target_name, &self.workspace.state_dir)?;
         validate_template_with_policy(
             "target.workspace.state_dir",
             &self.workspace.state_dir,
-            WORKSPACE_RUNTIME_TEMPLATE_VARS,
+            WORKSPACE_STATE_DIR_TEMPLATE_VARS,
             TemplatePolicy::ALLOW_UNBOUND_CONTEXT_PREFIX,
         )?;
         self.runtime.validate(target_name)?;
@@ -1038,14 +1083,14 @@ impl TargetConfig {
             validate_template_with_context(
                 &format!("{field}.workspace.container_path"),
                 container_path,
-                WORKSPACE_RUNTIME_TEMPLATE_VARS,
+                WORKSPACE_CONTAINER_PATH_TEMPLATE_VARS,
                 context_vars.keys(),
             )?;
         }
         validate_template_with_context(
             &format!("{field}.workspace.state_dir"),
             &self.workspace.state_dir,
-            WORKSPACE_RUNTIME_TEMPLATE_VARS,
+            WORKSPACE_STATE_DIR_TEMPLATE_VARS,
             context_vars.keys(),
         )?;
         self.control_sockets

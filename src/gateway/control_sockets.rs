@@ -7,7 +7,7 @@ use crate::config::{
 };
 use crate::context::RuntimeContext;
 use crate::fileutil::{AtomicWritePolicy, atomic_write_toml, write_private_file};
-use crate::paths::{self, UserContext};
+use crate::paths::UserContext;
 use crate::runtime;
 use crate::ssh_filter::SshCommandFilterPolicy;
 use crate::template::{self, Vars};
@@ -560,10 +560,26 @@ fn validate_control_socket_dir_permissions(
     Ok(())
 }
 
-pub(super) fn resolve_workspace_state_path(base: &Path, configured: &str) -> PathBuf {
-    paths::resolve_workspace(base, configured)
-        .components()
-        .collect()
+pub(super) fn resolve_workspace_state_path(
+    base: &Path,
+    configured: &str,
+) -> anyhow::Result<PathBuf> {
+    let path = Path::new(configured);
+    if configured == "~"
+        || configured.starts_with("~/")
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        anyhow::bail!(
+            "target.workspace.state_dir must stay within the workspace mount and must not render as absolute, home-relative, or with '..' components"
+        );
+    }
+    Ok(base.join(path).components().collect())
 }
 
 #[allow(clippy::too_many_arguments)]

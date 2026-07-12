@@ -105,14 +105,23 @@ pub(super) const TARGET_WORKSPACE_TEMPLATE_VARS: &[&str] = &[
     "session_id",
 ];
 
-pub(super) const WORKSPACE_RUNTIME_TEMPLATE_VARS: &[&str] = &[
+pub(super) const WORKSPACE_CONTAINER_PATH_TEMPLATE_VARS: &[&str] = &[
     "user",
     "uid",
     "gid",
-    "home",
     "container_user",
     "container_home",
-    "workspace",
+    "target",
+    "image",
+    "image_slug",
+    "container_name",
+    "session_id",
+];
+
+pub(super) const WORKSPACE_STATE_DIR_TEMPLATE_VARS: &[&str] = &[
+    "user",
+    "uid",
+    "gid",
     "target",
     "image",
     "image_slug",

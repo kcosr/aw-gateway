@@ -1687,12 +1687,19 @@ impl RuntimePaths {
         if !workspace_container_path.is_absolute() {
             anyhow::bail!("target.workspace.container_path must render to an absolute path");
         }
+        if workspace_container_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            anyhow::bail!("target.workspace.container_path must not render with '..' components");
+        }
+        let workspace_container_path: PathBuf = workspace_container_path.components().collect();
         let state_dir = template::render(&target.workspace.state_dir, &vars)?;
         let workspace_state_dir =
-            control_sockets::resolve_workspace_state_path(&workspace, &state_dir);
+            control_sockets::resolve_workspace_state_path(&workspace, &state_dir)?;
         let container_state_dir = workspace_state_dir.join(state_kind).join(state_id);
         let workspace_state_dir_in_container =
-            control_sockets::resolve_workspace_state_path(&workspace_container_path, &state_dir);
+            control_sockets::resolve_workspace_state_path(&workspace_container_path, &state_dir)?;
         let container_state_dir_in_container = workspace_state_dir_in_container
             .join(state_kind)
             .join(state_id);
