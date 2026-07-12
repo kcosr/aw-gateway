@@ -4705,12 +4705,23 @@ port = 40222
         .await
         .unwrap();
     assert_eq!(
-        runtime.paths.workspace_state_dir_in_container,
-        PathBuf::from("/var/lib/aw-gateway")
+        runtime.paths.workspace_state_dir.display().to_string(),
+        dir.path().join("managed-workspace").display().to_string()
     );
     assert_eq!(
-        runtime.inner_authorized_keys_in_container(),
-        PathBuf::from("/var/lib/aw-gateway/ssh/authorized_keys")
+        runtime
+            .paths
+            .workspace_state_dir_in_container
+            .display()
+            .to_string(),
+        "/var/lib/aw-gateway"
+    );
+    assert_eq!(
+        runtime
+            .inner_authorized_keys_in_container()
+            .display()
+            .to_string(),
+        "/var/lib/aw-gateway/ssh/authorized_keys"
     );
 }
 

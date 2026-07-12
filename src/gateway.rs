@@ -1688,10 +1688,11 @@ impl RuntimePaths {
             anyhow::bail!("target.workspace.container_path must render to an absolute path");
         }
         let state_dir = template::render(&target.workspace.state_dir, &vars)?;
-        let workspace_state_dir = workspace.join(&state_dir);
+        let workspace_state_dir =
+            control_sockets::resolve_workspace_state_path(&workspace, &state_dir);
         let container_state_dir = workspace_state_dir.join(state_kind).join(state_id);
         let workspace_state_dir_in_container =
-            control_sockets::resolve_container_base_path(&workspace_container_path, &state_dir);
+            control_sockets::resolve_workspace_state_path(&workspace_container_path, &state_dir);
         let container_state_dir_in_container = workspace_state_dir_in_container
             .join(state_kind)
             .join(state_id);

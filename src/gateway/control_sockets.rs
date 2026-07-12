@@ -560,13 +560,10 @@ fn validate_control_socket_dir_permissions(
     Ok(())
 }
 
-pub(super) fn resolve_container_base_path(home: &Path, configured: &str) -> PathBuf {
-    let base = paths::expand_home(home, configured);
-    if base.is_absolute() {
-        base
-    } else {
-        home.join(base)
-    }
+pub(super) fn resolve_workspace_state_path(base: &Path, configured: &str) -> PathBuf {
+    paths::resolve_workspace(base, configured)
+        .components()
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
