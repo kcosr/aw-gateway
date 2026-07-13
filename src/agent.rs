@@ -170,6 +170,26 @@ mod tests {
     }
 
     #[test]
+    fn production_health_probe_uses_control_listener() {
+        let cfg: ContainerAgentFile = toml::from_str(DEFAULT_AGENT_CONFIG).unwrap();
+        let acl_proxy = cfg
+            .container_agent
+            .services
+            .iter()
+            .find(|service| service.name == "acl-proxy")
+            .expect("sample config must define the acl-proxy service");
+        let HealthCheck::Http { url, .. } = acl_proxy
+            .health_check
+            .as_ref()
+            .expect("acl-proxy service must define an HTTP health check")
+        else {
+            panic!("acl-proxy service health check must use HTTP");
+        };
+
+        assert_eq!(url, "http://127.0.0.1:8898/_acl-proxy/ready");
+    }
+
+    #[test]
     fn reap_plan_preserves_named_process_tree_and_managed_services() {
         let config = IdleCleanupConfig {
             action: IdleCleanupAction::ReapProcesses,
