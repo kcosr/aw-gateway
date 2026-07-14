@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::path::Path;
 
+const MAX_DISPLAYED_SSH_COMMAND_CHARS: usize = 1_000;
+const TRUNCATION_MARKER: &str = "... [truncated]";
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SshCommandFilterPolicy {
@@ -67,6 +70,37 @@ pub fn decide_command(
 
 pub fn policy_is_restrictive(policy: &SshCommandFilterPolicy) -> bool {
     !policy.sftp.allows() || policy.legacy_scp != LegacyScpTransferMode::Allow
+}
+
+pub fn format_ssh_original_command(command: &str) -> String {
+    let mut escaped = String::with_capacity(command.len().min(MAX_DISPLAYED_SSH_COMMAND_CHARS));
+    let mut rendered_chars = 0;
+    let mut boundaries = vec![(0, 0)];
+
+    for character in command.chars() {
+        let rendered = if matches!(character, ' '..='~') {
+            character.to_string()
+        } else {
+            character.escape_default().to_string()
+        };
+        let character_count = rendered.chars().count();
+        if rendered_chars + character_count > MAX_DISPLAYED_SSH_COMMAND_CHARS {
+            let marker_chars = TRUNCATION_MARKER.chars().count();
+            while rendered_chars + marker_chars > MAX_DISPLAYED_SSH_COMMAND_CHARS {
+                boundaries.pop();
+                let &(byte_length, character_length) = boundaries.last().unwrap();
+                escaped.truncate(byte_length);
+                rendered_chars = character_length;
+            }
+            escaped.push_str(TRUNCATION_MARKER);
+            return escaped;
+        }
+        escaped.push_str(&rendered);
+        rendered_chars += character_count;
+        boundaries.push((escaped.len(), rendered_chars));
+    }
+
+    escaped
 }
 
 fn contains_restricted_shell_invocation(command: &str) -> bool {
@@ -450,5 +484,32 @@ mod tests {
                 "command {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn formats_rejected_command_with_control_escaping_and_bounded_length() {
+        let command = format!("printf hello\n{}", "x".repeat(1_200));
+        let formatted = format_ssh_original_command(&command);
+
+        assert!(formatted.starts_with("printf hello\\n"));
+        assert!(formatted.ends_with(TRUNCATION_MARKER));
+        assert_eq!(formatted.chars().count(), MAX_DISPLAYED_SSH_COMMAND_CHARS);
+        assert!(!formatted.contains('\n'));
+    }
+
+    #[test]
+    fn escapes_non_ascii_and_truncates_only_between_escape_sequences() {
+        assert_eq!(
+            format_ssh_original_command("printf \u{202e}secret\u{200b}"),
+            "printf \\u{202e}secret\\u{200b}"
+        );
+
+        let command = format!("{}\u{202e}{}", "x".repeat(980), "y".repeat(100));
+        let formatted = format_ssh_original_command(&command);
+        let displayed = formatted.strip_suffix(TRUNCATION_MARKER).unwrap();
+        assert!(displayed.chars().count() <= MAX_DISPLAYED_SSH_COMMAND_CHARS);
+        assert!(!displayed.ends_with('\\'));
+        assert!(!displayed.ends_with("\\u"));
+        assert!(!displayed.contains("\\u{202e"));
     }
 }

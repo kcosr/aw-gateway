@@ -1,4 +1,6 @@
-use aw_gateway::ssh_filter::{SshCommandDecision, decide_command, load_policy, shell_basename};
+use aw_gateway::ssh_filter::{
+    SshCommandDecision, decide_command, format_ssh_original_command, load_policy, shell_basename,
+};
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -28,6 +30,10 @@ fn main() -> anyhow::Result<()> {
         SshCommandDecision::RejectShellComposition => {
             eprintln!(
                 "blocked by policy: shell composition is not allowed when transfer policy is restrictive"
+            );
+            eprintln!(
+                "rejected SSH_ORIGINAL_COMMAND: {}",
+                format_ssh_original_command(original.as_deref().unwrap_or_default())
             );
             std::process::exit(1);
         }

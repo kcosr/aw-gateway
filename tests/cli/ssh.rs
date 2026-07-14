@@ -107,7 +107,10 @@ fn ssh_dispatch_rejects_host_side_transfer_commands_when_policy_disallows_them()
             .env("SSH_ORIGINAL_COMMAND", original_command)
             .assert()
             .failure()
-            .stderr(predicate::str::contains("shell composition is not allowed"));
+            .stderr(predicate::str::contains("shell composition is not allowed"))
+            .stderr(predicate::str::contains(format!(
+                "rejected SSH_ORIGINAL_COMMAND: {original_command}"
+            )));
     }
 }
 

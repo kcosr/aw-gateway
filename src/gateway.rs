@@ -17,7 +17,9 @@ use crate::runtime::{
     ContainerExecCaptureResult, ContainerExecSpec, ContainerExecStatusResult, ContainerRuntime,
 };
 use crate::ssh_dispatch::{self, Dispatch, GatewayAction};
-use crate::ssh_filter::{SshCommandDecision, SshCommandFilterPolicy, decide_command};
+use crate::ssh_filter::{
+    SshCommandDecision, SshCommandFilterPolicy, decide_command, format_ssh_original_command,
+};
 use crate::template::{self, Vars};
 use anyhow::Context;
 use std::collections::BTreeMap;
@@ -305,7 +307,8 @@ async fn dispatch_from_ssh(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             }
             SshCommandDecision::RejectShellComposition => {
                 anyhow::bail!(
-                    "blocked by policy: shell composition is not allowed when transfer policy is restrictive"
+                    "blocked by policy: shell composition is not allowed when transfer policy is restrictive\nrejected SSH_ORIGINAL_COMMAND: {}",
+                    format_ssh_original_command(command)
                 );
             }
             SshCommandDecision::LoginShell | SshCommandDecision::RunCommand(_) => {}
