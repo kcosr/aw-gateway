@@ -305,9 +305,9 @@ async fn dispatch_from_ssh(config_path: Option<PathBuf>) -> anyhow::Result<()> {
             SshCommandDecision::RejectSftp => {
                 anyhow::bail!("blocked by policy: sftp is not allowed");
             }
-            SshCommandDecision::RejectShellComposition => {
+            SshCommandDecision::RejectComposedTransfer => {
                 anyhow::bail!(
-                    "blocked by policy: shell composition is not allowed when transfer policy is restrictive\nrejected SSH_ORIGINAL_COMMAND: {}",
+                    "blocked by policy: shell composition invokes a restricted transfer command\nrejected SSH_ORIGINAL_COMMAND: {}",
                     format_ssh_original_command(command)
                 );
             }

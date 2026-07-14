@@ -21,7 +21,7 @@ fn prints_rejected_original_command_for_shell_composition() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "blocked by policy: shell composition is not allowed when transfer policy is restrictive",
+            "blocked by policy: shell composition invokes a restricted transfer command",
         ))
         .stderr(predicate::str::contains(
             "rejected SSH_ORIGINAL_COMMAND: printf hello; scp -t /tmp/file",
@@ -29,7 +29,7 @@ fn prints_rejected_original_command_for_shell_composition() {
 }
 
 #[test]
-fn allowed_command_still_executes_normally() {
+fn allowed_composed_command_still_executes_normally() {
     let (_dir, config) = restrictive_policy();
 
     Command::cargo_bin("aw-ssh-command-filter")
@@ -37,9 +37,9 @@ fn allowed_command_still_executes_normally() {
         .arg("--config")
         .arg(config)
         .env("SHELL", "/bin/sh")
-        .env("SSH_ORIGINAL_COMMAND", "printf allowed")
+        .env("SSH_ORIGINAL_COMMAND", "printf allowed; printf ' composed'")
         .assert()
         .success()
-        .stdout("allowed")
+        .stdout("allowed composed")
         .stderr(predicate::str::is_empty());
 }

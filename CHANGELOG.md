@@ -24,6 +24,11 @@
   receives the resolved key path, and the SSHD helper installs it as a global
   `AuthorizedKeysFile` directive
   ([#63](https://github.com/kcosr/aw-gateway/pull/63)).
+- Restrictive transfer policy no longer rejects ordinary shell composition.
+  Composed commands are blocked only when they contain a recognizable denied
+  SCP or SFTP server invocation, and rejections include a bounded, escaped copy
+  of `SSH_ORIGINAL_COMMAND`
+  ([#65](https://github.com/kcosr/aw-gateway/pull/65)).
 
 ## [0.9.0] - 2026-07-08
 
