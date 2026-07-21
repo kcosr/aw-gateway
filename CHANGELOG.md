@@ -25,6 +25,10 @@
 - Host socket targets can select the in-container consumer identity used for
   access probes. Required `pre_gate` services establish fail-closed setup before
   the generated agent activation gate releases relays or ordinary access.
+- Added an opt-in privileged Linux stack smoke that pins the reviewed
+  Access Runtime, ACL Proxy, and AW Gateway commits and exercises real
+  HTTP/HTTPS transparent redirects through the release relay, host UDS proxy,
+  parent proxy, fail-closed loss, and native-Linux pinned-inode recovery.
 - Added `workspace.container_path` so the host workspace can be mounted at a
   path separate from `container_home`, including persistent-home deployments
   that expose only a dedicated shared directory

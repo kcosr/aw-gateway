@@ -54,16 +54,22 @@ fn asset_scripts_are_shell_syntax_valid() {
             .success();
     }
 
-    Command::new("bash")
-        .args([
-            "-n",
-            &Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("smoke/scripts/run-transparent-firewall-smoke.sh")
-                .display()
-                .to_string(),
-        ])
-        .assert()
-        .success();
+    for script in [
+        "run-transparent-firewall-smoke.sh",
+        "run-transparent-uds-stack-smoke.sh",
+    ] {
+        Command::new("bash")
+            .args([
+                "-n",
+                &Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("smoke/scripts")
+                    .join(script)
+                    .display()
+                    .to_string(),
+            ])
+            .assert()
+            .success();
+    }
 }
 
 #[test]
@@ -174,6 +180,57 @@ fn transparent_uds_firewall_is_fail_closed_and_has_no_proxy_uid_bypass() {
     for forbidden in ["--uid-owner", "PROXY_UID", "--publish-socket"] {
         assert!(!script.contains(forbidden), "forbidden {forbidden:?}");
     }
+}
+
+#[test]
+fn transparent_uds_stack_smoke_structural_contract_is_explicit() {
+    let script = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("smoke/scripts/run-transparent-uds-stack-smoke.sh"),
+    )
+    .unwrap();
+
+    for required in [
+        "src=$HTTP_SOCKET,dst=/run/acl-proxy/transparent-http.sock",
+        "src=$HTTPS_SOCKET,dst=/run/acl-proxy/transparent-https.sock",
+        "src=$TMP_DIR/config/mitm-ca-cert.pem,dst=/etc/acl-proxy/mitm-ca-cert.pem",
+        "--privileged --network",
+        "--user 65534:65534",
+        "--expected-acl-sha",
+        "--expected-access-runtime-sha",
+        "--expected-aw-sha",
+        "status --porcelain --untracked-files=all",
+        "cargo build --quiet --locked --release",
+        "%{num_connects}",
+        "access-path=iptables-redirect-so-original-dst-proxy-v2-unix",
+        "https-mitm=passed",
+        "proxy-loss-fail-closed=passed",
+        "incremental-streaming=passed",
+        "active-stream-proxy-loss=passed",
+        "workload-isolation=passed",
+        "linux-socket-realization=pinned_inode",
+        "pinned-inode-rebind=passed",
+        "workload-recreate-recovery=passed",
+    ] {
+        assert!(script.contains(required), "missing {required:?}");
+    }
+    for forbidden in [
+        "src=$TMP_DIR/socket-runtime,dst=/run/acl-proxy",
+        "src=$ACL_CONFIG",
+        "src=$TMP_DIR/config,dst=",
+        "Re-using existing connection",
+    ] {
+        assert!(!script.contains(forbidden), "forbidden {forbidden:?}");
+    }
+    assert_eq!(script.matches("apt-get install").count(), 1);
+
+    let readme =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("smoke/README.md"))
+            .unwrap();
+    assert!(readme.contains("Transparent UDS Privileged Gate"));
+    assert!(readme.contains("Linux-only T04"));
+    assert!(readme.contains("structural contract and shell syntax"));
+    assert!(readme.contains("privileged gate."));
 }
 
 #[test]

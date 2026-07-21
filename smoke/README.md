@@ -123,6 +123,47 @@ Run one host:
 .venv/bin/python -m pytest --host macos-colima -q
 ```
 
+## Transparent UDS Privileged Gate
+
+`scripts/run-transparent-uds-stack-smoke.sh` is a separate, Linux-only T04
+integration gate. It runs a privileged Docker workload and installs temporary
+`iptables` rules inside that isolated container. It exercises the raw
+transparent-traffic seam: real HTTP and HTTPS redirects, original-destination
+recovery, PROXY v2 over exact Unix-socket mounts, ACL policy and MITM, parent
+proxy routing, fail-closed proxy loss, and Linux pinned-inode restart behavior.
+It does not invoke the `aw-gateway` CLI or claim lifecycle orchestration
+coverage. T03 lifecycle behavior remains covered by the pytest scenarios above.
+
+The gate requires clean AW Gateway, ACL Proxy, and access-runtime worktrees,
+including no untracked files. It performs a locked release build and rejects
+binaries outside the ACL Proxy worktree's `target/release` directory. The
+caller must pin the expected commit for all three repositories:
+
+```bash
+AW_REPO=/absolute/path/to/aw-gateway
+ACL_REPO=/absolute/path/to/acl-proxy
+ACCESS_RUNTIME_REPO=/absolute/path/to/access-runtime
+
+"$AW_REPO/smoke/scripts/run-transparent-uds-stack-smoke.sh" \
+  --acl-proxy-bin "$ACL_REPO/target/release/acl-proxy" \
+  --relay-bin "$ACL_REPO/target/release/acl-proxy-transparent-uds-relay" \
+  --acl-repo "$ACL_REPO" \
+  --access-runtime-repo "$ACCESS_RUNTIME_REPO" \
+  --aw-repo "$AW_REPO" \
+  --expected-acl-sha "$(git -C "$ACL_REPO" rev-parse HEAD)" \
+  --expected-access-runtime-sha "$(git -C "$ACCESS_RUNTIME_REPO" rev-parse HEAD)" \
+  --expected-aw-sha "$(git -C "$AW_REPO" rev-parse HEAD)"
+```
+
+The script prebuilds a disposable workload image before enabling the protected
+workload, prints repository and binary/image fingerprints, and removes its
+containers, network, image, and temporary files. Its HTTP/1 stream assertion
+proves incremental end-to-end delivery and interrupted active-stream behavior;
+the focused ACL/runtime and relay test suites remain authoritative for HTTP/2,
+WebSocket, backpressure bounds, and half-close semantics. `cargo test --test
+assets` checks only the harness's structural contract and shell syntax; it does
+not execute this privileged gate.
+
 ## What Gets Installed
 
 Linux operator layout:
