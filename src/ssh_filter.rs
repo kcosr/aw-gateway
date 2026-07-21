@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::path::Path;
 
+const MAX_DISPLAYED_SSH_COMMAND_CHARS: usize = 1_000;
+const TRUNCATION_MARKER: &str = "... [truncated]";
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SshCommandFilterPolicy {
@@ -28,7 +31,7 @@ pub enum SshCommandDecision {
     RunCommand(String),
     RejectLegacyScp,
     RejectSftp,
-    RejectShellComposition,
+    RejectComposedTransfer,
 }
 
 pub fn load_policy(path: &Path) -> anyhow::Result<SshCommandFilterPolicy> {
@@ -58,83 +61,122 @@ pub fn decide_command(
     if !policy.sftp.allows() && is_sftp_server_command(command) {
         return SshCommandDecision::RejectSftp;
     }
-    if policy_is_restrictive(policy) && contains_restricted_shell_invocation(command) {
-        return SshCommandDecision::RejectShellComposition;
+    if contains_denied_transfer_invocation(policy, command) {
+        return SshCommandDecision::RejectComposedTransfer;
     }
 
     SshCommandDecision::RunCommand(command.to_string())
 }
 
-pub fn policy_is_restrictive(policy: &SshCommandFilterPolicy) -> bool {
-    !policy.sftp.allows() || policy.legacy_scp != LegacyScpTransferMode::Allow
+pub fn format_ssh_original_command(command: &str) -> String {
+    let mut escaped = String::with_capacity(command.len().min(MAX_DISPLAYED_SSH_COMMAND_CHARS));
+    let mut rendered_chars = 0;
+    let mut boundaries = vec![(0, 0)];
+
+    for character in command.chars() {
+        let rendered = if matches!(character, ' '..='~') {
+            character.to_string()
+        } else {
+            character.escape_default().to_string()
+        };
+        let character_count = rendered.chars().count();
+        if rendered_chars + character_count > MAX_DISPLAYED_SSH_COMMAND_CHARS {
+            let marker_chars = TRUNCATION_MARKER.chars().count();
+            while rendered_chars + marker_chars > MAX_DISPLAYED_SSH_COMMAND_CHARS {
+                boundaries.pop();
+                let &(byte_length, character_length) = boundaries.last().unwrap();
+                escaped.truncate(byte_length);
+                rendered_chars = character_length;
+            }
+            escaped.push_str(TRUNCATION_MARKER);
+            return escaped;
+        }
+        escaped.push_str(&rendered);
+        rendered_chars += character_count;
+        boundaries.push((escaped.len(), rendered_chars));
+    }
+
+    escaped
 }
 
-fn contains_restricted_shell_invocation(command: &str) -> bool {
-    contains_shell_control_syntax(command) || uses_shell_prefix_or_wrapper(command)
-}
-
-// Best-effort guard against composing a denied transfer command behind a
-// permitted one. We reject only the bytes that can chain, substitute, or
-// subshell another program: `;` `|` `&` `(` `)` backtick and newlines. Bare
-// redirection (`<`, `>`) and variable expansion (`$`) are intentionally allowed
-// -- they cannot by themselves invoke a transfer program, and rejecting them
-// blocked ordinary commands such as `echo "$HOME"` or `cmd > out`. Command and
-// process substitution (`` `...` ``, `$(...)`, `<(...)`) stay caught through the
-// backtick and paren bytes. This is a convenience nudge, not a security
-// boundary.
-fn contains_shell_control_syntax(command: &str) -> bool {
-    command.bytes().any(|byte| {
-        matches!(
-            byte,
-            b';' | b'|' | b'&' | b'(' | b')' | b'`' | b'\n' | b'\r'
-        )
-    })
-}
-
-// Deliberately non-exhaustive best-effort denylist of leading shell builtins and
-// exec wrappers that would otherwise hide a denied `scp`/`sftp-server` behind a
-// permitted first word. A motivated user can still reach a transfer program
-// through an unlisted wrapper or interpreter; transfer policy is a convenience
-// control, so this list is intentionally not grown to chase every wrapper.
-fn uses_shell_prefix_or_wrapper(command: &str) -> bool {
+// Best-effort scan for recognizable transfer-server commands inside shell
+// composition. This is intentionally lexical rather than a complete shell
+// parser: transfer policy disables common SSH transfer workflows, but arbitrary
+// command execution remains capable of moving files through other means.
+fn contains_denied_transfer_invocation(policy: &SshCommandFilterPolicy, command: &str) -> bool {
     let Ok(words) = shell_words::split(command) else {
         return false;
     };
-    let Some(first) = words.first() else {
-        return false;
-    };
-    is_assignment_prefix(first)
-        || matches!(
-            path_basename(first),
-            "bash"
-                | "command"
-                | "dash"
-                | "env"
-                | "eval"
-                | "exec"
-                | "fish"
-                | "ksh"
-                | "nice"
-                | "nohup"
-                | "setsid"
-                | "sh"
-                | "stdbuf"
-                | "time"
-                | "timeout"
-                | "zsh"
-        )
+
+    for window in words.windows(3) {
+        if is_shell_interpreter(&window[0])
+            && window[1].starts_with('-')
+            && window[1][1..].contains('c')
+            && contains_denied_transfer_invocation(policy, &window[2])
+        {
+            return true;
+        }
+    }
+
+    let tokens = words
+        .iter()
+        .flat_map(|word| word.split(is_shell_control_character))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+
+    for (index, program) in tokens.iter().enumerate() {
+        match path_basename(program) {
+            "scp" => {
+                if let Some(direction) =
+                    legacy_scp_direction_from_args(tokens[index + 1..].iter().copied())
+                    && !legacy_scp_mode_allows(policy.legacy_scp, direction)
+                {
+                    return true;
+                }
+            }
+            "internal-sftp" | "sftp-server" if !policy.sftp.allows() => return true,
+            _ => {}
+        }
+    }
+
+    false
 }
 
-fn is_assignment_prefix(word: &str) -> bool {
-    let Some((name, _)) = word.split_once('=') else {
-        return false;
-    };
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+fn is_shell_control_character(character: char) -> bool {
+    matches!(character, ';' | '|' | '&' | '(' | ')' | '`' | '\n' | '\r')
+}
+
+fn is_shell_interpreter(program: &str) -> bool {
+    matches!(
+        path_basename(program),
+        "bash" | "dash" | "fish" | "ksh" | "sh" | "zsh"
+    )
+}
+
+fn legacy_scp_direction_from_args<'a>(
+    args: impl IntoIterator<Item = &'a str>,
+) -> Option<LegacyScpDirection> {
+    for arg in args {
+        if arg == "--" {
+            return None;
+        }
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let inbound = arg[1..].contains('t');
+        let outbound = arg[1..].contains('f');
+        if inbound && outbound {
+            return Some(LegacyScpDirection::Ambiguous);
+        }
+        if inbound {
+            return Some(LegacyScpDirection::Inbound);
+        }
+        if outbound {
+            return Some(LegacyScpDirection::Outbound);
+        }
+    }
+
+    None
 }
 
 pub fn is_legacy_scp_server_command(command: &str) -> bool {
@@ -157,27 +199,7 @@ pub fn legacy_scp_server_direction(command: &str) -> Option<LegacyScpDirection> 
         return None;
     }
 
-    for arg in words.iter().skip(1) {
-        if arg == "--" {
-            return None;
-        }
-        if !arg.starts_with('-') {
-            continue;
-        }
-        let inbound = arg[1..].contains('t');
-        let outbound = arg[1..].contains('f');
-        if inbound && outbound {
-            return Some(LegacyScpDirection::Ambiguous);
-        }
-        if inbound {
-            return Some(LegacyScpDirection::Inbound);
-        }
-        if outbound {
-            return Some(LegacyScpDirection::Outbound);
-        }
-    }
-
-    None
+    legacy_scp_direction_from_args(words.iter().skip(1).map(String::as_str))
 }
 
 pub fn legacy_scp_mode_allows(mode: LegacyScpTransferMode, direction: LegacyScpDirection) -> bool {
@@ -366,58 +388,94 @@ mod tests {
     }
 
     #[test]
-    fn rejects_shell_composition_when_policy_is_restrictive() {
-        for policy in [
-            SshCommandFilterPolicy {
-                sftp: SftpTransferMode::Deny,
-                legacy_scp: LegacyScpTransferMode::Allow,
-            },
-            SshCommandFilterPolicy {
-                sftp: SftpTransferMode::Allow,
-                legacy_scp: LegacyScpTransferMode::Deny,
-            },
+    fn rejects_recognizable_denied_transfer_commands_in_shell_composition() {
+        let policy = SshCommandFilterPolicy {
+            sftp: SftpTransferMode::Deny,
+            legacy_scp: LegacyScpTransferMode::Deny,
+        };
+        for command in [
+            "true; scp -t /tmp/file",
+            "true && scp -t /tmp/file",
+            "printf hi | scp -t /tmp/file",
+            "x=$(scp -t /tmp/file)",
+            "(scp -t /tmp/file)",
+            "cat <(scp -f /tmp/file)",
+            "echo `scp -t /tmp/file`",
+            "x=1 scp -t /tmp/file",
+            "command scp -t /tmp/file",
+            "exec scp -t /tmp/file",
+            "env /usr/libexec/openssh/sftp-server",
+            "nice scp -t /tmp/file",
+            "eval scp -t /tmp/file",
+            "sh -c 'scp -t /tmp/file'",
+            "bash -c 'scp -t /tmp/file'",
+            "dash -c 'scp -t /tmp/file'",
+            "fish -c 'scp -t /tmp/file'",
+            "ksh -c 'scp -t /tmp/file'",
+            "zsh -c 'scp -t /tmp/file'",
+            "nohup scp -t /tmp/file",
+            "time scp -t /tmp/file",
+            "timeout 60 scp -t /tmp/file",
+            "setsid scp -t /tmp/file",
+            "stdbuf -oL scp -t /tmp/file",
         ] {
-            for command in [
-                "true; scp -t /tmp/file",
-                "true && scp -t /tmp/file",
-                "printf hi | scp -t /tmp/file",
-                "x=$(scp -t /tmp/file)",
-                "(scp -t /tmp/file)",
-                "cat <(scp -f /tmp/file)",
-                "echo `scp -t /tmp/file`",
-                "x=1 scp -t /tmp/file",
-                "command scp -t /tmp/file",
-                "exec scp -t /tmp/file",
-                "env /usr/libexec/openssh/sftp-server",
-                "nice scp -t /tmp/file",
-                "eval scp -t /tmp/file",
-                "sh -c 'scp -t /tmp/file'",
-                "bash -c 'scp -t /tmp/file'",
-                "dash -c 'scp -t /tmp/file'",
-                "fish -c 'scp -t /tmp/file'",
-                "ksh -c 'scp -t /tmp/file'",
-                "zsh -c 'scp -t /tmp/file'",
-                "nohup scp -t /tmp/file",
-                "time scp -t /tmp/file",
-                "timeout 60 scp -t /tmp/file",
-                "setsid scp -t /tmp/file",
-                "stdbuf -oL scp -t /tmp/file",
-            ] {
-                assert_eq!(
-                    decide_command(&policy, Some(command)),
-                    SshCommandDecision::RejectShellComposition,
-                    "command {command:?}"
-                );
-            }
+            assert_eq!(
+                decide_command(&policy, Some(command)),
+                SshCommandDecision::RejectComposedTransfer,
+                "command {command:?}"
+            );
         }
     }
 
     #[test]
-    fn allows_shell_composition_when_policy_is_fully_allow() {
+    fn composed_transfer_checks_respect_protocol_policy() {
+        let sftp_only = SshCommandFilterPolicy {
+            sftp: SftpTransferMode::Deny,
+            legacy_scp: LegacyScpTransferMode::Allow,
+        };
         assert_eq!(
-            decide_command(&SshCommandFilterPolicy::default(), Some("true; echo ok")),
-            SshCommandDecision::RunCommand("true; echo ok".into())
+            decide_command(&sftp_only, Some("true; scp -t /tmp/file")),
+            SshCommandDecision::RunCommand("true; scp -t /tmp/file".into())
         );
+        assert_eq!(
+            decide_command(&sftp_only, Some("true; internal-sftp")),
+            SshCommandDecision::RejectComposedTransfer
+        );
+
+        let scp_only = SshCommandFilterPolicy {
+            sftp: SftpTransferMode::Allow,
+            legacy_scp: LegacyScpTransferMode::Deny,
+        };
+        assert_eq!(
+            decide_command(&scp_only, Some("true; internal-sftp")),
+            SshCommandDecision::RunCommand("true; internal-sftp".into())
+        );
+        assert_eq!(
+            decide_command(&scp_only, Some("true; scp -t /tmp/file")),
+            SshCommandDecision::RejectComposedTransfer
+        );
+    }
+
+    #[test]
+    fn allows_ordinary_shell_composition_when_policy_is_restrictive() {
+        let policy = SshCommandFilterPolicy {
+            sftp: SftpTransferMode::Deny,
+            legacy_scp: LegacyScpTransferMode::Deny,
+        };
+        for command in [
+            "true; echo ok",
+            "printf hi | sed s/hi/ok/",
+            "env printf hello",
+            "x=1 printf hello",
+            "echo 'scp -t /tmp/file'",
+            "sh -c 'if [ -z \"$SHELL\" ] || [ ! -x \"$SHELL\" ]; then exit 127; fi; CODEX_REMOTE_PAYLOAD=\"$1\"; export CODEX_REMOTE_PAYLOAD; exec \"$SHELL\" -l -c \"$CODEX_REMOTE_PAYLOAD\"' sh payload",
+        ] {
+            assert_eq!(
+                decide_command(&policy, Some(command)),
+                SshCommandDecision::RunCommand(command.into()),
+                "command {command:?}"
+            );
+        }
     }
 
     #[test]
@@ -450,5 +508,32 @@ mod tests {
                 "command {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn formats_rejected_command_with_control_escaping_and_bounded_length() {
+        let command = format!("printf hello\n{}", "x".repeat(1_200));
+        let formatted = format_ssh_original_command(&command);
+
+        assert!(formatted.starts_with("printf hello\\n"));
+        assert!(formatted.ends_with(TRUNCATION_MARKER));
+        assert_eq!(formatted.chars().count(), MAX_DISPLAYED_SSH_COMMAND_CHARS);
+        assert!(!formatted.contains('\n'));
+    }
+
+    #[test]
+    fn escapes_non_ascii_and_truncates_only_between_escape_sequences() {
+        assert_eq!(
+            format_ssh_original_command("printf \u{202e}secret\u{200b}"),
+            "printf \\u{202e}secret\\u{200b}"
+        );
+
+        let command = format!("{}\u{202e}{}", "x".repeat(980), "y".repeat(100));
+        let formatted = format_ssh_original_command(&command);
+        let displayed = formatted.strip_suffix(TRUNCATION_MARKER).unwrap();
+        assert!(displayed.chars().count() <= MAX_DISPLAYED_SSH_COMMAND_CHARS);
+        assert!(!displayed.ends_with('\\'));
+        assert!(!displayed.ends_with("\\u"));
+        assert!(!displayed.contains("\\u{202e"));
     }
 }
