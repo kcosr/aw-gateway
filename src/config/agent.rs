@@ -112,6 +112,7 @@ impl ContainerAgentConfig {
                 }
             }
         }
+        validate_service_startup_phases(&self.services)?;
         validate_service_dependency_graph(&self.services)?;
         if let Some(cleanup) = &self.idle_cleanup {
             cleanup.validate()?;
@@ -215,6 +216,7 @@ impl ContainerAgentConfigInput {
                 }
             }
         }
+        validate_service_startup_phases(&self.services)?;
         validate_service_dependency_graph(&self.services)?;
         if let Some(ssh_bridge) = &self.ssh_bridge {
             ssh_bridge.validate_partial_gateway()?;
@@ -276,6 +278,34 @@ fn validate_service_dependency_graph(services: &[ServiceConfig]) -> anyhow::Resu
     Ok(())
 }
 
+fn validate_service_startup_phases(services: &[ServiceConfig]) -> anyhow::Result<()> {
+    let phases: BTreeMap<&str, ServiceStartupPhase> = services
+        .iter()
+        .map(|service| (service.name.as_str(), service.startup_phase))
+        .collect();
+    for service in services {
+        if service.startup_phase != ServiceStartupPhase::PreGate {
+            continue;
+        }
+        if !service.required {
+            anyhow::bail!(
+                "pre_gate service {:?} must be required so the startup gate cannot open without it",
+                service.name
+            );
+        }
+        for dependency in &service.depends_on {
+            if phases.get(dependency.as_str()) != Some(&ServiceStartupPhase::PreGate) {
+                anyhow::bail!(
+                    "pre_gate service {:?} depends on after_gate service {:?}",
+                    service.name,
+                    dependency
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn visit_service_dependency<'a>(
     name: &'a str,
     services_by_name: &BTreeMap<&'a str, &'a ServiceConfig>,
@@ -317,6 +347,8 @@ pub struct ServiceConfig {
     pub required: bool,
     #[serde(default = "default_root")]
     pub user: String,
+    #[serde(default)]
+    pub startup_phase: ServiceStartupPhase,
     pub command: Vec<String>,
     pub cwd: Option<String>,
     #[serde(default)]
@@ -330,6 +362,14 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub env: BTreeMap<String, EnvValue>,
     pub health_check: Option<HealthCheck>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceStartupPhase {
+    PreGate,
+    #[default]
+    AfterGate,
 }
 
 impl ServiceConfig {
@@ -363,9 +403,6 @@ impl ServiceConfig {
             parse_duration(value)?;
         }
         if let Some(health_check) = &self.health_check {
-            if matches!(health_check, HealthCheck::Command { .. }) {
-                anyhow::bail!("service health_check does not support command checks");
-            }
             health_check.validate()?;
             health_check.validate_templates(AGENT_TEMPLATE_VARS)?;
         }

@@ -49,6 +49,66 @@ name = "{image_slug}"
 }
 
 #[test]
+fn gateway_config_validate_rejects_relative_leading_socket_path_templates() {
+    let dir = tempdir().unwrap();
+    let config = dir.path().join("gateway.toml");
+    let write_config = |container_path: &str| {
+        std::fs::write(
+            &config,
+            format!(
+                r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "ubuntu-dev"
+
+[targets.default.host_socket_exposures.traffic]
+host_path = "/not/a/live/socket"
+container_path = {container_path:?}
+user = "{{container_user}}"
+selinux_relabel = "none"
+"#
+            ),
+        )
+        .unwrap();
+    };
+
+    write_config("{uid}/traffic.sock");
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["config", "validate"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "normalized absolute non-root path",
+        ));
+
+    write_config("{container_home}/traffic.sock");
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["config", "validate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ok"));
+
+    write_config("/run/{uid}/traffic.sock");
+    Command::cargo_bin("aw-gateway")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .args(["config", "validate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ok"));
+}
+
+#[test]
 fn gateway_config_paths_reports_human_and_json_resolution() {
     let dir = tempdir().unwrap();
     let home = dir.path().join("home");

@@ -5660,3 +5660,302 @@ command = ["worker"]
     let err = cfg.validate().unwrap_err().to_string();
     assert!(err.contains("service.user"), "{err}");
 }
+
+#[test]
+fn host_socket_exposures_parse_and_replace_same_keys_atomically() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[target_defaults.host_socket_exposures.traffic]
+host_path = "/tmp/default.sock"
+container_path = "/run/default.sock"
+selinux_relabel = "none"
+
+[target_defaults.host_socket_exposures.metrics]
+host_path = "/tmp/metrics.sock"
+container_path = "/run/metrics.sock"
+selinux_relabel = "shared"
+
+[target_templates.host_proxy.host_socket_exposures.traffic]
+host_path = "/tmp/template.sock"
+container_path = "/run/template.sock"
+selinux_relabel = "private"
+
+[targets.default]
+use = ["host_proxy"]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.host_socket_exposures.traffic]
+host_path = "/tmp/target.sock"
+container_path = "/run/target.sock"
+selinux_relabel = "none"
+"#,
+    )
+    .unwrap();
+
+    cfg.validate().unwrap();
+    let target = cfg.effective_target("default").unwrap();
+    assert_eq!(target.host_socket_exposures.len(), 2);
+    assert_eq!(
+        target.host_socket_exposures["traffic"],
+        HostSocketExposureConfig {
+            host_path: "/tmp/target.sock".into(),
+            container_path: "/run/target.sock".into(),
+            user: "{container_user}".into(),
+            selinux_relabel: SelinuxRelabel::None,
+        }
+    );
+    assert_eq!(
+        target.host_socket_exposures["metrics"].selinux_relabel,
+        SelinuxRelabel::Shared
+    );
+}
+
+#[test]
+fn host_socket_exposures_reject_unknown_fields_and_aliases() {
+    for field in ["source", "direction", "readonly"] {
+        let raw = format!(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{{image_slug}}"
+
+[targets.default.host_socket_exposures.traffic]
+host_path = "/tmp/traffic.sock"
+container_path = "/run/traffic.sock"
+selinux_relabel = "none"
+{field} = "unsupported"
+"#
+        );
+        let err = toml::from_str::<GatewayConfig>(&raw)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field"), "{err}");
+        assert!(err.contains(field), "{err}");
+    }
+}
+
+#[test]
+fn host_socket_exposures_reject_static_path_errors_without_live_sockets() {
+    for container_path in [
+        "relative.sock",
+        "relative/{container_home}/traffic.sock",
+        "/run/../traffic.sock",
+        "/run//traffic.sock",
+        "/",
+    ] {
+        let input = format!(
+            r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+name = "ubuntu-dev"
+
+[targets.default.host_socket_exposures.traffic]
+host_path = "/definitely/not/a/live/socket"
+container_path = {container_path:?}
+selinux_relabel = "none"
+"#
+        );
+        let err = toml::from_str::<GatewayConfig>(&input)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("normalized absolute non-root"),
+            "{container_path}: {err}"
+        );
+    }
+
+    let duplicate = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+name = "ubuntu-dev"
+
+[targets.default.host_socket_exposures.first]
+host_path = "/tmp/shared.sock"
+container_path = "/run/first.sock"
+selinux_relabel = "none"
+
+[targets.default.host_socket_exposures.second]
+host_path = "/tmp/shared.sock"
+container_path = "/run/second.sock"
+selinux_relabel = "none"
+"#;
+    let err = toml::from_str::<GatewayConfig>(duplicate)
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("duplicates"), "{err}");
+
+    let duplicate_container = duplicate
+        .replacen("/tmp/shared.sock", "/tmp/first.sock", 1)
+        .replace("/run/second.sock", "/run/first.sock");
+    let err = toml::from_str::<GatewayConfig>(&duplicate_container)
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("container_path duplicates"), "{err}");
+}
+
+#[test]
+fn host_socket_exposure_static_validation_allows_rendered_container_paths() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "ubuntu-dev"
+
+[targets.default.host_socket_exposures.traffic]
+host_path = "/definitely/not/a/live/socket"
+container_path = "{container_home}/traffic.sock"
+user = "{container_user}"
+selinux_relabel = "none"
+"#,
+    )
+    .unwrap();
+    cfg.validate().unwrap();
+}
+
+#[test]
+fn pre_gate_services_are_required_and_cannot_depend_on_after_gate_services() {
+    let optional = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "ubuntu-dev"
+
+[targets.default.container_agent]
+enabled = true
+
+[[targets.default.container_agent.services]]
+name = "firewall"
+required = false
+user = "root"
+startup_phase = "pre_gate"
+command = ["firewall"]
+"#;
+    let err = toml::from_str::<GatewayConfig>(optional)
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("pre_gate service") && err.contains("must be required"),
+        "{err}"
+    );
+
+    let dependency = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "ubuntu-dev"
+
+[targets.default.container_agent]
+enabled = true
+
+[[targets.default.container_agent.services]]
+name = "relay"
+required = true
+user = "root"
+command = ["relay"]
+
+[[targets.default.container_agent.services]]
+name = "firewall"
+required = true
+user = "root"
+startup_phase = "pre_gate"
+command = ["firewall"]
+depends_on = ["relay"]
+"#;
+    let err = toml::from_str::<GatewayConfig>(dependency)
+        .unwrap()
+        .validate()
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("depends on after_gate"), "{err}");
+}
+
+#[test]
+fn colima_rejects_host_socket_exposures_during_config_validation() {
+    let cfg: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[runtime]
+type = "colima"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.host_socket_exposures.traffic]
+host_path = "/tmp/traffic.sock"
+container_path = "/run/traffic.sock"
+selinux_relabel = "none"
+"#,
+    )
+    .unwrap();
+
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains("host_socket_exposures"), "{err}");
+    assert!(err.contains("colima"), "{err}");
+}
+
+#[test]
+fn root_extends_replaces_host_socket_exposure_entries_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.toml");
+    let child = dir.path().join("child.toml");
+    std::fs::write(
+        &base,
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.host_socket_exposures.traffic]
+host_path = "/tmp/base.sock"
+container_path = "/run/base.sock"
+selinux_relabel = "none"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &child,
+        r#"
+extends = "base.toml"
+
+[targets.default.host_socket_exposures.traffic]
+host_path = "/tmp/child.sock"
+container_path = "/run/child.sock"
+"#,
+    )
+    .unwrap();
+
+    let err = format!("{:#}", GatewayConfig::load(&child).unwrap_err());
+    assert!(err.contains("selinux_relabel"), "{err}");
+}

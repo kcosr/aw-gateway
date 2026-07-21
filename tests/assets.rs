@@ -35,6 +35,7 @@ fn start_container_sshd_scripts() -> Vec<(&'static str, String)> {
 fn asset_scripts_are_shell_syntax_valid() {
     for script in [
         "aw-iptables",
+        "aw-transparent-uds-firewall",
         "copy-skel",
         "copy-workspace-template",
         "ensure-storage-conf",
@@ -52,6 +53,17 @@ fn asset_scripts_are_shell_syntax_valid() {
             .assert()
             .success();
     }
+
+    Command::new("bash")
+        .args([
+            "-n",
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("smoke/scripts/run-transparent-firewall-smoke.sh")
+                .display()
+                .to_string(),
+        ])
+        .assert()
+        .success();
 }
 
 #[test]
@@ -140,6 +152,44 @@ fn aw_iptables_usage_mentions_check_action() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("{add|check|status}"));
+}
+
+#[test]
+fn transparent_uds_firewall_is_fail_closed_and_has_no_proxy_uid_bypass() {
+    let script = std::fs::read_to_string(asset("aw-transparent-uds-firewall")).unwrap();
+
+    for required in [
+        "iptables-restore --test --noflush",
+        "ip6tables-restore --test --noflush",
+        "AWUDS_FAIL4",
+        "AWUDS_FAIL6",
+        "--dport 80 -j REDIRECT",
+        "--dport 443 -j REDIRECT",
+        "-p udp --dport 443 -j DROP",
+        "-j DROP",
+        "READY_FILE=\"$STATE_FILE.ready\"",
+    ] {
+        assert!(script.contains(required), "missing {required:?}");
+    }
+    for forbidden in ["--uid-owner", "PROXY_UID", "--publish-socket"] {
+        assert!(!script.contains(forbidden), "forbidden {forbidden:?}");
+    }
+}
+
+#[test]
+fn apple_host_proxy_profile_keeps_privilege_and_proxy_material_out_of_relay() {
+    let profile =
+        std::fs::read_to_string(example_asset("apple-container", "gateway-host-proxy.toml"))
+            .unwrap();
+
+    assert!(profile.contains("name = \"prepare-transparent-relay-user\""));
+    assert!(profile.contains("user = \"acl-relay\""));
+    assert_eq!(profile.matches("user = \"acl-relay\"").count(), 3);
+    assert!(profile.contains("startup_phase = \"pre_gate\""));
+    assert!(profile.contains("depends_on = [\"transparent-firewall\"]"));
+    assert!(!profile.contains("/opt/acl-proxy/bin/acl-proxy"));
+    assert!(!profile.contains("mitm-ca.key"));
+    assert!(!profile.contains("AW_IDENTITY_TOKEN"));
 }
 
 #[test]

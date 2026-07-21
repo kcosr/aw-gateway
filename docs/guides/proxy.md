@@ -187,6 +187,26 @@ command = ["/opt/site-policy/bin/proxy-firewall", "check", "{container_pid}"]
 
 See [Firewall Policy](firewall.md) for namespace and Colima placement details.
 
+## Host-Local Proxy Over Unix Sockets
+
+`examples/apple-container/gateway-host-proxy.toml` is an additive deployment
+profile for keeping the policy proxy, MITM private key, and credential material
+on the trusted host. It exposes only the host proxy's HTTP and HTTPS Unix
+listeners, provisions a dedicated non-root `acl-relay` account, runs
+`acl-proxy-transparent-uds-relay` as that account, and makes SSH depend on
+relay readiness.
+
+The profile's root-owned `transparent-firewall` service installs the repository
+asset `assets/aw-transparent-uds-firewall` in the typed `pre_gate` startup
+phase. AW Gateway waits for that service's health and probes both exposed
+sockets as the non-root `acl-relay` consumer before opening the agent startup
+gate, so the relay and ordinary access services cannot start first. The policy
+redirects TCP ports 80 and 443 to the relay, allows only loopback, established
+IPv4 traffic, and DNS to one explicit resolver, drops UDP/443, and denies all
+other IPv4 and non-loopback IPv6 egress. It has no proxy-UID or direct parent
+proxy exception. Replace the example DNS address and staging paths for the
+deployment; do not add a direct bypass covering protected web traffic.
+
 ## Validation
 
 Validate the layers independently:

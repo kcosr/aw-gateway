@@ -30,6 +30,8 @@ pub(super) struct ReadyStatus {
     pub(super) local_ssh: Option<LocalSshReady>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) client_config: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(super) host_socket_exposures: Vec<HostSocketExposureStatus>,
 }
 
 impl ReadyStatus {
@@ -84,6 +86,17 @@ pub(super) struct GatewayStatus {
     pub(super) local_ssh: Option<LocalSshReady>,
     pub(super) status: String,
     pub(super) agent: Option<Box<AgentStatus>>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(super) host_socket_exposures: Vec<HostSocketExposureStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(super) struct HostSocketExposureStatus {
+    pub(super) name: String,
+    pub(super) realization: String,
+    pub(super) ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) failure_category: Option<String>,
 }
 
 fn deserialize_required_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>

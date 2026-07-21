@@ -1,4 +1,4 @@
-use crate::config::{ContainerRuntimeType, RuntimeConfig};
+use crate::config::{ContainerRuntimeType, RuntimeConfig, SelinuxRelabel};
 use crate::context::{RuntimeContext, context_from_labels, context_label_key};
 use crate::template::{self, Vars};
 use anyhow::Context;
@@ -47,6 +47,7 @@ pub struct ContainerRunSpec {
     pub passwd_entry: Option<String>,
     pub state_dir_in_container: PathBuf,
     pub mounts: Vec<ContainerMountSpec>,
+    pub host_socket_exposures: Vec<HostSocketExposureSpec>,
     pub env: BTreeMap<String, String>,
     pub labels: BTreeMap<String, String>,
     pub publish_ssh: bool,
@@ -66,6 +67,41 @@ pub struct ContainerMountSpec {
     pub source: PathBuf,
     pub target: PathBuf,
     pub readonly: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostSocketExposureSpec {
+    pub name: String,
+    pub host_path: PathBuf,
+    pub container_path: PathBuf,
+    pub consumer_user: String,
+    pub selinux_relabel: SelinuxRelabel,
+    pub realization: HostSocketExposureRealization,
+    pub source_identity: UnixSourceIdentity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HostSocketExposureRealization {
+    PathReconnect,
+    PinnedInode,
+}
+
+impl HostSocketExposureRealization {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PathReconnect => "path_reconnect",
+            Self::PinnedInode => "pinned_inode",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnixSourceIdentity {
+    pub device: u64,
+    pub inode: u64,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -441,6 +477,7 @@ static CANCEL_MARKER_SWEEP_KEYS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::n
 static APPLE_PREFLIGHT_CACHE: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 const APPLE_CONTAINER_MIN_MACOS_MAJOR: u64 = 26;
 const APPLE_CONTAINER_MIN_VERSION: (u64, u64, u64) = (1, 0, 0);
+const APPLE_CONTAINER_SOCKET_EXPOSURE_MIN_VERSION: (u64, u64, u64) = (1, 1, 0);
 
 #[cfg(test)]
 thread_local! {
@@ -871,6 +908,47 @@ fn validate_apple_cli_version_json(stdout: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_apple_cli_minimum_version_json(
+    stdout: &[u8],
+    minimum: (u64, u64, u64),
+    requirement: &str,
+) -> anyhow::Result<()> {
+    let value = serde_json::from_slice::<serde_json::Value>(stdout)
+        .context("parse `container system version --format json` output as JSON")?;
+    let (raw, version) = apple_cli_version_candidate(&value).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{requirement}; `container system version --format json` did not contain a parseable container CLI version"
+        )
+    })?;
+    if version < minimum {
+        anyhow::bail!("{requirement}; `container system version --format json` reported {raw}");
+    }
+    Ok(())
+}
+
+fn require_linux_host(runtime: &str) -> anyhow::Result<()> {
+    if std::env::consts::OS != "linux" {
+        anyhow::bail!(
+            "host_socket_exposures require {runtime} to use a native local Linux host; current host OS is {}",
+            std::env::consts::OS
+        );
+    }
+    Ok(())
+}
+
+fn require_unix_socket(path: &Path, label: &str) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stat {label} {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if metadata.file_type().is_socket() {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("{label} {} is not a Unix socket", path.display())
+}
+
 fn apple_cli_version_candidate(value: &serde_json::Value) -> Option<(&str, (u64, u64, u64))> {
     if let Some(version) = documented_apple_cli_version(value) {
         return version.and_then(|raw| parse_semver_triplet(raw).map(|version| (raw, version)));
@@ -1048,6 +1126,114 @@ impl ContainerRuntime {
 
     pub fn env(&self) -> &BTreeMap<String, String> {
         &self.env
+    }
+
+    pub async fn validate_host_socket_exposure_support(
+        &self,
+        configured: bool,
+    ) -> anyhow::Result<()> {
+        if !configured {
+            return Ok(());
+        }
+        let runtime = self.clone();
+        tokio::task::spawn_blocking(move || {
+            runtime.validate_host_socket_exposure_support_blocking()
+        })
+        .await
+        .context("join host socket exposure runtime preflight")?
+    }
+
+    fn validate_host_socket_exposure_support_blocking(&self) -> anyhow::Result<()> {
+        match self.kind {
+            ContainerRuntimeType::AppleContainer => {
+                self.preflight()?;
+                #[cfg(test)]
+                if apple_preflight_test_bypassed() {
+                    return Ok(());
+                }
+                let output = run_apple_system_json_command(&self.program, &self.env, "version")?;
+                validate_apple_cli_minimum_version_json(
+                    &output.stdout,
+                    APPLE_CONTAINER_SOCKET_EXPOSURE_MIN_VERSION,
+                    "host_socket_exposures require Apple container CLI 1.1.0 or newer",
+                )
+            }
+            ContainerRuntimeType::Colima => {
+                anyhow::bail!("host_socket_exposures are not supported by the colima runtime")
+            }
+            ContainerRuntimeType::Podman => {
+                require_linux_host("podman")?;
+                for key in ["CONTAINER_HOST", "CONTAINER_CONNECTION"] {
+                    if std::env::var_os(key).is_some() || self.env.contains_key(key) {
+                        anyhow::bail!(
+                            "host_socket_exposures require a native local Podman runtime; {key} selects a remote or machine connection"
+                        );
+                    }
+                }
+                let mut command = StdCommand::new(&self.program);
+                command.envs(&self.env);
+                let output = command
+                    .args(["system", "connection", "list", "--format", "json"])
+                    .output()
+                    .context("run podman system connection list for host_socket_exposures")?;
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "podman connection preflight failed while validating host_socket_exposures: {}",
+                        command_output_text(&output)
+                    );
+                }
+                if podman_connection_list_has_default(&output.stdout)? {
+                    anyhow::bail!(
+                        "host_socket_exposures require native local Podman without a configured default remote or machine connection"
+                    );
+                }
+                Ok(())
+            }
+            ContainerRuntimeType::Docker => {
+                require_linux_host("docker")?;
+                if std::env::var_os("DOCKER_CONTEXT").is_some()
+                    || self.env.contains_key("DOCKER_CONTEXT")
+                {
+                    anyhow::bail!(
+                        "host_socket_exposures require Docker's native local default context; DOCKER_CONTEXT is set"
+                    );
+                }
+                let docker_host = self
+                    .env
+                    .get("DOCKER_HOST")
+                    .cloned()
+                    .or_else(|| std::env::var("DOCKER_HOST").ok());
+                let socket_path = match docker_host {
+                    Some(value) => value.strip_prefix("unix://").map(PathBuf::from).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "host_socket_exposures require a local Unix-socket Docker Engine; effective DOCKER_HOST is {value:?}"
+                        )
+                    })?,
+                    None => {
+                        let mut command = StdCommand::new(&self.program);
+                        command.envs(&self.env);
+                        let output = command
+                            .args(["context", "show"])
+                            .output()
+                            .context("run docker context show for host_socket_exposures")?;
+                        if !output.status.success() {
+                            anyhow::bail!(
+                                "docker context show failed while validating host_socket_exposures: {}",
+                                command_output_text(&output)
+                            );
+                        }
+                        let context = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if context != "default" {
+                            anyhow::bail!(
+                                "host_socket_exposures require Docker's native local default context; current context is {context:?}"
+                            );
+                        }
+                        PathBuf::from("/var/run/docker.sock")
+                    }
+                };
+                require_unix_socket(&socket_path, "Docker Engine endpoint")
+            }
+        }
     }
 
     pub async fn sweep_stale_cancel_markers(
@@ -1824,6 +2010,14 @@ impl ContainerRuntime {
                 options
             ));
         }
+        for exposure in &spec.host_socket_exposures {
+            args.push("--volume".into());
+            args.push(format!(
+                "{}:{}",
+                exposure.host_path.display(),
+                exposure.container_path.display()
+            ));
+        }
         args.push("--workdir".into());
         args.push(spec.container_home.display().to_string());
         args.push("--env".into());
@@ -1912,6 +2106,46 @@ impl ContainerRuntime {
                 mount.target.display(),
                 options
             ));
+        }
+        for exposure in &spec.host_socket_exposures {
+            match (self.kind, exposure.selinux_relabel) {
+                (ContainerRuntimeType::Podman, relabel) => {
+                    args.push("--mount".into());
+                    let relabel = match relabel {
+                        SelinuxRelabel::None => String::new(),
+                        SelinuxRelabel::Shared => ",relabel=shared".into(),
+                        SelinuxRelabel::Private => ",relabel=private".into(),
+                    };
+                    args.push(format!(
+                        "type=bind,src={},dst={}{}",
+                        exposure.host_path.display(),
+                        exposure.container_path.display(),
+                        relabel
+                    ));
+                }
+                (ContainerRuntimeType::Docker, SelinuxRelabel::None) => {
+                    args.push("--mount".into());
+                    args.push(format!(
+                        "type=bind,src={},dst={}",
+                        exposure.host_path.display(),
+                        exposure.container_path.display()
+                    ));
+                }
+                (ContainerRuntimeType::Docker, relabel) => {
+                    args.push("--volume".into());
+                    let suffix = match relabel {
+                        SelinuxRelabel::Shared => "z",
+                        SelinuxRelabel::Private => "Z",
+                        SelinuxRelabel::None => unreachable!(),
+                    };
+                    args.push(format!(
+                        "{}:{}:{suffix}",
+                        exposure.host_path.display(),
+                        exposure.container_path.display()
+                    ));
+                }
+                _ => unreachable!("common run args are only used by Podman and Docker"),
+            }
         }
         args.push("-w".into());
         args.push(spec.container_home.display().to_string());
@@ -2060,6 +2294,22 @@ impl ContainerRuntime {
             | ContainerRuntimeType::Colima => "ps",
         }
     }
+}
+
+fn podman_connection_list_has_default(stdout: &[u8]) -> anyhow::Result<bool> {
+    let entries = serde_json::from_slice::<Vec<serde_json::Value>>(stdout)
+        .context("parse podman system connection list output as JSON")?;
+    Ok(entries.iter().any(|entry| {
+        entry
+            .get("Default")
+            .or_else(|| entry.get("default"))
+            .and_then(|value| {
+                value
+                    .as_bool()
+                    .or_else(|| value.as_str().map(|value| value == "true"))
+            })
+            .unwrap_or(false)
+    }))
 }
 
 fn apply_command_env(command: &mut Command, env: &BTreeMap<String, String>) {
@@ -2610,6 +2860,46 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::net::UnixListener;
 
+    fn test_exposure(relabel: SelinuxRelabel) -> HostSocketExposureSpec {
+        HostSocketExposureSpec {
+            name: "traffic".into(),
+            host_path: PathBuf::from("/tmp/traffic.sock"),
+            container_path: PathBuf::from("/run/traffic.sock"),
+            consumer_user: "root".into(),
+            selinux_relabel: relabel,
+            realization: HostSocketExposureRealization::PinnedInode,
+            source_identity: UnixSourceIdentity {
+                device: 1,
+                inode: 2,
+                uid: 1000,
+                gid: 1000,
+                mode: 0o600,
+            },
+        }
+    }
+
+    fn test_run_spec(exposures: Vec<HostSocketExposureSpec>) -> ContainerRunSpec {
+        ContainerRunSpec {
+            name: "aw-local".into(),
+            hostname: "aw-local".into(),
+            image: "ubuntu/dev".into(),
+            workspace: PathBuf::from("/workspace"),
+            workspace_container_path: PathBuf::from("/root"),
+            container_home: PathBuf::from("/root"),
+            container_user: "root".into(),
+            passwd_entry: None,
+            state_dir_in_container: PathBuf::from("/root/.aw-gateway"),
+            mounts: Vec::new(),
+            host_socket_exposures: exposures,
+            env: BTreeMap::new(),
+            labels: BTreeMap::new(),
+            publish_ssh: false,
+            published_ssh_host_port: None,
+            extra_run_args: Vec::new(),
+            command: vec!["sleep".into(), "infinity".into()],
+        }
+    }
+
     #[test]
     fn podman_image_ref_adds_localhost_latest() {
         assert_eq!(
@@ -2638,6 +2928,146 @@ mod tests {
             docker_image_ref("registry.example.com/ubuntu/dev:dev"),
             "registry.example.com/ubuntu/dev:dev"
         );
+    }
+
+    #[test]
+    fn apple_socket_exposure_uses_volume_without_reverse_publish_or_mount() {
+        let runtime = ContainerRuntime {
+            kind: ContainerRuntimeType::AppleContainer,
+            program: "container".into(),
+            env: BTreeMap::new(),
+        };
+        let mut exposure = test_exposure(SelinuxRelabel::None);
+        exposure.realization = HostSocketExposureRealization::PathReconnect;
+        let args = runtime.run_args(&test_run_spec(vec![exposure]));
+
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["--volume", "/tmp/traffic.sock:/run/traffic.sock"] })
+        );
+        assert!(!args.iter().any(|arg| arg == "--publish-socket"));
+        assert!(!args.iter().any(|arg| arg == "--mount"));
+    }
+
+    #[test]
+    fn native_linux_socket_exposure_renders_explicit_relabel_choice() {
+        let podman = ContainerRuntime {
+            kind: ContainerRuntimeType::Podman,
+            program: "podman".into(),
+            env: BTreeMap::new(),
+        };
+        let docker = ContainerRuntime {
+            kind: ContainerRuntimeType::Docker,
+            program: "docker".into(),
+            env: BTreeMap::new(),
+        };
+
+        let podman_args =
+            podman.run_args(&test_run_spec(vec![test_exposure(SelinuxRelabel::Shared)]));
+        assert!(podman_args.windows(2).any(|pair| {
+            pair == [
+                "--mount",
+                "type=bind,src=/tmp/traffic.sock,dst=/run/traffic.sock,relabel=shared",
+            ]
+        }));
+
+        let docker_none =
+            docker.run_args(&test_run_spec(vec![test_exposure(SelinuxRelabel::None)]));
+        assert!(docker_none.windows(2).any(|pair| {
+            pair == [
+                "--mount",
+                "type=bind,src=/tmp/traffic.sock,dst=/run/traffic.sock",
+            ]
+        }));
+        let docker_private =
+            docker.run_args(&test_run_spec(vec![test_exposure(SelinuxRelabel::Private)]));
+        assert!(
+            docker_private
+                .windows(2)
+                .any(|pair| { pair == ["--volume", "/tmp/traffic.sock:/run/traffic.sock:Z"] })
+        );
+    }
+
+    #[test]
+    fn socket_exposure_runtime_preflight_rejects_remote_or_vm_backends() {
+        let colima = ContainerRuntime {
+            kind: ContainerRuntimeType::Colima,
+            program: "docker".into(),
+            env: BTreeMap::new(),
+        };
+        assert!(
+            colima
+                .validate_host_socket_exposure_support_blocking()
+                .unwrap_err()
+                .to_string()
+                .contains("colima")
+        );
+
+        let docker = ContainerRuntime {
+            kind: ContainerRuntimeType::Docker,
+            program: "docker".into(),
+            env: BTreeMap::from([("DOCKER_HOST".into(), "ssh://remote/run/docker.sock".into())]),
+        };
+        assert!(
+            docker
+                .validate_host_socket_exposure_support_blocking()
+                .unwrap_err()
+                .to_string()
+                .contains("local Unix-socket Docker Engine")
+        );
+
+        let podman = ContainerRuntime {
+            kind: ContainerRuntimeType::Podman,
+            program: "podman".into(),
+            env: BTreeMap::from([(
+                "CONTAINER_HOST".into(),
+                "ssh://remote/run/podman.sock".into(),
+            )]),
+        };
+        assert!(
+            podman
+                .validate_host_socket_exposure_support_blocking()
+                .unwrap_err()
+                .to_string()
+                .contains("native local Podman")
+        );
+    }
+
+    #[test]
+    fn podman_connection_preflight_detects_default_remote() {
+        assert!(!podman_connection_list_has_default(br#"[]"#).unwrap());
+        assert!(
+            podman_connection_list_has_default(
+                br#"[{"Name":"machine","URI":"ssh://host/run/podman.sock","Default":true}]"#
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn apple_socket_exposure_enforces_feature_version_minimum() {
+        let err = validate_apple_cli_minimum_version_json(
+            br#"{"version":"1.0.9"}"#,
+            APPLE_CONTAINER_SOCKET_EXPOSURE_MIN_VERSION,
+            "host_socket_exposures require Apple container CLI 1.1.0 or newer",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("1.1.0 or newer"), "{err}");
+        validate_apple_cli_minimum_version_json(
+            br#"{"version":"1.1.0"}"#,
+            APPLE_CONTAINER_SOCKET_EXPOSURE_MIN_VERSION,
+            "host_socket_exposures require Apple container CLI 1.1.0 or newer",
+        )
+        .unwrap();
+        let err = validate_apple_cli_minimum_version_json(
+            br#"{"build":"2026A42"}"#,
+            APPLE_CONTAINER_SOCKET_EXPOSURE_MIN_VERSION,
+            "host_socket_exposures require Apple container CLI 1.1.0 or newer",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("did not contain a parseable"), "{err}");
     }
 
     #[test]
@@ -2988,7 +3418,7 @@ esac
     }
 
     #[test]
-    fn apple_preflight_accepts_unknown_cli_version_shape_after_json_parse() {
+    fn apple_base_preflight_accepts_unknown_cli_version_shape() {
         validate_apple_cli_version_json(br#"{"build":"2026A42"}"#).unwrap();
     }
 
@@ -3694,6 +4124,7 @@ esac
             passwd_entry: None,
             state_dir_in_container: PathBuf::from("/root/.aw-gateway/containers/aw-local"),
             mounts: Vec::new(),
+            host_socket_exposures: Vec::new(),
             env: BTreeMap::from([("HOME".into(), "/root".into())]),
             labels: BTreeMap::from([("io.aw-gateway.gateway".into(), "true".into())]),
             publish_ssh: false,
@@ -3739,6 +4170,7 @@ esac
                     readonly: false,
                 },
             ],
+            host_socket_exposures: Vec::new(),
             env: BTreeMap::from([
                 ("AW_IDENTITY_TOKEN".into(), "token-secret".into()),
                 ("AW_SAFE".into(), "1".into()),
@@ -3831,6 +4263,7 @@ esac
             passwd_entry: None,
             state_dir_in_container: PathBuf::from("/root/.aw-gateway/containers/aw-local"),
             mounts: Vec::new(),
+            host_socket_exposures: Vec::new(),
             env: BTreeMap::new(),
             labels: BTreeMap::new(),
             publish_ssh: true,
@@ -4393,6 +4826,7 @@ exit 0
             passwd_entry: None,
             state_dir_in_container: PathBuf::from("/root/.aw-gateway/containers/aw-local"),
             mounts: Vec::new(),
+            host_socket_exposures: Vec::new(),
             env: BTreeMap::new(),
             labels: BTreeMap::new(),
             publish_ssh: true,
@@ -4422,6 +4856,7 @@ exit 0
             passwd_entry: None,
             state_dir_in_container: PathBuf::from("/root/.aw-gateway/containers/aw-local"),
             mounts: Vec::new(),
+            host_socket_exposures: Vec::new(),
             env: BTreeMap::new(),
             labels: BTreeMap::new(),
             publish_ssh: true,
@@ -4455,6 +4890,7 @@ exit 0
             passwd_entry: None,
             state_dir_in_container: PathBuf::from("/home/user/.aw-gateway/containers/aw-local"),
             mounts: Vec::new(),
+            host_socket_exposures: Vec::new(),
             env: BTreeMap::new(),
             labels: BTreeMap::new(),
             publish_ssh: false,

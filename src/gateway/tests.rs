@@ -301,6 +301,7 @@ fn enable_default_agent_services(cfg: &mut GatewayConfig) {
                 name: "acl-proxy".into(),
                 required: true,
                 user: "root".into(),
+                startup_phase: crate::config::ServiceStartupPhase::AfterGate,
                 command: vec![
                     "acl-proxy".into(),
                     "--config".into(),
@@ -320,6 +321,7 @@ fn enable_default_agent_services(cfg: &mut GatewayConfig) {
                 name: "container-sshd".into(),
                 required: true,
                 user: "root".into(),
+                startup_phase: crate::config::ServiceStartupPhase::AfterGate,
                 command: vec!["start-container-sshd".into()],
                 cwd: None,
                 restart: crate::config::RestartPolicy::Always,
@@ -3628,6 +3630,7 @@ exit 0
         .ensure_container_for_readiness_plan(
             ContainerReadinessPlan::StartStopped(existing),
             &mut cleanup,
+            &runtime.prepare_container_inputs().await.unwrap(),
         )
         .await
         .unwrap();
@@ -3642,6 +3645,7 @@ exit 0
 #[test]
 fn status_json_serializes_nullable_launch_fields() {
     let status = GatewayStatus {
+        host_socket_exposures: Vec::new(),
         target: "default".into(),
         session_id: None,
         launch: None,
@@ -3694,6 +3698,7 @@ fn status_json_serializes_nullable_launch_fields() {
 #[test]
 fn status_result_text_includes_access_method() {
     let status = GatewayStatus {
+        host_socket_exposures: Vec::new(),
         target: "default".into(),
         session_id: None,
         launch: None,
@@ -4075,7 +4080,8 @@ exit 0
     let runtime = test_runtime(&dir, fake_runtime, configure_apple_published_port_target);
     runtime.prepare_control_socket_dir().unwrap();
 
-    runtime.start_container().await.unwrap();
+    let prepared = runtime.prepare_container_inputs().await.unwrap();
+    runtime.start_container(&prepared).await.unwrap();
 
     let stable = runtime.paths.container_state_dir.join("published-ssh-port");
     let pending = runtime
@@ -4115,7 +4121,8 @@ exit 0
     let runtime = test_runtime(&dir, fake_runtime, configure_apple_published_port_target);
     runtime.prepare_control_socket_dir().unwrap();
 
-    let err = runtime.start_container().await.unwrap_err();
+    let prepared = runtime.prepare_container_inputs().await.unwrap();
+    let err = runtime.start_container(&prepared).await.unwrap_err();
 
     assert!(err.to_string().contains("run"), "{err:#}");
     assert!(
@@ -4182,7 +4189,8 @@ exit 0
     let runtime = test_runtime(&dir, fake_runtime, configure_apple_published_port_target);
     runtime.prepare_control_socket_dir().unwrap();
 
-    runtime.start_container().await.unwrap();
+    let prepared = runtime.prepare_container_inputs().await.unwrap();
+    runtime.start_container(&prepared).await.unwrap();
 
     let log = std::fs::read_to_string(log).unwrap();
     assert_eq!(log.matches("run ").count(), 2, "{log}");
@@ -5930,6 +5938,7 @@ fn target_service_override_is_written_to_container_agent_config() {
     let agent_config = std::fs::read_to_string(agent_path).unwrap();
     assert!(agent_config.contains("/etc/acl-proxy/internal-acl-proxy.toml"));
     assert!(!agent_config.contains("/etc/acl-proxy/acl-proxy.toml"));
+    assert!(!agent_config.contains("gateway_activation"));
     assert_eq!(agent_config.matches("name = \"acl-proxy\"").count(), 1);
 }
 
@@ -6564,6 +6573,127 @@ fn runtime_exec_without_agent_control_omits_control_socket_mount() {
             .iter()
             .all(|mount| mount.target.as_path() != Path::new("/run/aw-gateway/bad:image"))
     );
+}
+
+#[tokio::test]
+async fn socket_exposures_install_and_control_generic_agent_startup_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
+        enable_default_agent_services(cfg);
+    });
+    runtime.target.host_socket_exposures.insert(
+        "traffic".into(),
+        crate::config::HostSocketExposureConfig {
+            host_path: dir.path().join("traffic.sock").display().to_string(),
+            container_path: "/run/acl-proxy/traffic.sock".into(),
+            user: "root".into(),
+            selinux_relabel: crate::config::SelinuxRelabel::None,
+        },
+    );
+    std::fs::create_dir_all(&runtime.paths.container_state_dir).unwrap();
+    let prepared = host_socket_exposures::PreparedContainerInputs {
+        mounts: Vec::new(),
+        host_socket_exposures: vec![crate::runtime::HostSocketExposureSpec {
+            name: "traffic".into(),
+            host_path: dir.path().join("traffic.sock"),
+            container_path: PathBuf::from("/run/acl-proxy/traffic.sock"),
+            consumer_user: "root".into(),
+            selinux_relabel: crate::config::SelinuxRelabel::None,
+            realization: crate::runtime::HostSocketExposureRealization::PinnedInode,
+            source_identity: crate::runtime::UnixSourceIdentity {
+                device: 1,
+                inode: 2,
+                uid: 1000,
+                gid: 1000,
+                mode: 0o600,
+            },
+        }],
+        exposure_manifest: Some("sha256:test".into()),
+    };
+
+    let stale_gate = runtime.host_socket_exposure_startup_gate_host_path();
+    let stale_pre_gate = runtime.host_socket_exposure_pre_gate_ready_host_path();
+    std::fs::write(&stale_gate, b"stale\n").unwrap();
+    std::fs::write(&stale_pre_gate, b"stale\n").unwrap();
+    runtime
+        .reset_host_socket_exposure_startup_gate(&prepared)
+        .unwrap();
+    assert!(!stale_gate.exists());
+    assert!(!stale_pre_gate.exists());
+
+    let spec = runtime
+        .container_run_spec_with_inputs(None, None, &prepared, None)
+        .unwrap();
+    assert!(!spec.env.contains_key("AW_CONTAINER_STARTUP_GATE"));
+    let agent_file = runtime.write_container_agent_config().unwrap();
+    let activation = crate::config::ContainerAgentFile::load(&agent_file)
+        .unwrap()
+        .gateway_activation
+        .unwrap();
+    assert_eq!(
+        activation.startup_gate,
+        runtime.host_socket_exposure_startup_gate_container_path()
+    );
+    assert_eq!(
+        activation.pre_gate_ready,
+        runtime.host_socket_exposure_pre_gate_ready_container_path()
+    );
+    std::fs::write(&stale_pre_gate, b"ready\n").unwrap();
+    runtime
+        .wait_for_host_socket_exposure_pre_gate_ready(&prepared)
+        .await
+        .unwrap();
+    runtime
+        .open_host_socket_exposure_startup_gate(&prepared)
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(stale_gate).unwrap(), "ready\n");
+}
+
+#[tokio::test]
+async fn socket_exposure_endpoint_probe_runs_as_configured_consumer_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let log = dir.path().join("exec.log");
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "{}"
+exit 0
+"#,
+            log.display()
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |_| {});
+    let prepared = host_socket_exposures::PreparedContainerInputs {
+        mounts: Vec::new(),
+        host_socket_exposures: vec![crate::runtime::HostSocketExposureSpec {
+            name: "traffic".into(),
+            host_path: dir.path().join("traffic.sock"),
+            container_path: PathBuf::from("/run/acl-proxy/traffic.sock"),
+            consumer_user: "acl-relay".into(),
+            selinux_relabel: crate::config::SelinuxRelabel::None,
+            realization: crate::runtime::HostSocketExposureRealization::PinnedInode,
+            source_identity: crate::runtime::UnixSourceIdentity {
+                device: 1,
+                inode: 2,
+                uid: 1000,
+                gid: 1000,
+                mode: 0o600,
+            },
+        }],
+        exposure_manifest: Some("sha256:test".into()),
+    };
+
+    runtime
+        .validate_container_exposure_endpoints(&prepared)
+        .await
+        .unwrap();
+    let calls = std::fs::read_to_string(log).unwrap();
+    assert_eq!(calls.lines().count(), 2, "{calls}");
+    for call in calls.lines() {
+        assert!(call.contains("--user acl-relay"), "{call}");
+    }
 }
 
 #[cfg(unix)]

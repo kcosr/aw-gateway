@@ -9,12 +9,13 @@ mod state;
 mod status;
 
 use crate::cli::{AgentArgs, AgentCommand, AgentConfigCommand};
-use crate::config::{ContainerAgentFile, ControlSocketConfig};
+use crate::config::{ContainerAgentFile, ControlSocketConfig, ServiceStartupPhase};
 use crate::fileutil;
 use crate::paths;
 use crate::template::{self, Vars};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bridge::run_bridge;
 use control::{run_control_socket, wait_for_shutdown_signal};
@@ -23,6 +24,8 @@ use service::{ManagedService, service_supervisor};
 use state::{AgentState, SocketOwner};
 
 pub const DEFAULT_AGENT_CONFIG: &str = include_str!("../container-agent.sample.toml");
+pub(crate) const STARTUP_GATE_FILE_NAME: &str = "host-socket-exposures.ready";
+pub(crate) const PRE_GATE_READY_FILE_NAME: &str = "host-socket-exposures.pre-gate.ready";
 
 pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
     match args.command {
@@ -87,8 +90,35 @@ async fn run_agent(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         })
         .collect();
     *state.services.lock().await = services.clone();
-    for service in services.clone() {
-        tokio::spawn(service_supervisor(service, services.clone()));
+    if let Some(activation) = &cfg.gateway_activation {
+        let pre_gate_services: Vec<_> = services
+            .iter()
+            .filter(|service| service.config.startup_phase == ServiceStartupPhase::PreGate)
+            .cloned()
+            .collect();
+        for service in &pre_gate_services {
+            tokio::spawn(service_supervisor(service.clone(), services.clone()));
+        }
+        let _ = std::fs::remove_file(&activation.pre_gate_ready);
+        let monitor_active = Arc::new(AtomicBool::new(true));
+        let pre_gate_monitor = tokio::spawn(maintain_pre_gate_readiness(
+            pre_gate_services,
+            activation.pre_gate_ready.clone(),
+            monitor_active.clone(),
+        ));
+        wait_for_startup_gate(Some(&activation.startup_gate)).await;
+        monitor_active.store(false, Ordering::SeqCst);
+        let _ = pre_gate_monitor.await;
+        for service in services
+            .iter()
+            .filter(|service| service.config.startup_phase == ServiceStartupPhase::AfterGate)
+        {
+            tokio::spawn(service_supervisor(service.clone(), services.clone()));
+        }
+    } else {
+        for service in &services {
+            tokio::spawn(service_supervisor(service.clone(), services.clone()));
+        }
     }
 
     if let Some(bridge) = cfg
@@ -128,6 +158,48 @@ async fn run_agent(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     }
 }
 
+async fn wait_for_startup_gate(path: Option<&std::path::Path>) {
+    let Some(path) = path else {
+        return;
+    };
+    loop {
+        if std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn maintain_pre_gate_readiness(
+    services: Vec<Arc<ManagedService>>,
+    path: PathBuf,
+    active: Arc<AtomicBool>,
+) {
+    while active.load(Ordering::SeqCst) {
+        let mut ready = true;
+        for service in &services {
+            if !service.health_check().await.unwrap_or(false) {
+                ready = false;
+            }
+        }
+        if !active.load(Ordering::SeqCst) {
+            break;
+        }
+        if ready {
+            if !path.exists()
+                && let Err(err) = std::fs::write(&path, b"ready\n")
+            {
+                tracing::error!(path = %path.display(), error = %err, "write pre-gate readiness marker");
+            }
+        } else if let Err(err) = std::fs::remove_file(&path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::error!(path = %path.display(), error = %err, "remove pre-gate readiness marker");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 fn configured_control_socket(config: &Option<ControlSocketConfig>) -> Option<String> {
     match config {
         Some(ControlSocketConfig::Path(path)) => Some(path.clone()),
@@ -162,6 +234,57 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
     use tokio::time::{Duration, Instant, sleep};
+
+    #[tokio::test]
+    async fn startup_gate_waits_for_regular_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = dir.path().join("service-start.ready");
+        let waiter = tokio::spawn({
+            let gate = gate.clone();
+            async move { wait_for_startup_gate(Some(&gate)).await }
+        });
+        sleep(Duration::from_millis(75)).await;
+        assert!(!waiter.is_finished());
+        std::fs::create_dir(&gate).unwrap();
+        sleep(Duration::from_millis(75)).await;
+        assert!(!waiter.is_finished(), "a directory must not open the gate");
+        std::fs::remove_dir(&gate).unwrap();
+        std::fs::write(&gate, b"ready\n").unwrap();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn standalone_agent_config_has_no_gateway_activation() {
+        let cfg: ContainerAgentFile = toml::from_str(DEFAULT_AGENT_CONFIG).unwrap();
+        assert!(cfg.gateway_activation.is_none());
+    }
+
+    #[tokio::test]
+    async fn pre_gate_readiness_marker_is_managed_by_typed_phase_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("pre-gate.ready");
+        let active = Arc::new(AtomicBool::new(true));
+        let monitor = tokio::spawn(maintain_pre_gate_readiness(
+            Vec::new(),
+            marker.clone(),
+            active.clone(),
+        ));
+        for _ in 0..20 {
+            if marker.is_file() {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        assert!(marker.is_file());
+        active.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(1), monitor)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn sample_agent_config_validates() {
@@ -664,6 +787,7 @@ mod tests {
             name: name.to_string(),
             required: true,
             user: "root".to_string(),
+            startup_phase: crate::config::ServiceStartupPhase::AfterGate,
             command: vec!["sleep".to_string(), "infinity".to_string()],
             cwd: None,
             restart: RestartPolicy::Always,

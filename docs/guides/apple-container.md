@@ -11,7 +11,7 @@ This guide shows a local macOS setup for `aw-gateway` using Apple's
 > runtime should be treated as production-ready.
 
 Apple `container` runs Linux containers as lightweight virtual machines on an
-Apple silicon Mac. AW Gateway supports two local Apple profiles:
+Apple silicon Mac. AW Gateway supports these local Apple profiles:
 
 - No-SSH runtime execution with `access.method = "runtime_exec"`. This is the
   simplest local shell/run/launch path and does not publish a container SSH
@@ -19,8 +19,12 @@ Apple silicon Mac. AW Gateway supports two local Apple profiles:
 - SSH-compatible access with `local_ssh.backend = "published_port"` and
   `readiness = "ssh_only"`. Use this when you need OpenSSH, SCP, SFTP, or VS
   Code Remote-SSH.
+- An optional host-proxy SSH profile that exposes two existing host Unix
+  listeners to a minimal in-container transparent relay.
 
-Apple socket publishing is not supported. When the container agent is enabled
+Apple reverse socket publishing is not used. Typed `host_socket_exposures`
+require Apple Container 1.1 or newer and use host-to-container socket relays;
+they never use `--publish-socket`. When the container agent is enabled
 on Apple, set `container_agent.control_socket = false`; the host gateway does
 not use an agent control channel for Apple targets.
 
@@ -35,6 +39,8 @@ add-ons. See [Firewall Policy](firewall.md) and
 - macOS 26 or newer.
 - Apple `container` CLI 1.0.0 or newer on the non-interactive shell `PATH`, or
   an explicit `[runtime].program`.
+- Apple `container` CLI 1.1.0 or newer for targets with
+  `host_socket_exposures`.
 - Apple container system services started with `container system start`.
 - macOS arm64 `aw-gateway` host binary.
 - Linux arm64 container-side `aw-container-agent`,
@@ -59,10 +65,12 @@ Copyable examples live under:
 ```text
 examples/apple-container/
   Containerfile.ubuntu
+  gateway-host-proxy.toml
   gateway-local.toml
   gateway-runtime-exec.toml
   sshd_config_agent
   start-container-sshd
+  transparent-uds-relay.json
 ```
 
 Full-file code blocks below match files in `examples/apple-container/` unless

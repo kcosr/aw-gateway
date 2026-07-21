@@ -1,0 +1,250 @@
+schema_version = "1"
+default_target = "ubuntu-host-proxy"
+
+[runtime]
+type = "apple_container"
+
+[logging]
+level = "info"
+directory = "{state}/logs/gateway"
+max_bytes = 104857600
+max_files = 5
+console = false
+
+[target_defaults.workspace]
+path = "/Users/example/aw-gateway/workspace"
+state_dir = ".aw-gateway"
+
+[target_defaults.control_sockets]
+host_dir = "/Users/example/aw-gateway/cache/sockets/{runtime_id}"
+container_dir = "/run/aw-gateway"
+
+[target_defaults.host_socket_exposures.transparent_http]
+host_path = "/Users/example/Library/Application Support/AW Gateway/runtime/transparent-http.sock"
+container_path = "/run/acl-proxy/transparent-http.sock"
+user = "acl-relay"
+selinux_relabel = "none"
+
+[target_defaults.host_socket_exposures.transparent_https]
+host_path = "/Users/example/Library/Application Support/AW Gateway/runtime/transparent-https.sock"
+container_path = "/run/acl-proxy/transparent-https.sock"
+user = "acl-relay"
+selinux_relabel = "none"
+
+[ssh_dispatch]
+allow_interactive_shell = true
+allow_container_commands = true
+enabled_actions = [
+  "connect",
+  "up",
+  "status",
+  "targets",
+  "stop",
+  "set-default",
+  "show-default",
+  "reset-default",
+  "add-key",
+  "add-host-key",
+  "add-container-key",
+  "client-config",
+  "client-bundle",
+  "help",
+]
+
+[client_config]
+inner_alias_template = "aw-{target}"
+container_host_template = "aw-container-{target}"
+host = "localhost"
+gateway_path = "/Users/example/aw-gateway/bin/aw-gateway"
+default_identity_dir = "~/.ssh/aw-gateway"
+
+[targets.ubuntu-host-proxy]
+image = "aw-gateway/ubuntu-base"
+mode = "fixed"
+name = "{image_slug}-host-proxy"
+stop_when_idle = true
+remove_on_stop = false
+container_user = "root"
+container_home = "/home/{user}"
+
+[targets.ubuntu-host-proxy.container_env]
+CODEX_HOME = "/var/lib/codex"
+
+[targets.ubuntu-host-proxy.session_env]
+CODEX_HOME = "/var/lib/codex"
+NODE_EXTRA_CA_CERTS = "/etc/acl-proxy/acl-proxy-ca.crt"
+REQUESTS_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
+GIT_SSL_CAINFO = "/etc/ssl/certs/ca-certificates.crt"
+
+[targets.ubuntu-host-proxy.local_ssh]
+mode = "listen"
+backend = "published_port"
+readiness = "ssh_only"
+host = "127.0.0.1"
+
+[targets.ubuntu-host-proxy.identity]
+bootstrap_user = "root"
+session_user = "{user}"
+session_uid = "{uid}"
+session_gid = "{gid}"
+session_home = "/home/{user}"
+session_shell = "/bin/bash"
+
+[targets.ubuntu-host-proxy.idle_cleanup]
+owner = "gateway"
+action = "exit_container"
+idle_grace = "30s"
+preserve_processes = ["tmux", "screen"]
+poll_interval = "10s"
+shutdown_timeout = "10s"
+
+[[target_defaults.lifecycle_steps]]
+phase = "pre_start"
+name = "ensure-workspace"
+required = true
+timeout = "60s"
+command = ["/bin/mkdir", "-p", "{workspace}"]
+
+[[target_defaults.container_bootstrap_steps]]
+name = "prepare-codex-home"
+required = true
+user = "root"
+command = ["/bin/sh", "-lc", "mkdir -p /var/lib/codex && chown {uid}:{gid} /var/lib/codex"]
+
+[[target_defaults.container_bootstrap_steps]]
+name = "install-acl-proxy-ca"
+required = true
+user = "root"
+command = ["/bin/sh", "-lc", "cp /opt/aw-gateway/share/acl-proxy-ca.crt /usr/local/share/ca-certificates/acl-proxy-ca.crt && update-ca-certificates"]
+
+[[target_defaults.container_bootstrap_steps]]
+name = "prepare-transparent-relay-user"
+required = true
+user = "root"
+command = [
+  "/bin/sh", "-lc",
+  "getent group acl-relay >/dev/null || groupadd --system acl-relay; id -u acl-relay >/dev/null 2>&1 || useradd --system --gid acl-relay --home-dir /nonexistent --shell /usr/sbin/nologin acl-relay; test \"$(id -u acl-relay)\" -ne 0",
+]
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/aw-gateway/runtime/linux/aw-container-bootstrap"
+target = "/opt/aw-gateway/bin/aw-container-bootstrap"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/aw-gateway/runtime/linux/aw-container-agent"
+target = "/opt/aw-gateway/bin/aw-container-agent"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/aw-gateway/runtime/linux/aw-ssh-command-filter"
+target = "/opt/aw-gateway/bin/aw-ssh-command-filter"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/aw-gateway/runtime/linux/start-container-sshd"
+target = "/opt/aw-gateway/bin/start-container-sshd"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/aw-gateway/runtime/linux/sshd_config_agent"
+target = "/etc/ssh/sshd_config_agent"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/aw-gateway/runtime/linux/acl-proxy-transparent-uds-relay"
+target = "/opt/aw-gateway/bin/acl-proxy-transparent-uds-relay"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/aw-gateway/config/transparent-uds-relay.json"
+target = "/etc/aw-gateway/transparent-uds-relay.json"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/aw-gateway/runtime/linux/aw-transparent-uds-firewall"
+target = "/opt/aw-gateway/bin/aw-transparent-uds-firewall"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/Users/example/Library/Application Support/AW Gateway/certs/acl-proxy-ca.crt"
+target = "/opt/aw-gateway/share/acl-proxy-ca.crt"
+mode = "ro"
+
+[target_defaults.container_bootstrap]
+enabled = true
+entrypoint = "/opt/aw-gateway/bin/aw-container-bootstrap"
+agent_program = "/opt/aw-gateway/bin/aw-container-agent"
+
+[target_defaults.container_ssh.transfer]
+sftp = "allow"
+legacy_scp = "allow"
+
+[target_defaults.container_agent]
+enabled = true
+control_socket = false
+
+[[target_defaults.container_agent.services]]
+name = "transparent-firewall"
+required = true
+user = "root"
+startup_phase = "pre_gate"
+command = [
+  "/opt/aw-gateway/bin/aw-transparent-uds-firewall",
+  "watch",
+  "--dns-server", "192.168.64.1",
+  "--http-port", "3128",
+  "--https-port", "3129",
+]
+restart = "always"
+restart_backoff = "1s"
+startup_timeout = "10s"
+depends_on = []
+
+[target_defaults.container_agent.services.health_check]
+type = "command"
+command = ["/bin/test", "-f", "/run/aw-gateway/transparent-uds-firewall.generation.ready"]
+timeout = "1s"
+
+[[target_defaults.container_agent.services]]
+name = "transparent-relay"
+required = true
+user = "acl-relay"
+command = [
+  "/opt/aw-gateway/bin/acl-proxy-transparent-uds-relay",
+  "--config", "/etc/aw-gateway/transparent-uds-relay.json",
+]
+restart = "always"
+restart_backoff = "1s"
+startup_timeout = "10s"
+depends_on = ["transparent-firewall"]
+
+[target_defaults.container_agent.services.health_check]
+type = "tcp"
+host = "127.0.0.1"
+port = 3128
+interval = "1s"
+timeout = "1s"
+
+[[target_defaults.container_agent.services]]
+name = "container-sshd"
+required = true
+user = "root"
+command = ["/opt/aw-gateway/bin/start-container-sshd"]
+restart = "always"
+depends_on = ["transparent-relay"]
+
+[target_defaults.container_agent.services.health_check]
+type = "tcp"
+host = "127.0.0.1"
+port = 22
+interval = "2s"
+timeout = "1s"
+
+[target_defaults.container_agent.services.env.AW_SSHD_SETENV_CONFIG]
+value = "{container_state_dir}/sshd-session-env.conf"
+
+[target_defaults.container_agent.ssh_bridge]
+enabled = false
+target = "127.0.0.1:22"
+mode = "0600"

@@ -64,7 +64,7 @@ impl ManagedService {
         }
     }
 
-    async fn health_check(&self) -> anyhow::Result<bool> {
+    pub(super) async fn health_check(&self) -> anyhow::Result<bool> {
         let vars = self.vars();
         match &self.config.health_check {
             None | Some(HealthCheck::Process) => {
@@ -94,7 +94,93 @@ impl ManagedService {
                 .await
                 .is_ok_and(|result| result.unwrap_or(false)))
             }
-            Some(HealthCheck::Command { .. }) => Ok(false),
+            Some(HealthCheck::Command { command, timeout }) => {
+                self.command_health_check(command, timeout.as_deref()).await
+            }
+        }
+    }
+
+    async fn command_health_check(
+        &self,
+        configured_argv: &[String],
+        configured_timeout: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let process_running = self
+            .child
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|child| child.id())
+            .is_some_and(process_exists);
+        if !process_running {
+            return Ok(false);
+        }
+        let vars = self.vars();
+        let command_argv = template::render_argv(configured_argv, &vars)?;
+        let mut command = Command::new(&command_argv[0]);
+        command.args(&command_argv[1..]);
+        command.env_clear();
+        command.env(
+            "PATH",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string()),
+        );
+        if let Ok(home) = std::env::var("HOME") {
+            command.env("HOME", home);
+        }
+        if let Some(cwd) = &self.config.cwd {
+            command.current_dir(template::render(cwd, &vars)?);
+        }
+        for (key, value) in &self.config.env {
+            if let Some(value) = resolve_env(value, &vars)? {
+                command.env(key, value);
+            }
+        }
+        let drop_identity = if self.config.user != "root" {
+            let identity = resolve_service_user(&self.config.user)?;
+            let user = CString::new(self.config.user.clone())
+                .with_context(|| format!("service user {:?} contains NUL", self.config.user))?;
+            let groups =
+                crate::unix_priv::resolve_user_groups(&user, identity.gid).with_context(|| {
+                    format!("resolve groups for service user {:?}", self.config.user)
+                })?;
+            Some((identity, groups))
+        } else {
+            None
+        };
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if let Some((identity, groups)) = &drop_identity {
+                    crate::unix_priv::drop_to_user_pre_exec(identity.uid, identity.gid, groups)
+                } else {
+                    Ok(())
+                }
+            });
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let timeout = configured_timeout
+            .and_then(|value| parse_duration(value).ok())
+            .unwrap_or(Duration::from_secs(1));
+        let mut child = command
+            .spawn()
+            .context("start service command health check")?;
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(result) => Ok(result.is_ok_and(|status| status.success())),
+            Err(_) => {
+                if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
+                }
+                let _ = child.wait().await;
+                Ok(false)
+            }
         }
     }
 
@@ -715,6 +801,7 @@ mod tests {
             name: name.to_string(),
             required: true,
             user: "root".to_string(),
+            startup_phase: crate::config::ServiceStartupPhase::AfterGate,
             command,
             cwd: None,
             restart: RestartPolicy::Always,
@@ -774,5 +861,96 @@ mod tests {
                 healthy_uptime: true,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn service_command_health_check_uses_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ready");
+        let mut config = service_config("firewall", vec!["/bin/sleep".into(), "1".into()]);
+        config.health_check = Some(HealthCheck::Command {
+            command: vec![
+                "/bin/test".into(),
+                "-f".into(),
+                marker.display().to_string(),
+            ],
+            timeout: Some("1s".into()),
+        });
+        let service =
+            ManagedService::new(config, dir.path().to_path_buf(), LoggingConfig::default());
+
+        assert!(!service.health_check().await.unwrap());
+        start_service(&service).await.unwrap();
+        std::fs::write(&marker, b"").unwrap();
+        assert!(service.health_check().await.unwrap());
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_command_health_check_kills_and_reaps_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("health.pid");
+        let mut config = service_config("worker", vec!["/bin/sleep".into(), "5".into()]);
+        config.health_check = Some(HealthCheck::Command {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("echo $$ > {}; exec /bin/sleep 30", pid_file.display()),
+            ],
+            timeout: Some("100ms".into()),
+        });
+        let service =
+            ManagedService::new(config, dir.path().to_path_buf(), LoggingConfig::default());
+        start_service(&service).await.unwrap();
+
+        assert!(!service.health_check().await.unwrap());
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        assert!(!process_exists(pid), "timed-out health child {pid} leaked");
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn timed_out_command_health_check_kills_descendant_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("health-tree.pid");
+        let mut config = service_config("worker", vec!["/bin/sleep".into(), "5".into()]);
+        config.health_check = Some(HealthCheck::Command {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "/bin/sleep 30 & descendant=$!; echo \"$$ $descendant\" > {}; wait",
+                    pid_file.display()
+                ),
+            ],
+            timeout: Some("100ms".into()),
+        });
+        let service =
+            ManagedService::new(config, dir.path().to_path_buf(), LoggingConfig::default());
+        start_service(&service).await.unwrap();
+
+        assert!(!service.health_check().await.unwrap());
+        let pids: Vec<u32> = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .split_whitespace()
+            .map(|pid| pid.parse().unwrap())
+            .collect();
+        for _ in 0..20 {
+            if pids.iter().all(|pid| !process_exists(*pid)) {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        for pid in pids {
+            assert!(
+                !process_exists(pid),
+                "timed-out health descendant {pid} leaked"
+            );
+        }
+        service.stop().await;
     }
 }

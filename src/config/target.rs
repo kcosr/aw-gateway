@@ -337,6 +337,8 @@ pub struct TargetConfigInput {
     pub session_env_inherit: Vec<String>,
     #[serde(default)]
     pub container_mounts: Vec<ContainerMountConfig>,
+    #[serde(default)]
+    pub host_socket_exposures: BTreeMap<String, HostSocketExposureConfig>,
     pub stop_when_idle: Option<bool>,
     pub remove_on_stop: Option<bool>,
     pub idle_cleanup: Option<IdleCleanupConfigInput>,
@@ -437,6 +439,8 @@ impl TargetConfigInput {
         self.session_env_inherit
             .extend(later.session_env_inherit.clone());
         self.container_mounts.extend(later.container_mounts.clone());
+        self.host_socket_exposures
+            .extend(later.host_socket_exposures.clone());
         if let Some(stop_when_idle) = later.stop_when_idle {
             self.stop_when_idle = Some(stop_when_idle);
         }
@@ -638,6 +642,7 @@ impl TargetConfigInput {
         for mount in &self.container_mounts {
             mount.validate()?;
         }
+        validate_host_socket_exposures(&self.host_socket_exposures)?;
         if let Some(idle_cleanup) = &self.idle_cleanup {
             idle_cleanup.clone().into_effective()?;
         }
@@ -706,6 +711,12 @@ impl TargetConfigInput {
             control_sockets
                 .validate_context_templates(&format!("{field}.control_sockets"), context_vars)?;
         }
+        for (name, exposure) in &self.host_socket_exposures {
+            exposure.validate_context_templates(
+                &format!("{field}.host_socket_exposures.{name}"),
+                context_vars,
+            )?;
+        }
         Ok(())
     }
 
@@ -743,6 +754,7 @@ impl TargetConfigInput {
             session_env: self.session_env,
             session_env_inherit: self.session_env_inherit,
             container_mounts: self.container_mounts,
+            host_socket_exposures: self.host_socket_exposures,
             stop_when_idle: self.stop_when_idle.unwrap_or(false),
             remove_on_stop: self.remove_on_stop.unwrap_or(false),
             idle_cleanup: self
@@ -788,6 +800,8 @@ pub struct TargetConfig {
     pub session_env_inherit: Vec<String>,
     #[serde(default)]
     pub container_mounts: Vec<ContainerMountConfig>,
+    #[serde(default)]
+    pub host_socket_exposures: BTreeMap<String, HostSocketExposureConfig>,
     pub stop_when_idle: bool,
     pub remove_on_stop: bool,
     pub idle_cleanup: Option<IdleCleanupConfig>,
@@ -860,6 +874,7 @@ impl TargetConfig {
         for mount in &self.container_mounts {
             mount.validate()?;
         }
+        validate_host_socket_exposures(&self.host_socket_exposures)?;
         match self.mode {
             TargetMode::Fixed => {
                 if let Some(name) = &self.name {
@@ -1453,6 +1468,150 @@ pub struct ContainerMountConfig {
     pub target: String,
     #[serde(default)]
     pub mode: ContainerMountMode,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostSocketExposureConfig {
+    pub host_path: String,
+    pub container_path: String,
+    #[serde(default = "default_host_socket_consumer_user")]
+    pub user: String,
+    pub selinux_relabel: SelinuxRelabel,
+}
+
+fn default_host_socket_consumer_user() -> String {
+    SERVICE_USER_TEMPLATE.into()
+}
+
+impl HostSocketExposureConfig {
+    fn validate(&self, name: &str) -> anyhow::Result<()> {
+        for (field, value) in [
+            ("host_path", self.host_path.as_str()),
+            ("container_path", self.container_path.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                anyhow::bail!("host_socket_exposures.{name}.{field} must not be empty");
+            }
+            if value.contains(':') || value.contains(',') {
+                anyhow::bail!("host_socket_exposures.{name}.{field} must not contain ':' or ','");
+            }
+            validate_template(
+                &format!("host_socket_exposures.{name}.{field}"),
+                value,
+                GATEWAY_TEMPLATE_VARS_NO_PID,
+            )?;
+        }
+        if self.user.trim().is_empty() || self.user.contains(':') || self.user.contains(',') {
+            anyhow::bail!("host_socket_exposures.{name}.user must name one container user");
+        }
+        validate_template(
+            &format!("host_socket_exposures.{name}.user"),
+            &self.user,
+            GATEWAY_TEMPLATE_VARS_NO_PID,
+        )?;
+        validate_static_container_socket_path(name, &self.container_path)?;
+        Ok(())
+    }
+
+    fn validate_context_templates(
+        &self,
+        field: &str,
+        context_vars: &BTreeMap<String, ContextVarConfig>,
+    ) -> anyhow::Result<()> {
+        validate_template_with_context(
+            &format!("{field}.host_path"),
+            &self.host_path,
+            GATEWAY_TEMPLATE_VARS_NO_PID,
+            context_vars.keys(),
+        )?;
+        validate_template_with_context(
+            &format!("{field}.container_path"),
+            &self.container_path,
+            GATEWAY_TEMPLATE_VARS_NO_PID,
+            context_vars.keys(),
+        )?;
+        validate_template_with_context(
+            &format!("{field}.user"),
+            &self.user,
+            GATEWAY_TEMPLATE_VARS_NO_PID,
+            context_vars.keys(),
+        )
+    }
+}
+
+fn validate_host_socket_exposures(
+    exposures: &BTreeMap<String, HostSocketExposureConfig>,
+) -> anyhow::Result<()> {
+    let mut host_paths = BTreeMap::<&str, &str>::new();
+    let mut container_paths = BTreeMap::<&str, &str>::new();
+    for (name, exposure) in exposures {
+        validate_name("host socket exposure", name)?;
+        exposure.validate(name)?;
+        if let Some(existing) = host_paths.insert(&exposure.host_path, name) {
+            anyhow::bail!(
+                "host_socket_exposures.{name}.host_path duplicates host_socket_exposures.{existing}.host_path"
+            );
+        }
+        if let Some(existing) = container_paths.insert(&exposure.container_path, name) {
+            anyhow::bail!(
+                "host_socket_exposures.{name}.container_path duplicates host_socket_exposures.{existing}.container_path"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_static_container_socket_path(name: &str, value: &str) -> anyhow::Result<()> {
+    let references = template::referenced_keys(value)?;
+    let normalized = if let Some(rest) = value.strip_prefix('/') {
+        !rest.is_empty()
+            && !rest
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+    } else if !references.is_empty() && value.starts_with('{') {
+        value.find('}').is_some_and(|end| {
+            let leading_key = &value[1..end];
+            let suffix = &value[end + 1..];
+            leading_container_path_template_can_be_absolute(leading_key)
+                && (suffix.is_empty()
+                    || suffix.strip_prefix('/').is_some_and(|rest| {
+                        !rest.is_empty()
+                            && !rest
+                                .split('/')
+                                .any(|part| part.is_empty() || part == "." || part == "..")
+                    }))
+        })
+    } else {
+        false
+    };
+    if !normalized {
+        anyhow::bail!(
+            "host_socket_exposures.{name}.container_path must be a normalized absolute non-root path"
+        );
+    }
+    Ok(())
+}
+
+fn leading_container_path_template_can_be_absolute(key: &str) -> bool {
+    matches!(
+        key,
+        "container_home"
+            | "container_state_dir_in_container"
+            | "home"
+            | "workspace"
+            | "state"
+            | "state_dir"
+            | "container_state_dir"
+    ) || key.starts_with("var.")
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum SelinuxRelabel {
+    None,
+    Shared,
+    Private,
 }
 
 impl ContainerMountConfig {

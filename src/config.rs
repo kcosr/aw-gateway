@@ -3,7 +3,7 @@ use crate::context::{ContextVarConfig, validate_context_var_declarations};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod agent;
 mod http;
@@ -17,7 +17,7 @@ mod validation;
 
 pub use agent::{
     ContainerAgentConfig, ContainerAgentConfigInput, ControlSocketConfig, EnvValue, HealthCheck,
-    RestartPolicy, ServiceConfig, SshBridgeConfig, SshBridgeConfigInput,
+    RestartPolicy, ServiceConfig, ServiceStartupPhase, SshBridgeConfig, SshBridgeConfigInput,
 };
 pub use http::{HttpAuthConfig, HttpAuthType, HttpConfig};
 pub(crate) use launch::validate_launch_var_string_value;
@@ -36,14 +36,14 @@ pub use steps::{
 pub(crate) use target::DEFAULT_EPHEMERAL_NAME_PATTERN;
 pub use target::{
     ContainerBootstrapConfig, ContainerMountConfig, ContainerMountMode, ContainerSshConfig,
-    ContainerSshTransferConfig, ControlSocketsConfig, IdleCleanupAction, IdleCleanupConfig,
-    IdleCleanupConfigInput, IdleCleanupOwner, LegacyScpTransferMode, LocalSshBackend,
-    LocalSshConfig, LocalSshConfigInput, LocalSshMode, LocalSshReadiness, SftpTransferMode,
-    TargetAccessConfig, TargetAccessConfigInput, TargetAccessMethod, TargetConfig,
-    TargetConfigInput, TargetContainerBootstrapConfig, TargetContainerSshConfig,
-    TargetContainerSshTransferConfig, TargetControlSocketsConfig, TargetIdentityConfig, TargetMode,
-    TargetRuntimeConfig, TargetRuntimeConfigInput, WorkspaceCleanup, WorkspaceConfig,
-    WorkspaceConfigInput,
+    ContainerSshTransferConfig, ControlSocketsConfig, HostSocketExposureConfig, IdleCleanupAction,
+    IdleCleanupConfig, IdleCleanupConfigInput, IdleCleanupOwner, LegacyScpTransferMode,
+    LocalSshBackend, LocalSshConfig, LocalSshConfigInput, LocalSshMode, LocalSshReadiness,
+    SelinuxRelabel, SftpTransferMode, TargetAccessConfig, TargetAccessConfigInput,
+    TargetAccessMethod, TargetConfig, TargetConfigInput, TargetContainerBootstrapConfig,
+    TargetContainerSshConfig, TargetContainerSshTransferConfig, TargetControlSocketsConfig,
+    TargetIdentityConfig, TargetMode, TargetRuntimeConfig, TargetRuntimeConfigInput,
+    WorkspaceCleanup, WorkspaceConfig, WorkspaceConfigInput,
 };
 pub(crate) use validation::SERVICE_USER_TEMPLATE;
 pub use validation::parse_duration;
@@ -281,10 +281,35 @@ impl GatewayConfig {
         &self,
         targets: &BTreeMap<String, TargetConfig>,
     ) -> anyhow::Result<()> {
-        if self.runtime.runtime_type != ContainerRuntimeType::AppleContainer {
-            return Ok(());
-        }
         for (name, target) in targets {
+            if !target.host_socket_exposures.is_empty() {
+                match self.runtime.runtime_type {
+                    ContainerRuntimeType::Colima => anyhow::bail!(
+                        "target {name:?} configures host_socket_exposures but runtime type \"colima\" is not supported"
+                    ),
+                    ContainerRuntimeType::Podman | ContainerRuntimeType::Docker
+                        if !cfg!(target_os = "linux") =>
+                    {
+                        anyhow::bail!(
+                            "target {name:?} configures host_socket_exposures but runtime type {:?} requires AW Gateway to run on Linux",
+                            self.runtime.runtime_type
+                        )
+                    }
+                    ContainerRuntimeType::AppleContainer => {
+                        for (exposure_name, exposure) in &target.host_socket_exposures {
+                            if exposure.selinux_relabel != SelinuxRelabel::None {
+                                anyhow::bail!(
+                                    "target {name:?} host_socket_exposures.{exposure_name}.selinux_relabel must be \"none\" for runtime type \"apple_container\""
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if self.runtime.runtime_type != ContainerRuntimeType::AppleContainer {
+                continue;
+            }
             match target.access.method {
                 TargetAccessMethod::Ssh => {
                     match &target.local_ssh {
@@ -501,8 +526,40 @@ pub struct ContainerAgentFile {
     pub schema_version: String,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_activation: Option<GatewayAgentActivation>,
     #[serde(default)]
     pub container_agent: ContainerAgentConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayAgentActivation {
+    pub startup_gate: PathBuf,
+    pub pre_gate_ready: PathBuf,
+}
+
+impl GatewayAgentActivation {
+    fn validate(&self) -> anyhow::Result<()> {
+        for (label, path) in [
+            ("gateway_activation.startup_gate", &self.startup_gate),
+            ("gateway_activation.pre_gate_ready", &self.pre_gate_ready),
+        ] {
+            let value = path.as_os_str().to_string_lossy();
+            if value == "/"
+                || value.strip_prefix('/').is_none_or(|rest| {
+                    rest.split('/')
+                        .any(|part| part.is_empty() || part == "." || part == "..")
+                })
+            {
+                anyhow::bail!("{label} must be a normalized absolute non-root path");
+            }
+        }
+        if self.startup_gate == self.pre_gate_ready {
+            anyhow::bail!("gateway activation paths must be distinct");
+        }
+        Ok(())
+    }
 }
 
 impl ContainerAgentFile {
@@ -526,6 +583,9 @@ impl ContainerAgentFile {
         self.logging
             .validate_templates("logging", AGENT_TEMPLATE_VARS)?;
         self.logging.validate_values("logging")?;
+        if let Some(activation) = &self.gateway_activation {
+            activation.validate()?;
+        }
         self.container_agent.validate_agent_file()
     }
 }

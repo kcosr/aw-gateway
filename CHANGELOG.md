@@ -4,6 +4,9 @@
 
 ### Breaking Changes
 
+- Generic `container_mounts` now reject Unix socket, symlink, FIFO, and device
+  sources. Existing host socket integrations must use the typed
+  `host_socket_exposures` target map.
 - `workspace.state_dir` must now remain relative to the workspace mount;
   absolute, home-relative, and parent-traversing values are rejected. Fixed
   containers also record their resolved workspace layout and must be removed
@@ -12,6 +15,16 @@
 
 ### Added
 
+- Added typed host-to-container Unix socket exposure for Apple Container 1.1+
+  and native local Linux Docker/Podman, including strict source validation,
+  backend-specific realization, existing-container manifests, and readiness
+  status. Added an optional Apple host-proxy example with a supervised
+  transparent relay and fail-closed IPv4/IPv6 firewall policy.
+- Container-agent services now support bounded command health checks, allowing
+  dependents to wait for validated one-time setup rather than process liveness.
+- Host socket targets can select the in-container consumer identity used for
+  access probes. Required `pre_gate` services establish fail-closed setup before
+  the generated agent activation gate releases relays or ordinary access.
 - Added `workspace.container_path` so the host workspace can be mounted at a
   path separate from `container_home`, including persistent-home deployments
   that expose only a dedicated shared directory
