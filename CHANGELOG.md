@@ -20,11 +20,10 @@
   backend-specific realization, existing-container manifests, and readiness
   status. Added an optional Apple host-proxy example with a supervised
   transparent relay and fail-closed IPv4/IPv6 firewall policy.
-- Container-agent services now support bounded command health checks, allowing
-  dependents to wait for validated one-time setup rather than process liveness.
 - Host socket targets can select the in-container consumer identity used for
-  access probes. Required `pre_gate` services establish fail-closed setup before
-  the generated agent activation gate releases relays or ordinary access.
+  access probes. The host-proxy profile reuses required container bootstrap
+  steps for fail-closed firewall installation and ordinary service dependencies
+  for watcher, relay, and SSH startup ordering.
 - Added an opt-in privileged Linux stack smoke that pins the reviewed
   Access Runtime, ACL Proxy, and AW Gateway commits and exercises real
   HTTP/HTTPS transparent redirects through the release relay, host UDS proxy,

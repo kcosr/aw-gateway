@@ -886,10 +886,9 @@ Gateway configs commonly include:
 - `[target_defaults.container_agent]`: optional in-container supervision and SSH bridge
   support.
 - `[[target_defaults.container_agent.services]]`: in-container services supervised by
-  `aw-container-agent`. The optional `startup_phase = "pre_gate"` is restricted
-  to required setup services whose health must be established before a target
-  with host socket exposures can start ordinary services; pre-gate services
-  may depend only on other pre-gate services.
+  `aw-container-agent`. Use `depends_on` and dependency health checks to order
+  managed services. Required `container_bootstrap_steps` perform privileged
+  preparation before the agent starts.
 - `[target_defaults.container_agent.ssh_bridge]`: Unix socket bridge to container SSH. In
   gateway config, the socket path is generated from target control sockets.
 
@@ -948,15 +947,14 @@ reachable from the container:
 [target_defaults.host_socket_exposures.transparent_http]
 host_path = "/Users/alice/Library/Application Support/AW Gateway/runtime/transparent-http.sock"
 container_path = "/run/acl-proxy/transparent-http.sock"
-user = "acl-relay"
+user = "root"
 selinux_relabel = "none"
 ```
 
 AW Gateway validates the final source component without following symlinks,
 requires an existing Unix socket, rejects collisions with broader managed
 mounts, and checks the guest endpoint as the configured container user before
-opening an internal startup gate for the container agent and its managed
-services. Apple Container 1.1 or newer realizes the declaration as
+reporting the target ready. Apple Container 1.1 or newer realizes the declaration as
 a path-reconnecting UDS-over-vsock relay. Native local Linux Docker and Podman
 bind the current socket inode; replacing the host listener pathname requires
 container recreation unless the listener inode is preserved. Colima, VM-backed

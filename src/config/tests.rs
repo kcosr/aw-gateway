@@ -5833,8 +5833,8 @@ selinux_relabel = "none"
 }
 
 #[test]
-fn pre_gate_services_are_required_and_cannot_depend_on_after_gate_services() {
-    let optional = r#"
+fn container_agent_services_reject_removed_startup_phase() {
+    let raw = r#"
 schema_version = "1"
 
 [targets.default]
@@ -5847,52 +5847,48 @@ enabled = true
 
 [[targets.default.container_agent.services]]
 name = "firewall"
-required = false
+required = true
 user = "root"
 startup_phase = "pre_gate"
 command = ["firewall"]
 "#;
-    let err = toml::from_str::<GatewayConfig>(optional)
+
+    let err = toml::from_str::<GatewayConfig>(raw)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown field `startup_phase`"), "{err}");
+}
+
+#[test]
+fn container_agent_services_reject_host_only_command_health_checks() {
+    let raw = r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "ubuntu-dev"
+
+[targets.default.container_agent]
+enabled = true
+
+[[targets.default.container_agent.services]]
+name = "firewall"
+required = true
+user = "root"
+command = ["firewall"]
+health_check = { type = "command", command = ["firewall", "check"] }
+"#;
+
+    let err = toml::from_str::<GatewayConfig>(raw)
         .unwrap()
         .validate()
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("pre_gate service") && err.contains("must be required"),
+        err.contains("service health_check does not support command checks"),
         "{err}"
     );
-
-    let dependency = r#"
-schema_version = "1"
-
-[targets.default]
-image = "ubuntu/dev"
-mode = "fixed"
-name = "ubuntu-dev"
-
-[targets.default.container_agent]
-enabled = true
-
-[[targets.default.container_agent.services]]
-name = "relay"
-required = true
-user = "root"
-command = ["relay"]
-
-[[targets.default.container_agent.services]]
-name = "firewall"
-required = true
-user = "root"
-startup_phase = "pre_gate"
-command = ["firewall"]
-depends_on = ["relay"]
-"#;
-    let err = toml::from_str::<GatewayConfig>(dependency)
-        .unwrap()
-        .validate()
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("depends on after_gate"), "{err}");
 }
 
 #[test]

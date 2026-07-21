@@ -2,8 +2,8 @@ use super::{ControlSocketPaths, Runtime, UNIX_SOCKET_PATH_MAX_BYTES};
 use crate::config::{
     AGENT_SCHEMA_VERSION, BOOTSTRAP_SCHEMA_VERSION, BootstrapIdentity, ContainerAgentFile,
     ContainerBootstrapFile, ContainerRuntimeType, ControlSocketConfig, ControlSocketsConfig,
-    GatewayAgentActivation, IdleCleanupAction, IdleCleanupOwner, LoggingConfig,
-    RenderedContainerBootstrapStep, TargetConfig, default_control_socket_host_dir, validate_name,
+    IdleCleanupAction, IdleCleanupOwner, LoggingConfig, RenderedContainerBootstrapStep,
+    TargetConfig, default_control_socket_host_dir, validate_name,
 };
 use crate::context::RuntimeContext;
 use crate::fileutil::{AtomicWritePolicy, atomic_write_toml, write_private_file};
@@ -52,12 +52,6 @@ impl Runtime {
         let cfg = ContainerAgentFile {
             schema_version: AGENT_SCHEMA_VERSION.to_string(),
             logging: LoggingConfig::default(),
-            gateway_activation: (!self.target.host_socket_exposures.is_empty()).then(|| {
-                GatewayAgentActivation {
-                    startup_gate: self.host_socket_exposure_startup_gate_container_path(),
-                    pre_gate_ready: self.host_socket_exposure_pre_gate_ready_container_path(),
-                }
-            }),
             container_agent,
         };
         let path = self.container_agent_config_host();

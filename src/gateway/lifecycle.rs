@@ -53,7 +53,6 @@ impl Runtime {
             ContainerReadinessPlan::StartStopped(existing) => {
                 self.validate_labels(&existing)?;
                 self.validate_exposure_manifest(&existing, prepared)?;
-                self.reset_host_socket_exposure_startup_gate(prepared)?;
                 let apple_published_ssh_port = self.apple_restart_published_ssh_port()?;
                 self.run_lifecycle_phase(LifecyclePhase::PreStart, None)
                     .await?;
@@ -64,7 +63,6 @@ impl Runtime {
                 self.inspect_container_after_start().await
             }
             ContainerReadinessPlan::CreateMissing => {
-                self.reset_host_socket_exposure_startup_gate(prepared)?;
                 self.run_lifecycle_phase(LifecyclePhase::PreStart, None)
                     .await?;
                 self.remove_stale_control_socket_files()?;

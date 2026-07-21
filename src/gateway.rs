@@ -1893,11 +1893,6 @@ impl Runtime {
                 .await?;
             self.validate_labels(&inspect)?;
             self.validate_exposure_manifest(&inspect, &prepared_inputs)?;
-            self.wait_for_host_socket_exposure_pre_gate_ready(&prepared_inputs)
-                .await?;
-            self.validate_container_exposure_endpoints(&prepared_inputs)
-                .await?;
-            self.open_host_socket_exposure_startup_gate(&prepared_inputs)?;
             self.sweep_stale_cancel_markers().await;
             let container_pid = inspect.state.pid.map(|pid| pid.to_string());
             self.run_lifecycle_phase(LifecyclePhase::PostStartHost, container_pid.as_deref())
@@ -1905,6 +1900,8 @@ impl Runtime {
             if self.requires_agent_control() {
                 self.wait_agent_ready().await?;
             }
+            self.validate_container_exposure_endpoints(&prepared_inputs)
+                .await?;
             self.run_host_steps(container_pid.as_deref()).await?;
             if self.requires_agent_control() {
                 self.validate_agent_socket().await?;

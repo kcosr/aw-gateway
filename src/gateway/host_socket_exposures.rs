@@ -88,8 +88,22 @@ impl Runtime {
     ) -> anyhow::Result<()> {
         const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
         const READY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+        self.validate_container_exposure_endpoints_with_timing(
+            prepared,
+            CHECK_TIMEOUT,
+            READY_RETRY_INTERVAL,
+        )
+        .await
+    }
+
+    pub(super) async fn validate_container_exposure_endpoints_with_timing(
+        &self,
+        prepared: &PreparedContainerInputs,
+        check_timeout: Duration,
+        retry_interval: Duration,
+    ) -> anyhow::Result<()> {
         for exposure in &prepared.host_socket_exposures {
-            let deadline = tokio::time::Instant::now() + CHECK_TIMEOUT;
+            let deadline = tokio::time::Instant::now() + check_timeout;
             loop {
                 let mut failed = None;
                 for (flag, description) in [("-S", "a Unix socket"), ("-w", "accessible")] {
@@ -132,7 +146,7 @@ impl Runtime {
                         exposure.consumer_user
                     );
                 }
-                tokio::time::sleep(READY_RETRY_INTERVAL).await;
+                tokio::time::sleep(retry_interval).await;
             }
         }
         Ok(())
@@ -197,90 +211,6 @@ impl Runtime {
                     .collect()
             }
         }
-    }
-
-    pub(super) fn reset_host_socket_exposure_startup_gate(
-        &self,
-        prepared: &PreparedContainerInputs,
-    ) -> anyhow::Result<()> {
-        if prepared.host_socket_exposures.is_empty() || !self.agent_enabled() {
-            return Ok(());
-        }
-        for path in [
-            self.host_socket_exposure_startup_gate_host_path(),
-            self.host_socket_exposure_pre_gate_ready_host_path(),
-        ] {
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(err).with_context(|| format!("remove stale {}", path.display()));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn open_host_socket_exposure_startup_gate(
-        &self,
-        prepared: &PreparedContainerInputs,
-    ) -> anyhow::Result<()> {
-        if prepared.host_socket_exposures.is_empty() || !self.agent_enabled() {
-            return Ok(());
-        }
-        let path = self.host_socket_exposure_startup_gate_host_path();
-        std::fs::write(&path, b"ready\n")
-            .with_context(|| format!("open host socket exposure service gate {}", path.display()))
-    }
-
-    pub(super) fn host_socket_exposure_startup_gate_host_path(&self) -> PathBuf {
-        self.paths
-            .container_state_dir
-            .join(crate::agent::STARTUP_GATE_FILE_NAME)
-    }
-
-    pub(super) fn host_socket_exposure_startup_gate_container_path(&self) -> PathBuf {
-        self.paths
-            .container_state_dir_in_container
-            .join(crate::agent::STARTUP_GATE_FILE_NAME)
-    }
-
-    pub(super) fn host_socket_exposure_pre_gate_ready_host_path(&self) -> PathBuf {
-        self.paths
-            .container_state_dir
-            .join(crate::agent::PRE_GATE_READY_FILE_NAME)
-    }
-
-    pub(super) fn host_socket_exposure_pre_gate_ready_container_path(&self) -> PathBuf {
-        self.paths
-            .container_state_dir_in_container
-            .join(crate::agent::PRE_GATE_READY_FILE_NAME)
-    }
-
-    pub(super) async fn wait_for_host_socket_exposure_pre_gate_ready(
-        &self,
-        prepared: &PreparedContainerInputs,
-    ) -> anyhow::Result<()> {
-        if prepared.host_socket_exposures.is_empty() || !self.agent_enabled() {
-            return Ok(());
-        }
-        const PRE_GATE_TIMEOUT: Duration = Duration::from_secs(30);
-        let path = self.host_socket_exposure_pre_gate_ready_host_path();
-        tokio::time::timeout(PRE_GATE_TIMEOUT, async {
-            loop {
-                if std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "wait for fail-closed pre-gate services at {}",
-                path.display()
-            )
-        })
     }
 }
 

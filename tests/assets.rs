@@ -234,16 +234,32 @@ fn transparent_uds_stack_smoke_structural_contract_is_explicit() {
 }
 
 #[test]
-fn apple_host_proxy_profile_keeps_privilege_and_proxy_material_out_of_relay() {
+fn apple_host_proxy_profile_reuses_bootstrap_and_service_dependencies() {
     let profile =
         std::fs::read_to_string(example_asset("apple-container", "gateway-host-proxy.toml"))
             .unwrap();
 
-    assert!(profile.contains("name = \"prepare-transparent-relay-user\""));
-    assert!(profile.contains("user = \"acl-relay\""));
-    assert_eq!(profile.matches("user = \"acl-relay\"").count(), 3);
-    assert!(profile.contains("startup_phase = \"pre_gate\""));
+    assert!(profile.contains("name = \"install-transparent-firewall\""));
+    assert!(profile.contains("\n  \"repair\","));
+    assert!(!profile.contains("acl-relay"));
+    assert!(!profile.contains("startup_phase"));
+    assert!(profile.contains(
+        "[target_defaults.host_socket_exposures.transparent_http]\n\
+         host_path = \"/Users/example/Library/Application Support/AW Gateway/runtime/transparent-http.sock\"\n\
+         container_path = \"/run/acl-proxy/transparent-http.sock\"\n\
+         user = \"root\""
+    ));
+    assert!(profile.contains(
+        "[target_defaults.host_socket_exposures.transparent_https]\n\
+         host_path = \"/Users/example/Library/Application Support/AW Gateway/runtime/transparent-https.sock\"\n\
+         container_path = \"/run/acl-proxy/transparent-https.sock\"\n\
+         user = \"root\""
+    ));
+    assert!(profile.contains("name = \"transparent-relay\"\nrequired = true\nuser = \"root\""));
+    assert!(profile.contains("name = \"transparent-firewall\"\nrequired = true\nuser = \"root\""));
+    assert!(profile.contains("type = \"process\""));
     assert!(profile.contains("depends_on = [\"transparent-firewall\"]"));
+    assert!(profile.contains("depends_on = [\"transparent-relay\"]"));
     assert!(!profile.contains("/opt/acl-proxy/bin/acl-proxy"));
     assert!(!profile.contains("mitm-ca.key"));
     assert!(!profile.contains("AW_IDENTITY_TOKEN"));

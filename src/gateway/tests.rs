@@ -301,7 +301,6 @@ fn enable_default_agent_services(cfg: &mut GatewayConfig) {
                 name: "acl-proxy".into(),
                 required: true,
                 user: "root".into(),
-                startup_phase: crate::config::ServiceStartupPhase::AfterGate,
                 command: vec![
                     "acl-proxy".into(),
                     "--config".into(),
@@ -321,7 +320,6 @@ fn enable_default_agent_services(cfg: &mut GatewayConfig) {
                 name: "container-sshd".into(),
                 required: true,
                 user: "root".into(),
-                startup_phase: crate::config::ServiceStartupPhase::AfterGate,
                 command: vec!["start-container-sshd".into()],
                 cwd: None,
                 restart: crate::config::RestartPolicy::Always,
@@ -5938,7 +5936,6 @@ fn target_service_override_is_written_to_container_agent_config() {
     let agent_config = std::fs::read_to_string(agent_path).unwrap();
     assert!(agent_config.contains("/etc/acl-proxy/internal-acl-proxy.toml"));
     assert!(!agent_config.contains("/etc/acl-proxy/acl-proxy.toml"));
-    assert!(!agent_config.contains("gateway_activation"));
     assert_eq!(agent_config.matches("name = \"acl-proxy\"").count(), 1);
 }
 
@@ -6576,80 +6573,6 @@ fn runtime_exec_without_agent_control_omits_control_socket_mount() {
 }
 
 #[tokio::test]
-async fn socket_exposures_install_and_control_generic_agent_startup_gate() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut runtime = test_runtime(&dir, dir.path().join("runtime"), |cfg| {
-        enable_default_agent_services(cfg);
-    });
-    runtime.target.host_socket_exposures.insert(
-        "traffic".into(),
-        crate::config::HostSocketExposureConfig {
-            host_path: dir.path().join("traffic.sock").display().to_string(),
-            container_path: "/run/acl-proxy/traffic.sock".into(),
-            user: "root".into(),
-            selinux_relabel: crate::config::SelinuxRelabel::None,
-        },
-    );
-    std::fs::create_dir_all(&runtime.paths.container_state_dir).unwrap();
-    let prepared = host_socket_exposures::PreparedContainerInputs {
-        mounts: Vec::new(),
-        host_socket_exposures: vec![crate::runtime::HostSocketExposureSpec {
-            name: "traffic".into(),
-            host_path: dir.path().join("traffic.sock"),
-            container_path: PathBuf::from("/run/acl-proxy/traffic.sock"),
-            consumer_user: "root".into(),
-            selinux_relabel: crate::config::SelinuxRelabel::None,
-            realization: crate::runtime::HostSocketExposureRealization::PinnedInode,
-            source_identity: crate::runtime::UnixSourceIdentity {
-                device: 1,
-                inode: 2,
-                uid: 1000,
-                gid: 1000,
-                mode: 0o600,
-            },
-        }],
-        exposure_manifest: Some("sha256:test".into()),
-    };
-
-    let stale_gate = runtime.host_socket_exposure_startup_gate_host_path();
-    let stale_pre_gate = runtime.host_socket_exposure_pre_gate_ready_host_path();
-    std::fs::write(&stale_gate, b"stale\n").unwrap();
-    std::fs::write(&stale_pre_gate, b"stale\n").unwrap();
-    runtime
-        .reset_host_socket_exposure_startup_gate(&prepared)
-        .unwrap();
-    assert!(!stale_gate.exists());
-    assert!(!stale_pre_gate.exists());
-
-    let spec = runtime
-        .container_run_spec_with_inputs(None, None, &prepared, None)
-        .unwrap();
-    assert!(!spec.env.contains_key("AW_CONTAINER_STARTUP_GATE"));
-    let agent_file = runtime.write_container_agent_config().unwrap();
-    let activation = crate::config::ContainerAgentFile::load(&agent_file)
-        .unwrap()
-        .gateway_activation
-        .unwrap();
-    assert_eq!(
-        activation.startup_gate,
-        runtime.host_socket_exposure_startup_gate_container_path()
-    );
-    assert_eq!(
-        activation.pre_gate_ready,
-        runtime.host_socket_exposure_pre_gate_ready_container_path()
-    );
-    std::fs::write(&stale_pre_gate, b"ready\n").unwrap();
-    runtime
-        .wait_for_host_socket_exposure_pre_gate_ready(&prepared)
-        .await
-        .unwrap();
-    runtime
-        .open_host_socket_exposure_startup_gate(&prepared)
-        .unwrap();
-    assert_eq!(std::fs::read_to_string(stale_gate).unwrap(), "ready\n");
-}
-
-#[tokio::test]
 async fn socket_exposure_endpoint_probe_runs_as_configured_consumer_user() {
     let dir = tempfile::tempdir().unwrap();
     let fake_runtime = dir.path().join("runtime");
@@ -6694,6 +6617,53 @@ exit 0
     for call in calls.lines() {
         assert!(call.contains("--user acl-relay"), "{call}");
     }
+}
+
+#[tokio::test]
+async fn socket_exposure_endpoint_probe_fails_closed_after_bounded_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    write_fake_runtime(
+        &fake_runtime,
+        r#"#!/bin/sh
+exit 1
+"#,
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |_| {});
+    let prepared = host_socket_exposures::PreparedContainerInputs {
+        mounts: Vec::new(),
+        host_socket_exposures: vec![crate::runtime::HostSocketExposureSpec {
+            name: "traffic".into(),
+            host_path: dir.path().join("traffic.sock"),
+            container_path: PathBuf::from("/run/acl-proxy/traffic.sock"),
+            consumer_user: "root".into(),
+            selinux_relabel: crate::config::SelinuxRelabel::None,
+            realization: crate::runtime::HostSocketExposureRealization::PinnedInode,
+            source_identity: crate::runtime::UnixSourceIdentity {
+                device: 1,
+                inode: 2,
+                uid: 0,
+                gid: 0,
+                mode: 0o600,
+            },
+        }],
+        exposure_manifest: Some("sha256:test".into()),
+    };
+
+    let err = runtime
+        .validate_container_exposure_endpoints_with_timing(
+            &prepared,
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "host socket exposure \"traffic\" container endpoint failed the a Unix socket check as configured consumer \"root\""
+        ),
+        "{err:#}"
+    );
 }
 
 #[cfg(unix)]
