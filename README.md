@@ -947,7 +947,6 @@ reachable from the container:
 [target_defaults.host_socket_exposures.transparent_http]
 host_path = "/Users/alice/Library/Application Support/AW Gateway/runtime/transparent-http.sock"
 container_path = "/run/acl-proxy/transparent-http.sock"
-user = "root"
 selinux_relabel = "none"
 ```
 
@@ -961,15 +960,12 @@ container recreation unless the listener inode is preserved. Colima, VM-backed
 runtimes, and remote daemons are rejected.
 
 `selinux_relabel` is mandatory and accepts `none`, `shared`, or `private` on
-Linux. Apple accepts only `none`. `user` selects the actual in-container
-consumer used for post-create socket type and access probes and defaults to
-`{container_user}`. For Apple's root-owned guest endpoint, a root consumer may
-use restrictive source mode; an unknown non-root consumer requires deliberate
-other-write permission before the bounded in-container access probe. A later
-defaults, template, target, or root
-`extends` layer atomically replaces an exposure with the same key. Status JSON
-reports each exposure's `path_reconnect` or `pinned_inode` realization and a
-sanitized failure category.
+Linux. Apple accepts only `none`. Optional `user` selects the identity used only
+for the bounded post-create socket type and access readiness probes and defaults
+to `root`; it does not alter the container, socket, or runtime realization. A
+later defaults, template, target, or root `extends` layer atomically replaces an
+exposure with the same key. Status JSON reports each exposure's
+`path_reconnect` or `pinned_inode` realization and a sanitized failure category.
 
 Target-specific runtime and environment knobs are explicit:
 

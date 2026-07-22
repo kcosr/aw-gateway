@@ -1912,7 +1912,9 @@ impl Runtime {
                     LocalSshBackend::PublishedPort => self.wait_published_ssh_ready().await?,
                 }
             }
-            let status = self.status().await?;
+            let status = self
+                .status_with_inspect_and_prepared(Some(&inspect), Some(&prepared_inputs))
+                .await?;
             if self.requires_agent_control() && !status.agent_ready {
                 anyhow::bail!("container agent is not ready after host setup");
             }
@@ -1972,8 +1974,17 @@ impl Runtime {
         if let Some(inspect) = &inspect {
             self.validate_labels(inspect)?;
         }
+        self.status_with_inspect_and_prepared(inspect.as_ref(), None)
+            .await
+    }
+
+    async fn status_with_inspect_and_prepared(
+        &self,
+        inspect: Option<&crate::runtime::ContainerInspect>,
+        prepared: Option<&host_socket_exposures::PreparedContainerInputs>,
+    ) -> anyhow::Result<GatewayStatus> {
         let host_socket_exposures = self
-            .current_host_socket_exposure_statuses(inspect.as_ref())
+            .current_host_socket_exposure_statuses(inspect, prepared)
             .await;
         let agent = if self.agent_control_enabled() {
             self.agent_status().await.ok()
@@ -1984,7 +1995,7 @@ impl Runtime {
         let launch = status_launch(self.identity.session_id.as_deref(), &sessions);
         let agent_ready = agent.as_ref().is_some_and(|status| status.ready);
         let direct_endpoint = if self.direct_published_ssh_enabled() {
-            self.direct_status_ssh_endpoint(inspect.as_ref()).await?
+            self.direct_status_ssh_endpoint(inspect).await?
         } else {
             None
         };
@@ -1994,7 +2005,6 @@ impl Runtime {
         });
         let ssh_tcp = if self.direct_published_ssh_enabled() {
             inspect
-                .as_ref()
                 .is_some_and(|value| value.state.running)
                 .then_some(direct_endpoint)
                 .flatten()
@@ -2010,11 +2020,9 @@ impl Runtime {
             user: self.identity.user.user.clone(),
             image: self.target.image.clone(),
             access: self.access_name(),
-            container: inspect
-                .as_ref()
-                .map(|_| self.identity.container_name.clone()),
+            container: inspect.map(|_| self.identity.container_name.clone()),
             context: self.context.as_map().clone(),
-            container_pid: inspect.as_ref().and_then(|value| value.state.pid),
+            container_pid: inspect.and_then(|value| value.state.pid),
             active_sessions: sessions.len(),
             sessions,
             agent_ready,
@@ -2025,7 +2033,7 @@ impl Runtime {
                 "host-socket-exposure-unhealthy"
             } else {
                 gateway_status_name(
-                    inspect.as_ref().is_some_and(|value| value.state.running),
+                    inspect.is_some_and(|value| value.state.running),
                     self.requires_agent_control(),
                     agent.is_some(),
                     agent_ready,

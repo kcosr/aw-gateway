@@ -74,7 +74,7 @@ pub struct HostSocketExposureSpec {
     pub name: String,
     pub host_path: PathBuf,
     pub container_path: PathBuf,
-    pub consumer_user: String,
+    pub readiness_user: String,
     pub selinux_relabel: SelinuxRelabel,
     pub realization: HostSocketExposureRealization,
     pub source_identity: UnixSourceIdentity,
@@ -2865,7 +2865,7 @@ mod tests {
             name: "traffic".into(),
             host_path: PathBuf::from("/tmp/traffic.sock"),
             container_path: PathBuf::from("/run/traffic.sock"),
-            consumer_user: "root".into(),
+            readiness_user: "root".into(),
             selinux_relabel: relabel,
             realization: HostSocketExposureRealization::PinnedInode,
             source_identity: UnixSourceIdentity {

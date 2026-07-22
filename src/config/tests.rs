@@ -5704,7 +5704,7 @@ selinux_relabel = "none"
         HostSocketExposureConfig {
             host_path: "/tmp/target.sock".into(),
             container_path: "/run/target.sock".into(),
-            user: "{container_user}".into(),
+            user: "root".into(),
             selinux_relabel: SelinuxRelabel::None,
         }
     );

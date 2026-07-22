@@ -48,7 +48,7 @@ cleanup = "never"
 # [target_defaults.host_socket_exposures.example]
 # host_path = "/run/user/{uid}/example.sock"
 # container_path = "/run/example/example.sock"
-# user = "{container_user}"
+# user = "root"
 # selinux_relabel = "none"
 
 [targets.default]

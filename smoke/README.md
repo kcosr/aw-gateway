@@ -164,6 +164,35 @@ WebSocket, backpressure bounds, and half-close semantics. `cargo test --test
 assets` checks only the harness's structural contract and shell syntax; it does
 not execute this privileged gate.
 
+## Host Socket Exposure Docker Gate
+
+`scripts/run-host-socket-exposure-smoke.sh` is a separate opt-in Linux Docker
+gate for AW Gateway's typed `host_socket_exposures` lifecycle. It starts a
+temporary host UDS echo server, invokes the actual `aw-gateway up` path for a
+runtime-exec target, verifies the persisted realization manifest and exact
+Docker bind, then uses `aw-gateway run` to exchange bytes through the
+in-container socket. It replaces the host listener inode, proves the existing
+target becomes recreate-required, explicitly removes and recreates it through
+AW Gateway, and completes a second exchange. It deliberately does not implement
+the transparent relay or proxy protocol; the privileged transparent UDS gate
+owns that coverage.
+
+The gate requires Linux and a local Unix-socket Docker endpoint and refuses
+implicit image pulls. It uses the checked-out debug binary by default, or an
+explicit absolute binary and local image:
+
+```bash
+smoke/scripts/run-host-socket-exposure-smoke.sh
+
+AW_HOST_SOCKET_SMOKE_GATEWAY_BIN=/absolute/path/to/aw-gateway \
+AW_HOST_SOCKET_SMOKE_IMAGE=python:3.12-slim \
+  smoke/scripts/run-host-socket-exposure-smoke.sh
+```
+
+Temporary containers, state, workspace, and socket files are removed on every
+normal or failed run. Set `AW_HOST_SOCKET_SMOKE_KEEP_FAILED=1` to retain the
+temporary directory after a failure; the container is still removed.
+
 ## What Gets Installed
 
 Linux operator layout:

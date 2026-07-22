@@ -1475,13 +1475,13 @@ pub struct ContainerMountConfig {
 pub struct HostSocketExposureConfig {
     pub host_path: String,
     pub container_path: String,
-    #[serde(default = "default_host_socket_consumer_user")]
+    #[serde(default = "default_host_socket_readiness_user")]
     pub user: String,
     pub selinux_relabel: SelinuxRelabel,
 }
 
-fn default_host_socket_consumer_user() -> String {
-    SERVICE_USER_TEMPLATE.into()
+fn default_host_socket_readiness_user() -> String {
+    "root".into()
 }
 
 impl HostSocketExposureConfig {

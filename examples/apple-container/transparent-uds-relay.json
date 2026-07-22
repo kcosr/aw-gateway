@@ -1,5 +1,4 @@
 {
-  "schemaVersion": 1,
   "routes": [
     {
       "name": "http",
@@ -14,7 +13,7 @@
       "allowedOriginalPorts": [443]
     }
   ],
-  "setupTimeout": "1s",
+  "setupTimeout": "2s",
   "maxConnections": 1024,
   "copyBufferBytesPerDirection": 16384
 }

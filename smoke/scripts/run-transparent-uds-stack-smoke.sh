@@ -4,6 +4,7 @@ set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 FIREWALL="$ROOT/assets/aw-transparent-uds-firewall"
+RELAY_CONFIG="$ROOT/examples/apple-container/transparent-uds-relay.json"
 BASE_IMAGE=${AW_UDS_STACK_SMOKE_IMAGE:-ubuntu:24.04}
 
 ACL_PROXY_BIN=
@@ -214,6 +215,8 @@ require_absolute_file relay "$EXPECTED_RELAY_BIN"
 ACL_PROXY_BIN=$EXPECTED_ACL_PROXY_BIN
 RELAY_BIN=$EXPECTED_RELAY_BIN
 [[ -x $FIREWALL && ! -L $FIREWALL ]] || fail "firewall asset is missing or not executable"
+[[ -f $RELAY_CONFIG && ! -L $RELAY_CONFIG ]] \
+    || fail "checked-in relay config is missing: $RELAY_CONFIG"
 
 docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable"
 docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 \
@@ -602,27 +605,7 @@ stop_acl_proxy() {
 
 start_acl_proxy first
 
-cat >"$TMP_DIR/relay.json" <<'EOF'
-{
-  "routes": [
-    {
-      "name": "http",
-      "listen": "127.0.0.1:3128",
-      "allowedOriginalPorts": [80],
-      "upstreamSocket": "/run/acl-proxy/transparent-http.sock"
-    },
-    {
-      "name": "https",
-      "listen": "127.0.0.1:3129",
-      "allowedOriginalPorts": [443],
-      "upstreamSocket": "/run/acl-proxy/transparent-https.sock"
-    }
-  ],
-  "setupTimeout": "2s",
-  "maxConnections": 64,
-  "copyBufferBytesPerDirection": 16384
-}
-EOF
+cp -- "$RELAY_CONFIG" "$TMP_DIR/relay.json"
 chmod 0644 "$TMP_DIR/relay.json"
 
 cat >"$TMP_DIR/workload.sh" <<'SH'
@@ -650,9 +633,8 @@ for _ in {1..100}; do
     sleep 0.05
 done
 [[ -f /run/aw-gateway/transparent-uds-firewall.generation.ready ]]
-setpriv --reuid=65534 --regid=65534 --clear-groups \
-    /opt/aw-gateway/bin/acl-proxy-transparent-uds-relay \
-    --config /etc/aw-gateway/transparent-uds-relay.json \
+/opt/aw-gateway/bin/acl-proxy-transparent-uds-relay \
+    --config /etc/acl-proxy/transparent-uds-relay.json \
     >/tmp/relay.stdout 2>/tmp/relay.stderr &
 RELAY_PID=$!
 for _ in {1..100}; do
@@ -677,7 +659,7 @@ start_workload() {
         --mount "type=bind,src=$TMP_DIR/config/mitm-ca-cert.pem,dst=/etc/acl-proxy/mitm-ca-cert.pem,readonly" \
         --mount "type=bind,src=$RELAY_BIN,dst=/opt/aw-gateway/bin/acl-proxy-transparent-uds-relay,readonly" \
         --mount "type=bind,src=$FIREWALL,dst=/opt/aw-gateway/bin/aw-transparent-uds-firewall,readonly" \
-        --mount "type=bind,src=$TMP_DIR/relay.json,dst=/etc/aw-gateway/transparent-uds-relay.json,readonly" \
+        --mount "type=bind,src=$TMP_DIR/relay.json,dst=/etc/acl-proxy/transparent-uds-relay.json,readonly" \
         --mount "type=bind,src=$TMP_DIR/workload.sh,dst=/usr/local/bin/workload-smoke,readonly" \
         "$WORKLOAD_IMAGE" bash /usr/local/bin/workload-smoke >/dev/null
 

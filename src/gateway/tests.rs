@@ -6573,7 +6573,7 @@ fn runtime_exec_without_agent_control_omits_control_socket_mount() {
 }
 
 #[tokio::test]
-async fn socket_exposure_endpoint_probe_runs_as_configured_consumer_user() {
+async fn socket_exposure_endpoint_probe_runs_as_configured_readiness_user() {
     let dir = tempfile::tempdir().unwrap();
     let fake_runtime = dir.path().join("runtime");
     let log = dir.path().join("exec.log");
@@ -6594,7 +6594,7 @@ exit 0
             name: "traffic".into(),
             host_path: dir.path().join("traffic.sock"),
             container_path: PathBuf::from("/run/acl-proxy/traffic.sock"),
-            consumer_user: "acl-relay".into(),
+            readiness_user: "acl-relay".into(),
             selinux_relabel: crate::config::SelinuxRelabel::None,
             realization: crate::runtime::HostSocketExposureRealization::PinnedInode,
             source_identity: crate::runtime::UnixSourceIdentity {
@@ -6636,7 +6636,7 @@ exit 1
             name: "traffic".into(),
             host_path: dir.path().join("traffic.sock"),
             container_path: PathBuf::from("/run/acl-proxy/traffic.sock"),
-            consumer_user: "root".into(),
+            readiness_user: "root".into(),
             selinux_relabel: crate::config::SelinuxRelabel::None,
             realization: crate::runtime::HostSocketExposureRealization::PinnedInode,
             source_identity: crate::runtime::UnixSourceIdentity {
@@ -6660,10 +6660,154 @@ exit 1
         .unwrap_err();
     assert!(
         err.to_string().contains(
-            "host socket exposure \"traffic\" container endpoint failed the a Unix socket check as configured consumer \"root\""
+            "host socket exposure \"traffic\" container endpoint failed the a Unix socket check as configured readiness user \"root\""
         ),
         "{err:#}"
     );
+}
+
+#[tokio::test]
+async fn socket_exposure_status_attributes_guest_failure_to_one_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    write_fake_runtime(
+        &fake_runtime,
+        r#"#!/bin/sh
+case "$*" in
+  *unavailable.sock*) exit 1 ;;
+  *) exit 0 ;;
+esac
+"#,
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |_| {});
+    let exposure = |name: &str, path: &str| crate::runtime::HostSocketExposureSpec {
+        name: name.into(),
+        host_path: dir.path().join(format!("{name}.sock")),
+        container_path: PathBuf::from(path),
+        readiness_user: "root".into(),
+        selinux_relabel: crate::config::SelinuxRelabel::None,
+        realization: crate::runtime::HostSocketExposureRealization::PinnedInode,
+        source_identity: crate::runtime::UnixSourceIdentity {
+            device: 1,
+            inode: 2,
+            uid: 0,
+            gid: 0,
+            mode: 0o600,
+        },
+    };
+    let prepared = host_socket_exposures::PreparedContainerInputs {
+        mounts: Vec::new(),
+        host_socket_exposures: vec![
+            exposure("ready", "/run/acl-proxy/ready.sock"),
+            exposure("unavailable", "/run/acl-proxy/unavailable.sock"),
+        ],
+        exposure_manifest: Some("sha256:test".into()),
+    };
+    let inspect = crate::runtime::ContainerInspect {
+        id: "id".into(),
+        name: runtime.identity.container_name.clone(),
+        state: crate::runtime::ContainerState {
+            running: true,
+            pid: Some(123),
+        },
+        config: crate::runtime::ContainerConfig {
+            labels: BTreeMap::from([(
+                host_socket_exposures::HOST_SOCKET_EXPOSURE_MANIFEST_LABEL.into(),
+                "sha256:test".into(),
+            )]),
+        },
+    };
+
+    let statuses = runtime
+        .current_prepared_host_socket_exposure_statuses_with_timing(
+            Some(&inspect),
+            &prepared,
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+        )
+        .await;
+
+    assert_eq!(statuses.len(), 2);
+    assert!(statuses[0].ready, "{statuses:?}");
+    assert_eq!(statuses[0].failure_category, None);
+    assert!(!statuses[1].ready, "{statuses:?}");
+    assert_eq!(
+        statuses[1].failure_category.as_deref(),
+        Some("guest_endpoint_unavailable")
+    );
+}
+
+#[tokio::test]
+async fn socket_exposure_status_uses_one_deadline_and_preserves_entry_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    write_fake_runtime(
+        &fake_runtime,
+        r#"#!/bin/sh
+sleep 1
+"#,
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |_| {});
+    let exposure = |name: &str| crate::runtime::HostSocketExposureSpec {
+        name: name.into(),
+        host_path: dir.path().join(format!("{name}.sock")),
+        container_path: PathBuf::from(format!("/run/acl-proxy/{name}.sock")),
+        readiness_user: "root".into(),
+        selinux_relabel: crate::config::SelinuxRelabel::None,
+        realization: crate::runtime::HostSocketExposureRealization::PinnedInode,
+        source_identity: crate::runtime::UnixSourceIdentity {
+            device: 1,
+            inode: 2,
+            uid: 0,
+            gid: 0,
+            mode: 0o600,
+        },
+    };
+    let prepared = host_socket_exposures::PreparedContainerInputs {
+        mounts: Vec::new(),
+        host_socket_exposures: vec![exposure("third"), exposure("first"), exposure("second")],
+        exposure_manifest: Some("sha256:test".into()),
+    };
+    let inspect = crate::runtime::ContainerInspect {
+        id: "id".into(),
+        name: runtime.identity.container_name.clone(),
+        state: crate::runtime::ContainerState {
+            running: true,
+            pid: Some(123),
+        },
+        config: crate::runtime::ContainerConfig {
+            labels: BTreeMap::from([(
+                host_socket_exposures::HOST_SOCKET_EXPOSURE_MANIFEST_LABEL.into(),
+                "sha256:test".into(),
+            )]),
+        },
+    };
+
+    let started = tokio::time::Instant::now();
+    let statuses = runtime
+        .current_prepared_host_socket_exposure_statuses_with_timing(
+            Some(&inspect),
+            &prepared,
+            Duration::from_millis(40),
+            Duration::from_millis(1),
+        )
+        .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "status probes exceeded one shared deadline: {elapsed:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .map(|status| status.name.as_str())
+            .collect::<Vec<_>>(),
+        ["third", "first", "second"]
+    );
+    assert!(statuses.iter().all(|status| {
+        !status.ready && status.failure_category.as_deref() == Some("guest_endpoint_unavailable")
+    }));
 }
 
 #[cfg(unix)]

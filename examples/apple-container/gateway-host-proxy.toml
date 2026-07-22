@@ -22,13 +22,11 @@ container_dir = "/run/aw-gateway"
 [target_defaults.host_socket_exposures.transparent_http]
 host_path = "/Users/example/Library/Application Support/AW Gateway/runtime/transparent-http.sock"
 container_path = "/run/acl-proxy/transparent-http.sock"
-user = "root"
 selinux_relabel = "none"
 
 [target_defaults.host_socket_exposures.transparent_https]
 host_path = "/Users/example/Library/Application Support/AW Gateway/runtime/transparent-https.sock"
 container_path = "/run/acl-proxy/transparent-https.sock"
-user = "root"
 selinux_relabel = "none"
 
 [ssh_dispatch]
@@ -72,7 +70,7 @@ CODEX_HOME = "/var/lib/codex"
 
 [targets.ubuntu-host-proxy.session_env]
 CODEX_HOME = "/var/lib/codex"
-NODE_EXTRA_CA_CERTS = "/etc/acl-proxy/acl-proxy-ca.crt"
+NODE_EXTRA_CA_CERTS = "/usr/local/share/ca-certificates/acl-proxy-ca.crt"
 REQUESTS_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 GIT_SSL_CAINFO = "/etc/ssl/certs/ca-certificates.crt"
 
@@ -149,7 +147,7 @@ mode = "ro"
 
 [[target_defaults.container_mounts]]
 source = "/Users/example/aw-gateway/config/transparent-uds-relay.json"
-target = "/etc/aw-gateway/transparent-uds-relay.json"
+target = "/etc/acl-proxy/transparent-uds-relay.json"
 mode = "ro"
 
 [[target_defaults.container_mounts]]
@@ -213,7 +211,7 @@ required = true
 user = "root"
 command = [
   "/opt/aw-gateway/bin/acl-proxy-transparent-uds-relay",
-  "--config", "/etc/aw-gateway/transparent-uds-relay.json",
+  "--config", "/etc/acl-proxy/transparent-uds-relay.json",
 ]
 restart = "always"
 restart_backoff = "1s"

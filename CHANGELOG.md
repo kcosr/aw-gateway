@@ -20,14 +20,19 @@
   backend-specific realization, existing-container manifests, and readiness
   status. Added an optional Apple host-proxy example with a supervised
   transparent relay and fail-closed IPv4/IPv6 firewall policy.
-- Host socket targets can select the in-container consumer identity used for
-  access probes. The host-proxy profile reuses required container bootstrap
-  steps for fail-closed firewall installation and ordinary service dependencies
-  for watcher, relay, and SSH startup ordering.
+- Host socket targets can optionally select the in-container readiness identity
+  used only for bounded endpoint probes; it defaults to root and does not alter
+  realization or container reuse identity. The host-proxy profile reuses
+  required container bootstrap steps for fail-closed firewall installation and
+  ordinary service dependencies for watcher, relay, and SSH startup ordering.
 - Added an opt-in privileged Linux stack smoke that pins the reviewed
   Access Runtime, ACL Proxy, and AW Gateway commits and exercises real
   HTTP/HTTPS transparent redirects through the release relay, host UDS proxy,
   parent proxy, fail-closed loss, and native-Linux pinned-inode recovery.
+- Added an opt-in native Linux Docker smoke that drives typed host socket
+  exposure through AW Gateway's real create, readiness, manifest, runtime-exec,
+  pinned-inode replacement refusal, explicit removal, recreation, and second
+  UDS exchange without duplicating the proxy protocol.
 - Added `workspace.container_path` so the host workspace can be mounted at a
   path separate from `container_home`, including persistent-home deployments
   that expose only a dedicated shared directory

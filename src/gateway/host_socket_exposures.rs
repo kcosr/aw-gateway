@@ -5,6 +5,7 @@ use crate::runtime::{
 };
 use crate::template::Vars;
 use anyhow::Context;
+use futures_util::future::join_all;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -34,9 +35,6 @@ impl Runtime {
         let workspace_host = self.paths.workspace.clone();
         let workspace_container = self.paths.workspace_container_path.clone();
         let container_home = self.identity.container_home.clone();
-        let session_uid = self.identity.session_uid;
-        let session_gid = self.identity.session_gid;
-        let session_user = self.identity.container_user.clone();
         let (control_host, control_container) = self
             .requires_control_socket_dir()
             .then(|| {
@@ -55,9 +53,6 @@ impl Runtime {
                 &workspace_host,
                 &workspace_container,
                 &container_home,
-                session_uid,
-                session_gid,
-                &session_user,
                 control_host.as_deref(),
                 control_container.as_deref(),
             )
@@ -102,97 +97,86 @@ impl Runtime {
         check_timeout: Duration,
         retry_interval: Duration,
     ) -> anyhow::Result<()> {
-        for exposure in &prepared.host_socket_exposures {
-            let deadline = tokio::time::Instant::now() + check_timeout;
-            loop {
-                let mut failed = None;
-                for (flag, description) in [("-S", "a Unix socket"), ("-w", "accessible")] {
-                    let spec = crate::runtime::ContainerExecSpec {
-                        stdin_tty: false,
-                        stdout_tty: false,
-                        user: exposure.consumer_user.clone(),
-                        cwd: None,
-                        env: BTreeMap::new(),
-                        container_name: self.identity.container_name.clone(),
-                        command: vec![
-                            "/bin/test".into(),
-                            flag.into(),
-                            exposure.container_path.display().to_string(),
-                        ],
-                    };
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    let exit = self
-                        .container_runtime
-                        .exec_discard_with_timeout(&spec, Some(remaining))
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "check host socket exposure {:?} container endpoint as {:?}",
-                                exposure.name, exposure.consumer_user
-                            )
-                        })?;
-                    if exit != 0 {
-                        failed = Some(description);
-                        break;
-                    }
-                }
-                let Some(description) = failed else {
-                    break;
-                };
-                if tokio::time::Instant::now() >= deadline {
-                    anyhow::bail!(
-                        "host socket exposure {:?} container endpoint failed the {description} check as configured consumer {:?}",
-                        exposure.name,
-                        exposure.consumer_user
-                    );
-                }
-                tokio::time::sleep(retry_interval).await;
-            }
+        let deadline = tokio::time::Instant::now() + check_timeout;
+        let results = join_all(prepared.host_socket_exposures.iter().map(|exposure| {
+            self.validate_container_exposure_endpoint_until(exposure, deadline, retry_interval)
+        }))
+        .await;
+        for result in results {
+            result?;
         }
         Ok(())
+    }
+
+    async fn validate_container_exposure_endpoint_until(
+        &self,
+        exposure: &HostSocketExposureSpec,
+        deadline: tokio::time::Instant,
+        retry_interval: Duration,
+    ) -> anyhow::Result<()> {
+        loop {
+            let mut failed = None;
+            for (flag, description) in [("-S", "a Unix socket"), ("-w", "accessible")] {
+                let spec = crate::runtime::ContainerExecSpec {
+                    stdin_tty: false,
+                    stdout_tty: false,
+                    user: exposure.readiness_user.clone(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    container_name: self.identity.container_name.clone(),
+                    command: vec![
+                        "/bin/test".into(),
+                        flag.into(),
+                        exposure.container_path.display().to_string(),
+                    ],
+                };
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let exit = self
+                    .container_runtime
+                    .exec_discard_with_timeout(&spec, Some(remaining))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "check host socket exposure {:?} container endpoint as {:?}",
+                            exposure.name, exposure.readiness_user
+                        )
+                    })?;
+                if exit != 0 {
+                    failed = Some(description);
+                    break;
+                }
+            }
+            let Some(description) = failed else {
+                return Ok(());
+            };
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "host socket exposure {:?} container endpoint failed the {description} check as configured readiness user {:?}",
+                    exposure.name,
+                    exposure.readiness_user
+                );
+            }
+            tokio::time::sleep(retry_interval).await;
+        }
     }
 
     pub(super) async fn current_host_socket_exposure_statuses(
         &self,
         inspect: Option<&crate::runtime::ContainerInspect>,
+        prepared: Option<&PreparedContainerInputs>,
     ) -> Vec<super::HostSocketExposureStatus> {
         if self.target.host_socket_exposures.is_empty() {
             return removed_config_manifest_status(inspect, self.container_runtime.kind());
         }
+        if let Some(prepared) = prepared {
+            return self
+                .current_prepared_host_socket_exposure_statuses(inspect, prepared)
+                .await;
+        }
         match self.prepare_container_inputs().await {
             Ok(prepared) => {
-                let manifest_valid = inspect
-                    .map(|inspect| self.validate_exposure_manifest(inspect, &prepared).is_ok())
-                    .unwrap_or(false);
-                let running = inspect.is_some_and(|inspect| inspect.state.running);
-                let endpoint_valid = if manifest_valid && running {
-                    self.validate_container_exposure_endpoints(&prepared)
-                        .await
-                        .is_ok()
-                } else {
-                    false
-                };
-                let failure_category = if inspect.is_none() {
-                    Some("container_absent".into())
-                } else if !manifest_valid {
-                    Some("recreate_required".into())
-                } else if !running {
-                    Some("container_stopped".into())
-                } else if !endpoint_valid {
-                    Some("guest_endpoint_unavailable".into())
-                } else {
-                    None
-                };
-                prepared
-                    .host_socket_exposures
-                    .iter()
-                    .map(|exposure| super::HostSocketExposureStatus {
-                        name: exposure.name.clone(),
-                        realization: exposure.realization.as_str().into(),
-                        ready: failure_category.is_none(),
-                        failure_category: failure_category.clone(),
-                    })
-                    .collect()
+                self.current_prepared_host_socket_exposure_statuses(inspect, &prepared)
+                    .await
             }
             Err(_) => {
                 let realization = match self.container_runtime.kind() {
@@ -211,6 +195,87 @@ impl Runtime {
                     .collect()
             }
         }
+    }
+
+    async fn current_prepared_host_socket_exposure_statuses(
+        &self,
+        inspect: Option<&crate::runtime::ContainerInspect>,
+        prepared: &PreparedContainerInputs,
+    ) -> Vec<super::HostSocketExposureStatus> {
+        self.current_prepared_host_socket_exposure_statuses_impl(
+            inspect,
+            prepared,
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn current_prepared_host_socket_exposure_statuses_with_timing(
+        &self,
+        inspect: Option<&crate::runtime::ContainerInspect>,
+        prepared: &PreparedContainerInputs,
+        check_timeout: Duration,
+        retry_interval: Duration,
+    ) -> Vec<super::HostSocketExposureStatus> {
+        self.current_prepared_host_socket_exposure_statuses_impl(
+            inspect,
+            prepared,
+            check_timeout,
+            retry_interval,
+        )
+        .await
+    }
+
+    async fn current_prepared_host_socket_exposure_statuses_impl(
+        &self,
+        inspect: Option<&crate::runtime::ContainerInspect>,
+        prepared: &PreparedContainerInputs,
+        check_timeout: Duration,
+        retry_interval: Duration,
+    ) -> Vec<super::HostSocketExposureStatus> {
+        let manifest_valid = inspect
+            .map(|inspect| self.validate_exposure_manifest(inspect, prepared).is_ok())
+            .unwrap_or(false);
+        let running = inspect.is_some_and(|inspect| inspect.state.running);
+        let common_failure = if inspect.is_none() {
+            Some("container_absent")
+        } else if !manifest_valid {
+            Some("recreate_required")
+        } else if !running {
+            Some("container_stopped")
+        } else {
+            None
+        };
+        let mut statuses = Vec::with_capacity(prepared.host_socket_exposures.len());
+        if let Some(category) = common_failure {
+            return prepared
+                .host_socket_exposures
+                .iter()
+                .map(|exposure| super::HostSocketExposureStatus {
+                    name: exposure.name.clone(),
+                    realization: exposure.realization.as_str().into(),
+                    ready: false,
+                    failure_category: Some(category.into()),
+                })
+                .collect();
+        }
+        let deadline = tokio::time::Instant::now() + check_timeout;
+        let results = join_all(prepared.host_socket_exposures.iter().map(|exposure| {
+            self.validate_container_exposure_endpoint_until(exposure, deadline, retry_interval)
+        }))
+        .await;
+        for (exposure, result) in prepared.host_socket_exposures.iter().zip(results) {
+            let failure_category = result.is_err().then(|| "guest_endpoint_unavailable".into());
+            statuses.push(super::HostSocketExposureStatus {
+                name: exposure.name.clone(),
+                realization: exposure.realization.as_str().into(),
+                ready: failure_category.is_none(),
+                failure_category,
+            });
+        }
+        statuses
     }
 }
 
@@ -270,9 +335,6 @@ fn prepare_host_socket_exposures(
     workspace_host: &Path,
     workspace_container: &Path,
     container_home: &Path,
-    session_uid: u32,
-    session_gid: u32,
-    session_user: &str,
     control_host: Option<&Path>,
     control_container: Option<&Path>,
 ) -> anyhow::Result<PreparedContainerInputs> {
@@ -363,10 +425,10 @@ fn prepare_host_socket_exposures(
             &host_path,
             UNIX_SOCKET_PATH_MAX_BYTES,
         )?;
-        let consumer_user = crate::template::render(&config.user, vars)?;
+        let readiness_user = crate::template::render(&config.user, vars)?;
         crate::config::validate_name(
             &format!("host_socket_exposures.{name}.user"),
-            &consumer_user,
+            &readiness_user,
         )?;
         validate_socket_path_length(
             "host socket exposure container path",
@@ -374,19 +436,6 @@ fn prepare_host_socket_exposures(
             LINUX_UNIX_SOCKET_PATH_MAX_BYTES,
         )?;
         let identity = unix_socket_identity(&host_path, &name)?;
-        if realization == HostSocketExposureRealization::PathReconnect
-            && !apple_guest_mode_allows_consumer(
-                &consumer_user,
-                session_user,
-                session_uid,
-                session_gid,
-                identity.mode,
-            )
-        {
-            anyhow::bail!(
-                "host_socket_exposures.{name}.host_path permissions do not allow configured consumer {consumer_user:?} to access Apple's root-owned guest endpoint; non-root consumers that cannot be identified as the configured session user require deliberate other-write permission"
-            );
-        }
         for existing in &host_paths {
             reject_path_overlap(
                 &format!("host_socket_exposures.{name}.host_path"),
@@ -457,7 +506,7 @@ fn prepare_host_socket_exposures(
             name,
             host_path,
             container_path,
-            consumer_user,
+            readiness_user,
             selinux_relabel: config.selinux_relabel,
             realization,
             source_identity: identity,
@@ -470,26 +519,6 @@ fn prepare_host_socket_exposures(
         host_socket_exposures: exposures,
         exposure_manifest,
     })
-}
-
-fn apple_guest_mode_allows_consumer(
-    consumer_user: &str,
-    session_user: &str,
-    session_uid: u32,
-    session_gid: u32,
-    mode: u32,
-) -> bool {
-    if matches!(consumer_user, "root" | "0") {
-        return true;
-    }
-    let is_session_user = consumer_user == session_user
-        || consumer_user
-            .parse::<u32>()
-            .is_ok_and(|uid| uid == session_uid);
-    if is_session_user && session_uid == 0 {
-        return true;
-    }
-    (is_session_user && session_gid == 0 && mode & 0o020 != 0) || mode & 0o002 != 0
 }
 
 pub(super) fn canonicalize_generic_mount_source(
@@ -625,7 +654,6 @@ fn exposure_manifest(exposures: &[HostSocketExposureSpec]) -> String {
             &mut hasher,
             exposure.container_path.to_string_lossy().as_bytes(),
         );
-        hash_field(&mut hasher, exposure.consumer_user.as_bytes());
         hash_field(
             &mut hasher,
             format!("{:?}", exposure.selinux_relabel).as_bytes(),
@@ -663,8 +691,8 @@ mod tests {
     fn prepare(
         entries: impl IntoIterator<Item = (&'static str, HostSocketExposureConfig)>,
         runtime: ContainerRuntimeType,
-        session_uid: u32,
-        session_gid: u32,
+        _session_uid: u32,
+        _session_gid: u32,
     ) -> anyhow::Result<PreparedContainerInputs> {
         let vars = Vars::from([("container_user".into(), "test".into())]);
         prepare_host_socket_exposures(
@@ -678,9 +706,6 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")),
             Path::new("/workspace"),
             Path::new("/home/test"),
-            session_uid,
-            session_gid,
-            "test",
             None,
             None,
         )
@@ -786,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_exposure_paths_and_consumer_users_are_validated_after_rendering() {
+    fn rendered_exposure_paths_and_readiness_users_are_validated_after_rendering() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.sock");
         let second = dir.path().join("second.sock");
@@ -812,9 +837,6 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")),
             Path::new("/workspace"),
             Path::new("/home/test"),
-            1000,
-            1000,
-            "test",
             None,
             None,
         )
@@ -832,14 +854,14 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")),
             Path::new("/workspace"),
             Path::new("/home/test"),
-            1000,
-            1000,
-            "test",
             None,
             None,
         )
         .unwrap();
-        assert_eq!(prepared.host_socket_exposures[0].consumer_user, "acl-relay");
+        assert_eq!(
+            prepared.host_socket_exposures[0].readiness_user,
+            "acl-relay"
+        );
     }
 
     #[test]
@@ -882,9 +904,6 @@ mod tests {
                 &workspace_path,
                 Path::new("/workspace"),
                 Path::new("/home/test"),
-                1000,
-                1000,
-                "test",
                 None,
                 None,
             )
@@ -928,66 +947,25 @@ mod tests {
     }
 
     #[test]
-    fn apple_requires_non_root_guest_access_permission() {
+    fn apple_readiness_user_does_not_participate_in_host_preparation() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("traffic.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-        let err = prepare(
-            [("traffic", exposure(&socket, "/run/traffic.sock"))],
-            ContainerRuntimeType::AppleContainer,
-            1000,
-            1000,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("configured consumer") && err.contains("other-write"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn apple_permission_preflight_uses_rendered_consumer_not_session_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("traffic.sock");
-        let _listener = UnixListener::bind(&socket).unwrap();
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-        let mut root_consumer = exposure(&socket, "/run/root.sock");
-        root_consumer.user = "root".into();
-        prepare(
-            [("root", root_consumer)],
-            ContainerRuntimeType::AppleContainer,
-            1000,
-            1000,
-        )
-        .unwrap();
-
-        let mut unknown_consumer = exposure(&socket, "/run/relay.sock");
-        unknown_consumer.user = "acl-relay".into();
-        let err = prepare(
-            [("relay", unknown_consumer.clone())],
-            ContainerRuntimeType::AppleContainer,
-            0,
-            0,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("acl-relay") && err.contains("other-write"),
-            "{err}"
-        );
-
-        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o602)).unwrap();
-        prepare(
-            [("relay", unknown_consumer)],
+        let mut config = exposure(&socket, "/run/relay.sock");
+        config.user = "acl-relay".into();
+        let prepared = prepare(
+            [("relay", config)],
             ContainerRuntimeType::AppleContainer,
             0,
             0,
         )
         .unwrap();
+        assert_eq!(
+            prepared.host_socket_exposures[0].readiness_user,
+            "acl-relay"
+        );
     }
 
     #[test]
@@ -1036,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_tracks_rendered_consumer_user() {
+    fn manifest_ignores_readiness_user() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("traffic.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
@@ -1062,7 +1040,7 @@ mod tests {
         )
         .unwrap()
         .exposure_manifest;
-        assert_ne!(root_manifest, relay_manifest);
+        assert_eq!(root_manifest, relay_manifest);
     }
 
     #[test]
