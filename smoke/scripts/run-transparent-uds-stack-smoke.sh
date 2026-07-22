@@ -497,16 +497,18 @@ request_body_timeout = "2s"
 [listeners.transparent_http]
 endpoint.kind = "unix_proxy_v2"
 endpoint.path = "$HTTP_SOCKET"
-endpoint.mode = "0606"
-proxy_header_timeout = "1s"
+endpoint.mode = "0600"
+endpoint.proxy_header_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
 max_connections = 64
 
 [listeners.transparent_https]
 endpoint.kind = "unix_proxy_v2"
 endpoint.path = "$HTTPS_SOCKET"
-endpoint.mode = "0606"
-proxy_header_timeout = "1s"
+endpoint.mode = "0600"
+endpoint.proxy_header_timeout = "2s"
+endpoint.allowed_destination_ports = [443]
 http_versions = ["http1"]
 max_connections = 64
 

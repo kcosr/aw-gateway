@@ -231,6 +231,10 @@ fn transparent_uds_stack_smoke_structural_contract_is_explicit() {
         "--expected-aw-sha",
         "status --porcelain --untracked-files=all",
         "cargo build --quiet --locked --release",
+        "endpoint.mode = \"0600\"",
+        "endpoint.proxy_header_timeout = \"2s\"",
+        "endpoint.allowed_destination_ports = [80]",
+        "endpoint.allowed_destination_ports = [443]",
         "%{num_connects}",
         "access-path=iptables-redirect-so-original-dst-proxy-v2-unix",
         "https-mitm=passed",
@@ -249,6 +253,8 @@ fn transparent_uds_stack_smoke_structural_contract_is_explicit() {
         "src=$ACL_CONFIG",
         "src=$TMP_DIR/config,dst=",
         "Re-using existing connection",
+        "\nproxy_header_timeout =",
+        "endpoint.mode = \"0606\"",
     ] {
         assert!(!script.contains(forbidden), "forbidden {forbidden:?}");
     }
