@@ -164,6 +164,13 @@ WebSocket, backpressure bounds, and half-close semantics. `cargo test --test
 assets` checks only the harness's structural contract and shell syntax; it does
 not execute this privileged gate.
 
+The Docker workload sets `nofile=4096` because Docker's local default soft
+limit is lower than the shipped relay configuration's checked startup
+projection (`64 + route_count + 2 * maxConnections`, currently 2,114). This is
+Linux test scaffolding, not evidence of the Apple Container process limit. The
+deploying environment owns that limit; the relay validates the effective soft
+limit at startup and fails closed when the configured capacity does not fit.
+
 ## Host Socket Exposure Docker Gate
 
 `scripts/run-host-socket-exposure-smoke.sh` is a separate opt-in Linux Docker

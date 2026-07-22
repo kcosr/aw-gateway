@@ -225,6 +225,7 @@ fn transparent_uds_stack_smoke_structural_contract_is_explicit() {
         "src=$HTTPS_SOCKET,dst=/run/acl-proxy/transparent-https.sock",
         "src=$TMP_DIR/config/mitm-ca-cert.pem,dst=/etc/acl-proxy/mitm-ca-cert.pem",
         "--privileged --network",
+        "--ulimit nofile=4096:4096",
         "--user 65534:65534",
         "--expected-acl-sha",
         "--expected-access-runtime-sha",
@@ -336,6 +337,22 @@ fn transparent_relay_example_is_the_canonical_unversioned_contract() {
     assert!(!smoke.contains("setpriv --reuid"));
     assert!(smoke.contains("/etc/acl-proxy/transparent-uds-relay.json"));
     assert!(!smoke.contains("/etc/aw-gateway/transparent-uds-relay.json"));
+
+    let max_connections = config["maxConnections"].as_u64().unwrap();
+    let route_count = config["routes"].as_array().unwrap().len() as u64;
+    const RELAY_RESERVED_FILE_DESCRIPTORS: u64 = 64;
+    let required_descriptors = RELAY_RESERVED_FILE_DESCRIPTORS + route_count + 2 * max_connections;
+    let smoke_nofile = smoke
+        .lines()
+        .find_map(|line| line.split_once("nofile=").map(|(_, value)| value))
+        .and_then(|value| value.split(':').next())
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(
+        smoke_nofile >= required_descriptors,
+        "Docker smoke nofile limit does not satisfy the shipped relay projection"
+    );
 }
 
 #[test]

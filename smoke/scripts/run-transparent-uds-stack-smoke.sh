@@ -654,7 +654,9 @@ SH
 chmod 0700 "$TMP_DIR/workload.sh"
 
 start_workload() {
+    # The shipped 1,024-connection config projects 2,114 descriptors.
     docker run -d --name "$WORKLOAD_CONTAINER" --privileged --network "$NETWORK" \
+        --ulimit nofile=4096:4096 \
         --env "SMOKE_DNS=$NETWORK_GATEWAY" \
         --mount "type=bind,src=$HTTP_SOCKET,dst=/run/acl-proxy/transparent-http.sock" \
         --mount "type=bind,src=$HTTPS_SOCKET,dst=/run/acl-proxy/transparent-https.sock" \
