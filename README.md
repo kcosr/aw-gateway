@@ -867,6 +867,9 @@ Gateway configs commonly include:
   or `,`, targets must be absolute paths, and read-write mount sources must not
   resolve to world-writable paths. The generated workspace and control-socket
   mounts use the same separator checks.
+- `[target_defaults.host_socket_exposures.<name>]` and the corresponding target
+  and template maps expose one existing host Unix socket at one exact container
+  path. Socket sources are not accepted through `container_mounts`.
 - `[target_defaults.container_bootstrap]`: optional bootstrap entrypoint configuration and
   pre-agent container bootstrap steps. Targets may overlay
   `[targets.<name>.container_bootstrap]` field-by-field.
@@ -883,7 +886,9 @@ Gateway configs commonly include:
 - `[target_defaults.container_agent]`: optional in-container supervision and SSH bridge
   support.
 - `[[target_defaults.container_agent.services]]`: in-container services supervised by
-  `aw-container-agent`.
+  `aw-container-agent`. Use `depends_on` and dependency health checks to order
+  managed services. Required `container_bootstrap_steps` perform privileged
+  preparation before the agent starts.
 - `[target_defaults.container_agent.ssh_bridge]`: Unix socket bridge to container SSH. In
   gateway config, the socket path is generated from target control sockets.
 
@@ -932,6 +937,35 @@ For macOS/Colima, use a user-owned path because macOS does not normally provide
 host_dir = "/Users/alice/.cache/aw-gateway/sockets/{runtime_id}"
 container_dir = "/run/aw-gateway"
 ```
+
+### Host Socket Exposures
+
+Use the typed map when an existing listener on the runtime host must be
+reachable from the container:
+
+```toml
+[target_defaults.host_socket_exposures.transparent_http]
+host_path = "/Users/alice/Library/Application Support/AW Gateway/runtime/transparent-http.sock"
+container_path = "/run/acl-proxy/transparent-http.sock"
+selinux_relabel = "none"
+```
+
+AW Gateway validates the final source component without following symlinks,
+requires an existing Unix socket, rejects collisions with broader managed
+mounts, and checks the guest endpoint as the configured container user before
+reporting the target ready. Apple Container 1.1 or newer realizes the declaration as
+a path-reconnecting UDS-over-vsock relay. Native local Linux Docker and Podman
+bind the current socket inode; replacing the host listener pathname requires
+container recreation unless the listener inode is preserved. Colima, VM-backed
+runtimes, and remote daemons are rejected.
+
+`selinux_relabel` is mandatory and accepts `none`, `shared`, or `private` on
+Linux. Apple accepts only `none`. Optional `user` selects the identity used only
+for the bounded post-create socket type and access readiness probes and defaults
+to `root`; it does not alter the container, socket, or runtime realization. A
+later defaults, template, target, or root `extends` layer atomically replaces an
+exposure with the same key. Status JSON reports each exposure's
+`path_reconnect` or `pinned_inode` realization and a sanitized failure category.
 
 Target-specific runtime and environment knobs are explicit:
 
@@ -1211,6 +1245,8 @@ Root inheritance uses these merge rules:
 
 - Tables merge by key, except each service `env.<NAME>` value replaces the
   inherited value as a whole.
+- Each same-key `host_socket_exposures` entry replaces the inherited entry as a
+  whole rather than merging individual path or relabel fields.
 - Scalars and ordinary arrays replace the inherited value. This includes
   `container_mounts`, runtime argument arrays, command arrays, dependency
   arrays, allow-list arrays, and launch variable value arrays.
@@ -1891,6 +1927,9 @@ The `assets/` directory contains deployable helpers and image files:
   coding-agent egress. Review and adapt before deploying.
 - `assets/aw-iptables`: applies, checks, and reports namespace-local proxy
   firewall rules for a running container PID.
+- `assets/aw-transparent-uds-firewall`: installs, validates, repairs, and
+  watches the optional host-proxy profile's generation-based, fail-closed
+  transparent firewall inside the container.
 - `assets/ensure-storage-conf`: creates a rootless Podman storage config for
   shared image storage on managed hosts. It takes explicit `--template`,
   `--shared-store`, and optional `--storage-conf` arguments.

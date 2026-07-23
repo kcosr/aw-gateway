@@ -1,5 +1,6 @@
 use super::Runtime;
 use super::failures::ContainerNotFound;
+use super::host_socket_exposures::PreparedContainerInputs;
 use crate::config::{IdleCleanupAction, IdleCleanupConfig, IdleCleanupOwner, LifecyclePhase};
 use crate::runtime::ContainerInspect;
 use anyhow::Context;
@@ -41,14 +42,17 @@ impl Runtime {
         &self,
         plan: ContainerReadinessPlan,
         failed_start_cleanup: &mut FailedStartCleanup,
+        prepared: &PreparedContainerInputs,
     ) -> anyhow::Result<ContainerInspect> {
         match plan {
             ContainerReadinessPlan::ReuseRunning(existing) => {
                 self.validate_labels(&existing)?;
+                self.validate_exposure_manifest(&existing, prepared)?;
                 Ok(existing)
             }
             ContainerReadinessPlan::StartStopped(existing) => {
                 self.validate_labels(&existing)?;
+                self.validate_exposure_manifest(&existing, prepared)?;
                 let apple_published_ssh_port = self.apple_restart_published_ssh_port()?;
                 self.run_lifecycle_phase(LifecyclePhase::PreStart, None)
                     .await?;
@@ -63,7 +67,7 @@ impl Runtime {
                     .await?;
                 self.remove_stale_control_socket_files()?;
                 failed_start_cleanup.mark_runtime_start_attempted();
-                self.start_container().await?;
+                self.start_container(prepared).await?;
                 self.inspect_container_after_start().await
             }
         }

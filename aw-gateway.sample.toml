@@ -40,6 +40,17 @@ path = "workspace"
 state_dir = ".aw-gateway"
 cleanup = "never"
 
+# Optional typed host-to-container Unix socket exposure. The source must be an
+# existing socket when this target starts. Apple Container accepts only
+# selinux_relabel = "none"; native Linux Docker/Podman also accept "shared" or
+# "private" as an explicit host-label mutation decision.
+#
+# [target_defaults.host_socket_exposures.example]
+# host_path = "/run/user/{uid}/example.sock"
+# container_path = "/run/example/example.sock"
+# user = "root"
+# selinux_relabel = "none"
+
 [targets.default]
 image = "ubuntu/dev"
 mode = "fixed"

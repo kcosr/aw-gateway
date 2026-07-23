@@ -36,14 +36,14 @@ pub use steps::{
 pub(crate) use target::DEFAULT_EPHEMERAL_NAME_PATTERN;
 pub use target::{
     ContainerBootstrapConfig, ContainerMountConfig, ContainerMountMode, ContainerSshConfig,
-    ContainerSshTransferConfig, ControlSocketsConfig, IdleCleanupAction, IdleCleanupConfig,
-    IdleCleanupConfigInput, IdleCleanupOwner, LegacyScpTransferMode, LocalSshBackend,
-    LocalSshConfig, LocalSshConfigInput, LocalSshMode, LocalSshReadiness, SftpTransferMode,
-    TargetAccessConfig, TargetAccessConfigInput, TargetAccessMethod, TargetConfig,
-    TargetConfigInput, TargetContainerBootstrapConfig, TargetContainerSshConfig,
-    TargetContainerSshTransferConfig, TargetControlSocketsConfig, TargetIdentityConfig, TargetMode,
-    TargetRuntimeConfig, TargetRuntimeConfigInput, WorkspaceCleanup, WorkspaceConfig,
-    WorkspaceConfigInput,
+    ContainerSshTransferConfig, ControlSocketsConfig, HostSocketExposureConfig, IdleCleanupAction,
+    IdleCleanupConfig, IdleCleanupConfigInput, IdleCleanupOwner, LegacyScpTransferMode,
+    LocalSshBackend, LocalSshConfig, LocalSshConfigInput, LocalSshMode, LocalSshReadiness,
+    SelinuxRelabel, SftpTransferMode, TargetAccessConfig, TargetAccessConfigInput,
+    TargetAccessMethod, TargetConfig, TargetConfigInput, TargetContainerBootstrapConfig,
+    TargetContainerSshConfig, TargetContainerSshTransferConfig, TargetControlSocketsConfig,
+    TargetIdentityConfig, TargetMode, TargetRuntimeConfig, TargetRuntimeConfigInput,
+    WorkspaceCleanup, WorkspaceConfig, WorkspaceConfigInput,
 };
 pub(crate) use validation::SERVICE_USER_TEMPLATE;
 pub use validation::parse_duration;
@@ -281,10 +281,35 @@ impl GatewayConfig {
         &self,
         targets: &BTreeMap<String, TargetConfig>,
     ) -> anyhow::Result<()> {
-        if self.runtime.runtime_type != ContainerRuntimeType::AppleContainer {
-            return Ok(());
-        }
         for (name, target) in targets {
+            if !target.host_socket_exposures.is_empty() {
+                match self.runtime.runtime_type {
+                    ContainerRuntimeType::Colima => anyhow::bail!(
+                        "target {name:?} configures host_socket_exposures but runtime type \"colima\" is not supported"
+                    ),
+                    ContainerRuntimeType::Podman | ContainerRuntimeType::Docker
+                        if !cfg!(target_os = "linux") =>
+                    {
+                        anyhow::bail!(
+                            "target {name:?} configures host_socket_exposures but runtime type {:?} requires AW Gateway to run on Linux",
+                            self.runtime.runtime_type
+                        )
+                    }
+                    ContainerRuntimeType::AppleContainer => {
+                        for (exposure_name, exposure) in &target.host_socket_exposures {
+                            if exposure.selinux_relabel != SelinuxRelabel::None {
+                                anyhow::bail!(
+                                    "target {name:?} host_socket_exposures.{exposure_name}.selinux_relabel must be \"none\" for runtime type \"apple_container\""
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if self.runtime.runtime_type != ContainerRuntimeType::AppleContainer {
+                continue;
+            }
             match target.access.method {
                 TargetAccessMethod::Ssh => {
                     match &target.local_ssh {

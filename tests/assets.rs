@@ -35,6 +35,7 @@ fn start_container_sshd_scripts() -> Vec<(&'static str, String)> {
 fn asset_scripts_are_shell_syntax_valid() {
     for script in [
         "aw-iptables",
+        "aw-transparent-uds-firewall",
         "copy-skel",
         "copy-workspace-template",
         "ensure-storage-conf",
@@ -52,6 +53,53 @@ fn asset_scripts_are_shell_syntax_valid() {
             .assert()
             .success();
     }
+
+    for script in [
+        "run-host-socket-exposure-smoke.sh",
+        "run-transparent-firewall-smoke.sh",
+        "run-transparent-uds-stack-smoke.sh",
+    ] {
+        Command::new("bash")
+            .args([
+                "-n",
+                &Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("smoke/scripts")
+                    .join(script)
+                    .display()
+                    .to_string(),
+            ])
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn host_socket_exposure_smoke_drives_the_gateway_lifecycle() {
+    let script = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("smoke/scripts/run-host-socket-exposure-smoke.sh"),
+    )
+    .unwrap();
+
+    for required in [
+        "gateway up socket-smoke --json",
+        "io.aw-gateway.host-socket-exposures.v1",
+        "host_socket_exposures.echo",
+        "container_path = \"/run/acl-proxy/echo.sock\"",
+        "gateway run socket-smoke -- python3",
+        "remove socket-smoke",
+        "pinned-inode-rebind-fail-closed=passed",
+        "gateway-remove=passed",
+        "workload-recreate-recovery=passed",
+        "second-uds-exchange=passed",
+    ] {
+        assert!(script.contains(required), "missing {required:?}");
+    }
+    for forbidden in ["docker run", "--mount", "PROXY Protocol", "AWID"] {
+        assert!(!script.contains(forbidden), "forbidden {forbidden:?}");
+    }
+    assert_eq!(script.matches("gateway remove socket-smoke").count(), 2);
+    assert!(!script.contains("gateway remove socket-smoke || true"));
 }
 
 #[test]
@@ -140,6 +188,171 @@ fn aw_iptables_usage_mentions_check_action() {
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("{add|check|status}"));
+}
+
+#[test]
+fn transparent_uds_firewall_is_fail_closed_and_has_no_proxy_uid_bypass() {
+    let script = std::fs::read_to_string(asset("aw-transparent-uds-firewall")).unwrap();
+
+    for required in [
+        "iptables-restore --test --noflush",
+        "ip6tables-restore --test --noflush",
+        "AWUDS_FAIL4",
+        "AWUDS_FAIL6",
+        "--dport 80 -j REDIRECT",
+        "--dport 443 -j REDIRECT",
+        "-p udp --dport 443 -j DROP",
+        "-j DROP",
+        "READY_FILE=\"$STATE_FILE.ready\"",
+    ] {
+        assert!(script.contains(required), "missing {required:?}");
+    }
+    for forbidden in ["--uid-owner", "PROXY_UID", "--publish-socket"] {
+        assert!(!script.contains(forbidden), "forbidden {forbidden:?}");
+    }
+}
+
+#[test]
+fn transparent_uds_stack_smoke_structural_contract_is_explicit() {
+    let script = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("smoke/scripts/run-transparent-uds-stack-smoke.sh"),
+    )
+    .unwrap();
+
+    for required in [
+        "src=$HTTP_SOCKET,dst=/run/acl-proxy/transparent-http.sock",
+        "src=$HTTPS_SOCKET,dst=/run/acl-proxy/transparent-https.sock",
+        "src=$TMP_DIR/config/mitm-ca-cert.pem,dst=/etc/acl-proxy/mitm-ca-cert.pem",
+        "--privileged --network",
+        "--ulimit nofile=4096:4096",
+        "--user 65534:65534",
+        "--expected-acl-sha",
+        "--expected-access-runtime-sha",
+        "--expected-aw-sha",
+        "status --porcelain --untracked-files=all",
+        "cargo build --quiet --locked --release",
+        "endpoint.mode = \"0600\"",
+        "endpoint.proxy_header_timeout = \"2s\"",
+        "endpoint.allowed_destination_ports = [80]",
+        "endpoint.allowed_destination_ports = [443]",
+        "%{num_connects}",
+        "access-path=iptables-redirect-so-original-dst-proxy-v2-unix",
+        "https-mitm=passed",
+        "proxy-loss-fail-closed=passed",
+        "incremental-streaming=passed",
+        "active-stream-proxy-loss=passed",
+        "workload-isolation=passed",
+        "linux-socket-realization=pinned_inode",
+        "pinned-inode-rebind=passed",
+        "workload-recreate-recovery=passed",
+    ] {
+        assert!(script.contains(required), "missing {required:?}");
+    }
+    for forbidden in [
+        "src=$TMP_DIR/socket-runtime,dst=/run/acl-proxy",
+        "src=$ACL_CONFIG",
+        "src=$TMP_DIR/config,dst=",
+        "Re-using existing connection",
+        "\nproxy_header_timeout =",
+        "endpoint.mode = \"0606\"",
+    ] {
+        assert!(!script.contains(forbidden), "forbidden {forbidden:?}");
+    }
+    assert_eq!(script.matches("apt-get install").count(), 1);
+
+    let readme =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("smoke/README.md"))
+            .unwrap();
+    assert!(readme.contains("Transparent UDS Privileged Gate"));
+    assert!(readme.contains("Linux-only T04"));
+    assert!(readme.contains("structural contract and shell syntax"));
+    assert!(readme.contains("privileged gate."));
+}
+
+#[test]
+fn apple_host_proxy_profile_reuses_bootstrap_and_service_dependencies() {
+    let profile =
+        std::fs::read_to_string(example_asset("apple-container", "gateway-host-proxy.toml"))
+            .unwrap();
+
+    assert!(profile.contains("name = \"install-transparent-firewall\""));
+    assert!(profile.contains("\n  \"repair\","));
+    assert!(!profile.contains("acl-relay"));
+    assert!(!profile.contains("startup_phase"));
+    assert!(profile.contains(
+        "[target_defaults.host_socket_exposures.transparent_http]\n\
+         host_path = \"/Users/example/Library/Application Support/AW Gateway/runtime/transparent-http.sock\"\n\
+         container_path = \"/run/acl-proxy/transparent-http.sock\"\n\
+         selinux_relabel = \"none\""
+    ));
+    assert!(profile.contains(
+        "[target_defaults.host_socket_exposures.transparent_https]\n\
+         host_path = \"/Users/example/Library/Application Support/AW Gateway/runtime/transparent-https.sock\"\n\
+         container_path = \"/run/acl-proxy/transparent-https.sock\"\n\
+         selinux_relabel = \"none\""
+    ));
+    assert!(
+        profile.contains(
+            "NODE_EXTRA_CA_CERTS = \"/usr/local/share/ca-certificates/acl-proxy-ca.crt\""
+        )
+    );
+    assert!(profile.contains("target = \"/etc/acl-proxy/transparent-uds-relay.json\""));
+    assert!(profile.contains("\"--config\", \"/etc/acl-proxy/transparent-uds-relay.json\""));
+    assert!(profile.contains("name = \"transparent-relay\"\nrequired = true\nuser = \"root\""));
+    assert!(profile.contains("name = \"transparent-firewall\"\nrequired = true\nuser = \"root\""));
+    assert!(profile.contains("type = \"process\""));
+    assert!(profile.contains("depends_on = [\"transparent-firewall\"]"));
+    assert!(profile.contains("depends_on = [\"transparent-relay\"]"));
+    assert!(!profile.contains("/opt/acl-proxy/bin/acl-proxy"));
+    assert!(!profile.contains("mitm-ca.key"));
+    assert!(!profile.contains("AW_IDENTITY_TOKEN"));
+}
+
+#[test]
+fn transparent_relay_example_is_the_canonical_unversioned_contract() {
+    let path = example_asset("apple-container", "transparent-uds-relay.json");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+    assert!(config.get("schemaVersion").is_none());
+    assert_eq!(config["setupTimeout"], "2s");
+    assert_eq!(
+        config["routes"][0]["upstreamSocket"],
+        "/run/acl-proxy/transparent-http.sock"
+    );
+    assert_eq!(
+        config["routes"][1]["upstreamSocket"],
+        "/run/acl-proxy/transparent-https.sock"
+    );
+
+    let smoke = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("smoke/scripts/run-transparent-uds-stack-smoke.sh"),
+    )
+    .unwrap();
+    assert!(smoke.contains("examples/apple-container/transparent-uds-relay.json"));
+    assert!(smoke.contains("cp -- \"$RELAY_CONFIG\" \"$TMP_DIR/relay.json\""));
+    assert!(!smoke.contains("cat >\"$TMP_DIR/relay.json\""));
+    assert!(!smoke.contains("setpriv --reuid"));
+    assert!(smoke.contains("/etc/acl-proxy/transparent-uds-relay.json"));
+    assert!(!smoke.contains("/etc/aw-gateway/transparent-uds-relay.json"));
+
+    let max_connections = config["maxConnections"].as_u64().unwrap();
+    let route_count = config["routes"].as_array().unwrap().len() as u64;
+    const RELAY_RESERVED_FILE_DESCRIPTORS: u64 = 64;
+    let required_descriptors = RELAY_RESERVED_FILE_DESCRIPTORS + route_count + 2 * max_connections;
+    let smoke_nofile = smoke
+        .lines()
+        .find_map(|line| line.split_once("nofile=").map(|(_, value)| value))
+        .and_then(|value| value.split(':').next())
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(
+        smoke_nofile >= required_descriptors,
+        "Docker smoke nofile limit does not satisfy the shipped relay projection"
+    );
 }
 
 #[test]

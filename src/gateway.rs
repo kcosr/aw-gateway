@@ -59,6 +59,7 @@ mod control_sockets;
 mod execution;
 mod failures;
 mod health;
+mod host_socket_exposures;
 mod http;
 mod identity;
 mod lifecycle;
@@ -85,8 +86,8 @@ use health::run_health_check;
 use lifecycle::{FailedStartCleanup, readiness_plan};
 use lifecycle_hooks::host_hook_timeout;
 use model::{
-    GatewayStatus, LaunchDetail, LaunchStepDetail, LaunchSummary, LaunchVarMetadata, LocalSshReady,
-    ReadyStatus, TargetEntry, TcpEndpoint, gateway_status_name,
+    GatewayStatus, HostSocketExposureStatus, LaunchDetail, LaunchStepDetail, LaunchSummary,
+    LaunchVarMetadata, LocalSshReady, ReadyStatus, TargetEntry, TcpEndpoint, gateway_status_name,
 };
 use ops::{
     CanonicalLaunchVarValue, CapturedStream, ExecutionOutcome, GatewayOperation,
@@ -1877,15 +1878,21 @@ impl Runtime {
                     self.write_container_bootstrap_config()?;
                 }
             }
+            let prepared_inputs = self.prepare_container_inputs().await?;
             let inspect = self
                 .container_runtime
                 .inspect(&self.identity.container_name)
                 .await?;
             let plan = readiness_plan(inspect);
             let inspect = self
-                .ensure_container_for_readiness_plan(plan, &mut failed_start_cleanup)
+                .ensure_container_for_readiness_plan(
+                    plan,
+                    &mut failed_start_cleanup,
+                    &prepared_inputs,
+                )
                 .await?;
             self.validate_labels(&inspect)?;
+            self.validate_exposure_manifest(&inspect, &prepared_inputs)?;
             self.sweep_stale_cancel_markers().await;
             let container_pid = inspect.state.pid.map(|pid| pid.to_string());
             self.run_lifecycle_phase(LifecyclePhase::PostStartHost, container_pid.as_deref())
@@ -1893,6 +1900,8 @@ impl Runtime {
             if self.requires_agent_control() {
                 self.wait_agent_ready().await?;
             }
+            self.validate_container_exposure_endpoints(&prepared_inputs)
+                .await?;
             self.run_host_steps(container_pid.as_deref()).await?;
             if self.requires_agent_control() {
                 self.validate_agent_socket().await?;
@@ -1903,15 +1912,27 @@ impl Runtime {
                     LocalSshBackend::PublishedPort => self.wait_published_ssh_ready().await?,
                 }
             }
-            let status = self.status().await?;
+            let status = self
+                .status_with_inspect_and_prepared(Some(&inspect), Some(&prepared_inputs))
+                .await?;
             if self.requires_agent_control() && !status.agent_ready {
                 anyhow::bail!("container agent is not ready after host setup");
             }
-            Ok((inspect, status))
+            if status
+                .host_socket_exposures
+                .iter()
+                .any(|entry| !entry.ready)
+            {
+                anyhow::bail!(
+                    "one or more host socket exposures became unhealthy during target startup"
+                );
+            }
+            let exposure_statuses = status.host_socket_exposures.clone();
+            Ok((inspect, status, exposure_statuses))
         }
         .await;
 
-        let (inspect, status) = match result {
+        let (inspect, status, host_socket_exposures) = match result {
             Ok(value) => value,
             Err(err) => {
                 failed_start_cleanup.run_if_needed(self).await;
@@ -1933,6 +1954,7 @@ impl Runtime {
             status: status.status,
             local_ssh: status.local_ssh,
             client_config: None,
+            host_socket_exposures,
         })
     }
 
@@ -1952,6 +1974,18 @@ impl Runtime {
         if let Some(inspect) = &inspect {
             self.validate_labels(inspect)?;
         }
+        self.status_with_inspect_and_prepared(inspect.as_ref(), None)
+            .await
+    }
+
+    async fn status_with_inspect_and_prepared(
+        &self,
+        inspect: Option<&crate::runtime::ContainerInspect>,
+        prepared: Option<&host_socket_exposures::PreparedContainerInputs>,
+    ) -> anyhow::Result<GatewayStatus> {
+        let host_socket_exposures = self
+            .current_host_socket_exposure_statuses(inspect, prepared)
+            .await;
         let agent = if self.agent_control_enabled() {
             self.agent_status().await.ok()
         } else {
@@ -1961,7 +1995,7 @@ impl Runtime {
         let launch = status_launch(self.identity.session_id.as_deref(), &sessions);
         let agent_ready = agent.as_ref().is_some_and(|status| status.ready);
         let direct_endpoint = if self.direct_published_ssh_enabled() {
-            self.direct_status_ssh_endpoint(inspect.as_ref()).await?
+            self.direct_status_ssh_endpoint(inspect).await?
         } else {
             None
         };
@@ -1971,13 +2005,13 @@ impl Runtime {
         });
         let ssh_tcp = if self.direct_published_ssh_enabled() {
             inspect
-                .as_ref()
                 .is_some_and(|value| value.state.running)
                 .then_some(direct_endpoint)
                 .flatten()
         } else {
             self.published_ssh_endpoint().await?
         };
+        let exposure_unhealthy = host_socket_exposures.iter().any(|entry| !entry.ready);
         Ok(GatewayStatus {
             target: self.identity.target_name.clone(),
             session_id: self.identity.session_id.clone(),
@@ -1986,25 +2020,28 @@ impl Runtime {
             user: self.identity.user.user.clone(),
             image: self.target.image.clone(),
             access: self.access_name(),
-            container: inspect
-                .as_ref()
-                .map(|_| self.identity.container_name.clone()),
+            container: inspect.map(|_| self.identity.container_name.clone()),
             context: self.context.as_map().clone(),
-            container_pid: inspect.as_ref().and_then(|value| value.state.pid),
+            container_pid: inspect.and_then(|value| value.state.pid),
             active_sessions: sessions.len(),
             sessions,
             agent_ready,
             ssh_socket: self.ssh_socket_endpoint(),
             ssh_tcp,
             local_ssh,
-            status: gateway_status_name(
-                inspect.as_ref().is_some_and(|value| value.state.running),
-                self.requires_agent_control(),
-                agent.is_some(),
-                agent_ready,
-            )
+            status: if exposure_unhealthy {
+                "host-socket-exposure-unhealthy"
+            } else {
+                gateway_status_name(
+                    inspect.is_some_and(|value| value.state.running),
+                    self.requires_agent_control(),
+                    agent.is_some(),
+                    agent_ready,
+                )
+            }
             .into(),
             agent: agent.map(Box::new),
+            host_socket_exposures,
         })
     }
 

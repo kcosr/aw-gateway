@@ -17,8 +17,18 @@ const WORKSPACE_TARGET_LABEL: &str = "io.aw-gateway.workspace.target";
 const WORKSPACE_STATE_HOST_LABEL: &str = "io.aw-gateway.workspace.state_host";
 const WORKSPACE_STATE_CONTAINER_LABEL: &str = "io.aw-gateway.workspace.state_container";
 
+use super::host_socket_exposures::{HOST_SOCKET_EXPOSURE_MANIFEST_LABEL, PreparedContainerInputs};
+
 impl Runtime {
+    #[cfg(test)]
     pub(super) fn labels(&self) -> BTreeMap<String, String> {
+        self.labels_with_exposure_manifest(None)
+    }
+
+    fn labels_with_exposure_manifest(
+        &self,
+        exposure_manifest: Option<&str>,
+    ) -> BTreeMap<String, String> {
         let mut labels = self.validation_labels();
         labels.extend([
             ("io.aw-gateway.image".into(), self.target.image.clone()),
@@ -39,6 +49,12 @@ impl Runtime {
             && let Some(launch_name) = &self.identity.launch_name
         {
             labels.insert("io.aw-gateway.launch".into(), launch_name.clone());
+        }
+        if let Some(exposure_manifest) = exposure_manifest {
+            labels.insert(
+                HOST_SOCKET_EXPOSURE_MANIFEST_LABEL.into(),
+                exposure_manifest.into(),
+            );
         }
         labels
     }
@@ -147,7 +163,10 @@ impl Runtime {
         })
     }
 
-    pub(super) async fn start_container(&self) -> anyhow::Result<()> {
+    pub(super) async fn start_container(
+        &self,
+        prepared: &PreparedContainerInputs,
+    ) -> anyhow::Result<()> {
         let identity_token = self
             .target
             .container_agent
@@ -158,21 +177,19 @@ impl Runtime {
             .agent_control_enabled()
             .then(|| self.ensure_control_token())
             .transpose()?;
-        let mounts = self.container_mounts_async().await?;
-        warn_about_unsafe_container_mounts_async(&mounts).await?;
         if self.needs_explicit_published_ssh_port() {
             return self
                 .start_container_with_explicit_published_ssh_port(
                     identity_token.as_deref(),
                     control_token.as_deref(),
-                    mounts,
+                    prepared,
                 )
                 .await;
         }
-        let run_spec = self.container_run_spec_with_mounts(
+        let run_spec = self.container_run_spec_with_inputs(
             identity_token.as_deref(),
             control_token.as_deref(),
-            mounts,
+            prepared,
             None,
         )?;
         self.container_runtime.run_detached(&run_spec).await
@@ -185,14 +202,22 @@ impl Runtime {
         control_token: Option<&str>,
     ) -> anyhow::Result<ContainerRunSpec> {
         let mounts = self.container_mounts()?;
-        self.container_run_spec_with_mounts(identity_token, control_token, mounts, None)
+        if !self.target.host_socket_exposures.is_empty() {
+            anyhow::bail!("host socket exposure tests must use prepare_container_inputs");
+        }
+        let prepared = PreparedContainerInputs {
+            mounts,
+            host_socket_exposures: Vec::new(),
+            exposure_manifest: None,
+        };
+        self.container_run_spec_with_inputs(identity_token, control_token, &prepared, None)
     }
 
-    fn container_run_spec_with_mounts(
+    pub(super) fn container_run_spec_with_inputs(
         &self,
         identity_token: Option<&str>,
         control_token: Option<&str>,
-        mounts: Vec<ContainerMountSpec>,
+        prepared: &PreparedContainerInputs,
         published_ssh_host_port: Option<u16>,
     ) -> anyhow::Result<ContainerRunSpec> {
         let mut env = BTreeMap::new();
@@ -263,9 +288,10 @@ impl Runtime {
                 .is_podman()
                 .then(|| self.passwd_entry()),
             state_dir_in_container: self.paths.container_state_dir_in_container.clone(),
-            mounts,
+            mounts: prepared.mounts.clone(),
+            host_socket_exposures: prepared.host_socket_exposures.clone(),
             env,
-            labels: self.labels(),
+            labels: self.labels_with_exposure_manifest(prepared.exposure_manifest.as_deref()),
             publish_ssh: self.ssh_endpoint_configured()
                 && self.ssh_backend() == LocalSshBackend::PublishedPort,
             published_ssh_host_port,
@@ -284,16 +310,16 @@ impl Runtime {
         &self,
         identity_token: Option<&str>,
         control_token: Option<&str>,
-        mounts: Vec<ContainerMountSpec>,
+        prepared: &PreparedContainerInputs,
     ) -> anyhow::Result<()> {
         for attempt in 1..=PUBLISHED_SSH_RUN_ATTEMPTS {
             let pending = self
                 .prepare_published_ssh_host_port_for_create()?
                 .expect("explicit published SSH port should allocate pending state");
-            let run_spec = self.container_run_spec_with_mounts(
+            let run_spec = self.container_run_spec_with_inputs(
                 identity_token,
                 control_token,
-                mounts.clone(),
+                prepared,
                 Some(pending.port()),
             )?;
             drop(pending);
@@ -308,7 +334,7 @@ impl Runtime {
                         && published_port_bind_conflict(&err) =>
                 {
                     self.remove_pending_published_ssh_port();
-                    self.remove_label_validated_leftover_after_failed_published_port_run()
+                    self.remove_label_validated_leftover_after_failed_published_port_run(prepared)
                         .await?;
                 }
                 Err(err) => {
@@ -322,6 +348,7 @@ impl Runtime {
 
     async fn remove_label_validated_leftover_after_failed_published_port_run(
         &self,
+        prepared: &PreparedContainerInputs,
     ) -> anyhow::Result<()> {
         let Some(inspect) = self
             .container_runtime
@@ -337,6 +364,7 @@ impl Runtime {
                     self.identity.container_name
                 )
             })?;
+        self.validate_exposure_manifest(&inspect, prepared)?;
         self.container_runtime
             .rm(&self.identity.container_name)
             .await
@@ -466,7 +494,7 @@ impl Runtime {
         render_container_mounts(self.container_mount_inputs())
     }
 
-    async fn container_mounts_async(&self) -> anyhow::Result<Vec<ContainerMountSpec>> {
+    pub(super) async fn container_mounts_async(&self) -> anyhow::Result<Vec<ContainerMountSpec>> {
         let inputs = self.container_mount_inputs();
         tokio::task::spawn_blocking(move || render_container_mounts(inputs))
             .await
@@ -567,17 +595,16 @@ fn render_container_mounts(
         .enumerate()
         .map(|(index, mount)| {
             let source = PathBuf::from(template::render(&mount.source, &inputs.vars)?);
-            let source = source
-                .canonicalize()
-                .with_context(|| format!("container mount source #{index} {}", source.display()))?;
+            let source = super::host_socket_exposures::canonicalize_generic_mount_source(
+                &source,
+                &format!("container mount source #{index}"),
+            )?;
             validate_bind_mount_path(&format!("container mount source #{index}"), &source)?;
             let target = PathBuf::from(template::render(&mount.target, &inputs.vars)?);
-            if !target.is_absolute() {
-                anyhow::bail!(
-                    "container mount target #{} must render to an absolute path",
-                    index
-                );
-            }
+            super::host_socket_exposures::validate_normalized_container_path(
+                &format!("container mount target #{index}"),
+                &target,
+            )?;
             validate_bind_mount_path(&format!("container mount target #{index}"), &target)?;
             Ok(ContainerMountSpec {
                 source,
@@ -612,7 +639,7 @@ fn validate_bind_mount_path(label: &str, path: &std::path::Path) -> anyhow::Resu
     Ok(())
 }
 
-async fn warn_about_unsafe_container_mounts_async(
+pub(super) async fn warn_about_unsafe_container_mounts_async(
     mounts: &[ContainerMountSpec],
 ) -> anyhow::Result<()> {
     let mounts = mounts.to_vec();

@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+# Install a fail-closed transparent egress policy inside one container.
+
+set -euo pipefail
+
+HTTP_PORT=3128
+HTTPS_PORT=3129
+DNS_SERVER=""
+STATE_FILE=/run/aw-gateway/transparent-uds-firewall.generation
+CHECK_INTERVAL=5
+FAILSAFE4_CHAIN=AWUDS_FAIL4
+FAILSAFE6_CHAIN=AWUDS_FAIL6
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: aw-transparent-uds-firewall {install|repair|check|remove|watch} \
+  --dns-server <IPv4> [--http-port <port>] [--https-port <port>] \
+  [--state-file <path>] [--check-interval <seconds>]
+EOF
+    exit 1
+}
+
+[[ $# -ge 1 ]] || usage
+ACTION="$1"
+shift
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dns-server) [[ $# -ge 2 ]] || usage; DNS_SERVER="$2"; shift 2 ;;
+        --http-port) [[ $# -ge 2 ]] || usage; HTTP_PORT="$2"; shift 2 ;;
+        --https-port) [[ $# -ge 2 ]] || usage; HTTPS_PORT="$2"; shift 2 ;;
+        --state-file) [[ $# -ge 2 ]] || usage; STATE_FILE="$2"; shift 2 ;;
+        --check-interval) [[ $# -ge 2 ]] || usage; CHECK_INTERVAL="$2"; shift 2 ;;
+        *) usage ;;
+    esac
+done
+
+validate_port() {
+    local label="$1" value="$2"
+    [[ "$value" =~ ^[0-9]+$ ]] || die "$label must be numeric"
+    (( value >= 1 && value <= 65535 )) || die "$label must be between 1 and 65535"
+}
+
+validate_ipv4() {
+    local value="$1" part
+    [[ "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS=. read -r -a parts <<<"$value"
+    for part in "${parts[@]}"; do
+        (( 10#$part <= 255 )) || return 1
+    done
+}
+
+validate_port http-port "$HTTP_PORT"
+validate_port https-port "$HTTPS_PORT"
+[[ "$HTTP_PORT" != "$HTTPS_PORT" ]] || die "http-port and https-port must differ"
+validate_port check-interval "$CHECK_INTERVAL"
+validate_ipv4 "$DNS_SERVER" || die "dns-server must be one explicit IPv4 address"
+[[ "$DNS_SERVER" != 127.* ]] || die "dns-server must not use loopback"
+[[ "$STATE_FILE" = /* ]] || die "state-file must be absolute"
+
+for command in flock iptables iptables-restore ip6tables ip6tables-restore; do
+    command -v "$command" >/dev/null 2>&1 || die "required command not found: $command"
+done
+
+STATE_DIR=$(dirname -- "$STATE_FILE")
+READY_FILE="$STATE_FILE.ready"
+mkdir -p -- "$STATE_DIR"
+chmod 0700 -- "$STATE_DIR"
+exec 9>"$STATE_FILE.lock"
+flock -x 9
+
+current_generation() {
+    if [[ -f "$STATE_FILE" ]]; then
+        local generation
+        generation=$(<"$STATE_FILE")
+        [[ "$generation" =~ ^[0-9a-f]{16}$ ]] || die "invalid firewall generation state"
+        printf '%s' "$generation"
+    fi
+}
+
+chain_names() {
+    local generation="$1"
+    NAT_CHAIN="AWUDSN_$generation"
+    FILTER_CHAIN="AWUDSF_$generation"
+    FILTER6_CHAIN="AWUDS6_$generation"
+}
+
+chain_rules_are() {
+    local command="$1" table="$2" chain="$3" actual actual_count actual_tags
+    local expected_count expected_tags="" tag rule
+    local -a rule_words
+    shift 3
+    (( $# % 2 == 0 )) || return 1
+    expected_count=$(($# / 2))
+    if [[ "$table" = filter ]]; then
+        actual=$($command -S "$chain" 2>/dev/null) || return 1
+    else
+        actual=$($command -t "$table" -S "$chain" 2>/dev/null) || return 1
+    fi
+    actual_count=$(awk -v chain="$chain" '$1 == "-A" && $2 == chain { count += 1 } END { print count + 0 }' <<<"$actual")
+    [[ "$actual_count" = "$expected_count" ]] || return 1
+    actual_tags=$(awk -v chain="$chain" '
+        $1 == "-A" && $2 == chain {
+            for (i = 3; i <= NF; i++) {
+                if ($i == "--comment" && i < NF) {
+                    tag = $(i + 1)
+                    gsub(/^"|"$/, "", tag)
+                    print tag
+                }
+            }
+        }
+    ' <<<"$actual")
+    while (( $# > 0 )); do
+        tag="$1"
+        rule="$2"
+        shift 2
+        expected_tags+="${expected_tags:+$'\n'}$tag"
+        read -r -a rule_words <<<"$rule"
+        if [[ "$table" = filter ]]; then
+            "$command" -C "$chain" -m comment --comment "$tag" "${rule_words[@]}" 2>/dev/null || return 1
+        else
+            "$command" -t "$table" -C "$chain" -m comment --comment "$tag" "${rule_words[@]}" 2>/dev/null || return 1
+        fi
+    done
+    [[ "$actual_tags" = "$expected_tags" ]]
+}
+
+output_hook_count_is() {
+    local command="$1" table="$2" chain="$3" expected="$4" count rules
+    if [[ "$table" = filter ]]; then
+        rules=$($command -S OUTPUT)
+    else
+        rules=$($command -t "$table" -S OUTPUT)
+    fi
+    count=$(awk -v chain="$chain" '
+        $1 == "-A" && $2 == "OUTPUT" {
+            for (i = 3; i < NF; i++) {
+                if ($i == "-j" && $(i + 1) == chain) count += 1
+            }
+        }
+        END { print count + 0 }
+    ' <<<"$rules")
+    [[ "$count" = "$expected" ]]
+}
+
+check_failsafe() {
+    output_hook_count_is iptables filter "$FAILSAFE4_CHAIN" 1 || return 1
+    chain_rules_are iptables filter "$FAILSAFE4_CHAIN" \
+        "awuds.failsafe4.loopback" "-d 127.0.0.0/8 -j ACCEPT" \
+        "awuds.failsafe4.dns-udp" "-d $DNS_SERVER/32 -p udp -m udp --dport 53 -j ACCEPT" \
+        "awuds.failsafe4.dns-tcp" "-d $DNS_SERVER/32 -p tcp -m tcp --dport 53 -j ACCEPT" \
+        "awuds.failsafe4.drop" "-j DROP" || return 1
+    output_hook_count_is ip6tables filter "$FAILSAFE6_CHAIN" 1 || return 1
+    chain_rules_are ip6tables filter "$FAILSAFE6_CHAIN" \
+        "awuds.failsafe6.loopback" "-d ::1/128 -j ACCEPT" \
+        "awuds.failsafe6.drop" "-j DROP" || return 1
+}
+
+output_hook_is() {
+    local command="$1" table="$2" position="$3" chain="$4" tag="$5" rule rule_tag rule_jump tag_count
+    if [[ "$table" = filter ]]; then
+        "$command" -C OUTPUT -m comment --comment "$tag" -j "$chain" 2>/dev/null || return 1
+        rule=$($command -S OUTPUT | awk -v position="$position" \
+            '$1 == "-A" && $2 == "OUTPUT" { count += 1; if (count == position) { print; exit } }')
+        tag_count=$($command -S OUTPUT | awk -v tag="$tag" '
+            $1 == "-A" && $2 == "OUTPUT" {
+                for (i = 3; i < NF; i++) if ($i == "--comment") {
+                    value = $(i + 1); gsub(/^"|"$/, "", value); if (value == tag) count += 1
+                }
+            }
+            END { print count + 0 }
+        ')
+    else
+        "$command" -t "$table" -C OUTPUT -m comment --comment "$tag" -j "$chain" 2>/dev/null || return 1
+        rule=$($command -t "$table" -S OUTPUT | awk -v position="$position" \
+            '$1 == "-A" && $2 == "OUTPUT" { count += 1; if (count == position) { print; exit } }')
+        tag_count=$($command -t "$table" -S OUTPUT | awk -v tag="$tag" '
+            $1 == "-A" && $2 == "OUTPUT" {
+                for (i = 3; i < NF; i++) if ($i == "--comment") {
+                    value = $(i + 1); gsub(/^"|"$/, "", value); if (value == tag) count += 1
+                }
+            }
+            END { print count + 0 }
+        ')
+    fi
+    rule_tag=$(awk '{ for (i = 3; i < NF; i++) if ($i == "--comment") { value = $(i + 1); gsub(/^"|"$/, "", value); print value; exit } }' <<<"$rule")
+    rule_jump=$(awk '{ for (i = 3; i < NF; i++) if ($i == "-j") { print $(i + 1); exit } }' <<<"$rule")
+    [[ "$rule_tag" = "$tag" && "$rule_jump" = "$chain" && "$tag_count" = 1 ]] &&
+        output_hook_count_is "$command" "$table" "$chain" 1
+}
+
+output_hook_delete_commands() {
+    local command="$1" table="$2" chain="$3"
+    if [[ "$table" = filter ]]; then
+        "$command" -S OUTPUT
+    else
+        "$command" -t "$table" -S OUTPUT
+    fi | awk -v chain="$chain" '
+        $1 == "-A" && $2 == "OUTPUT" {
+            position += 1
+            for (i = 3; i < NF; i++) if ($i == "-j" && $(i + 1) == chain) print position
+        }
+    ' | sort -rn | awk '{ print "-D OUTPUT " $1 }'
+}
+
+remove_output_hooks() {
+    local command="$1" table="$2" chain="$3" position
+    while true; do
+        if [[ "$table" = filter ]]; then
+            position=$($command -S OUTPUT | awk -v chain="$chain" '
+                $1 == "-A" && $2 == "OUTPUT" { position += 1; for (i = 3; i < NF; i++) if ($i == "-j" && $(i + 1) == chain) { print position; exit } }
+            ')
+        else
+            position=$($command -t "$table" -S OUTPUT | awk -v chain="$chain" '
+                $1 == "-A" && $2 == "OUTPUT" { position += 1; for (i = 3; i < NF; i++) if ($i == "-j" && $(i + 1) == chain) { print position; exit } }
+            ')
+        fi
+        [[ -n "$position" ]] || break
+        if [[ "$table" = filter ]]; then
+            "$command" -D OUTPUT "$position"
+        else
+            "$command" -t "$table" -D OUTPUT "$position"
+        fi
+    done
+}
+
+remove_failsafe() {
+    remove_output_hooks iptables filter "$FAILSAFE4_CHAIN"
+    iptables -F "$FAILSAFE4_CHAIN" 2>/dev/null || true
+    iptables -X "$FAILSAFE4_CHAIN" 2>/dev/null || true
+    remove_output_hooks ip6tables filter "$FAILSAFE6_CHAIN"
+    ip6tables -F "$FAILSAFE6_CHAIN" 2>/dev/null || true
+    ip6tables -X "$FAILSAFE6_CHAIN" 2>/dev/null || true
+}
+
+ensure_failsafe() {
+    local directory
+    directory=$(mktemp -d "$STATE_DIR/failsafe.XXXXXX")
+    cat >"$directory/filter4.restore" <<EOF
+*filter
+:$FAILSAFE4_CHAIN - [0:0]
+-F $FAILSAFE4_CHAIN
+-A $FAILSAFE4_CHAIN -m comment --comment awuds.failsafe4.loopback -d 127.0.0.0/8 -j ACCEPT
+-A $FAILSAFE4_CHAIN -m comment --comment awuds.failsafe4.dns-udp -p udp -d $DNS_SERVER --dport 53 -j ACCEPT
+-A $FAILSAFE4_CHAIN -m comment --comment awuds.failsafe4.dns-tcp -p tcp -d $DNS_SERVER --dport 53 -j ACCEPT
+-A $FAILSAFE4_CHAIN -m comment --comment awuds.failsafe4.drop -j DROP
+$(output_hook_delete_commands iptables filter "$FAILSAFE4_CHAIN")
+-I OUTPUT 1 -m comment --comment awuds.failsafe4.hook -j $FAILSAFE4_CHAIN
+COMMIT
+EOF
+    cat >"$directory/filter6.restore" <<EOF
+*filter
+:$FAILSAFE6_CHAIN - [0:0]
+-F $FAILSAFE6_CHAIN
+-A $FAILSAFE6_CHAIN -m comment --comment awuds.failsafe6.loopback -d ::1/128 -j ACCEPT
+-A $FAILSAFE6_CHAIN -m comment --comment awuds.failsafe6.drop -j DROP
+$(output_hook_delete_commands ip6tables filter "$FAILSAFE6_CHAIN")
+-I OUTPUT 1 -m comment --comment awuds.failsafe6.hook -j $FAILSAFE6_CHAIN
+COMMIT
+EOF
+    # Each family switches atomically from its old fail-safe to a complete,
+    # first-position fail-safe. Never remove these hooks on later failure.
+    iptables-restore --test --noflush <"$directory/filter4.restore"
+    ip6tables-restore --test --noflush <"$directory/filter6.restore"
+    iptables-restore --noflush <"$directory/filter4.restore"
+    ip6tables-restore --noflush <"$directory/filter6.restore"
+    rm -rf -- "$directory"
+    check_failsafe || die "fail-safe firewall hooks failed validation"
+    output_hook_is iptables filter 1 "$FAILSAFE4_CHAIN" awuds.failsafe4.hook || die "IPv4 fail-safe hook is not first"
+    output_hook_is ip6tables filter 1 "$FAILSAFE6_CHAIN" awuds.failsafe6.hook || die "IPv6 fail-safe hook is not first"
+}
+
+check_generation() {
+    local generation="$1"
+    chain_names "$generation"
+    chain_rules_are iptables nat "$NAT_CHAIN" \
+        "awuds.gen.$generation.nat.http" "-p tcp -m tcp --dport 80 -j REDIRECT --to-ports $HTTP_PORT" \
+        "awuds.gen.$generation.nat.https" "-p tcp -m tcp --dport 443 -j REDIRECT --to-ports $HTTPS_PORT" \
+        "awuds.gen.$generation.nat.loopback" "-d 127.0.0.0/8 -j RETURN" \
+        "awuds.gen.$generation.nat.return" "-j RETURN" || return 1
+    chain_rules_are iptables filter "$FILTER_CHAIN" \
+        "awuds.gen.$generation.filter4.dnat" "-m conntrack --ctstate DNAT -j ACCEPT" \
+        "awuds.gen.$generation.filter4.loopback" "-d 127.0.0.0/8 -j ACCEPT" \
+        "awuds.gen.$generation.filter4.http" "-p tcp -m tcp --dport 80 -j DROP" \
+        "awuds.gen.$generation.filter4.https" "-p tcp -m tcp --dport 443 -j DROP" \
+        "awuds.gen.$generation.filter4.quic" "-p udp -m udp --dport 443 -j DROP" \
+        "awuds.gen.$generation.filter4.established" "-m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
+        "awuds.gen.$generation.filter4.dns-udp" "-d $DNS_SERVER/32 -p udp -m udp --dport 53 -j ACCEPT" \
+        "awuds.gen.$generation.filter4.dns-tcp" "-d $DNS_SERVER/32 -p tcp -m tcp --dport 53 -j ACCEPT" \
+        "awuds.gen.$generation.filter4.drop" "-j DROP" || return 1
+    chain_rules_are ip6tables filter "$FILTER6_CHAIN" \
+        "awuds.gen.$generation.filter6.loopback" "-d ::1/128 -j ACCEPT" \
+        "awuds.gen.$generation.filter6.quic" "-p udp -m udp --dport 443 -j DROP" \
+        "awuds.gen.$generation.filter6.drop" "-j DROP" || return 1
+    output_hook_is iptables filter 1 "$FILTER_CHAIN" "awuds.gen.$generation.filter4.hook" || return 1
+    output_hook_is iptables filter 2 "$FAILSAFE4_CHAIN" awuds.failsafe4.hook || return 1
+    output_hook_is iptables nat 1 "$NAT_CHAIN" "awuds.gen.$generation.nat.hook" || return 1
+    output_hook_is ip6tables filter 1 "$FILTER6_CHAIN" "awuds.gen.$generation.filter6.hook" || return 1
+    output_hook_is ip6tables filter 2 "$FAILSAFE6_CHAIN" awuds.failsafe6.hook || return 1
+}
+
+remove_generation() {
+    local generation="$1"
+    chain_names "$generation"
+    remove_output_hooks iptables nat "$NAT_CHAIN"
+    iptables -t nat -F "$NAT_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$NAT_CHAIN" 2>/dev/null || true
+    remove_output_hooks iptables filter "$FILTER_CHAIN"
+    iptables -F "$FILTER_CHAIN" 2>/dev/null || true
+    iptables -X "$FILTER_CHAIN" 2>/dev/null || true
+    remove_output_hooks ip6tables filter "$FILTER6_CHAIN"
+    ip6tables -F "$FILTER6_CHAIN" 2>/dev/null || true
+    ip6tables -X "$FILTER6_CHAIN" 2>/dev/null || true
+}
+
+remove_orphan_generations() {
+    local chain generation
+    declare -A generations=()
+    while read -r chain; do
+        if [[ "$chain" =~ ^AWUDS(F|6|N)_([0-9a-f]{16})$ ]]; then
+            generations["${BASH_REMATCH[2]}"]=1
+        fi
+    done < <(
+        {
+            iptables -S | awk '$1 == "-N" { print $2 }'
+            iptables -t nat -S | awk '$1 == "-N" { print $2 }'
+            ip6tables -S | awk '$1 == "-N" { print $2 }'
+        } | sort -u
+    )
+    for generation in "${!generations[@]}"; do
+        remove_generation "$generation"
+    done
+}
+
+write_restore_files() {
+    local directory="$1"
+    cat >"$directory/filter6.restore" <<EOF
+*filter
+:$FILTER6_CHAIN - [0:0]
+-A $FILTER6_CHAIN -m comment --comment awuds.gen.$generation.filter6.loopback -d ::1/128 -j ACCEPT
+-A $FILTER6_CHAIN -m comment --comment awuds.gen.$generation.filter6.quic -p udp --dport 443 -j DROP
+-A $FILTER6_CHAIN -m comment --comment awuds.gen.$generation.filter6.drop -j DROP
+-I OUTPUT 1 -m comment --comment awuds.gen.$generation.filter6.hook -j $FILTER6_CHAIN
+COMMIT
+EOF
+    cat >"$directory/ipv4.restore" <<EOF
+*filter
+:$FILTER_CHAIN - [0:0]
+-A $FILTER_CHAIN -m comment --comment awuds.gen.$generation.filter4.dnat -m conntrack --ctstate DNAT -j ACCEPT
+-A $FILTER_CHAIN -m comment --comment awuds.gen.$generation.filter4.loopback -d 127.0.0.0/8 -j ACCEPT
+-A $FILTER_CHAIN -m comment --comment awuds.gen.$generation.filter4.http -p tcp --dport 80 -j DROP
+-A $FILTER_CHAIN -m comment --comment awuds.gen.$generation.filter4.https -p tcp --dport 443 -j DROP
+-A $FILTER_CHAIN -m comment --comment awuds.gen.$generation.filter4.quic -p udp --dport 443 -j DROP
+-A $FILTER_CHAIN -m comment --comment awuds.gen.$generation.filter4.established -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-A $FILTER_CHAIN -m comment --comment awuds.gen.$generation.filter4.dns-udp -p udp -d $DNS_SERVER --dport 53 -j ACCEPT
+-A $FILTER_CHAIN -m comment --comment awuds.gen.$generation.filter4.dns-tcp -p tcp -d $DNS_SERVER --dport 53 -j ACCEPT
+-A $FILTER_CHAIN -m comment --comment awuds.gen.$generation.filter4.drop -j DROP
+-I OUTPUT 1 -m comment --comment awuds.gen.$generation.filter4.hook -j $FILTER_CHAIN
+COMMIT
+*nat
+:$NAT_CHAIN - [0:0]
+-A $NAT_CHAIN -m comment --comment awuds.gen.$generation.nat.http -p tcp --dport 80 -j REDIRECT --to-ports $HTTP_PORT
+-A $NAT_CHAIN -m comment --comment awuds.gen.$generation.nat.https -p tcp --dport 443 -j REDIRECT --to-ports $HTTPS_PORT
+-A $NAT_CHAIN -m comment --comment awuds.gen.$generation.nat.loopback -d 127.0.0.0/8 -j RETURN
+-A $NAT_CHAIN -m comment --comment awuds.gen.$generation.nat.return -j RETURN
+-I OUTPUT 1 -m comment --comment awuds.gen.$generation.nat.hook -j $NAT_CHAIN
+COMMIT
+EOF
+}
+
+new_generation_id() {
+    local epoch pid generation
+    epoch=$(date +%s)
+    pid=${AW_FIREWALL_TEST_PID:-$$}
+    [[ "$epoch" =~ ^[0-9]+$ ]] || die "clock returned an invalid epoch"
+    [[ "$pid" =~ ^[0-9]+$ ]] || die "generation PID must be numeric"
+    printf -v generation '%08x%04x%04x' \
+        "$((10#$epoch & 0xffffffff))" \
+        "$((10#$pid & 0xffff))" \
+        "$((RANDOM & 0xffff))"
+    [[ "$generation" =~ ^[0-9a-f]{16}$ ]] || die "failed to create a valid firewall generation"
+    printf '%s' "$generation"
+}
+
+install_generation() {
+    local previous generation transaction_dir state_tmp
+    ensure_failsafe
+    previous=$(current_generation)
+    generation=$(new_generation_id)
+    chain_names "$generation"
+    transaction_dir=$(mktemp -d "$STATE_DIR/firewall.XXXXXX")
+    trap 'rm -rf -- "$transaction_dir"' RETURN
+    write_restore_files "$transaction_dir"
+
+    # IPv6 is denied first. IPv4 filter and NAT chains are populated and hooked
+    # by one restore invocation; the filter table commits before redirects.
+    if ! {
+        ip6tables-restore --test --noflush <"$transaction_dir/filter6.restore" &&
+        iptables-restore --test --noflush <"$transaction_dir/ipv4.restore" &&
+        ip6tables-restore --noflush <"$transaction_dir/filter6.restore" &&
+        iptables-restore --noflush <"$transaction_dir/ipv4.restore"
+    }; then
+        remove_generation "$generation"
+        die "firewall generation transaction failed"
+    fi
+
+    if ! check_generation "$generation"; then
+        remove_generation "$generation"
+        die "new firewall generation failed post-install validation"
+    fi
+    state_tmp="$STATE_FILE.tmp.$$"
+    printf '%s\n' "$generation" >"$state_tmp"
+    chmod 0600 "$state_tmp"
+    mv -f -- "$state_tmp" "$STATE_FILE"
+    if [[ -n "$previous" && "$previous" != "$generation" ]]; then
+        remove_generation "$previous"
+    fi
+    trap - RETURN
+    rm -rf -- "$transaction_dir"
+}
+
+check_current() {
+    local generation
+    check_failsafe || return 1
+    generation=$(current_generation)
+    [[ -n "$generation" ]] || return 1
+    check_generation "$generation"
+}
+
+case "$ACTION" in
+    install) install_generation ;;
+    repair) check_current 2>/dev/null || install_generation ;;
+    check) check_current || die "firewall generation or fail-safe hooks are incomplete" ;;
+    remove)
+        remove_orphan_generations
+        remove_failsafe
+        rm -f -- "$STATE_FILE" "$READY_FILE"
+        ;;
+    watch)
+        trap 'rm -f -- "$READY_FILE"' EXIT
+        check_current 2>/dev/null || install_generation
+        : >"$READY_FILE"
+        chmod 0600 "$READY_FILE"
+        flock -u 9
+        while true; do
+            sleep "$CHECK_INTERVAL"
+            flock -x 9
+            if ! check_current 2>/dev/null; then
+                rm -f -- "$READY_FILE"
+                install_generation
+                : >"$READY_FILE"
+                chmod 0600 "$READY_FILE"
+            fi
+            flock -u 9
+        done
+        ;;
+    *) usage ;;
+esac

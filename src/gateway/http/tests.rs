@@ -1899,6 +1899,7 @@ async fn malformed_json_mode_output_and_launch_var_errors_are_stable() {
 #[tokio::test]
 async fn status_shape_can_be_wrapped_in_data_envelope() {
     let status = GatewayStatus {
+        host_socket_exposures: Vec::new(),
         target: "default".into(),
         session_id: None,
         launch: None,

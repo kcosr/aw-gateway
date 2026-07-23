@@ -30,7 +30,7 @@ AW_IDENTITY_TOKEN = { inherit = "AW_IDENTITY_TOKEN" }
 
 [container_agent.services.health_check]
 type = "http"
-url = "http://127.0.0.1:8881/_acl-proxy/ready"
+url = "http://127.0.0.1:8898/_acl-proxy/ready"
 expect_status = 200
 expect_json = { status = "ready" }
 interval = "2s"

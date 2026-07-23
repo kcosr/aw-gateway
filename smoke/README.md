@@ -123,6 +123,83 @@ Run one host:
 .venv/bin/python -m pytest --host macos-colima -q
 ```
 
+## Transparent UDS Privileged Gate
+
+`scripts/run-transparent-uds-stack-smoke.sh` is a separate, Linux-only T04
+integration gate. It runs a privileged Docker workload and installs temporary
+`iptables` rules inside that isolated container. It exercises the raw
+transparent-traffic seam: real HTTP and HTTPS redirects, original-destination
+recovery, PROXY v2 over exact Unix-socket mounts, ACL policy and MITM, parent
+proxy routing, fail-closed proxy loss, and Linux pinned-inode restart behavior.
+It does not invoke the `aw-gateway` CLI or claim lifecycle orchestration
+coverage. T03 lifecycle behavior remains covered by the pytest scenarios above.
+
+The gate requires clean AW Gateway, ACL Proxy, and access-runtime worktrees,
+including no untracked files. It performs a locked release build and rejects
+binaries outside the ACL Proxy worktree's `target/release` directory. The
+caller must pin the expected commit for all three repositories:
+
+```bash
+AW_REPO=/absolute/path/to/aw-gateway
+ACL_REPO=/absolute/path/to/acl-proxy
+ACCESS_RUNTIME_REPO=/absolute/path/to/access-runtime
+
+"$AW_REPO/smoke/scripts/run-transparent-uds-stack-smoke.sh" \
+  --acl-proxy-bin "$ACL_REPO/target/release/acl-proxy" \
+  --relay-bin "$ACL_REPO/target/release/acl-proxy-transparent-uds-relay" \
+  --acl-repo "$ACL_REPO" \
+  --access-runtime-repo "$ACCESS_RUNTIME_REPO" \
+  --aw-repo "$AW_REPO" \
+  --expected-acl-sha "$(git -C "$ACL_REPO" rev-parse HEAD)" \
+  --expected-access-runtime-sha "$(git -C "$ACCESS_RUNTIME_REPO" rev-parse HEAD)" \
+  --expected-aw-sha "$(git -C "$AW_REPO" rev-parse HEAD)"
+```
+
+The script prebuilds a disposable workload image before enabling the protected
+workload, prints repository and binary/image fingerprints, and removes its
+containers, network, image, and temporary files. Its HTTP/1 stream assertion
+proves incremental end-to-end delivery and interrupted active-stream behavior;
+the focused ACL/runtime and relay test suites remain authoritative for HTTP/2,
+WebSocket, backpressure bounds, and half-close semantics. `cargo test --test
+assets` checks only the harness's structural contract and shell syntax; it does
+not execute this privileged gate.
+
+The Docker workload sets `nofile=4096` because Docker's local default soft
+limit is lower than the shipped relay configuration's checked startup
+projection (`64 + route_count + 2 * maxConnections`, currently 2,114). This is
+Linux test scaffolding, not evidence of the Apple Container process limit. The
+deploying environment owns that limit; the relay validates the effective soft
+limit at startup and fails closed when the configured capacity does not fit.
+
+## Host Socket Exposure Docker Gate
+
+`scripts/run-host-socket-exposure-smoke.sh` is a separate opt-in Linux Docker
+gate for AW Gateway's typed `host_socket_exposures` lifecycle. It starts a
+temporary host UDS echo server, invokes the actual `aw-gateway up` path for a
+runtime-exec target, verifies the persisted realization manifest and exact
+Docker bind, then uses `aw-gateway run` to exchange bytes through the
+in-container socket. It replaces the host listener inode, proves the existing
+target becomes recreate-required, explicitly removes and recreates it through
+AW Gateway, and completes a second exchange. It deliberately does not implement
+the transparent relay or proxy protocol; the privileged transparent UDS gate
+owns that coverage.
+
+The gate requires Linux and a local Unix-socket Docker endpoint and refuses
+implicit image pulls. It uses the checked-out debug binary by default, or an
+explicit absolute binary and local image:
+
+```bash
+smoke/scripts/run-host-socket-exposure-smoke.sh
+
+AW_HOST_SOCKET_SMOKE_GATEWAY_BIN=/absolute/path/to/aw-gateway \
+AW_HOST_SOCKET_SMOKE_IMAGE=python:3.12-slim \
+  smoke/scripts/run-host-socket-exposure-smoke.sh
+```
+
+Temporary containers, state, workspace, and socket files are removed on every
+normal or failed run. Set `AW_HOST_SOCKET_SMOKE_KEEP_FAILED=1` to retain the
+temporary directory after a failure; the container is still removed.
+
 ## What Gets Installed
 
 Linux operator layout:
