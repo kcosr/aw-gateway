@@ -4,7 +4,9 @@ use crate::fileutil::{
     AtomicWritePolicy, atomic_write_file, remove_if_exists, set_mode, write_private_file,
 };
 use crate::paths;
+use access_identity::SensitiveBearer;
 use anyhow::Context;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -116,8 +118,8 @@ impl Runtime {
         // request `AW_IDENTITY_TOKEN` via EnvValue::inherit. Keep this in sync
         // with ContainerAgentConfig::needs_identity_token when adding new token
         // consumer mechanisms.
-        if let Ok(value) = std::env::var("AW_IDENTITY_TOKEN") {
-            return validate_identity_token_content(&value, Path::new("AW_IDENTITY_TOKEN"));
+        if let Some(value) = std::env::var_os("AW_IDENTITY_TOKEN") {
+            return validate_identity_token_environment(value);
         }
         let path = self.identity.user.config_dir().join("identity-token");
         ensure_identity_token_file(&path)
@@ -341,7 +343,8 @@ pub(super) fn ensure_identity_token_file(path: &Path) -> anyhow::Result<String> 
 
     match options.open(path) {
         Ok(mut file) => {
-            writeln!(file, "{token}").with_context(|| format!("write {}", path.display()))?;
+            file.write_all(token.as_bytes())
+                .with_context(|| format!("write {}", path.display()))?;
             set_mode(path, 0o600)?;
             Ok(token)
         }
@@ -355,21 +358,17 @@ pub(super) fn ensure_identity_token_file(path: &Path) -> anyhow::Result<String> 
     }
 }
 
+pub(super) fn validate_identity_token_environment(value: OsString) -> anyhow::Result<String> {
+    let value = value
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("identity token environment source is invalid"))?;
+    validate_identity_token_content(&value, Path::new("AW_IDENTITY_TOKEN"))
+}
+
 pub(super) fn validate_identity_token_content(value: &str, path: &Path) -> anyhow::Result<String> {
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        anyhow::bail!("identity token file {} is empty", path.display());
-    }
-    if value.len() > 4096 {
-        anyhow::bail!("identity token file {} is too large", path.display());
-    }
-    if value.lines().count() != 1 {
-        anyhow::bail!(
-            "identity token file {} must contain exactly one line",
-            path.display()
-        );
-    }
-    Ok(value)
+    SensitiveBearer::new(value.as_bytes())
+        .map_err(|_| anyhow::anyhow!("identity token source {} is invalid", path.display()))?;
+    Ok(value.to_owned())
 }
 
 pub(super) fn validate_control_token_content(value: &str, path: &Path) -> anyhow::Result<String> {

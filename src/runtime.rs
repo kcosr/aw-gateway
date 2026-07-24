@@ -35,7 +35,7 @@ pub struct ContainerRuntime {
     env: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ContainerRunSpec {
     pub name: String,
     pub hostname: String,
@@ -54,6 +54,32 @@ pub struct ContainerRunSpec {
     pub published_ssh_host_port: Option<u16>,
     pub extra_run_args: Vec<String>,
     pub command: Vec<String>,
+}
+
+impl fmt::Debug for ContainerRunSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env_keys = self.env.keys().collect::<Vec<_>>();
+        formatter
+            .debug_struct("ContainerRunSpec")
+            .field("name", &self.name)
+            .field("hostname", &self.hostname)
+            .field("image", &self.image)
+            .field("workspace", &self.workspace)
+            .field("workspace_container_path", &self.workspace_container_path)
+            .field("container_home", &self.container_home)
+            .field("container_user", &self.container_user)
+            .field("passwd_entry", &self.passwd_entry)
+            .field("state_dir_in_container", &self.state_dir_in_container)
+            .field("mounts", &self.mounts)
+            .field("host_socket_exposures", &self.host_socket_exposures)
+            .field("env_keys", &env_keys)
+            .field("labels", &self.labels)
+            .field("publish_ssh", &self.publish_ssh)
+            .field("published_ssh_host_port", &self.published_ssh_host_port)
+            .field("extra_run_args", &self.extra_run_args)
+            .field("command", &self.command)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2898,6 +2924,23 @@ mod tests {
             extra_run_args: Vec::new(),
             command: vec!["sleep".into(), "infinity".into()],
         }
+    }
+
+    #[test]
+    fn container_run_spec_debug_redacts_environment_values() {
+        let mut spec = test_run_spec(Vec::new());
+        spec.env.insert(
+            "AW_IDENTITY_TOKEN".into(),
+            "abcdefghijklmnopqrstuvwxyzABCDEF".into(),
+        );
+        spec.env
+            .insert("AW_SAFE".into(), "visible-but-redacted".into());
+
+        let debug = format!("{spec:?}");
+        assert!(debug.contains("AW_IDENTITY_TOKEN"));
+        assert!(debug.contains("AW_SAFE"));
+        assert!(!debug.contains("abcdefghijklmnopqrstuvwxyzABCDEF"));
+        assert!(!debug.contains("visible-but-redacted"));
     }
 
     #[test]

@@ -1,8 +1,9 @@
 use access_async_contracts::{AccessCancellation, BoxAccessFuture};
+#[cfg(test)]
+use access_flow_relay::ConnectionCloseCategory;
 use access_flow_relay::{
     AccessFlowRelay, AccessFlowRelayEvent, AccessFlowRelayEventKind, AccessFlowRelayFailure,
-    AccessFlowRelayObserver, AccessFlowRelayResourceBudget, ConnectionCloseCategory,
-    RunningAccessFlowRelay,
+    AccessFlowRelayObserver, AccessFlowRelayResourceBudget, RunningAccessFlowRelay,
 };
 use access_flow_unix::UnixAccessFlowConnector;
 use access_identity::IdentityPresentation;
@@ -210,9 +211,7 @@ impl AccessFlowRelayObserver for RelayObserver {
             AccessFlowRelayEventKind::ConnectionOpened => {
                 self.active_flows.fetch_add(1, Ordering::AcqRel);
             }
-            AccessFlowRelayEventKind::ConnectionClosed
-                if event.close_category != Some(ConnectionCloseCategory::Saturated) =>
-            {
+            AccessFlowRelayEventKind::ConnectionClosed => {
                 if self
                     .active_flows
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -723,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn observer_delta_accounting_is_stable_under_snapshot_interleaving() {
+    fn observer_delta_accounting_ignores_rejections_and_snapshot_interleaving() {
         let active_flows = Arc::new(AtomicUsize::new(0));
         let observer = RelayObserver {
             active_flows: Arc::clone(&active_flows),
@@ -740,8 +739,13 @@ mod tests {
             1,
         ));
         observer.observe(observed_event(
-            AccessFlowRelayEventKind::ConnectionClosed,
+            AccessFlowRelayEventKind::ConnectionRejected,
             Some(ConnectionCloseCategory::Saturated),
+            2,
+        ));
+        observer.observe(observed_event(
+            AccessFlowRelayEventKind::ConnectionRejected,
+            Some(ConnectionCloseCategory::Cancelled),
             2,
         ));
         assert_eq!(active_flows.load(Ordering::Acquire), 2);
@@ -768,7 +772,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn supervisor_probes_prepares_reports_ready_and_stops() {
+    async fn supervisor_keeps_live_flow_until_drain_deadline_then_forces_it() {
         let dir = tempfile::tempdir().unwrap();
         let endpoint = dir.path().join("access-flow.sock");
         let endpoint_listener = std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
@@ -830,12 +834,41 @@ mod tests {
         assert_eq!(&received, b"still-open");
         assert_eq!(control.active_flows(), 1);
 
-        drop(client);
-        drop(channel);
-        control
-            .shutdown(Instant::now() + Duration::from_secs(1))
-            .await;
+        let shutdown_control = control.clone();
+        let shutdown = tokio::spawn(async move {
+            shutdown_control
+                .shutdown(Instant::now() + Duration::from_millis(200))
+                .await;
+        });
+        sleep(Duration::from_millis(30)).await;
+        assert!(!shutdown.is_finished());
+        client.write_all(b"pre-deadline").await.unwrap();
+        let mut pre_deadline = [0_u8; 12];
+        channel.read_exact(&mut pre_deadline).await.unwrap();
+        assert_eq!(&pre_deadline, b"pre-deadline");
+        assert_eq!(control.active_flows(), 1);
+
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
         supervisor.await.unwrap().unwrap();
+        assert_eq!(control.active_flows(), 0);
+        let mut eof = [0_u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), client.read(&mut eof))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), channel.read(&mut eof))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
         assert_eq!(
             control.status().await.state,
             AccessFlowRelayStateName::Stopped

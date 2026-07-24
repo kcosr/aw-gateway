@@ -7319,15 +7319,35 @@ fn public_key_validation_accepts_known_types() {
 }
 
 #[test]
-fn identity_token_validation_requires_single_non_empty_line() {
+fn identity_token_validation_enforces_exact_canonical_bearer_bytes() {
     let path = PathBuf::from("/tmp/token");
+    let valid = "abcdefghijklmnopqrstuvwxyzABCDEF";
     assert_eq!(
-        validate_identity_token_content("abc\n", &path).unwrap(),
-        "abc"
+        validate_identity_token_content(valid, &path).unwrap(),
+        valid
     );
     assert!(validate_identity_token_content("", &path).is_err());
-    assert!(validate_identity_token_content("a\nb", &path).is_err());
+    assert!(validate_identity_token_content("short", &path).is_err());
+    assert!(validate_identity_token_content(&format!("{valid}\n"), &path).is_err());
+    assert!(validate_identity_token_content(&format!("{valid}\r\n"), &path).is_err());
+    assert!(validate_identity_token_content(&format!("{valid}\0"), &path).is_err());
+    assert!(validate_identity_token_content(&format!(" {valid}"), &path).is_err());
+    assert!(validate_identity_token_content(&format!("{valid} "), &path).is_err());
+    assert!(validate_identity_token_content(&format!("é{valid}"), &path).is_err());
     assert!(validate_identity_token_content(&"x".repeat(4097), &path).is_err());
+}
+
+#[test]
+#[cfg(unix)]
+fn identity_token_environment_rejects_present_non_unicode_bytes() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let error = super::identity::validate_identity_token_environment(std::ffi::OsString::from_vec(
+        vec![0xff; 32],
+    ))
+    .unwrap_err()
+    .to_string();
+    assert_eq!(error, "identity token environment source is invalid");
 }
 
 #[test]
@@ -7368,6 +7388,7 @@ fn identity_token_is_generated_once_with_private_permissions() {
     let second = ensure_identity_token_file(&path).unwrap();
 
     assert_eq!(first, second);
+    assert_eq!(std::fs::read(&path).unwrap(), first.as_bytes());
     assert_eq!(first.len(), 36);
     assert_eq!(&first[14..15], "4");
     assert!(matches!(&first[19..20], "8" | "9" | "a" | "b"));
