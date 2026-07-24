@@ -15,5 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Test Access Runtime pin validator
+        run: python3 scripts/test-access-runtime-pin.py
       - name: Reproduce pinned Access Runtime build
         run: scripts/check-access-runtime-pin.sh
