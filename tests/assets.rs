@@ -283,7 +283,7 @@ fn transparent_uds_stack_smoke_structural_contract_is_explicit() {
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("smoke/README.md"))
             .unwrap();
     assert!(readme.contains("Transparent UDS Privileged Gate"));
-    assert!(readme.contains("Linux-only T04"));
+    assert!(readme.contains("Linux-only privileged"));
     assert!(readme.contains("structural contract and shell syntax"));
     assert!(readme.contains("privileged gate."));
 }

@@ -125,14 +125,16 @@ Run one host:
 
 ## Transparent UDS Privileged Gate
 
-`scripts/run-transparent-uds-stack-smoke.sh` is a separate, Linux-only T04
-integration gate. It runs a privileged Docker workload and installs temporary
+`scripts/run-transparent-uds-stack-smoke.sh` is the Linux-only privileged
+integration component of the active Program's exact-tuple Gate X. It runs a
+Docker workload and installs temporary
 `iptables` rules inside that isolated container. It exercises the raw
 transparent-traffic seam: real HTTP and HTTPS redirects, original-destination
 recovery, AW Access Flow over exact Unix-socket mounts, ACL policy and MITM, parent
 proxy routing, fail-closed proxy loss, and Linux pinned-inode restart behavior.
 It does not invoke the `aw-gateway` CLI or claim lifecycle orchestration
-coverage. T03 lifecycle behavior remains covered by the pytest scenarios above.
+coverage. Gate W and the host-socket exposure smoke own gateway lifecycle
+behavior.
 
 The gate requires clean AW Gateway, ACL Proxy, and access-runtime worktrees,
 including no untracked files. The caller supplies exact release binaries built

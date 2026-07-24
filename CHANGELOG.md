@@ -36,13 +36,15 @@
 - Added typed host-to-container Unix socket exposure for Apple Container 1.1+
   and native local Linux Docker/Podman, including strict source validation,
   backend-specific realization, existing-container manifests, and readiness
-  status. Added an optional Apple host-proxy example with a supervised
-  transparent relay and fail-closed IPv4/IPv6 firewall policy.
+  status. Added an optional Apple host-proxy example with the shared Access
+  Flow relay embedded in `aw-container-agent` and fail-closed IPv4/IPv6
+  firewall policy.
 - Host socket targets can optionally select the in-container readiness identity
   used only for bounded endpoint probes; it defaults to root and does not alter
   realization or container reuse identity. The host-proxy profile reuses
   required container bootstrap steps for fail-closed firewall installation and
-  ordinary service dependencies for watcher, relay, and SSH startup ordering.
+  combines ordinary watcher service dependencies with the synthetic
+  `@access-flow-relay` readiness node for SSH startup ordering.
 - Added an opt-in privileged Linux stack smoke that pins the reviewed
   Access Runtime, ACL Proxy, and AW Gateway commits and exercises real
   HTTP/HTTPS transparent redirects through the release relay, host UDS proxy,

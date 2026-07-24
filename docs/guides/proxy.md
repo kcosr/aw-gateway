@@ -228,10 +228,13 @@ For VS Code or other Node-based tools, also validate from an SSH session so
 
 ## Implementation Option
 
-One possible proxy implementation is
-[acl-proxy](https://github.com/kcosr/acl-proxy). `aw-gateway` does not require
-that project; any proxy with a stable command, config file, health check, CA
-bundle, and firewall policy can use the same integration pattern.
+The typed host-socket exposure is application-neutral, and the embedded relay
+connects to any Unix listener that implements AW Access Flow version 1. The
+provided host-local profile uses
+[acl-proxy](https://github.com/kcosr/acl-proxy-access-runtime) because it
+supplies the required Access Flow listeners plus transparent HTTP/HTTPS policy
+and MITM behavior. Another implementation must provide those same protocol and
+deployment contracts; a generic Unix socket alone is not sufficient.
 
 The repository includes `assets/acl-proxy.example.toml` as a small starter
 policy for common coding-agent egress: broad GitHub access, optional GitHub
