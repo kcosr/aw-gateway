@@ -475,6 +475,11 @@ mod tests {
         let config = product_gateway_config();
         let target = config.effective_target("ubuntu-host-proxy").unwrap();
         let relay = target.container_agent.access_flow_relay.unwrap();
+        let AccessFlowRelayPresentation::BearerEnvironment { variable } = &relay.presentation
+        else {
+            panic!("shipped host-proxy relay must use bearer_environment");
+        };
+        assert_eq!(variable, "AW_IDENTITY_TOKEN");
         let compiled = relay
             .compile_with_presentation(
                 AccessFlowRelayValidationMode::Agent,
