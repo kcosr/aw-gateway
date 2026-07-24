@@ -427,8 +427,8 @@ mod tests {
     use access_flow::write_access_flow_preface;
     #[cfg(target_os = "linux")]
     use access_flow_conformance::{
-        NormalizedAccessFlowTransport, load_adapter_parity_fixture, load_awaf_vector_suite,
-        project_relay_plan,
+        FixturePresentationKind, NormalizedAccessFlowTransport, load_adapter_parity_fixture,
+        load_awaf_vector_suite, project_relay_plan,
     };
     #[cfg(target_os = "linux")]
     use access_flow_unix::{NormalizedUnixSocketPath, UnixAccessFlowEndpoint};
@@ -543,41 +543,43 @@ mod tests {
                 .iter()
                 .map(|vector| vector.name())
                 .collect::<Vec<_>>(),
-            ["absent", "anonymous", "bearer"]
+            [
+                "absent",
+                "anonymous",
+                "bearer",
+                "unicast-before-multicast",
+                "reserved-after-multicast",
+                "high-unicast-before-broadcast",
+            ]
         );
 
-        let presentation_configs = [
-            ("absent", AccessFlowRelayPresentation::Disabled {}),
-            ("anonymous", AccessFlowRelayPresentation::Anonymous {}),
-            (
-                "bearer",
-                AccessFlowRelayPresentation::BearerEnvironment {
+        for vector in suite.vectors() {
+            let bearer_expected = vector.presentation() == FixturePresentationKind::Bearer;
+            let presentation_config = match vector.presentation() {
+                FixturePresentationKind::Disabled => AccessFlowRelayPresentation::Disabled {},
+                FixturePresentationKind::Anonymous => AccessFlowRelayPresentation::Anonymous {},
+                FixturePresentationKind::Bearer => AccessFlowRelayPresentation::BearerEnvironment {
                     variable: IDENTITY_SOURCE.to_string(),
                 },
-            ),
-        ];
-        for (vector, &(expected_name, ref presentation_config)) in
-            suite.vectors().iter().zip(&presentation_configs)
-        {
-            assert_eq!(vector.name(), expected_name);
+            };
             let mut agent_config = target.container_agent.clone();
             agent_config
                 .access_flow_relay
                 .as_mut()
                 .unwrap()
-                .presentation = presentation_config.clone();
+                .presentation = presentation_config;
 
             let mut identity_requests = Vec::new();
             let (presentation, service_identity) =
                 activate_identity_environment_with(&agent_config, |variable| {
                     identity_requests.push(variable.to_string());
-                    assert_eq!(expected_name, "bearer");
+                    assert!(bearer_expected);
                     assert_eq!(variable, IDENTITY_SOURCE);
                     Some(Zeroizing::new(BEARER.to_vec()))
                 })
                 .unwrap();
             assert!(service_identity.is_none());
-            if expected_name == "bearer" {
+            if bearer_expected {
                 assert_eq!(identity_requests, [IDENTITY_SOURCE]);
             } else {
                 assert!(identity_requests.is_empty());
@@ -590,15 +592,43 @@ mod tests {
                     presentation.unwrap(),
                 )
                 .unwrap();
-            let mut wire = Zeroizing::new(Vec::<u8>::new());
-            write_access_flow_preface(
-                &mut *wire,
-                vector.destination(),
-                compiled.plan.presentation(),
+            let matching_routes = compiled
+                .plan
+                .routes()
+                .iter()
+                .filter(|route| {
+                    route
+                        .allowed_destination_ports()
+                        .contains(&vector.destination().port())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching_routes.len(),
+                1,
+                "{} must map to one product route",
+                vector.name()
+            );
+            let mapped_destination = access_flow::AccessFlowDestination::new(
+                vector.destination().address(),
+                matching_routes[0]
+                    .allowed_destination_ports()
+                    .iter()
+                    .find(|port| **port == vector.destination().port())
+                    .expect("matching route contains the vector port")
+                    .get(),
             )
-            .await
             .unwrap();
-            assert_eq!(wire.as_slice(), vector.wire(), "vector {expected_name}");
+            assert_eq!(
+                mapped_destination,
+                vector.destination(),
+                "{}",
+                vector.name()
+            );
+            let mut wire = Zeroizing::new(Vec::<u8>::new());
+            write_access_flow_preface(&mut *wire, mapped_destination, compiled.plan.presentation())
+                .await
+                .unwrap();
+            assert_eq!(wire.as_slice(), vector.wire(), "vector {}", vector.name());
         }
     }
 
