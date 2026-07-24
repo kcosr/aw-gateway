@@ -213,6 +213,41 @@ canonical_repo() {
     printf '%s\n' "$canonical"
 }
 
+canonical_private_temp_base() {
+    local candidate=$1
+    [[ $candidate == /* ]] || fail "smoke temporary base must be absolute"
+    python3 - "$candidate" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+candidate = pathlib.Path(sys.argv[1])
+try:
+    base = candidate.resolve(strict=True)
+except OSError as error:
+    raise SystemExit(f"smoke temporary base is unavailable: {error}")
+if not base.is_dir():
+    raise SystemExit("smoke temporary base is not a directory")
+
+def require_trusted_directory(current: pathlib.Path) -> None:
+    metadata = current.lstat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(f"smoke temporary base has a non-directory ancestor: {current}")
+    if metadata.st_uid not in (0, os.geteuid()):
+        raise SystemExit(f"smoke temporary base has an untrusted owner: {current}")
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise SystemExit(f"smoke temporary base is group/other writable: {current}")
+
+current = pathlib.Path("/")
+require_trusted_directory(current)
+for component in base.parts[1:]:
+    current /= component
+    require_trusted_directory(current)
+print(base)
+PY
+}
+
 require_expected_sha() {
     local label=$1 repo=$2 expected=$3 actual
     [[ $expected =~ ^[0-9a-f]{40}$ ]] || fail "$label expected SHA must be a full lowercase SHA-1"
@@ -249,7 +284,10 @@ docker image inspect python:3.12-slim >/dev/null 2>&1 \
     || fail "required local image is unavailable (refusing an implicit pull): python:3.12-slim"
 
 umask 077
-TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/aw-transparent-uds-stack.XXXXXX")
+TEMP_BASE_INPUT=${AW_UDS_STACK_SMOKE_TEMP_BASE:-${HOME:-}}
+[[ -n $TEMP_BASE_INPUT ]] || fail "HOME or AW_UDS_STACK_SMOKE_TEMP_BASE is required"
+SMOKE_TEMP_BASE=$(canonical_private_temp_base "$TEMP_BASE_INPUT")
+TMP_DIR=$(mktemp -d "$SMOKE_TEMP_BASE/.aw-transparent-uds-stack.XXXXXX")
 mkdir -m 0700 "$TMP_DIR/home" "$TMP_DIR/socket-runtime" "$TMP_DIR/config" \
     "$TMP_DIR/logs" "$TMP_DIR/parent-logs"
 touch "$TMP_DIR/parent-logs/events.jsonl"
@@ -259,7 +297,7 @@ IDENTITY_TOKEN=$(openssl rand -hex 24)
 IDENTITY_TOKEN_FILE="$TMP_DIR/config/identity-token"
 IDENTITY_FIFO="$TMP_DIR/identity-token.fifo"
 BEARER_HISTORY="$TMP_DIR/.bearer-history"
-printf '%s\n' "$IDENTITY_TOKEN" >"$IDENTITY_TOKEN_FILE"
+printf '%s' "$IDENTITY_TOKEN" >"$IDENTITY_TOKEN_FILE"
 chmod 0600 "$IDENTITY_TOKEN_FILE"
 printf '%s\n' "$IDENTITY_TOKEN" >"$BEARER_HISTORY"
 chmod 0600 "$BEARER_HISTORY"
@@ -904,18 +942,12 @@ assert_workload_relay_alive() {
     ' || fail "workload relay consumer is not running"
 }
 
-assert_workload_bearer_removed() {
+assert_workload_launcher_bearer_removed() {
     docker exec "$WORKLOAD_CONTAINER" sh -eu -c '
         test "${AW_IDENTITY_TOKEN+x}" != x
         relay_pid=$(cat /tmp/relay.pid)
         kill -0 "$relay_pid"
-        scratch=/tmp/relay.environ
-        trap '"'"'rm -f -- "$scratch"'"'"' EXIT
-        rm -f -- "$scratch"
-        umask 077
-        tr "\0" "\n" </proc/"$relay_pid"/environ >"$scratch"
-        ! grep -q "^AW_IDENTITY_TOKEN=" "$scratch"
-    ' || fail "could not prove live relay bearer removal"
+    ' || fail "could not prove launcher bearer removal with a live relay"
 }
 
 capture_workload_observations() {
@@ -970,7 +1002,7 @@ PY
 
 start_workload
 assert_workload_relay_alive
-assert_workload_bearer_removed
+assert_workload_launcher_bearer_removed
 
 python3 - "$WORKLOAD_CONTAINER" "$HTTP_SOCKET" "$HTTPS_SOCKET" \
     "$TMP_DIR/config/mitm-ca-cert.pem" "$WORKLOAD_ARTIFACT" "$FIREWALL" \
@@ -1132,7 +1164,7 @@ NEXT_IDENTITY_TOKEN=$(openssl rand -hex 24)
 [[ $NEXT_IDENTITY_TOKEN =~ ^[0-9a-f]{48}$ ]] \
     || fail "could not create the replacement workload bearer"
 printf '%s\n' "$NEXT_IDENTITY_TOKEN" >>"$BEARER_HISTORY"
-printf '%s\n' "$NEXT_IDENTITY_TOKEN" >"$IDENTITY_TOKEN_FILE.next"
+printf '%s' "$NEXT_IDENTITY_TOKEN" >"$IDENTITY_TOKEN_FILE.next"
 chmod 0600 "$IDENTITY_TOKEN_FILE.next"
 mv -f -- "$IDENTITY_TOKEN_FILE.next" "$IDENTITY_TOKEN_FILE"
 kill -HUP "$ACL_PID"
@@ -1174,7 +1206,7 @@ ACTIVE_BEARER=$NEXT_IDENTITY_TOKEN
 unset IDENTITY_TOKEN NEXT_IDENTITY_TOKEN
 start_workload
 assert_workload_relay_alive
-assert_workload_bearer_removed
+assert_workload_launcher_bearer_removed
 body=$(request_http http://origin.test/rotated)
 [[ $body == 'origin:/rotated:identity=absent' ]] \
     || fail "replacement workload bearer did not authenticate"
@@ -1269,7 +1301,7 @@ scan_observable_secrets
 docker rm -f "$WORKLOAD_CONTAINER" >/dev/null
 start_workload
 assert_workload_relay_alive
-assert_workload_bearer_removed
+assert_workload_launcher_bearer_removed
 NEW_WORKLOAD_HTTP_ID=$(docker exec "$WORKLOAD_CONTAINER" \
     stat -Lc '%d:%i' /run/acl-proxy/transparent-http.sock)
 NEW_WORKLOAD_HTTPS_ID=$(docker exec "$WORKLOAD_CONTAINER" \

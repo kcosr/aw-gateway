@@ -164,7 +164,10 @@ Each run prebuilds a disposable workload image before enabling the protected
 workload, delivers the bearer through a one-use FIFO so Docker launch metadata
 does not retain it, and proves required principal/group authorization,
 protected-carrier stripping, disruptive token rotation, resolver-generation
-retirement, and live-process environment removal. It prints repository and
+retirement, Docker metadata absence, and launcher-environment removal. Linux
+may retain the initial exec environment for trusted container root even after
+process-local removal; the Program explicitly does not claim isolation from
+container root or the trusted runtime operator. It prints repository and
 binary/image fingerprints and removes its containers, network, image, and
 temporary files. The HTTP/1 stream assertion proves incremental end-to-end
 delivery and interrupted active-stream behavior; focused ACL/runtime and relay
