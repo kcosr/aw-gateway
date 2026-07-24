@@ -22,10 +22,10 @@ name = "aw-ssh-command-filter"
 path = "src/bin/aw-ssh-command-filter.rs"
 
 [dependencies]
-access-async-contracts = { git = "https://github.com/kcosr/access-runtime.git", rev = "39ab65c67b386886eaab671f2c27cf2e199dd955" }
-access-flow-relay = { git = "https://github.com/kcosr/access-runtime.git", rev = "39ab65c67b386886eaab671f2c27cf2e199dd955" }
-access-flow-unix = { git = "https://github.com/kcosr/access-runtime.git", rev = "39ab65c67b386886eaab671f2c27cf2e199dd955" }
-access-identity = { git = "https://github.com/kcosr/access-runtime.git", rev = "39ab65c67b386886eaab671f2c27cf2e199dd955" }
+access-async-contracts = { git = "https://github.com/kcosr/access-runtime.git", rev = "c6af6ef8e2c5083f9f880fcd9022910a694cbfdb" }
+access-flow-relay = { git = "https://github.com/kcosr/access-runtime.git", rev = "c6af6ef8e2c5083f9f880fcd9022910a694cbfdb" }
+access-flow-unix = { git = "https://github.com/kcosr/access-runtime.git", rev = "c6af6ef8e2c5083f9f880fcd9022910a694cbfdb" }
+access-identity = { git = "https://github.com/kcosr/access-runtime.git", rev = "c6af6ef8e2c5083f9f880fcd9022910a694cbfdb" }
 anyhow = "1.0.100"
 axum = { version = "0.8.7", features = ["ws"] }
 clap = { version = "4.5.53", features = ["derive", "env"] }
@@ -55,5 +55,5 @@ tokio-tungstenite = "0.29.0"
 tower = { version = "0.5.2", features = ["util"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-access-flow = { git = "https://github.com/kcosr/access-runtime.git", rev = "39ab65c67b386886eaab671f2c27cf2e199dd955" }
-access-flow-conformance = { git = "https://github.com/kcosr/access-runtime.git", rev = "39ab65c67b386886eaab671f2c27cf2e199dd955" }
+access-flow = { git = "https://github.com/kcosr/access-runtime.git", rev = "c6af6ef8e2c5083f9f880fcd9022910a694cbfdb" }
+access-flow-conformance = { git = "https://github.com/kcosr/access-runtime.git", rev = "c6af6ef8e2c5083f9f880fcd9022910a694cbfdb" }
