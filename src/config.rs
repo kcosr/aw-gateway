@@ -15,9 +15,13 @@ mod steps;
 mod target;
 mod validation;
 
+pub(crate) use agent::{
+    ACCESS_FLOW_RELAY_NODE, AccessFlowRelayValidationMode, CompiledAccessFlowRelayConfig,
+};
 pub use agent::{
-    ContainerAgentConfig, ContainerAgentConfigInput, ControlSocketConfig, EnvValue, HealthCheck,
-    RestartPolicy, ServiceConfig, SshBridgeConfig, SshBridgeConfigInput,
+    AccessFlowRelayConfig, AccessFlowRelayPresentation, AccessFlowRelayRoute,
+    AccessFlowRelayTransport, ContainerAgentConfig, ContainerAgentConfigInput, ControlSocketConfig,
+    EnvValue, HealthCheck, RestartPolicy, ServiceConfig, SshBridgeConfig, SshBridgeConfigInput,
 };
 pub use http::{HttpAuthConfig, HttpAuthType, HttpConfig};
 pub(crate) use launch::validate_launch_var_string_value;

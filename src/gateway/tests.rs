@@ -275,6 +275,8 @@ fn disable_default_container_agent(cfg: &mut GatewayConfig) {
         ssh_bridge: None,
         control_socket: None,
         idle_cleanup: None,
+
+        access_flow_relay: None,
     });
 }
 
@@ -290,6 +292,8 @@ fn enable_default_ssh_bridge(cfg: &mut GatewayConfig) {
         }),
         control_socket: None,
         idle_cleanup: None,
+
+        access_flow_relay: None,
     });
 }
 
@@ -340,6 +344,8 @@ fn enable_default_agent_services(cfg: &mut GatewayConfig) {
         }),
         control_socket: None,
         idle_cleanup: None,
+
+        access_flow_relay: None,
     });
 }
 
@@ -353,6 +359,8 @@ fn configure_apple_published_port_target(cfg: &mut GatewayConfig) {
         ssh_bridge: None,
         control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
         idle_cleanup: None,
+
+        access_flow_relay: None,
     });
     cfg.targets.get_mut("default").unwrap().local_ssh = Some(crate::config::LocalSshConfigInput {
         backend: Some(LocalSshBackend::PublishedPort),
@@ -373,6 +381,8 @@ fn configure_direct_published_port_target(
         ssh_bridge: None,
         control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
         idle_cleanup: None,
+
+        access_flow_relay: None,
     });
     cfg.targets.get_mut("default").unwrap().local_ssh = Some(crate::config::LocalSshConfigInput {
         mode: Some(LocalSshMode::Direct),
@@ -3050,6 +3060,8 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
             Some(crate::config::LocalSshConfigInput {
@@ -3098,6 +3110,8 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
             Some(crate::config::LocalSshConfigInput {
@@ -3178,6 +3192,8 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
             Some(crate::config::LocalSshConfigInput {
@@ -3231,6 +3247,8 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
             Some(crate::config::LocalSshConfigInput {
@@ -3549,6 +3567,8 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
             Some(crate::config::LocalSshConfigInput {
@@ -3601,6 +3621,8 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
             Some(crate::config::LocalSshConfigInput {
@@ -6003,6 +6025,8 @@ async fn typed_agent_status_ready_drives_wait_and_runtime_status() {
             ssh_bridge: None,
             control_socket: None,
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
     });
     let agent_server = bind_fake_agent_control(
@@ -6033,6 +6057,8 @@ async fn malformed_typed_agent_status_is_agent_unavailable() {
             ssh_bridge: None,
             control_socket: None,
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
     });
     let agent_server = bind_fake_agent_control(

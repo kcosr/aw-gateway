@@ -16,8 +16,8 @@ use tokio::time::{Duration, sleep};
 
 use super::idle::reap_processes;
 use super::lifecycle::{
-    exit_pid1_agent_process_success, schedule_forced_exit_after, shutdown_agent,
-    shutdown_watchdog_delay,
+    ForcedExitStatus, exit_pid1_agent_process_for_state, schedule_forced_exit_after,
+    shutdown_agent, shutdown_watchdog_delay,
 };
 use super::socket::{bind_private_unix_socket, validate_control_peer};
 use super::state::AgentState;
@@ -46,7 +46,12 @@ pub(super) async fn run_control_socket(state: Arc<AgentState>, path: &Path) -> a
             result = &mut shutdown => {
                 result?;
                 let delay = shutdown_watchdog_delay(&state, Duration::from_secs(30)).await;
-                schedule_forced_exit_after(delay, "control-signal");
+                schedule_forced_exit_after(
+                    state.clone(),
+                    delay,
+                    "control-signal",
+                    ForcedExitStatus::Success,
+                );
                 shutdown_agent(state).await;
                 return Ok(());
             }
@@ -82,7 +87,7 @@ pub(super) async fn run_control_socket(state: Arc<AgentState>, path: &Path) -> a
 pub(super) async fn wait_for_shutdown_signal(state: Arc<AgentState>) -> anyhow::Result<()> {
     shutdown_signal().await?;
     let delay = shutdown_watchdog_delay(&state, Duration::from_secs(30)).await;
-    schedule_forced_exit_after(delay, "signal");
+    schedule_forced_exit_after(state.clone(), delay, "signal", ForcedExitStatus::Success);
     shutdown_agent(state).await;
     Ok(())
 }
@@ -176,7 +181,12 @@ async fn handle_control_connection(
         }
         ControlRequest::Shutdown(_) => {
             let delay = shutdown_watchdog_delay(&state, Duration::from_secs(30)).await;
-            schedule_forced_exit_after(delay, "control-request");
+            schedule_forced_exit_after(
+                state.clone(),
+                delay,
+                "control-request",
+                ForcedExitStatus::Success,
+            );
             shutdown_agent(state.clone()).await;
             let response = ControlSuccess::new(
                 id,
@@ -185,9 +195,10 @@ async fn handle_control_connection(
                 },
             );
             write_control_response(reader.into_inner(), response).await?;
-            tokio::spawn(async {
+            let exit_state = state.clone();
+            tokio::spawn(async move {
                 sleep(Duration::from_millis(10)).await;
-                exit_pid1_agent_process_success();
+                exit_pid1_agent_process_for_state(&exit_state, ForcedExitStatus::Success);
             });
         }
         ControlRequest::ReapNow(_) => {

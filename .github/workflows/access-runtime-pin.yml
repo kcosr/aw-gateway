@@ -1,0 +1,19 @@
+name: Access Runtime Pin
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Reproduce pinned Access Runtime build
+        run: scripts/check-access-runtime-pin.sh

@@ -4487,8 +4487,10 @@ exit 0
         let _apple_preflight_bypass = disable_apple_preflight_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
-        std::fs::write(
-            &runtime_program,
+        let staging = dir.path().join("fake-runtime.staging");
+        let mut runtime_file = std::fs::File::create(&staging).unwrap();
+        std::io::Write::write_all(
+            &mut runtime_file,
             r#"#!/bin/sh
 case "$1" in
   list)
@@ -4503,10 +4505,14 @@ JSON
     ;;
 esac
 exit 0
-"#,
+"#
+            .as_bytes(),
         )
         .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        runtime_file.sync_all().unwrap();
+        drop(runtime_file);
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(staging, &runtime_program).unwrap();
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::AppleContainer,
             program: runtime_program.display().to_string(),

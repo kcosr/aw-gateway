@@ -3,6 +3,7 @@ mod control;
 mod idle;
 mod lifecycle;
 mod process;
+mod relay;
 mod service;
 mod socket;
 mod state;
@@ -19,6 +20,7 @@ use std::sync::Arc;
 use bridge::run_bridge;
 use control::{run_control_socket, wait_for_shutdown_signal};
 use idle::run_idle_cleanup;
+use relay::{RelayControl, run_relay_supervisor};
 use service::{ManagedService, service_supervisor};
 use state::{AgentState, SocketOwner};
 
@@ -65,12 +67,21 @@ async fn run_agent(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         .as_ref()
         .is_some_and(|bridge| bridge.enabled);
     let socket_owner = SocketOwner::from_env()?;
+    let (access_flow_relay, relay_commands) = cfg
+        .container_agent
+        .access_flow_relay
+        .as_ref()
+        .map(RelayControl::configured)
+        .map_or((None, None), |(control, commands)| {
+            (Some(control), Some(commands))
+        });
     let state = Arc::new(AgentState::new(
         state_dir.clone(),
         cfg.container_agent.idle_cleanup.clone(),
         bridge_enabled,
         std::env::var("AW_CONTAINER_CONTROL_TOKEN").ok(),
         socket_owner,
+        access_flow_relay.clone(),
     ));
 
     let services: Vec<_> = cfg
@@ -88,8 +99,23 @@ async fn run_agent(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         .collect();
     *state.services.lock().await = services.clone();
     for service in services.clone() {
-        tokio::spawn(service_supervisor(service, services.clone()));
+        tokio::spawn(service_supervisor(service, services.clone(), state.clone()));
     }
+    let relay_task = if let (Some(config), Some(control), Some(commands)) = (
+        cfg.container_agent.access_flow_relay.clone(),
+        access_flow_relay,
+        relay_commands,
+    ) {
+        Some(tokio::spawn(run_relay_supervisor(
+            config,
+            services.clone(),
+            state.clone(),
+            control,
+            commands,
+        )))
+    } else {
+        None
+    };
 
     if let Some(bridge) = cfg
         .container_agent
@@ -115,16 +141,123 @@ async fn run_agent(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         });
     }
 
-    if let Some(control_socket) = configured_control_socket(&cfg.container_agent.control_socket) {
-        let mut vars = Vars::new();
-        vars.insert(
-            "container_state_dir".into(),
-            state_dir.display().to_string(),
-        );
-        let control_socket = PathBuf::from(template::render(&control_socket, &vars)?);
-        run_control_socket(state, &control_socket).await
+    let control: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>> =
+        if let Some(control_socket) = configured_control_socket(&cfg.container_agent.control_socket)
+        {
+            let mut vars = Vars::new();
+            vars.insert(
+                "container_state_dir".into(),
+                state_dir.display().to_string(),
+            );
+            let control_socket = PathBuf::from(template::render(&control_socket, &vars)?);
+            let state = state.clone();
+            Box::pin(async move { run_control_socket(state, &control_socket).await })
+        } else {
+            Box::pin(wait_for_shutdown_signal(state.clone()))
+        };
+    tokio::pin!(control);
+    if let Some(mut relay_task) = relay_task {
+        enum AgentEvent {
+            Control(anyhow::Result<()>),
+            RelayFatal(relay::RelayFatalKind),
+            RelayTerminated(Result<anyhow::Result<()>, tokio::task::JoinError>),
+        }
+        let event = tokio::select! {
+            result = &mut control => AgentEvent::Control(result),
+            fatal = wait_for_relay_fatal(&state) => AgentEvent::RelayFatal(fatal),
+            result = &mut relay_task => AgentEvent::RelayTerminated(result),
+        };
+        match event {
+            AgentEvent::Control(result) => {
+                if !state
+                    .shutting_down
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    lifecycle::shutdown_agent(state.clone()).await;
+                }
+                let relay_result = relay_task.await;
+                if let Some(fatal) = state.relay_fatal() {
+                    return finish_relay_fatal_shutdown(state, fatal).await;
+                }
+                if let Some(fatal) = relay_termination_fatal_kind(
+                    &relay_result,
+                    state
+                        .shutting_down
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ) {
+                    return finish_relay_fatal_shutdown(state, fatal).await;
+                }
+                result
+            }
+            AgentEvent::RelayFatal(fatal) => {
+                let result = finish_relay_fatal_shutdown(state, fatal).await;
+                let _ = relay_task.await;
+                result
+            }
+            AgentEvent::RelayTerminated(result) => {
+                let shutting_down = state
+                    .shutting_down
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if let Some(fatal) = state
+                    .relay_fatal()
+                    .or_else(|| relay_termination_fatal_kind(&result, shutting_down))
+                {
+                    finish_relay_fatal_shutdown(state, fatal).await
+                } else {
+                    control.await
+                }
+            }
+        }
     } else {
-        wait_for_shutdown_signal(state).await
+        control.await
+    }
+}
+
+fn relay_termination_fatal_kind(
+    result: &Result<anyhow::Result<()>, tokio::task::JoinError>,
+    shutting_down: bool,
+) -> Option<relay::RelayFatalKind> {
+    match result {
+        Err(_) => Some(relay::RelayFatalKind::ManagerPanic),
+        Ok(result) => relay_manager_completion_fatal_kind(result, shutting_down),
+    }
+}
+
+fn relay_manager_completion_fatal_kind(
+    result: &anyhow::Result<()>,
+    shutting_down: bool,
+) -> Option<relay::RelayFatalKind> {
+    match result {
+        Err(_) => Some(relay::RelayFatalKind::ManagerFailure),
+        Ok(()) if !shutting_down => Some(relay::RelayFatalKind::UnexpectedExit),
+        Ok(()) => None,
+    }
+}
+
+async fn finish_relay_fatal_shutdown(
+    state: Arc<AgentState>,
+    fatal: relay::RelayFatalKind,
+) -> anyhow::Result<()> {
+    state.publish_relay_fatal(fatal);
+    let delay =
+        lifecycle::shutdown_watchdog_delay(&state, std::time::Duration::from_secs(30)).await;
+    lifecycle::schedule_forced_exit_after(
+        state.clone(),
+        delay,
+        "access-flow-relay-failure",
+        lifecycle::ForcedExitStatus::Fatal,
+    );
+    lifecycle::shutdown_agent(state).await;
+    anyhow::bail!("access flow relay terminated unexpectedly ({fatal:?})")
+}
+
+async fn wait_for_relay_fatal(state: &AgentState) -> relay::RelayFatalKind {
+    loop {
+        let notified = state.relay_fatal_notify.notified();
+        if let Some(fatal) = state.relay_fatal() {
+            return fatal;
+        }
+        notified.await;
     }
 }
 
@@ -143,11 +276,12 @@ mod tests {
     use super::*;
     use crate::agent::control::unauthorized_if_needed;
     use crate::agent::idle::build_reap_plan;
-    use crate::agent::lifecycle::{shutdown_agent, shutdown_watchdog_delay};
+    use crate::agent::lifecycle::{ForcedExitStatus, shutdown_agent, shutdown_watchdog_delay};
     use crate::agent::process::{ProcInfo, current_uid, process_exists};
     use crate::agent::service::{
-        RotatingServiceLog, health_check_interval, health_check_timeout, resolve_service_user,
-        service_stop_order, should_restart, wait_for_dependencies,
+        RotatingServiceLog, health_check_interval, health_check_timeout,
+        relay_dependent_service_stop_order, resolve_service_user, service_stop_order,
+        should_restart, wait_for_dependencies,
     };
     use crate::agent::socket::validate_control_peer;
     use crate::agent::status::status_payload;
@@ -259,12 +393,13 @@ mod tests {
 
     #[test]
     fn control_auth_helper_requires_token_for_mutating_methods() {
-        let no_token_state = AgentState::new(PathBuf::from("/tmp"), None, false, None, None);
+        let no_token_state = AgentState::new(PathBuf::from("/tmp"), None, false, None, None, None);
         let token_state = AgentState::new(
             PathBuf::from("/tmp"),
             None,
             false,
             Some("secret".into()),
+            None,
             None,
         );
         let id = serde_json::Value::String("request".into());
@@ -393,7 +528,7 @@ mod tests {
         let started_at = Instant::now();
         let ready = tokio::time::timeout(
             Duration::from_secs(2),
-            wait_for_dependencies(&sshd, &[proxy]),
+            wait_for_dependencies(&sshd, &[proxy], None),
         )
         .await
         .unwrap()
@@ -427,7 +562,7 @@ mod tests {
         );
         sshd.stopping.store(true, Ordering::SeqCst);
 
-        let ready = wait_for_dependencies(&sshd, &[proxy]).await.unwrap();
+        let ready = wait_for_dependencies(&sshd, &[proxy], None).await.unwrap();
 
         assert!(!ready);
     }
@@ -471,7 +606,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_is_not_ready_when_agent_is_shutting_down() {
-        let state = AgentState::new(PathBuf::from("/tmp"), None, true, None, None);
+        let state = AgentState::new(PathBuf::from("/tmp"), None, true, None, None, None);
         state.bridge_ready.store(true, Ordering::SeqCst);
         state.shutting_down.store(true, Ordering::SeqCst);
 
@@ -487,6 +622,7 @@ mod tests {
             PathBuf::from("/tmp"),
             None,
             true,
+            None,
             None,
             None,
         ));
@@ -506,6 +642,7 @@ mod tests {
             true,
             None,
             None,
+            None,
         ));
 
         assert!(shutdown_agent(state.clone()).await);
@@ -518,6 +655,7 @@ mod tests {
             PathBuf::from("/tmp"),
             None,
             true,
+            None,
             None,
             None,
         ));
@@ -550,6 +688,7 @@ mod tests {
             PathBuf::from("/tmp"),
             None,
             true,
+            None,
             None,
             None,
         ));
@@ -657,6 +796,66 @@ mod tests {
             .map(|service| service.config.name.clone())
             .collect();
         assert_eq!(ordered, vec!["proxy", "sshd", "metrics"]);
+    }
+
+    #[test]
+    fn relay_dependent_stop_order_excludes_prerequisites_and_unrelated_services() {
+        let services = vec![
+            Arc::new(ManagedService::new(
+                test_service("transparent-firewall", Vec::new()),
+                PathBuf::from("/tmp"),
+                LoggingConfig::default(),
+            )),
+            Arc::new(ManagedService::new(
+                test_service("workload", vec!["@access-flow-relay"]),
+                PathBuf::from("/tmp"),
+                LoggingConfig::default(),
+            )),
+            Arc::new(ManagedService::new(
+                test_service("dependent", vec!["workload"]),
+                PathBuf::from("/tmp"),
+                LoggingConfig::default(),
+            )),
+            Arc::new(ManagedService::new(
+                test_service("unrelated", Vec::new()),
+                PathBuf::from("/tmp"),
+                LoggingConfig::default(),
+            )),
+        ];
+        let names: Vec<_> = relay_dependent_service_stop_order(&services)
+            .into_iter()
+            .map(|service| service.config.name.clone())
+            .collect();
+        assert_eq!(names, ["dependent", "workload"]);
+    }
+
+    #[test]
+    fn relay_manager_termination_and_watchdog_status_are_fail_closed() {
+        assert_eq!(
+            relay_manager_completion_fatal_kind(&Ok(()), false),
+            Some(relay::RelayFatalKind::UnexpectedExit)
+        );
+        assert_eq!(relay_manager_completion_fatal_kind(&Ok(()), true), None);
+        assert_eq!(
+            relay_manager_completion_fatal_kind(&Err(anyhow::anyhow!("failed")), true),
+            Some(relay::RelayFatalKind::ManagerFailure)
+        );
+        assert_eq!(ForcedExitStatus::Success.code(), 0);
+        assert_ne!(ForcedExitStatus::Fatal.code(), 0);
+    }
+
+    #[tokio::test]
+    async fn relay_manager_join_panic_is_classified_as_fatal() {
+        let task = tokio::spawn(async {
+            panic!("injected relay manager panic");
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        });
+        let result = task.await;
+        assert_eq!(
+            relay_termination_fatal_kind(&result, false),
+            Some(relay::RelayFatalKind::ManagerPanic)
+        );
     }
 
     fn test_service(name: &str, depends_on: Vec<&str>) -> ServiceConfig {

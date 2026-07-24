@@ -5643,6 +5643,197 @@ depends_on = ["acl-proxy"]
     assert!(err.contains("dependency cycle"), "{err}");
 }
 
+const AGENT_ACCESS_FLOW_RELAY: &str = r#"
+schema_version = "1"
+
+[container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 32
+copy_buffer_bytes_per_direction = 16384
+start_after_services = ["transparent-firewall"]
+
+[container_agent.access_flow_relay.presentation]
+kind = "disabled"
+
+[[container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/acl-proxy/transparent-http.sock"
+
+[[container_agent.services]]
+name = "transparent-firewall"
+command = ["/bin/true"]
+
+[[container_agent.services]]
+name = "workload"
+command = ["/bin/true"]
+depends_on = ["@access-flow-relay"]
+"#;
+
+#[test]
+fn container_agent_accepts_strict_access_flow_relay_and_absence() {
+    let configured: ContainerAgentFile = toml::from_str(AGENT_ACCESS_FLOW_RELAY).unwrap();
+    configured.validate().unwrap();
+    let relay = configured.container_agent.access_flow_relay.unwrap();
+    assert_eq!(relay.routes.len(), 1);
+    assert_eq!(relay.routes[0].name, "http");
+
+    let absent: ContainerAgentFile = toml::from_str("schema_version = \"1\"").unwrap();
+    absent.validate().unwrap();
+    assert!(absent.container_agent.access_flow_relay.is_none());
+}
+
+#[test]
+fn gateway_relay_templates_render_to_strict_agent_literals() {
+    let raw = AGENT_ACCESS_FLOW_RELAY.replace(
+        "/run/acl-proxy/transparent-http.sock",
+        "{container_state_dir_in_container}/transparent-http.sock",
+    );
+    let mut config: ContainerAgentFile = toml::from_str(&raw).unwrap();
+    let relay = config.container_agent.access_flow_relay.as_mut().unwrap();
+    relay
+        .render(&BTreeMap::from([(
+            "container_state_dir_in_container".into(),
+            "/run/aw-gateway".into(),
+        )]))
+        .unwrap();
+    config.validate().unwrap();
+    let encoded = toml::to_string(&config).unwrap();
+    assert!(encoded.contains("/run/aw-gateway/transparent-http.sock"));
+    assert!(!encoded.contains('{'));
+}
+
+#[test]
+fn container_agent_rejects_unknown_partial_and_removed_relay_shapes() {
+    for invalid in [
+        AGENT_ACCESS_FLOW_RELAY.replace("kind = \"unix\"", "kind = \"tls_tcp\""),
+        AGENT_ACCESS_FLOW_RELAY.replace(
+            "path = \"/run/acl-proxy/transparent-http.sock\"",
+            "path = \"/run/acl-proxy/transparent-http.sock\"\ncertificate = \"/tmp/cert\"",
+        ),
+        AGENT_ACCESS_FLOW_RELAY.replace(
+            "[container_agent.access_flow_relay.presentation]\nkind = \"disabled\"\n",
+            "",
+        ),
+        AGENT_ACCESS_FLOW_RELAY.replace("access_flow_relay", "local_flow_relay"),
+        AGENT_ACCESS_FLOW_RELAY.replace("@access-flow-relay", "@local-flow-relay"),
+    ] {
+        let rejected = match toml::from_str::<ContainerAgentFile>(&invalid) {
+            Ok(config) => config.validate().is_err(),
+            Err(_) => true,
+        };
+        assert!(rejected, "unexpectedly accepted:\n{invalid}");
+    }
+}
+
+#[test]
+fn container_agent_relay_participates_in_dependency_cycle_validation() {
+    let cyclic = AGENT_ACCESS_FLOW_RELAY.replace(
+        "name = \"transparent-firewall\"\ncommand = [\"/bin/true\"]",
+        "name = \"transparent-firewall\"\ncommand = [\"/bin/true\"]\ndepends_on = [\"@access-flow-relay\"]",
+    );
+    let config: ContainerAgentFile = toml::from_str(&cyclic).unwrap();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("dependency cycle"), "{error}");
+    assert!(error.contains("@access-flow-relay"), "{error}");
+}
+
+#[test]
+fn gateway_relay_overlay_is_whole_table_replacement() {
+    let config: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[target_defaults.container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 32
+copy_buffer_bytes_per_direction = 16384
+
+[target_defaults.container_agent.access_flow_relay.presentation]
+kind = "disabled"
+
+[[target_defaults.container_agent.access_flow_relay.routes]]
+name = "default-http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[target_defaults.container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/default.sock"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "default"
+
+[targets.default.container_agent.access_flow_relay]
+setup_timeout = "3s"
+drain_timeout = "11s"
+max_connections = 8
+copy_buffer_bytes_per_direction = 8192
+
+[targets.default.container_agent.access_flow_relay.presentation]
+kind = "disabled"
+
+[[targets.default.container_agent.access_flow_relay.routes]]
+name = "target-https"
+listen = "127.0.0.1:3129"
+allowed_destination_ports = [443]
+
+[targets.default.container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/target.sock"
+"#,
+    )
+    .unwrap();
+    config.validate().unwrap();
+    let target = config.effective_target("default").unwrap();
+    let relay = target.container_agent.access_flow_relay.unwrap();
+    assert_eq!(relay.setup_timeout, "3s");
+    assert_eq!(relay.routes.len(), 1);
+    assert_eq!(relay.routes[0].name, "target-https");
+}
+
+#[test]
+fn gateway_incomplete_relay_replacement_does_not_borrow_inherited_fields() {
+    let invalid = r#"
+schema_version = "1"
+
+[target_defaults.container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 32
+copy_buffer_bytes_per_direction = 16384
+
+[target_defaults.container_agent.access_flow_relay.presentation]
+kind = "disabled"
+
+[[target_defaults.container_agent.access_flow_relay.routes]]
+name = "default-http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[target_defaults.container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/default.sock"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "default"
+
+[targets.default.container_agent.access_flow_relay]
+setup_timeout = "3s"
+"#;
+    assert!(toml::from_str::<GatewayConfig>(invalid).is_err());
+}
+
 #[test]
 fn standalone_container_agent_rejects_gateway_service_user_templates() {
     let cfg: ContainerAgentFile = toml::from_str(
@@ -5954,4 +6145,54 @@ container_path = "/run/child.sock"
 
     let err = format!("{:#}", GatewayConfig::load(&child).unwrap_err());
     assert!(err.contains("selinux_relabel"), "{err}");
+}
+
+#[test]
+fn root_extends_replaces_access_flow_relay_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.toml");
+    let child = dir.path().join("child.toml");
+    std::fs::write(
+        &base,
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 32
+copy_buffer_bytes_per_direction = 16384
+
+[targets.default.container_agent.access_flow_relay.presentation]
+kind = "disabled"
+
+[[targets.default.container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[targets.default.container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/base.sock"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &child,
+        r#"
+extends = "base.toml"
+
+[targets.default.container_agent.access_flow_relay]
+setup_timeout = "3s"
+"#,
+    )
+    .unwrap();
+
+    let error = format!("{:#}", GatewayConfig::load(&child).unwrap_err());
+    assert!(error.contains("drain_timeout"), "{error}");
 }

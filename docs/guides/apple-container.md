@@ -20,7 +20,7 @@ Apple silicon Mac. AW Gateway supports these local Apple profiles:
   `readiness = "ssh_only"`. Use this when you need OpenSSH, SCP, SFTP, or VS
   Code Remote-SSH.
 - An optional host-proxy SSH profile that exposes two existing host Unix
-  listeners to a minimal in-container transparent relay.
+  listeners to the shared Access Flow relay embedded in `aw-container-agent`.
 
 Apple reverse socket publishing is not used. Typed `host_socket_exposures`
 require Apple Container 1.1 or newer and use host-to-container socket relays;
@@ -70,7 +70,6 @@ examples/apple-container/
   gateway-runtime-exec.toml
   sshd_config_agent
   start-container-sshd
-  transparent-uds-relay.json
 ```
 
 Full-file code blocks below match files in `examples/apple-container/` unless

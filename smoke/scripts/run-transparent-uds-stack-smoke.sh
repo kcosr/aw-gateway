@@ -4,11 +4,10 @@ set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 FIREWALL="$ROOT/assets/aw-transparent-uds-firewall"
-RELAY_CONFIG="$ROOT/examples/apple-container/transparent-uds-relay.json"
 BASE_IMAGE=${AW_UDS_STACK_SMOKE_IMAGE:-ubuntu:24.04}
 
 ACL_PROXY_BIN=
-RELAY_BIN=
+AGENT_BIN=
 ACL_REPO=
 ACCESS_RUNTIME_REPO=
 AW_REPO=
@@ -34,7 +33,7 @@ usage() {
     cat >&2 <<'EOF'
 Usage: run-transparent-uds-stack-smoke.sh \
   --acl-proxy-bin <absolute-path> \
-  --relay-bin <absolute-path> \
+  --agent-bin <absolute-path> \
   --acl-repo <absolute-path> \
   --access-runtime-repo <absolute-path> \
   --aw-repo <absolute-path> \
@@ -114,9 +113,9 @@ while (($#)); do
             ACL_PROXY_BIN=$2
             shift 2
             ;;
-        --relay-bin)
+        --agent-bin)
             (($# >= 2)) || usage
-            RELAY_BIN=$2
+            AGENT_BIN=$2
             shift 2
             ;;
         --acl-repo)
@@ -153,7 +152,7 @@ while (($#)); do
     esac
 done
 
-[[ -n $ACL_PROXY_BIN && -n $RELAY_BIN && -n $ACL_REPO \
+[[ -n $ACL_PROXY_BIN && -n $AGENT_BIN && -n $ACL_REPO \
     && -n $ACCESS_RUNTIME_REPO && -n $AW_REPO && -n $EXPECTED_ACL_SHA \
     && -n $EXPECTED_ACCESS_RUNTIME_SHA && -n $EXPECTED_AW_SHA ]] || usage
 
@@ -198,25 +197,22 @@ require_expected_sha aw-gateway "$AW_REPO" "$EXPECTED_AW_SHA"
     || fail "aw-repo must be clean for provenance-bound smoke evidence"
 
 EXPECTED_ACL_PROXY_BIN="$ACL_REPO/target/release/acl-proxy"
-EXPECTED_RELAY_BIN="$ACL_REPO/target/release/acl-proxy-transparent-uds-relay"
+EXPECTED_AGENT_BIN="$AW_REPO/target/release/aw-container-agent"
 [[ $(readlink -m -- "$ACL_PROXY_BIN") == "$EXPECTED_ACL_PROXY_BIN" ]] \
     || fail "acl-proxy-bin must be $EXPECTED_ACL_PROXY_BIN"
-[[ $(readlink -m -- "$RELAY_BIN") == "$EXPECTED_RELAY_BIN" ]] \
-    || fail "relay-bin must be $EXPECTED_RELAY_BIN"
+[[ $(readlink -m -- "$AGENT_BIN") == "$EXPECTED_AGENT_BIN" ]] \
+    || fail "agent-bin must be $EXPECTED_AGENT_BIN"
 cargo build --quiet --locked --release --manifest-path "$ACL_REPO/Cargo.toml" \
     --bin acl-proxy \
     || fail "locked ACL Proxy release build failed"
-cargo build --quiet --locked --release --manifest-path "$ACL_REPO/Cargo.toml" \
-    --package acl-proxy-transparent-uds-relay \
-    --bin acl-proxy-transparent-uds-relay \
-    || fail "locked ACL Proxy release build failed"
+cargo build --quiet --locked --release --manifest-path "$AW_REPO/Cargo.toml" \
+    --bin aw-container-agent \
+    || fail "locked AW container-agent release build failed"
 require_absolute_file acl-proxy "$EXPECTED_ACL_PROXY_BIN"
-require_absolute_file relay "$EXPECTED_RELAY_BIN"
+require_absolute_file agent "$EXPECTED_AGENT_BIN"
 ACL_PROXY_BIN=$EXPECTED_ACL_PROXY_BIN
-RELAY_BIN=$EXPECTED_RELAY_BIN
+AGENT_BIN=$EXPECTED_AGENT_BIN
 [[ -x $FIREWALL && ! -L $FIREWALL ]] || fail "firewall asset is missing or not executable"
-[[ -f $RELAY_CONFIG && ! -L $RELAY_CONFIG ]] \
-    || fail "checked-in relay config is missing: $RELAY_CONFIG"
 
 docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable"
 docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 \
@@ -495,22 +491,32 @@ base_path = "/_acl-proxy"
 request_body_timeout = "2s"
 
 [listeners.transparent_http]
-endpoint.kind = "unix_proxy_v2"
-endpoint.path = "$HTTP_SOCKET"
-endpoint.mode = "0600"
-endpoint.proxy_header_timeout = "2s"
-endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
 max_connections = 64
 
+[listeners.transparent_http.endpoint]
+kind = "access_flow"
+admission_timeout = "2s"
+allowed_destination_ports = [80]
+
+[listeners.transparent_http.endpoint.transport]
+kind = "unix"
+path = "$HTTP_SOCKET"
+mode = "0600"
+
 [listeners.transparent_https]
-endpoint.kind = "unix_proxy_v2"
-endpoint.path = "$HTTPS_SOCKET"
-endpoint.mode = "0600"
-endpoint.proxy_header_timeout = "2s"
-endpoint.allowed_destination_ports = [443]
 http_versions = ["http1"]
 max_connections = 64
+
+[listeners.transparent_https.endpoint]
+kind = "access_flow"
+admission_timeout = "2s"
+allowed_destination_ports = [443]
+
+[listeners.transparent_https.endpoint.transport]
+kind = "unix"
+path = "$HTTPS_SOCKET"
+mode = "0600"
 
 [mitm]
 mode = "files"
@@ -607,8 +613,60 @@ stop_acl_proxy() {
 
 start_acl_proxy first
 
-cp -- "$RELAY_CONFIG" "$TMP_DIR/relay.json"
-chmod 0644 "$TMP_DIR/relay.json"
+cat >"$TMP_DIR/container-agent.toml" <<'EOF'
+schema_version = "1"
+
+[container_agent]
+enabled = true
+control_socket = false
+
+[container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 1024
+copy_buffer_bytes_per_direction = 16384
+start_after_services = ["transparent-firewall"]
+
+[container_agent.access_flow_relay.presentation]
+kind = "disabled"
+
+[[container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/acl-proxy/transparent-http.sock"
+
+[[container_agent.access_flow_relay.routes]]
+name = "https"
+listen = "127.0.0.1:3129"
+allowed_destination_ports = [443]
+
+[container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/acl-proxy/transparent-https.sock"
+
+[[container_agent.services]]
+name = "transparent-firewall"
+required = true
+user = "root"
+command = [
+  "/opt/aw-gateway/bin/aw-transparent-uds-firewall",
+  "watch",
+  "--dns-server", "SMOKE_DNS_REPLACED",
+  "--http-port", "3128",
+  "--https-port", "3129",
+]
+restart = "always"
+depends_on = []
+
+[container_agent.services.health_check]
+type = "process"
+EOF
+sed -i "s/SMOKE_DNS_REPLACED/$NETWORK_GATEWAY/" "$TMP_DIR/container-agent.toml"
+chmod 0600 "$TMP_DIR/container-agent.toml"
 
 cat >"$TMP_DIR/workload.sh" <<'SH'
 #!/usr/bin/env bash
@@ -617,53 +675,42 @@ cleanup() {
     local status=$?
     set +e
     if (( status != 0 )); then
-        [[ ! -s /tmp/relay.stdout ]] || cat /tmp/relay.stdout >&2
-        [[ ! -s /tmp/relay.stderr ]] || cat /tmp/relay.stderr >&2
+        [[ ! -s /tmp/agent.stdout ]] || cat /tmp/agent.stdout >&2
+        [[ ! -s /tmp/agent.stderr ]] || cat /tmp/agent.stderr >&2
     fi
-    [[ -z ${RELAY_PID:-} ]] || kill "$RELAY_PID" 2>/dev/null || true
-    [[ -z ${FIREWALL_PID:-} ]] || kill "$FIREWALL_PID" 2>/dev/null || true
+    [[ -z ${AGENT_PID:-} ]] || kill "$AGENT_PID" 2>/dev/null || true
     wait 2>/dev/null || true
     exit "$status"
 }
 trap cleanup EXIT INT TERM
-/opt/aw-gateway/bin/aw-transparent-uds-firewall watch \
-    --dns-server "$SMOKE_DNS" --http-port 3128 --https-port 3129 &
-FIREWALL_PID=$!
-for _ in {1..100}; do
-    [[ -f /run/aw-gateway/transparent-uds-firewall.generation.ready ]] && break
-    kill -0 "$FIREWALL_PID"
-    sleep 0.05
-done
-[[ -f /run/aw-gateway/transparent-uds-firewall.generation.ready ]]
-/opt/aw-gateway/bin/acl-proxy-transparent-uds-relay \
-    --config /etc/acl-proxy/transparent-uds-relay.json \
-    >/tmp/relay.stdout 2>/tmp/relay.stderr &
-RELAY_PID=$!
+/opt/aw-gateway/bin/aw-container-agent \
+    --config /etc/aw-gateway/container-agent.toml run \
+    >/tmp/agent.stdout 2>/tmp/agent.stderr &
+AGENT_PID=$!
 for _ in {1..100}; do
     if timeout 0.2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3128' \
         && timeout 0.2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3129'; then
         touch /tmp/stack.ready
         break
     fi
-    kill -0 "$RELAY_PID"
+    kill -0 "$AGENT_PID"
     sleep 0.05
 done
 [[ -f /tmp/stack.ready ]]
-wait "$RELAY_PID"
+wait "$AGENT_PID"
 SH
 chmod 0700 "$TMP_DIR/workload.sh"
 
 start_workload() {
-    # The shipped 1,024-connection config projects 2,114 descriptors.
+    # The integrated 1,024-flow agent projection fits below this checked limit.
     docker run -d --name "$WORKLOAD_CONTAINER" --privileged --network "$NETWORK" \
         --ulimit nofile=4096:4096 \
-        --env "SMOKE_DNS=$NETWORK_GATEWAY" \
         --mount "type=bind,src=$HTTP_SOCKET,dst=/run/acl-proxy/transparent-http.sock" \
         --mount "type=bind,src=$HTTPS_SOCKET,dst=/run/acl-proxy/transparent-https.sock" \
         --mount "type=bind,src=$TMP_DIR/config/mitm-ca-cert.pem,dst=/etc/acl-proxy/mitm-ca-cert.pem,readonly" \
-        --mount "type=bind,src=$RELAY_BIN,dst=/opt/aw-gateway/bin/acl-proxy-transparent-uds-relay,readonly" \
+        --mount "type=bind,src=$AGENT_BIN,dst=/opt/aw-gateway/bin/aw-container-agent,readonly" \
         --mount "type=bind,src=$FIREWALL,dst=/opt/aw-gateway/bin/aw-transparent-uds-firewall,readonly" \
-        --mount "type=bind,src=$TMP_DIR/relay.json,dst=/etc/acl-proxy/transparent-uds-relay.json,readonly" \
+        --mount "type=bind,src=$TMP_DIR/container-agent.toml,dst=/etc/aw-gateway/container-agent.toml,readonly" \
         --mount "type=bind,src=$TMP_DIR/workload.sh,dst=/usr/local/bin/workload-smoke,readonly" \
         "$WORKLOAD_IMAGE" bash /usr/local/bin/workload-smoke >/dev/null
 
@@ -683,17 +730,17 @@ start_workload() {
 start_workload
 
 python3 - "$WORKLOAD_CONTAINER" "$HTTP_SOCKET" "$HTTPS_SOCKET" \
-    "$TMP_DIR/config/mitm-ca-cert.pem" "$RELAY_BIN" "$FIREWALL" \
-    "$TMP_DIR/relay.json" "$TMP_DIR/workload.sh" <<'PY'
+    "$TMP_DIR/config/mitm-ca-cert.pem" "$AGENT_BIN" "$FIREWALL" \
+    "$TMP_DIR/container-agent.toml" "$TMP_DIR/workload.sh" <<'PY'
 import json
 import pathlib
 import subprocess
 import sys
 
-container, http_socket, https_socket, public_ca, relay, firewall, config, script = sys.argv[1:]
+container, http_socket, https_socket, public_ca, agent, firewall, config, script = sys.argv[1:]
 inspect = json.loads(subprocess.check_output(["docker", "inspect", container]))[0]
 sources = {mount["Source"] for mount in inspect["Mounts"]}
-expected = {http_socket, https_socket, public_ca, relay, firewall, config, script}
+expected = {http_socket, https_socket, public_ca, agent, firewall, config, script}
 if sources != expected:
     raise SystemExit(f"unexpected workload mount inventory: {sources!r}")
 if any("acl-proxy.toml" in source or "key" in pathlib.Path(source).name.lower() for source in sources):
@@ -899,7 +946,7 @@ https_body=$(request_https https://origin.test/recovered)
 
 ACL_SHA=$(git -C "$ACL_REPO" rev-parse HEAD)
 printf '%s\n' \
-    "access-path=iptables-redirect-so-original-dst-proxy-v2-unix" \
+    "access-path=iptables-redirect-so-original-dst-awaf-unix" \
     "http-allow=passed" \
     "https-mitm=passed" \
     "parent-proxy=passed" \
@@ -920,7 +967,7 @@ printf '%s\n' \
     "base-image-id=$BASE_IMAGE_ID" \
     "workload-image-id=$WORKLOAD_IMAGE_ID" \
     "acl-proxy-sha256=$(sha256sum "$ACL_PROXY_BIN" | awk '{print $1}')" \
-    "relay-sha256=$(sha256sum "$RELAY_BIN" | awk '{print $1}')" \
+    "aw-container-agent-sha256=$(sha256sum "$AGENT_BIN" | awk '{print $1}')" \
     "aw-firewall-sha256=$(sha256sum "$FIREWALL" | awk '{print $1}')"
 printf '%s\n' 'transparent-uds-stack-smoke=passed'
 SUCCESS=1

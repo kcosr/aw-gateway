@@ -625,6 +625,39 @@ timeout = "1s"
 Supported service health checks include process, TCP, and HTTP checks. HTTP
 checks can require status codes and top-level JSON field matches.
 
+The optional Access Flow relay runs inside `aw-container-agent`; it is not a
+supervised child process. Every route listens on IPv4 loopback, recovers the
+original redirected destination, publishes an AW Access Flow preface, and
+connects to one Unix socket. L03 accepts only explicit disabled presentation:
+
+```toml
+[target_defaults.container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 1024
+copy_buffer_bytes_per_direction = 16384
+start_after_services = ["transparent-firewall"]
+
+[target_defaults.container_agent.access_flow_relay.presentation]
+kind = "disabled"
+
+[[target_defaults.container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[target_defaults.container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/acl-proxy/transparent-http.sock"
+```
+
+Services may depend on the reserved `@access-flow-relay` node. Relay activation
+waits until every required service named by `start_after_services` is healthy.
+The relay joins the same cycle validation, aggregate readiness, status, idle
+activity, fatal shutdown, and reverse dependency ordering as managed services.
+On shutdown the agent closes relay admission, stops relay-dependent services,
+drains established flows for the configured bound, then stops prerequisites.
+
 Services do not inherit sensitive gateway environment by default. A service
 receives values such as `AW_IDENTITY_TOKEN` only when explicitly configured in
 the service `env` table:
@@ -885,6 +918,10 @@ Gateway configs commonly include:
   `[targets.<name>.container_ssh.transfer]`.
 - `[target_defaults.container_agent]`: optional in-container supervision and SSH bridge
   support.
+- `[target_defaults.container_agent.access_flow_relay]`: optional embedded
+  transparent TCP-to-Access-Flow relay with strict Unix routes. The relay table
+  replaces as one object in target overlays; an omitted table inherits, while
+  a present incomplete table is invalid and never borrows omitted fields.
 - `[[target_defaults.container_agent.services]]`: in-container services supervised by
   `aw-container-agent`. Use `depends_on` and dependency health checks to order
   managed services. Required `container_bootstrap_steps` perform privileged
@@ -1247,6 +1284,9 @@ Root inheritance uses these merge rules:
   inherited value as a whole.
 - Each same-key `host_socket_exposures` entry replaces the inherited entry as a
   whole rather than merging individual path or relabel fields.
+- `container_agent.access_flow_relay` replaces as a whole typed component when
+  a later target layer supplies it. Its routes and lifecycle bounds never merge
+  piecemeal.
 - Scalars and ordinary arrays replace the inherited value. This includes
   `container_mounts`, runtime argument arrays, command arrays, dependency
   arrays, allow-list arrays, and launch variable value arrays.

@@ -22,6 +22,10 @@ name = "aw-ssh-command-filter"
 path = "src/bin/aw-ssh-command-filter.rs"
 
 [dependencies]
+access-async-contracts = { git = "https://github.com/kcosr/access-runtime.git", rev = "52ad634fc1efccb62bf967f441a0047d56c1f425" }
+access-flow-relay = { git = "https://github.com/kcosr/access-runtime.git", rev = "52ad634fc1efccb62bf967f441a0047d56c1f425" }
+access-flow-unix = { git = "https://github.com/kcosr/access-runtime.git", rev = "52ad634fc1efccb62bf967f441a0047d56c1f425" }
+access-identity = { git = "https://github.com/kcosr/access-runtime.git", rev = "52ad634fc1efccb62bf967f441a0047d56c1f425" }
 anyhow = "1.0.100"
 axum = { version = "0.8.7", features = ["ws"] }
 clap = { version = "4.5.53", features = ["derive", "env"] }

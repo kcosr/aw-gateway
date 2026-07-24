@@ -388,6 +388,7 @@ impl TargetConfigInput {
                 ssh_bridge: None,
                 control_socket: None,
                 idle_cleanup: None,
+                access_flow_relay: None,
             }),
             container_ssh: Some(TargetContainerSshConfig {
                 transfer: Some(TargetContainerSshTransferConfig {

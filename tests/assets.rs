@@ -232,12 +232,14 @@ fn transparent_uds_stack_smoke_structural_contract_is_explicit() {
         "--expected-aw-sha",
         "status --porcelain --untracked-files=all",
         "cargo build --quiet --locked --release",
-        "endpoint.mode = \"0600\"",
-        "endpoint.proxy_header_timeout = \"2s\"",
-        "endpoint.allowed_destination_ports = [80]",
-        "endpoint.allowed_destination_ports = [443]",
+        "[listeners.transparent_http.endpoint]",
+        "kind = \"access_flow\"",
+        "admission_timeout = \"2s\"",
+        "[listeners.transparent_http.endpoint.transport]",
+        "allowed_destination_ports = [80]",
+        "allowed_destination_ports = [443]",
         "%{num_connects}",
-        "access-path=iptables-redirect-so-original-dst-proxy-v2-unix",
+        "access-path=iptables-redirect-so-original-dst-awaf-unix",
         "https-mitm=passed",
         "proxy-loss-fail-closed=passed",
         "incremental-streaming=passed",
@@ -297,51 +299,42 @@ fn apple_host_proxy_profile_reuses_bootstrap_and_service_dependencies() {
             "NODE_EXTRA_CA_CERTS = \"/usr/local/share/ca-certificates/acl-proxy-ca.crt\""
         )
     );
-    assert!(profile.contains("target = \"/etc/acl-proxy/transparent-uds-relay.json\""));
-    assert!(profile.contains("\"--config\", \"/etc/acl-proxy/transparent-uds-relay.json\""));
-    assert!(profile.contains("name = \"transparent-relay\"\nrequired = true\nuser = \"root\""));
+    assert!(profile.contains("[target_defaults.container_agent.access_flow_relay]"));
+    assert!(profile.contains("start_after_services = [\"transparent-firewall\"]"));
+    assert!(profile.contains("kind = \"disabled\""));
+    assert!(profile.contains("kind = \"unix\""));
+    assert!(profile.contains("allowed_destination_ports = [80]"));
+    assert!(profile.contains("allowed_destination_ports = [443]"));
     assert!(profile.contains("name = \"transparent-firewall\"\nrequired = true\nuser = \"root\""));
     assert!(profile.contains("type = \"process\""));
-    assert!(profile.contains("depends_on = [\"transparent-firewall\"]"));
-    assert!(profile.contains("depends_on = [\"transparent-relay\"]"));
+    assert!(profile.contains("depends_on = [\"@access-flow-relay\"]"));
+    assert!(!profile.contains("transparent-relay"));
+    assert!(!profile.contains("transparent-uds-relay.json"));
+    assert!(!profile.contains("acl-proxy-transparent-uds-relay"));
     assert!(!profile.contains("/opt/acl-proxy/bin/acl-proxy"));
     assert!(!profile.contains("mitm-ca.key"));
     assert!(!profile.contains("AW_IDENTITY_TOKEN"));
 }
 
 #[test]
-fn transparent_relay_example_is_the_canonical_unversioned_contract() {
-    let path = example_asset("apple-container", "transparent-uds-relay.json");
-    let raw = std::fs::read_to_string(&path).unwrap();
-    let config: serde_json::Value = serde_json::from_str(&raw).unwrap();
-
-    assert!(config.get("schemaVersion").is_none());
-    assert_eq!(config["setupTimeout"], "2s");
-    assert_eq!(
-        config["routes"][0]["upstreamSocket"],
-        "/run/acl-proxy/transparent-http.sock"
-    );
-    assert_eq!(
-        config["routes"][1]["upstreamSocket"],
-        "/run/acl-proxy/transparent-https.sock"
-    );
-
+fn transparent_stack_smoke_uses_embedded_access_flow_relay() {
     let smoke = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("smoke/scripts/run-transparent-uds-stack-smoke.sh"),
     )
     .unwrap();
-    assert!(smoke.contains("examples/apple-container/transparent-uds-relay.json"));
-    assert!(smoke.contains("cp -- \"$RELAY_CONFIG\" \"$TMP_DIR/relay.json\""));
-    assert!(!smoke.contains("cat >\"$TMP_DIR/relay.json\""));
+    assert!(smoke.contains("[container_agent.access_flow_relay]"));
+    assert!(smoke.contains("/opt/aw-gateway/bin/aw-container-agent"));
+    assert!(smoke.contains("/etc/aw-gateway/container-agent.toml"));
+    assert!(smoke.contains("kind = \"disabled\""));
+    assert!(smoke.contains("kind = \"unix\""));
+    assert!(!smoke.contains("acl-proxy-transparent-uds-relay"));
+    assert!(!smoke.contains("transparent-uds-relay.json"));
     assert!(!smoke.contains("setpriv --reuid"));
-    assert!(smoke.contains("/etc/acl-proxy/transparent-uds-relay.json"));
-    assert!(!smoke.contains("/etc/aw-gateway/transparent-uds-relay.json"));
-
-    let max_connections = config["maxConnections"].as_u64().unwrap();
-    let route_count = config["routes"].as_array().unwrap().len() as u64;
-    const RELAY_RESERVED_FILE_DESCRIPTORS: u64 = 64;
-    let required_descriptors = RELAY_RESERVED_FILE_DESCRIPTORS + route_count + 2 * max_connections;
+    let max_connections = 1024_u64;
+    let route_count = 2_u64;
+    const NO_BRIDGE_AGENT_RESERVE: u64 = 273 + 3;
+    let required_descriptors = NO_BRIDGE_AGENT_RESERVE + 2 * route_count + 2 * max_connections;
     let smoke_nofile = smoke
         .lines()
         .find_map(|line| line.split_once("nofile=").map(|(_, value)| value))
@@ -353,6 +346,42 @@ fn transparent_relay_example_is_the_canonical_unversioned_contract() {
         smoke_nofile >= required_descriptors,
         "Docker smoke nofile limit does not satisfy the shipped relay projection"
     );
+}
+
+#[test]
+fn embedded_relay_uses_shared_runtime_engine_without_a_copied_data_plane() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cargo = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let relay = std::fs::read_to_string(root.join("src/agent/relay.rs")).unwrap();
+    let production = relay.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+
+    for dependency in ["access-flow-relay", "access-flow-unix", "access-identity"] {
+        assert!(
+            cargo.contains(dependency),
+            "missing shared Runtime dependency {dependency:?}"
+        );
+    }
+    for required in [
+        "AccessFlowRelay::new(",
+        "UnixAccessFlowConnector::new()",
+        "RunningAccessFlowRelay",
+    ] {
+        assert!(
+            production.contains(required),
+            "missing shared relay ownership marker {required:?}"
+        );
+    }
+    for copied_engine_marker in [
+        "struct RunningAccessFlowRelay",
+        "TcpListener::bind(",
+        "copy_bidirectional(",
+        "write_all(b\"AWAF",
+    ] {
+        assert!(
+            !production.contains(copied_engine_marker),
+            "copied relay engine marker found: {copied_engine_marker:?}"
+        );
+    }
 }
 
 #[test]

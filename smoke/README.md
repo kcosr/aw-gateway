@@ -129,7 +129,7 @@ Run one host:
 integration gate. It runs a privileged Docker workload and installs temporary
 `iptables` rules inside that isolated container. It exercises the raw
 transparent-traffic seam: real HTTP and HTTPS redirects, original-destination
-recovery, PROXY v2 over exact Unix-socket mounts, ACL policy and MITM, parent
+recovery, AW Access Flow over exact Unix-socket mounts, ACL policy and MITM, parent
 proxy routing, fail-closed proxy loss, and Linux pinned-inode restart behavior.
 It does not invoke the `aw-gateway` CLI or claim lifecycle orchestration
 coverage. T03 lifecycle behavior remains covered by the pytest scenarios above.
@@ -146,7 +146,7 @@ ACCESS_RUNTIME_REPO=/absolute/path/to/access-runtime
 
 "$AW_REPO/smoke/scripts/run-transparent-uds-stack-smoke.sh" \
   --acl-proxy-bin "$ACL_REPO/target/release/acl-proxy" \
-  --relay-bin "$ACL_REPO/target/release/acl-proxy-transparent-uds-relay" \
+  --agent-bin "$AW_REPO/target/release/aw-container-agent" \
   --acl-repo "$ACL_REPO" \
   --access-runtime-repo "$ACCESS_RUNTIME_REPO" \
   --aw-repo "$AW_REPO" \
@@ -165,11 +165,12 @@ assets` checks only the harness's structural contract and shell syntax; it does
 not execute this privileged gate.
 
 The Docker workload sets `nofile=4096` because Docker's local default soft
-limit is lower than the shipped relay configuration's checked startup
-projection (`64 + route_count + 2 * maxConnections`, currently 2,114). This is
-Linux test scaffolding, not evidence of the Apple Container process limit. The
-deploying environment owns that limit; the relay validates the effective soft
-limit at startup and fails closed when the configured capacity does not fit.
+limit is lower than the integrated agent's checked descriptor projection. The
+projection includes the frozen no-bridge agent reserve plus relay listeners,
+accept transients, source streams, and Unix channels. This is Linux test
+scaffolding, not evidence of the Apple Container process limit. The deploying
+environment owns that limit; the agent validates the effective soft limit at
+startup and fails closed when the configured capacity does not fit.
 
 ## Host Socket Exposure Docker Gate
 

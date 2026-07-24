@@ -116,7 +116,9 @@ fn merge_tables(
             base.insert(key, child_value);
             continue;
         }
-        if is_atomic_host_socket_exposure_map(path) {
+        if is_atomic_host_socket_exposure_map(path)
+            || is_atomic_access_flow_relay_component(&child_path)
+        {
             base.insert(key, child_value);
         } else if let Some(base_value) = base.remove(&key) {
             base.insert(key, merge_values(base_value, child_value, &child_path)?);
@@ -125,6 +127,24 @@ fn merge_tables(
         }
     }
     Ok(())
+}
+
+fn is_atomic_access_flow_relay_component(path: &[String]) -> bool {
+    matches_path(
+        path,
+        &["target_defaults", "container_agent", "access_flow_relay"],
+    ) || matches_path(
+        path,
+        &[
+            "target_templates",
+            "*",
+            "container_agent",
+            "access_flow_relay",
+        ],
+    ) || matches_path(
+        path,
+        &["targets", "*", "container_agent", "access_flow_relay"],
+    )
 }
 
 fn is_atomic_host_socket_exposure_map(path: &[String]) -> bool {

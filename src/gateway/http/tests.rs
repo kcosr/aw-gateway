@@ -21,15 +21,20 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tower::ServiceExt;
 
 fn write_fake_runtime(path: &std::path::Path, script: &str) {
-    std::fs::write(path, script).unwrap();
+    let staging = path.with_extension("staging");
+    let mut file = std::fs::File::create(&staging).unwrap();
+    file.write_all(script.as_bytes()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        let mut permissions = std::fs::metadata(&staging).unwrap().permissions();
         permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).unwrap();
+        std::fs::set_permissions(&staging, permissions).unwrap();
     }
+    std::fs::rename(staging, path).unwrap();
 }
 
 fn fake_running_runtime_script(log: &std::path::Path) -> String {
@@ -1927,6 +1932,7 @@ async fn status_shape_can_be_wrapped_in_data_envelope() {
                 active_streams: 0,
                 active_sessions: 0,
             },
+            access_flow_relay: None,
             idle_cleanup: Some(crate::agent_control::IdleCleanupStatus {
                 owner: "agent".into(),
                 action: "exit_container".into(),

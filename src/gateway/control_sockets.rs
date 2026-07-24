@@ -49,11 +49,16 @@ impl Runtime {
             };
         }
         self.render_gateway_managed_service_fields(&mut container_agent)?;
+        if let Some(relay) = &mut container_agent.access_flow_relay {
+            relay.render(&self.vars(None))?;
+        }
         let cfg = ContainerAgentFile {
             schema_version: AGENT_SCHEMA_VERSION.to_string(),
             logging: LoggingConfig::default(),
             container_agent,
         };
+        cfg.validate()
+            .context("validate rendered container-agent configuration")?;
         let path = self.container_agent_config_host();
         atomic_write_toml(&path, &cfg, AtomicWritePolicy::fixed_no_fsync(0o600))
             .with_context(|| format!("write {}", path.display()))?;

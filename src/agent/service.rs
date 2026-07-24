@@ -19,6 +19,8 @@ use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant, sleep};
 
 use super::process::process_exists;
+use super::relay::RelayControl;
+use super::state::AgentState;
 
 #[derive(Debug)]
 pub(super) struct ManagedService {
@@ -64,7 +66,7 @@ impl ManagedService {
         }
     }
 
-    async fn health_check(&self) -> anyhow::Result<bool> {
+    pub(super) async fn health_check(&self) -> anyhow::Result<bool> {
         let vars = self.vars();
         match &self.config.health_check {
             None | Some(HealthCheck::Process) => {
@@ -125,6 +127,7 @@ impl ManagedService {
 pub(super) async fn service_supervisor(
     service: Arc<ManagedService>,
     all_services: Vec<Arc<ManagedService>>,
+    state: Arc<AgentState>,
 ) {
     let base_backoff = service
         .config
@@ -143,7 +146,9 @@ pub(super) async fn service_supervisor(
         if service.stopping.load(Ordering::SeqCst) {
             break;
         }
-        match wait_for_dependencies(&service, &all_services).await {
+        match wait_for_dependencies(&service, &all_services, state.access_flow_relay.as_deref())
+            .await
+        {
             Ok(true) => {}
             Ok(false) => break,
             Err(err) => {
@@ -301,6 +306,7 @@ pub(super) fn should_restart(policy: RestartPolicy, exit_success: bool) -> bool 
 pub(super) async fn wait_for_dependencies(
     service: &ManagedService,
     all_services: &[Arc<ManagedService>],
+    access_flow_relay: Option<&RelayControl>,
 ) -> anyhow::Result<bool> {
     if service.config.depends_on.is_empty() {
         return Ok(true);
@@ -313,6 +319,15 @@ pub(super) async fn wait_for_dependencies(
         }
         let mut missing = Vec::new();
         for dep in &service.config.depends_on {
+            if dep == crate::config::ACCESS_FLOW_RELAY_NODE {
+                let Some(relay) = access_flow_relay else {
+                    anyhow::bail!("dependency {dep:?} is not configured");
+                };
+                if !relay.is_ready() {
+                    missing.push(dep.clone());
+                }
+                continue;
+            }
             let Some(dep_service) = all_services
                 .iter()
                 .find(|candidate| candidate.config.name == *dep)
@@ -651,6 +666,42 @@ pub(super) fn service_stop_order(services: &[Arc<ManagedService>]) -> Vec<Arc<Ma
         visit(&service.config.name, services, &mut visited, &mut ordered);
     }
     ordered
+}
+
+pub(super) fn relay_dependent_service_stop_order(
+    services: &[Arc<ManagedService>],
+) -> Vec<Arc<ManagedService>> {
+    let mut dependent_names: BTreeSet<String> = services
+        .iter()
+        .filter(|service| {
+            service
+                .config
+                .depends_on
+                .iter()
+                .any(|dependency| dependency == crate::config::ACCESS_FLOW_RELAY_NODE)
+        })
+        .map(|service| service.config.name.clone())
+        .collect();
+    loop {
+        let before = dependent_names.len();
+        for service in services {
+            if service
+                .config
+                .depends_on
+                .iter()
+                .any(|dependency| dependent_names.contains(dependency))
+            {
+                dependent_names.insert(service.config.name.clone());
+            }
+        }
+        if dependent_names.len() == before {
+            break;
+        }
+    }
+    service_stop_order(services)
+        .into_iter()
+        .filter(|service| dependent_names.contains(&service.config.name))
+        .collect()
 }
 
 async fn stop_child_gracefully(service: &ManagedService, mut child: Child) {

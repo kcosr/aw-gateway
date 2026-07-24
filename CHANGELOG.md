@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- Embedded the shared Access Flow relay in `aw-container-agent` behind strict
+  typed Unix-route configuration, synthetic dependency readiness, checked
+  process resource budgets, and admission-first bounded shutdown. The
+  integrated Apple host-proxy profile no longer mounts or supervises a
+  standalone relay executable or JSON file.
+
 ### Breaking Changes
 
 - Generic `container_mounts` now reject Unix socket, symlink, FIFO, and device
