@@ -11,6 +11,7 @@ mod health_probe;
 mod launch_args;
 pub mod logging;
 pub mod paths;
+pub mod process_security;
 mod random;
 mod rotating_log;
 pub mod runtime;

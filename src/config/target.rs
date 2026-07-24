@@ -980,8 +980,14 @@ impl TargetConfig {
                 }
             }
         }
+        self.container_agent.validate_gateway()?;
         self.container_ssh.validate()?;
         if self.access.method == TargetAccessMethod::RuntimeExec {
+            if self.container_agent.needs_identity_token() {
+                anyhow::bail!(
+                    "target {target_name:?} access.method = \"runtime_exec\" does not support container_agent deployment identity bearer consumers"
+                );
+            }
             if self.local_ssh.is_some() {
                 anyhow::bail!(
                     "target {target_name:?} access.method = \"runtime_exec\" cannot configure local_ssh"
@@ -1036,7 +1042,42 @@ impl TargetConfig {
         for step in &self.container_bootstrap_steps {
             step.validate()?;
         }
-        self.container_agent.validate_gateway()?;
+        self.validate_identity_token_environment_boundaries()?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_identity_token_environment_boundaries(&self) -> anyhow::Result<()> {
+        if let Some(source) = self.container_agent.access_flow_presentation_source() {
+            if self.container_env.contains_key(source) {
+                anyhow::bail!(
+                    "target.container_env cannot define the access flow presentation source"
+                );
+            }
+            if self.session_env.contains_key(source)
+                || self.session_env_inherit.iter().any(|name| name == source)
+            {
+                anyhow::bail!(
+                    "target session environment cannot contain the access flow presentation source"
+                );
+            }
+        }
+        if self.container_agent.needs_identity_token() {
+            if self.container_env.contains_key("AW_IDENTITY_TOKEN") {
+                anyhow::bail!(
+                    "target.container_env cannot define the deployment identity token environment"
+                );
+            }
+            if self.session_env.contains_key("AW_IDENTITY_TOKEN")
+                || self
+                    .session_env_inherit
+                    .iter()
+                    .any(|name| name == "AW_IDENTITY_TOKEN")
+            {
+                anyhow::bail!(
+                    "target session environment cannot contain the deployment identity token environment"
+                );
+            }
+        }
         Ok(())
     }
 

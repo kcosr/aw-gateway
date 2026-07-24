@@ -14,8 +14,15 @@ use crate::config::{ContainerAgentFile, ControlSocketConfig};
 use crate::fileutil;
 use crate::paths;
 use crate::template::{self, Vars};
+use access_identity::{IdentityPresentation, SensitiveBearer};
+#[cfg(test)]
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(test)]
+use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use bridge::run_bridge;
 use control::{run_control_socket, wait_for_shutdown_signal};
@@ -26,7 +33,7 @@ use state::{AgentState, SocketOwner};
 
 pub const DEFAULT_AGENT_CONFIG: &str = include_str!("../container-agent.sample.toml");
 
-pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
+pub fn run(args: AgentArgs) -> anyhow::Result<()> {
     match args.command {
         Some(AgentCommand::Config(AgentConfigCommand::Validate)) => {
             let path = paths::agent_config_path(args.config);
@@ -51,12 +58,126 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
             println!("{}", path.display());
             Ok(())
         }
-        Some(AgentCommand::Run) | None => run_agent(args.config).await,
+        Some(AgentCommand::Run) | None => {
+            let prepared = prepare_agent(args.config)?;
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(run_agent(prepared))
+        }
     }
 }
 
-async fn run_agent(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+struct PreparedAgent {
+    cfg: ContainerAgentFile,
+    relay_presentation: Option<IdentityPresentation>,
+    service_identity_token: Option<Arc<SensitiveBearer>>,
+}
+
+fn prepare_agent(config_path: Option<PathBuf>) -> anyhow::Result<PreparedAgent> {
     let cfg = ContainerAgentFile::load(&paths::agent_config_path(config_path))?;
+    let (relay_presentation, service_identity_token) =
+        activate_identity_environment(&cfg.container_agent)?;
+    Ok(PreparedAgent {
+        cfg,
+        relay_presentation,
+        service_identity_token,
+    })
+}
+
+fn activate_identity_environment(
+    config: &crate::config::ContainerAgentConfig,
+) -> anyhow::Result<(Option<IdentityPresentation>, Option<Arc<SensitiveBearer>>)> {
+    activate_identity_environment_with(config, take_identity_environment)
+}
+
+fn activate_identity_environment_with(
+    config: &crate::config::ContainerAgentConfig,
+    mut take_environment: impl FnMut(&str) -> Option<Zeroizing<Vec<u8>>>,
+) -> anyhow::Result<(Option<IdentityPresentation>, Option<Arc<SensitiveBearer>>)> {
+    const CANONICAL_SOURCE: &str = "AW_IDENTITY_TOKEN";
+
+    let relay_source = config
+        .access_flow_relay
+        .as_ref()
+        .and_then(|relay| relay.presentation.environment_variable());
+    let custom_relay_source = relay_source.filter(|source| *source != CANONICAL_SOURCE);
+    let canonical_required =
+        config.services_need_identity_token() || relay_source == Some(CANONICAL_SOURCE);
+
+    // Consume every required locator before validating any value so an error
+    // cannot leave another required bearer in the process environment.
+    let canonical_value = if canonical_required {
+        take_environment(CANONICAL_SOURCE)
+    } else {
+        None
+    };
+    let custom_relay_value = custom_relay_source.and_then(&mut take_environment);
+
+    let relay_presentation = config
+        .access_flow_relay
+        .as_ref()
+        .map(|relay| match &relay.presentation {
+            crate::config::AccessFlowRelayPresentation::Disabled {} => {
+                Ok(IdentityPresentation::Disabled)
+            }
+            crate::config::AccessFlowRelayPresentation::Anonymous {} => {
+                Ok(IdentityPresentation::Anonymous)
+            }
+            crate::config::AccessFlowRelayPresentation::BearerEnvironment { variable } => {
+                let value = if variable == CANONICAL_SOURCE {
+                    canonical_value.as_deref()
+                } else {
+                    custom_relay_value.as_deref()
+                }
+                .ok_or_else(|| anyhow::anyhow!("required agent identity environment is missing"))?;
+                validated_sensitive_bearer(value).map(IdentityPresentation::Bearer)
+            }
+        })
+        .transpose()?;
+
+    let service_identity_token = config
+        .services_need_identity_token()
+        .then(|| {
+            let value = canonical_value
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("required agent identity environment is missing"))?;
+            validated_sensitive_bearer(value).map(Arc::new)
+        })
+        .transpose()?;
+
+    Ok((relay_presentation, service_identity_token))
+}
+
+fn take_identity_environment(variable: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let value = std::env::var_os(variable);
+    // SAFETY: agent preparation runs before the Tokio runtime or any worker
+    // thread is constructed.
+    unsafe {
+        std::env::remove_var(variable);
+    }
+    value.map(|value| Zeroizing::new(value.into_vec()))
+}
+
+fn validated_sensitive_bearer(value: &[u8]) -> anyhow::Result<SensitiveBearer> {
+    SensitiveBearer::new(value)
+        .map_err(|_| anyhow::anyhow!("required agent identity environment is invalid"))
+}
+
+#[cfg(test)]
+fn sensitive_bearer_from_environment(value: OsString) -> anyhow::Result<IdentityPresentation> {
+    let mut bytes = value.into_vec();
+    let bearer = validated_sensitive_bearer(&bytes);
+    bytes.zeroize();
+    bearer.map(IdentityPresentation::Bearer)
+}
+
+async fn run_agent(prepared: PreparedAgent) -> anyhow::Result<()> {
+    let PreparedAgent {
+        cfg,
+        relay_presentation,
+        service_identity_token,
+    } = prepared;
     let state_dir = std::env::var_os("AW_CONTAINER_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(paths::DEFAULT_AGENT_STATE_DIR));
@@ -90,10 +211,15 @@ async fn run_agent(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         .clone()
         .into_iter()
         .map(|service| {
-            Arc::new(ManagedService::new(
+            let identity_token = service
+                .needs_identity_token()
+                .then(|| service_identity_token.clone())
+                .flatten();
+            Arc::new(ManagedService::new_with_identity_token(
                 service,
                 state_dir.clone(),
                 cfg.logging.clone(),
+                identity_token,
             ))
         })
         .collect();
@@ -101,13 +227,15 @@ async fn run_agent(config_path: Option<PathBuf>) -> anyhow::Result<()> {
     for service in services.clone() {
         tokio::spawn(service_supervisor(service, services.clone(), state.clone()));
     }
-    let relay_task = if let (Some(config), Some(control), Some(commands)) = (
+    let relay_task = if let (Some(config), Some(presentation), Some(control), Some(commands)) = (
         cfg.container_agent.access_flow_relay.clone(),
+        relay_presentation,
         access_flow_relay,
         relay_commands,
     ) {
         Some(tokio::spawn(run_relay_supervisor(
             config,
+            presentation,
             services.clone(),
             state.clone(),
             control,
@@ -287,20 +415,182 @@ mod tests {
     use crate::agent::status::status_payload;
     use crate::agent_control::ControlRequest;
     use crate::config::{
-        HealthCheck, IdleCleanupAction, IdleCleanupConfig, LoggingConfig, RestartPolicy,
-        ServiceConfig,
+        ContainerAgentConfig, ContainerAgentFile, HealthCheck, IdleCleanupAction,
+        IdleCleanupConfig, LoggingConfig, RestartPolicy, ServiceConfig,
     };
     use crate::health_probe::{JsonFieldCheck, check_json_fields};
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
+
+    fn identity_activation_config(
+        relay_source: Option<&str>,
+        service_identity: bool,
+    ) -> ContainerAgentConfig {
+        let mut raw =
+            "schema_version = \"1\"\n[container_agent]\ncontrol_socket = false\n".to_string();
+        if let Some(source) = relay_source {
+            raw.push_str(&format!(
+                r#"
+[container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 4
+copy_buffer_bytes_per_direction = 4096
+
+[container_agent.access_flow_relay.presentation]
+kind = "bearer_environment"
+variable = "{source}"
+
+[[container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/tmp/access-flow.sock"
+"#
+            ));
+        }
+        if service_identity {
+            raw.push_str(
+                r#"
+[[container_agent.services]]
+name = "approved"
+command = ["/bin/true"]
+restart = "never"
+
+[container_agent.services.env]
+AW_IDENTITY_TOKEN = { inherit = "AW_IDENTITY_TOKEN" }
+"#,
+            );
+        }
+        toml::from_str::<ContainerAgentFile>(&raw)
+            .unwrap()
+            .container_agent
+    }
+
+    #[test]
+    fn identity_activation_matrix_reads_each_locator_once_into_independent_sensitive_state() {
+        const CANONICAL: &str = "AW_IDENTITY_TOKEN";
+        const CUSTOM: &str = "AW_ACCESS_FLOW_TEST_TOKEN";
+        let canonical_bearer = b"canonicalABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let custom_bearer = b"custom-bearer-ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+        for (relay_source, service_identity, expected_locators) in [
+            (Some(CANONICAL), false, vec![CANONICAL]),
+            (Some(CUSTOM), false, vec![CUSTOM]),
+            (None, true, vec![CANONICAL]),
+            (Some(CANONICAL), true, vec![CANONICAL]),
+            (Some(CUSTOM), true, vec![CANONICAL, CUSTOM]),
+        ] {
+            let config = identity_activation_config(relay_source, service_identity);
+            let mut values = BTreeMap::from([
+                (CANONICAL.to_string(), canonical_bearer.to_vec()),
+                (CUSTOM.to_string(), custom_bearer.to_vec()),
+            ]);
+            let mut locators = Vec::new();
+            let (relay, service) = activate_identity_environment_with(&config, |locator| {
+                locators.push(locator.to_string());
+                values.remove(locator).map(Zeroizing::new)
+            })
+            .unwrap();
+            locators.sort();
+            let mut expected: Vec<_> = expected_locators.into_iter().map(str::to_string).collect();
+            expected.sort();
+            assert_eq!(locators, expected);
+
+            match (relay_source, relay.as_ref()) {
+                (Some(CANONICAL), Some(IdentityPresentation::Bearer(bearer))) => {
+                    bearer.expose(|value| assert_eq!(value, canonical_bearer));
+                }
+                (Some(CUSTOM), Some(IdentityPresentation::Bearer(bearer))) => {
+                    bearer.expose(|value| assert_eq!(value, custom_bearer));
+                }
+                (None, None) => {}
+                _ => panic!("unexpected relay presentation"),
+            }
+            match (service_identity, service.as_ref()) {
+                (true, Some(bearer)) => {
+                    bearer.expose(|value| assert_eq!(value, canonical_bearer));
+                }
+                (false, None) => {}
+                _ => panic!("unexpected service identity state"),
+            }
+
+            if relay_source == Some(CANONICAL) && service_identity {
+                let relay_pointer = match relay.as_ref().unwrap() {
+                    IdentityPresentation::Bearer(bearer) => bearer.expose(|value| value.as_ptr()),
+                    _ => unreachable!(),
+                };
+                let service_pointer = service.as_ref().unwrap().expose(|value| value.as_ptr());
+                assert_ne!(relay_pointer, service_pointer);
+            }
+        }
+    }
+
+    #[test]
+    fn identity_activation_consumes_all_required_locators_before_sanitized_failure() {
+        const CANONICAL: &str = "AW_IDENTITY_TOKEN";
+        const CUSTOM: &str = "AW_ACCESS_FLOW_TEST_TOKEN";
+        let config = identity_activation_config(Some(CUSTOM), true);
+
+        for values in [
+            BTreeMap::new(),
+            BTreeMap::from([(CUSTOM.to_string(), b"invalid bearer".to_vec())]),
+            BTreeMap::from([(
+                CANONICAL.to_string(),
+                b"canonicalABCDEFGHIJKLMNOPQRSTUVWXYZ".to_vec(),
+            )]),
+        ] {
+            let mut values = values;
+            let mut locators = Vec::new();
+            let error = match activate_identity_environment_with(&config, |locator| {
+                locators.push(locator.to_string());
+                values.remove(locator).map(Zeroizing::new)
+            }) {
+                Ok(_) => panic!("identity activation unexpectedly succeeded"),
+                Err(error) => error.to_string(),
+            };
+            locators.sort();
+            let mut expected = vec![CANONICAL.to_string(), CUSTOM.to_string()];
+            expected.sort();
+            assert_eq!(locators, expected);
+            assert!(!error.contains(CANONICAL), "{error}");
+            assert!(!error.contains(CUSTOM), "{error}");
+            assert!(!error.contains("invalid bearer"), "{error}");
+        }
+    }
     use tokio::time::{Duration, Instant, sleep};
 
     #[test]
     fn sample_agent_config_validates() {
         let cfg: ContainerAgentFile = toml::from_str(DEFAULT_AGENT_CONFIG).unwrap();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn bearer_environment_value_is_validated_into_sensitive_storage() {
+        let presentation =
+            sensitive_bearer_from_environment(OsString::from("abcdefghijklmnopqrstuvwxyzABCDEF"))
+                .unwrap();
+        let IdentityPresentation::Bearer(bearer) = presentation else {
+            panic!("expected bearer presentation");
+        };
+        assert_eq!(bearer.len(), 32);
+        bearer.expose(|value| assert_eq!(value, b"abcdefghijklmnopqrstuvwxyzABCDEF"));
+    }
+
+    #[test]
+    fn invalid_bearer_environment_error_is_secret_free() {
+        let error = sensitive_bearer_from_environment(OsString::from("short-secret"))
+            .err()
+            .expect("short bearer must fail")
+            .to_string();
+        assert_eq!(error, "required agent identity environment is invalid");
+        assert!(!error.contains("short-secret"));
     }
 
     #[test]

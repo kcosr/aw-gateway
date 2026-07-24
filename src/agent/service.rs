@@ -5,9 +5,13 @@ use crate::config::{
 use crate::health_probe::{JsonFieldCheck, check_json_fields, http_get};
 use crate::rotating_log::{RotationState, RotationStep};
 use crate::template::{self, Vars};
+use access_identity::SensitiveBearer;
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
+use std::ffi::OsStr;
+use std::fmt;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -22,23 +26,49 @@ use super::process::process_exists;
 use super::relay::RelayControl;
 use super::state::AgentState;
 
-#[derive(Debug)]
 pub(super) struct ManagedService {
     pub(super) config: ServiceConfig,
     state_dir: PathBuf,
     logging: LoggingConfig,
+    identity_token: Option<Arc<SensitiveBearer>>,
     pub(super) child: Mutex<Option<Child>>,
     pub(super) stopping: AtomicBool,
     restart_count: AtomicUsize,
     pub(super) last_error: Mutex<Option<String>>,
 }
 
+impl fmt::Debug for ManagedService {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedService")
+            .field("config", &self.config)
+            .field("state_dir", &self.state_dir)
+            .field("logging", &self.logging)
+            .field(
+                "identity_token",
+                &self.identity_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 impl ManagedService {
+    #[cfg(test)]
     pub(super) fn new(config: ServiceConfig, state_dir: PathBuf, logging: LoggingConfig) -> Self {
+        Self::new_with_identity_token(config, state_dir, logging, None)
+    }
+
+    pub(super) fn new_with_identity_token(
+        config: ServiceConfig,
+        state_dir: PathBuf,
+        logging: LoggingConfig,
+        identity_token: Option<Arc<SensitiveBearer>>,
+    ) -> Self {
         Self {
             config,
             state_dir,
             logging,
+            identity_token,
             child: Mutex::new(None),
             stopping: AtomicBool::new(false),
             restart_count: AtomicUsize::new(0),
@@ -426,7 +456,20 @@ async fn start_service(service: &ManagedService) -> anyhow::Result<()> {
         command.current_dir(template::render(cwd, &vars)?);
     }
     for (key, value) in &service.config.env {
-        if let Some(value) = resolve_env(value, &vars)? {
+        if value.inherit.as_deref() == Some("AW_IDENTITY_TOKEN") {
+            if key != "AW_IDENTITY_TOKEN" {
+                anyhow::bail!(
+                    "service deployment identity inheritance must use its canonical environment entry"
+                );
+            }
+            let identity_token = service
+                .identity_token
+                .as_ref()
+                .context("service deployment identity is unavailable")?;
+            identity_token.expose(|bearer| {
+                command.env(key, OsStr::from_bytes(bearer));
+            });
+        } else if let Some(value) = resolve_env(value, &vars)? {
             command.env(key, value);
         }
     }
@@ -824,6 +867,87 @@ mod tests {
                 exit_success: true,
                 healthy_uptime: true,
             }
+        );
+    }
+
+    #[test]
+    fn managed_service_debug_omits_canonical_and_invalid_identity_environment_sources() {
+        for (destination, source) in [
+            ("AW_IDENTITY_TOKEN", "AW_IDENTITY_TOKEN"),
+            ("AW_IDENTITY_TOKEN", "private-token.locator"),
+            ("private-token.destination", "AW_IDENTITY_TOKEN"),
+        ] {
+            let mut config = service_config("debug-redaction", vec!["/bin/true".into()]);
+            config.env.insert(
+                destination.into(),
+                EnvValue {
+                    value: None,
+                    file: None,
+                    inherit: Some(source.into()),
+                    interpolate: true,
+                    required: true,
+                },
+            );
+            let service = ManagedService::new(
+                config,
+                PathBuf::from("/tmp/managed-service-debug"),
+                LoggingConfig::default(),
+            );
+
+            let debug = format!("{service:?}");
+            assert!(debug.contains("env_entry_count: 1"), "{debug}");
+            assert!(!debug.contains(destination), "{debug}");
+            assert!(!debug.contains(source), "{debug}");
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_service_reuses_retained_identity_across_restarts_without_debug_exposure() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("identity-values");
+        let bearer_value = b"abcdefghijklmnopqrstuvwxyzABCDEF";
+        let mut config = service_config(
+            "approved",
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "printf '%s\\n' \"$AW_IDENTITY_TOKEN\" >> '{}'",
+                    output.display()
+                ),
+            ],
+        );
+        config.env.insert(
+            "AW_IDENTITY_TOKEN".into(),
+            EnvValue {
+                value: None,
+                file: None,
+                inherit: Some("AW_IDENTITY_TOKEN".into()),
+                interpolate: true,
+                required: true,
+            },
+        );
+        let bearer = Arc::new(SensitiveBearer::new(bearer_value).unwrap());
+        let service = ManagedService::new_with_identity_token(
+            config,
+            dir.path().to_path_buf(),
+            LoggingConfig::default(),
+            Some(bearer),
+        );
+
+        let debug = format!("{service:?}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(!debug.contains(std::str::from_utf8(bearer_value).unwrap()));
+
+        for _ in 0..2 {
+            start_service(&service).await.unwrap();
+            let mut child = service.child.lock().await.take().unwrap();
+            assert!(child.wait().await.unwrap().success());
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(output).unwrap(),
+            "abcdefghijklmnopqrstuvwxyzABCDEF\nabcdefghijklmnopqrstuvwxyzABCDEF\n"
         );
     }
 }

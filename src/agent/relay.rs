@@ -5,6 +5,7 @@ use access_flow_relay::{
     RunningAccessFlowRelay,
 };
 use access_flow_unix::UnixAccessFlowConnector;
+use access_identity::IdentityPresentation;
 use anyhow::Context;
 use std::fs::FileType;
 use std::os::unix::fs::FileTypeExt;
@@ -238,12 +239,21 @@ impl AccessFlowRelayObserver for RelayObserver {
 
 pub(super) async fn run_relay_supervisor(
     config: AccessFlowRelayConfig,
+    presentation: IdentityPresentation,
     services: Vec<Arc<ManagedService>>,
     state: Arc<AgentState>,
     control: Arc<RelayControl>,
     mut commands: RelayCommandReceiver,
 ) -> anyhow::Result<()> {
-    let result = run_relay(&config, &services, &state, &control, &mut commands.0).await;
+    let result = run_relay(
+        &config,
+        presentation,
+        &services,
+        &state,
+        &control,
+        &mut commands.0,
+    )
+    .await;
     if let Err(err) = result {
         control.accepting.store(false, Ordering::Release);
         control.set_state(AccessFlowRelayStateName::Failed).await;
@@ -256,6 +266,7 @@ pub(super) async fn run_relay_supervisor(
 
 async fn run_relay(
     config: &AccessFlowRelayConfig,
+    presentation: IdentityPresentation,
     services: &[Arc<ManagedService>],
     state: &AgentState,
     control: &RelayControl,
@@ -265,7 +276,10 @@ async fn run_relay(
         return finish_cancelled_start(control, commands).await;
     }
     let compiled = config
-        .compile(crate::config::AccessFlowRelayValidationMode::Agent)
+        .compile_with_presentation(
+            crate::config::AccessFlowRelayValidationMode::Agent,
+            presentation,
+        )
         .context("compile access flow relay configuration")?;
     probe_unix_endpoints(&compiled)?;
     let budget = relay_resource_budget(state.bridge_enabled, services.len())?;
@@ -634,7 +648,7 @@ mod tests {
             max_connections: 4,
             copy_buffer_bytes_per_direction: 4096,
             start_after_services: Vec::new(),
-            presentation: AccessFlowRelayPresentation::Disabled,
+            presentation: AccessFlowRelayPresentation::Disabled {},
             routes: vec![AccessFlowRelayRoute {
                 name: "http".into(),
                 listen,
@@ -676,6 +690,35 @@ mod tests {
             TOTAL_AGENT_MEMORY_PREFLIGHT_BYTES
                 - BRIDGE_NON_RELAY_MEMORY_BYTES
                 - 4 * PER_SERVICE_NON_RELAY_MEMORY_BYTES
+        );
+    }
+
+    #[test]
+    fn relay_resource_projection_accounts_for_retained_bearer() {
+        let config = test_config("127.0.0.1:3128".into(), "/tmp/access-flow.sock".into());
+        let compiled = config
+            .compile_with_presentation(
+                crate::config::AccessFlowRelayValidationMode::Agent,
+                IdentityPresentation::Bearer(
+                    access_identity::SensitiveBearer::new(b"abcdefghijklmnopqrstuvwxyzABCDEF")
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+        let relay = AccessFlowRelay::new(
+            compiled.plan,
+            UnixAccessFlowConnector::new(),
+            Arc::new(RelayObserver {
+                active_flows: Arc::new(AtomicUsize::new(0)),
+            }),
+            relay_resource_budget(false, 0).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(relay.resource_projection().presentation_bytes, 32);
+        assert!(
+            relay.resource_projection().total_memory_bytes
+                >= relay.resource_projection().presentation_bytes
         );
     }
 
@@ -746,6 +789,7 @@ mod tests {
         ));
         let supervisor = tokio::spawn(run_relay_supervisor(
             config,
+            IdentityPresentation::Disabled,
             Vec::new(),
             state,
             control.clone(),
@@ -820,6 +864,7 @@ mod tests {
         ));
         let supervisor = tokio::spawn(run_relay_supervisor(
             config,
+            IdentityPresentation::Disabled,
             Vec::new(),
             state.clone(),
             control.clone(),
@@ -898,9 +943,15 @@ mod tests {
             Some(control.clone()),
         ));
 
-        let result =
-            run_relay_supervisor(config, Vec::new(), state.clone(), control.clone(), commands)
-                .await;
+        let result = run_relay_supervisor(
+            config,
+            IdentityPresentation::Disabled,
+            Vec::new(),
+            state.clone(),
+            control.clone(),
+            commands,
+        )
+        .await;
         assert!(result.is_err());
         assert_eq!(state.relay_fatal(), Some(RelayFatalKind::ManagerFailure));
         let status = control.status().await;

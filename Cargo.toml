@@ -22,10 +22,10 @@ name = "aw-ssh-command-filter"
 path = "src/bin/aw-ssh-command-filter.rs"
 
 [dependencies]
-access-async-contracts = { git = "https://github.com/kcosr/access-runtime.git", rev = "52ad634fc1efccb62bf967f441a0047d56c1f425" }
-access-flow-relay = { git = "https://github.com/kcosr/access-runtime.git", rev = "52ad634fc1efccb62bf967f441a0047d56c1f425" }
-access-flow-unix = { git = "https://github.com/kcosr/access-runtime.git", rev = "52ad634fc1efccb62bf967f441a0047d56c1f425" }
-access-identity = { git = "https://github.com/kcosr/access-runtime.git", rev = "52ad634fc1efccb62bf967f441a0047d56c1f425" }
+access-async-contracts = { git = "https://github.com/kcosr/access-runtime.git", rev = "0373a1b0f192927a6b8abaa05af8847f18a90546" }
+access-flow-relay = { git = "https://github.com/kcosr/access-runtime.git", rev = "0373a1b0f192927a6b8abaa05af8847f18a90546" }
+access-flow-unix = { git = "https://github.com/kcosr/access-runtime.git", rev = "0373a1b0f192927a6b8abaa05af8847f18a90546" }
+access-identity = { git = "https://github.com/kcosr/access-runtime.git", rev = "0373a1b0f192927a6b8abaa05af8847f18a90546" }
 anyhow = "1.0.100"
 axum = { version = "0.8.7", features = ["ws"] }
 clap = { version = "4.5.53", features = ["derive", "env"] }
@@ -45,6 +45,7 @@ toml = "0.9.8"
 tracing = "0.1.41"
 tracing-appender = "0.2.4"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+zeroize = "1.8.2"
 
 [dev-dependencies]
 assert_cmd = "2.1.1"

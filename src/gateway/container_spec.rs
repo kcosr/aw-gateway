@@ -220,9 +220,23 @@ impl Runtime {
         prepared: &PreparedContainerInputs,
         published_ssh_host_port: Option<u16>,
     ) -> anyhow::Result<ContainerRunSpec> {
+        if let Some(relay) = &self.target.container_agent.access_flow_relay {
+            relay.presentation.validate()?;
+        }
+        self.target
+            .validate_identity_token_environment_boundaries()?;
         let mut env = BTreeMap::new();
         if let Some(identity_token) = identity_token {
-            env.insert("AW_IDENTITY_TOKEN".into(), identity_token.to_string());
+            if let Some(source) = self
+                .target
+                .container_agent
+                .access_flow_presentation_source()
+            {
+                env.insert(source.to_string(), identity_token.to_string());
+            }
+            if self.target.container_agent.services_need_identity_token() {
+                env.insert("AW_IDENTITY_TOKEN".into(), identity_token.to_string());
+            }
         }
         if let Some(control_token) = control_token {
             env.insert(

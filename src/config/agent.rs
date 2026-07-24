@@ -11,7 +11,7 @@ use access_flow_relay::{
     AccessFlowRelayPlan, AccessFlowRelayPlanError, AccessFlowRoute, AccessFlowRouteName,
 };
 use access_flow_unix::{NormalizedUnixSocketPath, UnixAccessFlowEndpoint, UnixExecutionTarget};
-use access_identity::IdentityPresentation;
+use access_identity::{IdentityPresentation, SensitiveBearer};
 
 pub const ACCESS_FLOW_RELAY_NODE: &str = "@access-flow-relay";
 const REMOVED_LOCAL_FLOW_RELAY_NODE: &str = "@local-flow-relay";
@@ -120,8 +120,15 @@ impl ContainerAgentConfig {
             return Ok(());
         }
         let mut names = BTreeSet::new();
+        let presentation_source = self
+            .access_flow_relay
+            .as_ref()
+            .and_then(|relay| relay.presentation.environment_variable());
         for service in &self.services {
             service.validate(service_user_template_mode)?;
+            if let Some(source) = presentation_source {
+                validate_service_presentation_source(service, source)?;
+            }
             if !names.insert(service.name.clone()) {
                 anyhow::bail!("duplicate container_agent service {:?}", service.name);
             }
@@ -176,20 +183,43 @@ impl ContainerAgentConfig {
     }
 
     pub fn needs_identity_token(&self) -> bool {
-        // The gateway provisions AW_IDENTITY_TOKEN only for container-agent
-        // services that explicitly inherit that variable. New token consumers
-        // must either use the same EnvValue::inherit mechanism or update this
-        // predicate and the container run environment together.
         self.enabled
-            && self.services.iter().any(|service| {
-                service.env.values().any(|value| {
-                    value
-                        .inherit
-                        .as_deref()
-                        .is_some_and(|name| name == "AW_IDENTITY_TOKEN")
-                })
-            })
+            && (self.access_flow_presentation_source().is_some()
+                || self.services_need_identity_token())
     }
+
+    pub fn access_flow_presentation_source(&self) -> Option<&str> {
+        self.enabled
+            .then_some(self.access_flow_relay.as_ref())
+            .flatten()
+            .and_then(|relay| relay.presentation.environment_variable())
+    }
+
+    pub fn services_need_identity_token(&self) -> bool {
+        self.enabled
+            && self
+                .services
+                .iter()
+                .any(ServiceConfig::needs_identity_token)
+    }
+}
+
+fn validate_service_presentation_source(
+    service: &ServiceConfig,
+    source: &str,
+) -> anyhow::Result<()> {
+    for (key, value) in &service.env {
+        let approved_identity_entry = source == "AW_IDENTITY_TOKEN"
+            && key == "AW_IDENTITY_TOKEN"
+            && value.inherit.as_deref() == Some("AW_IDENTITY_TOKEN");
+        if !approved_identity_entry && (key == source || value.inherit.as_deref() == Some(source)) {
+            anyhow::bail!(
+                "container_agent service {:?} cannot use the access flow presentation source in this environment entry",
+                service.name
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -400,7 +430,7 @@ fn visit_service_dependency<'a>(
     Ok(())
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     pub name: String,
@@ -423,6 +453,27 @@ pub struct ServiceConfig {
     pub health_check: Option<HealthCheck>,
 }
 
+impl std::fmt::Debug for ServiceConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServiceConfig")
+            .field("name", &self.name)
+            .field("required", &self.required)
+            .field("user", &self.user)
+            .field("command", &self.command)
+            .field("cwd", &self.cwd)
+            .field("restart", &self.restart)
+            .field("restart_backoff", &self.restart_backoff)
+            .field("restart_backoff_max", &self.restart_backoff_max)
+            .field("startup_timeout", &self.startup_timeout)
+            .field("shutdown_timeout", &self.shutdown_timeout)
+            .field("depends_on", &self.depends_on)
+            .field("env_entry_count", &self.env.len())
+            .field("health_check", &self.health_check)
+            .finish()
+    }
+}
+
 impl ServiceConfig {
     fn validate(&self, user_template_mode: ServiceUserTemplateMode) -> anyhow::Result<()> {
         validate_name("service", &self.name)?;
@@ -438,6 +489,7 @@ impl ServiceConfig {
                 validate_name("depends_on", dep)?;
             }
         }
+        self.validate_identity_environment_contract()?;
         for key in self.env.keys() {
             validate_env_key(key)?;
         }
@@ -469,6 +521,27 @@ impl ServiceConfig {
         }
         Ok(())
     }
+
+    fn validate_identity_environment_contract(&self) -> anyhow::Result<()> {
+        for (key, value) in &self.env {
+            let reserved_destination = key == "AW_IDENTITY_TOKEN";
+            let canonical_source = value.inherit.as_deref() == Some("AW_IDENTITY_TOKEN");
+            if (reserved_destination && !value.is_canonical_identity_inheritance())
+                || (!reserved_destination && canonical_source)
+            {
+                anyhow::bail!(
+                    "container_agent service deployment identity environment contract is invalid"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn needs_identity_token(&self) -> bool {
+        self.env
+            .get("AW_IDENTITY_TOKEN")
+            .is_some_and(EnvValue::is_canonical_identity_inheritance)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -486,6 +559,7 @@ pub struct AccessFlowRelayConfig {
 
 impl AccessFlowRelayConfig {
     fn validate(&self, mode: AccessFlowRelayValidationMode) -> anyhow::Result<()> {
+        self.presentation.validate()?;
         let _ = self.compile(mode)?;
         Ok(())
     }
@@ -493,6 +567,14 @@ impl AccessFlowRelayConfig {
     pub(crate) fn compile(
         &self,
         mode: AccessFlowRelayValidationMode,
+    ) -> anyhow::Result<CompiledAccessFlowRelayConfig> {
+        self.compile_with_presentation(mode, self.presentation.validation_value()?)
+    }
+
+    pub(crate) fn compile_with_presentation(
+        &self,
+        mode: AccessFlowRelayValidationMode,
+        presentation: IdentityPresentation,
     ) -> anyhow::Result<CompiledAccessFlowRelayConfig> {
         let setup_timeout = parse_duration(&self.setup_timeout)
             .context("container_agent.access_flow_relay.setup_timeout")?;
@@ -534,7 +616,7 @@ impl AccessFlowRelayConfig {
         }
         let plan = AccessFlowRelayPlan::new(
             routes,
-            IdentityPresentation::Disabled,
+            presentation,
             setup_timeout,
             max_connections,
             copy_buffer_bytes_per_direction,
@@ -570,10 +652,79 @@ pub(crate) struct CompiledAccessFlowRelayConfig {
     pub(crate) drain_timeout: Duration,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AccessFlowRelayPresentation {
-    Disabled,
+    Disabled {},
+    Anonymous {},
+    BearerEnvironment { variable: String },
+}
+
+impl std::fmt::Debug for AccessFlowRelayPresentation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled {} => formatter.write_str("Disabled"),
+            Self::Anonymous {} => formatter.write_str("Anonymous"),
+            Self::BearerEnvironment { .. } => formatter
+                .debug_struct("BearerEnvironment")
+                .field("variable", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+impl AccessFlowRelayPresentation {
+    pub fn environment_variable(&self) -> Option<&str> {
+        match self {
+            Self::BearerEnvironment { variable } => Some(variable),
+            Self::Disabled {} | Self::Anonymous {} => None,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if let Some(variable) = self.environment_variable() {
+            validate_presentation_source(variable)?;
+        }
+        Ok(())
+    }
+
+    fn validation_value(&self) -> anyhow::Result<IdentityPresentation> {
+        match self {
+            Self::Disabled {} => Ok(IdentityPresentation::Disabled),
+            Self::Anonymous {} => Ok(IdentityPresentation::Anonymous),
+            Self::BearerEnvironment { .. } => Ok(IdentityPresentation::Bearer(
+                SensitiveBearer::new(b"abcdefghijklmnopqrstuvwxyzABCDEF")
+                    .context("construct access flow bearer validation value")?,
+            )),
+        }
+    }
+}
+
+fn validate_presentation_source(variable: &str) -> anyhow::Result<()> {
+    let bytes = variable.as_bytes();
+    let valid_start = bytes
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_');
+    if bytes.len() > 256
+        || !valid_start
+        || !bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        anyhow::bail!(
+            "container_agent.access_flow_relay.presentation.variable must match [A-Za-z_][A-Za-z0-9_]* and be at most 256 bytes"
+        );
+    }
+    if variable != "AW_IDENTITY_TOKEN"
+        && variable
+            .strip_prefix("AW_ACCESS_FLOW_")
+            .is_none_or(str::is_empty)
+    {
+        anyhow::bail!(
+            "container_agent.access_flow_relay.presentation.variable must use the AW Access Flow source namespace"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -711,7 +862,7 @@ pub enum RestartPolicy {
     Always,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnvValue {
     pub value: Option<String>,
@@ -723,7 +874,28 @@ pub struct EnvValue {
     pub required: bool,
 }
 
+impl std::fmt::Debug for EnvValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnvValue")
+            .field("value", &self.value.as_ref().map(|_| "<redacted>"))
+            .field("file", &self.file.as_ref().map(|_| "<redacted>"))
+            .field("inherit", &self.inherit.as_ref().map(|_| "<redacted>"))
+            .field("interpolate", &self.interpolate)
+            .field("required", &self.required)
+            .finish()
+    }
+}
+
 impl EnvValue {
+    fn is_canonical_identity_inheritance(&self) -> bool {
+        self.value.is_none()
+            && self.file.is_none()
+            && self.inherit.as_deref() == Some("AW_IDENTITY_TOKEN")
+            && self.interpolate
+            && self.required
+    }
+
     pub fn resolve(&self, vars: &BTreeMap<String, String>) -> anyhow::Result<Option<String>> {
         self.validate()?;
         let value = if let Some(value) = &self.value {

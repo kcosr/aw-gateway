@@ -5272,7 +5272,7 @@ fn rendered_default_control_socket_host_dir_is_marked_default() {
 }
 
 #[test]
-fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
+fn podman_run_args_start_agent_as_root_without_unrequested_identity_token() {
     let dir = tempfile::tempdir().unwrap();
     let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
     let target = cfg.effective_target("default").unwrap();
@@ -5314,7 +5314,6 @@ fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
         "{}:/home/alice:Z",
         runtime.paths.workspace.display()
     )));
-    assert!(args.contains(&"AW_IDENTITY_TOKEN".to_string()));
     assert!(args.contains(&"AW_CONTAINER_CONTROL_TOKEN".to_string()));
     assert!(args.contains(&"AW_AUTHENTICATED_UID".to_string()));
     assert!(args.contains(&"AW_AUTHENTICATED_GID".to_string()));
@@ -5328,10 +5327,7 @@ fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
             .iter()
             .any(|arg| arg == "AW_CONTAINER_CONTROL_TOKEN=control-token")
     );
-    assert_eq!(
-        env.get("AW_IDENTITY_TOKEN").map(String::as_str),
-        Some("identity-token")
-    );
+    assert!(!env.contains_key("AW_IDENTITY_TOKEN"));
     assert_eq!(
         env.get("AW_CONTAINER_CONTROL_TOKEN").map(String::as_str),
         Some("control-token")
@@ -6180,6 +6176,299 @@ fn container_run_env_does_not_include_target_session_env() {
     assert!(!env_config.contains("AW_GATEWAY_TEST_INHERITED_SESSION_ENV"));
     assert!(env_config.contains("AW_GATEWAY_TEST_SESSION_OVERRIDE_ENV=explicit"));
     assert!(!env_config.contains("inherited-value"));
+}
+
+#[test]
+fn service_only_parent_presentation_inherits_identity_token_without_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let mut target = cfg.effective_target("default").unwrap();
+    let agent: crate::config::ContainerAgentFile =
+        toml::from_str(crate::agent::DEFAULT_AGENT_CONFIG).unwrap();
+    target.container_agent = agent.container_agent;
+    assert!(target.container_agent.access_flow_relay.is_none());
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+
+    std::fs::create_dir_all(&runtime.paths.container_state_dir).unwrap();
+    let agent_config_path = runtime.write_container_agent_config().unwrap();
+    let agent_config = std::fs::read_to_string(agent_config_path).unwrap();
+    assert!(agent_config.contains("inherit = \"AW_IDENTITY_TOKEN\""));
+    assert!(!agent_config.contains("bearer_environment"));
+    assert!(!agent_config.contains("AW_ACCESS_FLOW_TEST_TOKEN"));
+    assert!(!agent_config.contains("abcdefghijklmnopqrstuvwxyzABCDEF"));
+
+    let spec = runtime
+        .container_run_spec(Some("abcdefghijklmnopqrstuvwxyzABCDEF"), None)
+        .unwrap();
+    let args = runtime.container_runtime.run_args(&spec);
+    let env = runtime.container_runtime.run_env(&spec);
+    assert_eq!(
+        env.get("AW_IDENTITY_TOKEN").map(String::as_str),
+        Some("abcdefghijklmnopqrstuvwxyzABCDEF")
+    );
+    assert!(args.contains(&"AW_IDENTITY_TOKEN".to_string()));
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.contains("abcdefghijklmnopqrstuvwxyzABCDEF"))
+    );
+    assert!(
+        !runtime
+            .session_env_with_lookup(|_| Some("must-not-be-read".into()))
+            .unwrap()
+            .contains_key("AW_IDENTITY_TOKEN")
+    );
+}
+
+#[test]
+fn bearer_relay_injects_host_identity_only_under_configured_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let mut target = cfg.effective_target("default").unwrap();
+    target.container_agent.access_flow_relay = Some(test_access_flow_relay(
+        crate::config::AccessFlowRelayPresentation::BearerEnvironment {
+            variable: "AW_ACCESS_FLOW_TEST_TOKEN".into(),
+        },
+    ));
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+
+    std::fs::create_dir_all(&runtime.paths.container_state_dir).unwrap();
+    let agent_config_path = runtime.write_container_agent_config().unwrap();
+    let agent_config = std::fs::read_to_string(agent_config_path).unwrap();
+    assert!(agent_config.contains("kind = \"bearer_environment\""));
+    assert!(agent_config.contains("variable = \"AW_ACCESS_FLOW_TEST_TOKEN\""));
+    assert!(!agent_config.contains("abcdefghijklmnopqrstuvwxyzABCDEF"));
+
+    let spec = runtime
+        .container_run_spec(Some("abcdefghijklmnopqrstuvwxyzABCDEF"), None)
+        .unwrap();
+    let args = runtime.container_runtime.run_args(&spec);
+    let env = runtime.container_runtime.run_env(&spec);
+
+    assert_eq!(
+        env.get("AW_ACCESS_FLOW_TEST_TOKEN").map(String::as_str),
+        Some("abcdefghijklmnopqrstuvwxyzABCDEF")
+    );
+    assert!(!env.contains_key("AW_IDENTITY_TOKEN"));
+    assert!(args.contains(&"AW_ACCESS_FLOW_TEST_TOKEN".to_string()));
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.contains("abcdefghijklmnopqrstuvwxyzABCDEF"))
+    );
+}
+
+#[test]
+fn bearer_relay_source_is_rejected_from_container_and_session_environments() {
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let target = cfg.effective_target("default").unwrap();
+
+    for kind in ["container", "session", "session_inherit"] {
+        let mut candidate = target.clone();
+        candidate.container_agent.access_flow_relay = Some(test_access_flow_relay(
+            crate::config::AccessFlowRelayPresentation::BearerEnvironment {
+                variable: "AW_ACCESS_FLOW_TEST_TOKEN".into(),
+            },
+        ));
+        match kind {
+            "container" => {
+                candidate
+                    .container_env
+                    .insert("AW_ACCESS_FLOW_TEST_TOKEN".into(), "literal".into());
+            }
+            "session" => {
+                candidate
+                    .session_env
+                    .insert("AW_ACCESS_FLOW_TEST_TOKEN".into(), "literal".into());
+            }
+            "session_inherit" => candidate
+                .session_env_inherit
+                .push("AW_ACCESS_FLOW_TEST_TOKEN".into()),
+            _ => unreachable!(),
+        }
+        let error = candidate.validate("default").unwrap_err().to_string();
+        assert!(
+            error.contains("access flow presentation source"),
+            "{kind}: {error}"
+        );
+        assert!(
+            !error.contains("AW_ACCESS_FLOW_TEST_TOKEN"),
+            "{kind}: {error}"
+        );
+    }
+}
+
+#[test]
+fn identity_token_name_is_rejected_from_authored_environments_for_every_consumer_mode() {
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let base = cfg.effective_target("default").unwrap();
+
+    for consumer in ["relay", "service"] {
+        for environment in ["container", "session", "session_inherit"] {
+            let mut candidate = base.clone();
+            if consumer == "relay" {
+                candidate.container_agent.access_flow_relay = Some(test_access_flow_relay(
+                    crate::config::AccessFlowRelayPresentation::BearerEnvironment {
+                        variable: "AW_ACCESS_FLOW_TEST_TOKEN".into(),
+                    },
+                ));
+            } else {
+                let mut agent: crate::config::ContainerAgentFile =
+                    toml::from_str(crate::agent::DEFAULT_AGENT_CONFIG).unwrap();
+                agent.container_agent.ssh_bridge = None;
+                candidate.container_agent = agent.container_agent;
+            }
+            match environment {
+                "container" => {
+                    candidate
+                        .container_env
+                        .insert("AW_IDENTITY_TOKEN".into(), "authored-value".into());
+                }
+                "session" => {
+                    candidate
+                        .session_env
+                        .insert("AW_IDENTITY_TOKEN".into(), "authored-value".into());
+                }
+                "session_inherit" => candidate
+                    .session_env_inherit
+                    .push("AW_IDENTITY_TOKEN".into()),
+                _ => unreachable!(),
+            }
+
+            let error = candidate.validate("default").unwrap_err().to_string();
+            assert!(error.contains("deployment identity token"), "{error}");
+            assert!(
+                !error.contains("AW_IDENTITY_TOKEN"),
+                "{consumer}/{environment}: {error}"
+            );
+            assert!(!error.contains("authored-value"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn run_spec_rejects_non_product_source_and_identity_environment_overwrites() {
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let base = cfg.effective_target("default").unwrap();
+
+    for (source, collide_identity_environment) in [
+        ("AW_CONTAINER_CONTROL_TOKEN", false),
+        ("AW_ACCESS_FLOW_TEST_TOKEN", true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut target = base.clone();
+        target.container_agent.access_flow_relay = Some(test_access_flow_relay(
+            crate::config::AccessFlowRelayPresentation::BearerEnvironment {
+                variable: source.into(),
+            },
+        ));
+        if collide_identity_environment {
+            target
+                .container_env
+                .insert("AW_IDENTITY_TOKEN".into(), "authored-value".into());
+        }
+        let container_runtime =
+            ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+        let runtime = test_alice_runtime(
+            cfg.clone(),
+            target,
+            container_runtime,
+            &dir,
+            dir.path().join("container-state"),
+        );
+
+        let error = runtime
+            .container_run_spec(
+                Some("abcdefghijklmnopqrstuvwxyzABCDEF"),
+                Some("control-value-must-not-overwrite-bearer"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("AW Access Flow source namespace")
+                || error.contains("deployment identity token"),
+            "{error}"
+        );
+        for secret in [
+            source,
+            "AW_IDENTITY_TOKEN",
+            "authored-value",
+            "abcdefghijklmnopqrstuvwxyzABCDEF",
+            "control-value-must-not-overwrite-bearer",
+        ] {
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
+}
+
+#[test]
+fn identity_token_provenance_cannot_bypass_run_spec_environment_boundaries() {
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let base = cfg.effective_target("default").unwrap();
+    let token_dir = tempfile::tempdir().unwrap();
+    let file_token = ensure_identity_token_file(&token_dir.path().join("identity-token")).unwrap();
+
+    for host_token in ["abcdefghijklmnopqrstuvwxyzABCDEF".to_string(), file_token] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut target = base.clone();
+        target.container_agent.access_flow_relay = Some(test_access_flow_relay(
+            crate::config::AccessFlowRelayPresentation::BearerEnvironment {
+                variable: "AW_ACCESS_FLOW_TEST_TOKEN".into(),
+            },
+        ));
+        target
+            .session_env
+            .insert("AW_IDENTITY_TOKEN".into(), "session-value".into());
+        let container_runtime =
+            ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+        let runtime = test_alice_runtime(
+            cfg.clone(),
+            target,
+            container_runtime,
+            &dir,
+            dir.path().join("container-state"),
+        );
+
+        let error = runtime
+            .container_run_spec(Some(&host_token), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("deployment identity token"), "{error}");
+        assert!(!error.contains("AW_IDENTITY_TOKEN"), "{error}");
+        assert!(!error.contains(&host_token), "{error}");
+        assert!(!error.contains("session-value"), "{error}");
+    }
+}
+
+fn test_access_flow_relay(
+    presentation: crate::config::AccessFlowRelayPresentation,
+) -> crate::config::AccessFlowRelayConfig {
+    crate::config::AccessFlowRelayConfig {
+        setup_timeout: "2s".into(),
+        drain_timeout: "10s".into(),
+        max_connections: 32,
+        copy_buffer_bytes_per_direction: 16_384,
+        start_after_services: Vec::new(),
+        presentation,
+        routes: vec![crate::config::AccessFlowRelayRoute {
+            name: "http".into(),
+            listen: "127.0.0.1:3128".into(),
+            allowed_destination_ports: vec![80],
+            transport: crate::config::AccessFlowRelayTransport::Unix {
+                path: "/run/acl-proxy/transparent-http.sock".into(),
+            },
+        }],
+    }
 }
 
 #[test]

@@ -21,6 +21,18 @@
 
 ### Added
 
+- Access Flow relay presentation now supports strict `disabled`, `anonymous`,
+  and environment-backed bearer modes. Container bootstrap and agent startup
+  suppress core/dump capture before sensitive work, bearer activation is
+  read-once and clearing, and relay source names are barred from child and
+  workload environments. Custom sources are constrained to the
+  `AW_ACCESS_FLOW_` product namespace, service inheritance is activated into
+  clearing state before runtime threads, and authored container/session
+  environments cannot shadow or expose the deployment identity token.
+- Effective targets now reject `access.method = "runtime_exec"` when the
+  container agent consumes a deployment identity bearer, because runtime
+  metadata can retain the launch environment and runtime-exec sessions can
+  inherit it beyond the agent's read-and-clear boundary.
 - Added typed host-to-container Unix socket exposure for Apple Container 1.1+
   and native local Linux Docker/Podman, including strict source validation,
   backend-specific realization, existing-container manifests, and readiness

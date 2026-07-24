@@ -301,7 +301,8 @@ fn apple_host_proxy_profile_reuses_bootstrap_and_service_dependencies() {
     );
     assert!(profile.contains("[target_defaults.container_agent.access_flow_relay]"));
     assert!(profile.contains("start_after_services = [\"transparent-firewall\"]"));
-    assert!(profile.contains("kind = \"disabled\""));
+    assert!(profile.contains("kind = \"bearer_environment\""));
+    assert!(profile.contains("variable = \"AW_IDENTITY_TOKEN\""));
     assert!(profile.contains("kind = \"unix\""));
     assert!(profile.contains("allowed_destination_ports = [80]"));
     assert!(profile.contains("allowed_destination_ports = [443]"));
@@ -313,7 +314,6 @@ fn apple_host_proxy_profile_reuses_bootstrap_and_service_dependencies() {
     assert!(!profile.contains("acl-proxy-transparent-uds-relay"));
     assert!(!profile.contains("/opt/acl-proxy/bin/acl-proxy"));
     assert!(!profile.contains("mitm-ca.key"));
-    assert!(!profile.contains("AW_IDENTITY_TOKEN"));
 }
 
 #[test]

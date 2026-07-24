@@ -5,12 +5,12 @@ version = 4
 [[package]]
 name = "access-async-contracts"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=52ad634fc1efccb62bf967f441a0047d56c1f425#52ad634fc1efccb62bf967f441a0047d56c1f425"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=0373a1b0f192927a6b8abaa05af8847f18a90546#0373a1b0f192927a6b8abaa05af8847f18a90546"
 
 [[package]]
 name = "access-flow"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=52ad634fc1efccb62bf967f441a0047d56c1f425#52ad634fc1efccb62bf967f441a0047d56c1f425"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=0373a1b0f192927a6b8abaa05af8847f18a90546#0373a1b0f192927a6b8abaa05af8847f18a90546"
 dependencies = [
  "access-async-contracts",
  "access-identity",
@@ -21,7 +21,7 @@ dependencies = [
 [[package]]
 name = "access-flow-relay"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=52ad634fc1efccb62bf967f441a0047d56c1f425#52ad634fc1efccb62bf967f441a0047d56c1f425"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=0373a1b0f192927a6b8abaa05af8847f18a90546#0373a1b0f192927a6b8abaa05af8847f18a90546"
 dependencies = [
  "access-async-contracts",
  "access-flow",
@@ -33,7 +33,7 @@ dependencies = [
 [[package]]
 name = "access-flow-unix"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=52ad634fc1efccb62bf967f441a0047d56c1f425#52ad634fc1efccb62bf967f441a0047d56c1f425"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=0373a1b0f192927a6b8abaa05af8847f18a90546#0373a1b0f192927a6b8abaa05af8847f18a90546"
 dependencies = [
  "access-async-contracts",
  "access-flow",
@@ -45,7 +45,7 @@ dependencies = [
 [[package]]
 name = "access-identity"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=52ad634fc1efccb62bf967f441a0047d56c1f425#52ad634fc1efccb62bf967f441a0047d56c1f425"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=0373a1b0f192927a6b8abaa05af8847f18a90546#0373a1b0f192927a6b8abaa05af8847f18a90546"
 dependencies = [
  "access-async-contracts",
  "hmac",
@@ -179,6 +179,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

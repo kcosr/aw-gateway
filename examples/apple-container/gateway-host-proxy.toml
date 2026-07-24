@@ -184,7 +184,8 @@ copy_buffer_bytes_per_direction = 16384
 start_after_services = ["transparent-firewall"]
 
 [target_defaults.container_agent.access_flow_relay.presentation]
-kind = "disabled"
+kind = "bearer_environment"
+variable = "AW_IDENTITY_TOKEN"
 
 [[target_defaults.container_agent.access_flow_relay.routes]]
 name = "http"
