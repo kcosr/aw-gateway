@@ -414,15 +414,188 @@ mod tests {
     use crate::agent::socket::validate_control_peer;
     use crate::agent::status::status_payload;
     use crate::agent_control::ControlRequest;
+    #[cfg(target_os = "linux")]
+    use crate::config::{
+        AccessFlowRelayPresentation, AccessFlowRelayValidationMode, GatewayConfig,
+    };
     use crate::config::{
         ContainerAgentConfig, ContainerAgentFile, HealthCheck, IdleCleanupAction,
         IdleCleanupConfig, LoggingConfig, RestartPolicy, ServiceConfig,
     };
     use crate::health_probe::{JsonFieldCheck, check_json_fields};
+    #[cfg(target_os = "linux")]
+    use access_flow::write_access_flow_preface;
+    #[cfg(target_os = "linux")]
+    use access_flow_conformance::{
+        NormalizedAccessFlowTransport, load_adapter_parity_fixture, load_awaf_vector_suite,
+        project_relay_plan,
+    };
+    #[cfg(target_os = "linux")]
+    use access_flow_unix::{NormalizedUnixSocketPath, UnixAccessFlowEndpoint};
     use std::collections::{BTreeMap, BTreeSet};
+    #[cfg(target_os = "linux")]
+    use std::path::Path;
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
+
+    #[cfg(target_os = "linux")]
+    const PRODUCT_HTTP_ENDPOINT: &str = "/run/acl-proxy/transparent-http.sock";
+    #[cfg(target_os = "linux")]
+    const PRODUCT_HTTPS_ENDPOINT: &str = "/run/acl-proxy/transparent-https.sock";
+    #[cfg(target_os = "linux")]
+    const CONFORMANCE_HTTP_ENDPOINT: &str = "/run/access-flow/conformance-http.sock";
+    #[cfg(target_os = "linux")]
+    const CONFORMANCE_HTTPS_ENDPOINT: &str = "/run/access-flow/conformance-https.sock";
+
+    #[cfg(target_os = "linux")]
+    fn product_gateway_config() -> GatewayConfig {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/apple-container/gateway-host-proxy.toml");
+        let config = GatewayConfig::load(&path).unwrap();
+        config.validate().unwrap();
+        config
+    }
+
+    #[cfg(target_os = "linux")]
+    fn normalize_product_endpoint(
+        endpoint: &UnixAccessFlowEndpoint,
+    ) -> anyhow::Result<NormalizedAccessFlowTransport> {
+        let normalized = match endpoint.path().as_str() {
+            PRODUCT_HTTP_ENDPOINT => CONFORMANCE_HTTP_ENDPOINT,
+            PRODUCT_HTTPS_ENDPOINT => CONFORMANCE_HTTPS_ENDPOINT,
+            _ => anyhow::bail!("unrecognized AW Gateway Access Flow endpoint"),
+        };
+        Ok(NormalizedAccessFlowTransport::unix(normalized)?)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn product_access_flow_relay_matches_shared_adapter_fixture() {
+        let config = product_gateway_config();
+        let target = config.effective_target("ubuntu-host-proxy").unwrap();
+        let relay = target.container_agent.access_flow_relay.unwrap();
+        let compiled = relay
+            .compile_with_presentation(
+                AccessFlowRelayValidationMode::Agent,
+                IdentityPresentation::Disabled,
+            )
+            .unwrap();
+
+        let product_paths = compiled
+            .plan
+            .routes()
+            .iter()
+            .map(|route| route.endpoint().path().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            product_paths,
+            [PRODUCT_HTTP_ENDPOINT, PRODUCT_HTTPS_ENDPOINT]
+        );
+
+        let projected = project_relay_plan(&compiled.plan, compiled.drain_timeout, |endpoint| {
+            normalize_product_endpoint(endpoint).unwrap()
+        });
+        assert_eq!(
+            projected,
+            *load_adapter_parity_fixture().unwrap().relay_plan()
+        );
+
+        let unknown_path = "/run/acl-proxy/unrecognized-sensitive-name.sock";
+        let unknown =
+            UnixAccessFlowEndpoint::new(NormalizedUnixSocketPath::new(unknown_path).unwrap());
+        let error = normalize_product_endpoint(&unknown)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "unrecognized AW Gateway Access Flow endpoint");
+        assert!(!error.contains(unknown_path), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn product_access_flow_wire_matches_shared_named_vectors() {
+        const IDENTITY_SOURCE: &str = "AW_IDENTITY_TOKEN";
+        const BEARER: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyzABCDEF";
+
+        let config = product_gateway_config();
+        let target = config.effective_target("ubuntu-host-proxy").unwrap();
+        let suite = load_awaf_vector_suite().unwrap();
+        let adapter_fixture = load_adapter_parity_fixture().unwrap();
+        let vector_names = suite
+            .vectors()
+            .iter()
+            .map(|vector| vector.name())
+            .collect::<Vec<_>>();
+        let required_vector_names = adapter_fixture
+            .required_awaf_vectors()
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>();
+        assert_eq!(vector_names, required_vector_names);
+        assert_eq!(
+            suite
+                .vectors()
+                .iter()
+                .map(|vector| vector.name())
+                .collect::<Vec<_>>(),
+            ["absent", "anonymous", "bearer"]
+        );
+
+        let presentation_configs = [
+            ("absent", AccessFlowRelayPresentation::Disabled {}),
+            ("anonymous", AccessFlowRelayPresentation::Anonymous {}),
+            (
+                "bearer",
+                AccessFlowRelayPresentation::BearerEnvironment {
+                    variable: IDENTITY_SOURCE.to_string(),
+                },
+            ),
+        ];
+        for (vector, &(expected_name, ref presentation_config)) in
+            suite.vectors().iter().zip(&presentation_configs)
+        {
+            assert_eq!(vector.name(), expected_name);
+            let mut agent_config = target.container_agent.clone();
+            agent_config
+                .access_flow_relay
+                .as_mut()
+                .unwrap()
+                .presentation = presentation_config.clone();
+
+            let mut identity_requests = Vec::new();
+            let (presentation, service_identity) =
+                activate_identity_environment_with(&agent_config, |variable| {
+                    identity_requests.push(variable.to_string());
+                    assert_eq!(expected_name, "bearer");
+                    assert_eq!(variable, IDENTITY_SOURCE);
+                    Some(Zeroizing::new(BEARER.to_vec()))
+                })
+                .unwrap();
+            assert!(service_identity.is_none());
+            if expected_name == "bearer" {
+                assert_eq!(identity_requests, [IDENTITY_SOURCE]);
+            } else {
+                assert!(identity_requests.is_empty());
+            }
+
+            let relay = agent_config.access_flow_relay.unwrap();
+            let compiled = relay
+                .compile_with_presentation(
+                    AccessFlowRelayValidationMode::Agent,
+                    presentation.unwrap(),
+                )
+                .unwrap();
+            let mut wire = Zeroizing::new(Vec::<u8>::new());
+            write_access_flow_preface(
+                &mut *wire,
+                vector.destination(),
+                compiled.plan.presentation(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(wire.as_slice(), vector.wire(), "vector {expected_name}");
+        }
+    }
 
     fn identity_activation_config(
         relay_source: Option<&str>,
