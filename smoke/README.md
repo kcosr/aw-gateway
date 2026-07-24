@@ -135,34 +135,42 @@ It does not invoke the `aw-gateway` CLI or claim lifecycle orchestration
 coverage. T03 lifecycle behavior remains covered by the pytest scenarios above.
 
 The gate requires clean AW Gateway, ACL Proxy, and access-runtime worktrees,
-including no untracked files. It performs a locked release build and rejects
-binaries outside the ACL Proxy worktree's `target/release` directory. The
-caller must pin the expected commit for all three repositories:
+including no untracked files. The caller supplies exact release binaries built
+in a fresh external disk-backed target directory and pins the expected commit
+for all three repositories. Run the gate once for each relay consumer:
 
 ```bash
 AW_REPO=/absolute/path/to/aw-gateway
 ACL_REPO=/absolute/path/to/acl-proxy
 ACCESS_RUNTIME_REPO=/absolute/path/to/access-runtime
+BUILD_ROOT=/home/kevin/build/access-flow-gate-x
 
-"$AW_REPO/smoke/scripts/run-transparent-uds-stack-smoke.sh" \
-  --acl-proxy-bin "$ACL_REPO/target/release/acl-proxy" \
-  --agent-bin "$AW_REPO/target/release/aw-container-agent" \
-  --acl-repo "$ACL_REPO" \
-  --access-runtime-repo "$ACCESS_RUNTIME_REPO" \
-  --aw-repo "$AW_REPO" \
-  --expected-acl-sha "$(git -C "$ACL_REPO" rev-parse HEAD)" \
-  --expected-access-runtime-sha "$(git -C "$ACCESS_RUNTIME_REPO" rev-parse HEAD)" \
-  --expected-aw-sha "$(git -C "$AW_REPO" rev-parse HEAD)"
+for consumer in standalone-relay integrated-agent; do
+  "$AW_REPO/smoke/scripts/run-transparent-uds-stack-smoke.sh" \
+    --relay-consumer "$consumer" \
+    --acl-proxy-bin "$BUILD_ROOT/acl/release/acl-proxy" \
+    --relay-bin "$BUILD_ROOT/acl/release/acl-proxy-access-flow-relay" \
+    --agent-bin "$BUILD_ROOT/aw/release/aw-container-agent" \
+    --acl-repo "$ACL_REPO" \
+    --access-runtime-repo "$ACCESS_RUNTIME_REPO" \
+    --aw-repo "$AW_REPO" \
+    --expected-acl-sha "$(git -C "$ACL_REPO" rev-parse HEAD)" \
+    --expected-access-runtime-sha "$(git -C "$ACCESS_RUNTIME_REPO" rev-parse HEAD)" \
+    --expected-aw-sha "$(git -C "$AW_REPO" rev-parse HEAD)"
+done
 ```
 
-The script prebuilds a disposable workload image before enabling the protected
-workload, prints repository and binary/image fingerprints, and removes its
-containers, network, image, and temporary files. Its HTTP/1 stream assertion
-proves incremental end-to-end delivery and interrupted active-stream behavior;
-the focused ACL/runtime and relay test suites remain authoritative for HTTP/2,
-WebSocket, backpressure bounds, and half-close semantics. `cargo test --test
-assets` checks only the harness's structural contract and shell syntax; it does
-not execute this privileged gate.
+Each run prebuilds a disposable workload image before enabling the protected
+workload, delivers the bearer through a one-use FIFO so Docker launch metadata
+does not retain it, and proves required principal/group authorization,
+protected-carrier stripping, disruptive token rotation, resolver-generation
+retirement, and live-process environment removal. It prints repository and
+binary/image fingerprints and removes its containers, network, image, and
+temporary files. The HTTP/1 stream assertion proves incremental end-to-end
+delivery and interrupted active-stream behavior; focused ACL/runtime and relay
+test suites remain authoritative for HTTP/2, WebSocket, backpressure bounds,
+and half-close semantics. `cargo test --test assets` checks only the harness's
+structural contract and shell syntax; it does not execute this privileged gate.
 
 The Docker workload sets `nofile=4096` because Docker's local default soft
 limit is lower than the integrated agent's checked descriptor projection. The

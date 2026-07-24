@@ -231,7 +231,11 @@ fn transparent_uds_stack_smoke_structural_contract_is_explicit() {
         "--expected-access-runtime-sha",
         "--expected-aw-sha",
         "status --porcelain --untracked-files=all",
-        "cargo build --quiet --locked --release",
+        "--relay-consumer",
+        "--acl-proxy-bin",
+        "--agent-bin",
+        "--relay-bin",
+        "require_absolute_file",
         "[listeners.transparent_http.endpoint]",
         "kind = \"access_flow\"",
         "admission_timeout = \"2s\"",
@@ -244,6 +248,12 @@ fn transparent_uds_stack_smoke_structural_contract_is_explicit() {
         "proxy-loss-fail-closed=passed",
         "incremental-streaming=passed",
         "active-stream-proxy-loss=passed",
+        "identity-authentication=passed",
+        "token-rotation-resolver-reload=passed",
+        "observable-secret-scan=passed",
+        "could not capture required workload output",
+        "docker stop --time 15",
+        "stop_acl_proxy\ncapture_workload_observations final-workload\nscan_observable_secrets",
         "workload-isolation=passed",
         "linux-socket-realization=pinned_inode",
         "pinned-inode-rebind=passed",
@@ -317,7 +327,7 @@ fn apple_host_proxy_profile_reuses_bootstrap_and_service_dependencies() {
 }
 
 #[test]
-fn transparent_stack_smoke_uses_embedded_access_flow_relay() {
+fn transparent_stack_smoke_covers_both_access_flow_relay_consumers() {
     let smoke = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("smoke/scripts/run-transparent-uds-stack-smoke.sh"),
@@ -326,7 +336,15 @@ fn transparent_stack_smoke_uses_embedded_access_flow_relay() {
     assert!(smoke.contains("[container_agent.access_flow_relay]"));
     assert!(smoke.contains("/opt/aw-gateway/bin/aw-container-agent"));
     assert!(smoke.contains("/etc/aw-gateway/container-agent.toml"));
-    assert!(smoke.contains("kind = \"disabled\""));
+    assert!(smoke.contains("standalone-relay"));
+    assert!(smoke.contains("integrated-agent"));
+    assert!(smoke.contains("/opt/acl-proxy/bin/acl-proxy-access-flow-relay"));
+    assert!(smoke.contains("/etc/acl-proxy/access-flow-relay.json"));
+    assert!(smoke.contains("kind = \"bearer_environment\""));
+    assert!(smoke.contains("variable = \"AW_IDENTITY_TOKEN\""));
+    assert!(smoke.contains("mode = \"required\""));
+    assert!(smoke.contains("identity_states = [\"authenticated\"]"));
+    assert!(smoke.contains("token-rotation-resolver-reload=passed"));
     assert!(smoke.contains("kind = \"unix\""));
     assert!(!smoke.contains("acl-proxy-transparent-uds-relay"));
     assert!(!smoke.contains("transparent-uds-relay.json"));
