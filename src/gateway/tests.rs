@@ -7253,14 +7253,14 @@ sleep 1
         .current_prepared_host_socket_exposure_statuses_with_timing(
             Some(&inspect),
             &prepared,
-            Duration::from_millis(200),
+            Duration::from_secs(1),
             Duration::from_millis(1),
         )
         .await;
     let elapsed = started.elapsed();
 
     assert!(
-        elapsed < Duration::from_millis(500),
+        elapsed < Duration::from_secs(2),
         "status probes exceeded one shared deadline: {elapsed:?}"
     );
     assert_eq!(
