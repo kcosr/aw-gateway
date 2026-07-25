@@ -13,6 +13,18 @@ if [[ -n ${AW_ADVISORY_DB:-} ]]; then
             printf '%s\n' 'AW_ADVISORY_DB must name one complete Git repository' >&2
             exit 1
         }
+    [[ $(git -C "$advisory_root" config --get remote.origin.url) == \
+        "https://github.com/RustSec/advisory-db.git" ]] \
+        || {
+            printf '%s\n' 'AW_ADVISORY_DB must be the RustSec advisory database' >&2
+            exit 1
+        }
+    git -C "$advisory_root" ls-tree -r --name-only HEAD -- crates \
+        | grep -E '^crates/[^/]+/RUSTSEC-[0-9]{4}-[0-9]{4}\.md$' >/dev/null \
+        || {
+            printf '%s\n' 'AW_ADVISORY_DB must contain tracked RustSec advisories' >&2
+            exit 1
+        }
     [[ -z $(git -C "$advisory_root" status --porcelain=v1 --untracked-files=all) ]] \
         || {
             printf '%s\n' 'AW_ADVISORY_DB must be clean' >&2
