@@ -65,6 +65,9 @@
 
 ### Fixed
 
+- Host socket exposure readiness retries now stop at their shared endpoint
+  deadline instead of sleeping a full retry interval beyond it, while terminal
+  probe timeouts retain the last completed readiness failure.
 - Managed state and SSH authorized keys now resolve consistently on both sides
   of custom workspace mounts. The conventional `container-sshd` service
   receives the resolved key path, and the SSHD helper installs it as a global

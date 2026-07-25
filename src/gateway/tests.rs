@@ -6887,6 +6887,31 @@ fn runtime_exec_without_agent_control_omits_control_socket_mount() {
     );
 }
 
+fn prepared_test_host_socket_exposure(
+    dir: &tempfile::TempDir,
+    readiness_user: &str,
+) -> host_socket_exposures::PreparedContainerInputs {
+    host_socket_exposures::PreparedContainerInputs {
+        mounts: Vec::new(),
+        host_socket_exposures: vec![crate::runtime::HostSocketExposureSpec {
+            name: "traffic".into(),
+            host_path: dir.path().join("traffic.sock"),
+            container_path: PathBuf::from("/run/acl-proxy/traffic.sock"),
+            readiness_user: readiness_user.into(),
+            selinux_relabel: crate::config::SelinuxRelabel::None,
+            realization: crate::runtime::HostSocketExposureRealization::PinnedInode,
+            source_identity: crate::runtime::UnixSourceIdentity {
+                device: 1,
+                inode: 2,
+                uid: 0,
+                gid: 0,
+                mode: 0o600,
+            },
+        }],
+        exposure_manifest: Some("sha256:test".into()),
+    }
+}
+
 #[tokio::test]
 async fn socket_exposure_endpoint_probe_runs_as_configured_readiness_user() {
     let dir = tempfile::tempdir().unwrap();
@@ -6903,35 +6928,26 @@ exit 0
         ),
     );
     let runtime = test_runtime(&dir, fake_runtime, |_| {});
-    let prepared = host_socket_exposures::PreparedContainerInputs {
-        mounts: Vec::new(),
-        host_socket_exposures: vec![crate::runtime::HostSocketExposureSpec {
-            name: "traffic".into(),
-            host_path: dir.path().join("traffic.sock"),
-            container_path: PathBuf::from("/run/acl-proxy/traffic.sock"),
-            readiness_user: "acl-relay".into(),
-            selinux_relabel: crate::config::SelinuxRelabel::None,
-            realization: crate::runtime::HostSocketExposureRealization::PinnedInode,
-            source_identity: crate::runtime::UnixSourceIdentity {
-                device: 1,
-                inode: 2,
-                uid: 1000,
-                gid: 1000,
-                mode: 0o600,
-            },
-        }],
-        exposure_manifest: Some("sha256:test".into()),
-    };
+    let prepared = prepared_test_host_socket_exposure(&dir, "acl-relay");
 
     runtime
         .validate_container_exposure_endpoints(&prepared)
         .await
         .unwrap();
     let calls = std::fs::read_to_string(log).unwrap();
-    assert_eq!(calls.lines().count(), 2, "{calls}");
-    for call in calls.lines() {
+    let calls = calls.lines().collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    for call in &calls {
         assert!(call.contains("--user acl-relay"), "{call}");
     }
+    assert!(
+        calls[0].contains("/bin/test -S /run/acl-proxy/traffic.sock"),
+        "{calls:?}"
+    );
+    assert!(
+        calls[1].contains("/bin/test -w /run/acl-proxy/traffic.sock"),
+        "{calls:?}"
+    );
 }
 
 #[tokio::test]
@@ -6945,25 +6961,7 @@ exit 1
 "#,
     );
     let runtime = test_runtime(&dir, fake_runtime, |_| {});
-    let prepared = host_socket_exposures::PreparedContainerInputs {
-        mounts: Vec::new(),
-        host_socket_exposures: vec![crate::runtime::HostSocketExposureSpec {
-            name: "traffic".into(),
-            host_path: dir.path().join("traffic.sock"),
-            container_path: PathBuf::from("/run/acl-proxy/traffic.sock"),
-            readiness_user: "root".into(),
-            selinux_relabel: crate::config::SelinuxRelabel::None,
-            realization: crate::runtime::HostSocketExposureRealization::PinnedInode,
-            source_identity: crate::runtime::UnixSourceIdentity {
-                device: 1,
-                inode: 2,
-                uid: 0,
-                gid: 0,
-                mode: 0o600,
-            },
-        }],
-        exposure_manifest: Some("sha256:test".into()),
-    };
+    let prepared = prepared_test_host_socket_exposure(&dir, "root");
 
     let started = tokio::time::Instant::now();
     let err = runtime
@@ -6983,6 +6981,109 @@ exit 1
             "host socket exposure \"traffic\" container endpoint failed the a Unix socket check as configured readiness user \"root\""
         ),
         "{err:#}"
+    );
+}
+
+#[tokio::test]
+async fn socket_exposure_endpoint_probe_reports_accessibility_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    write_fake_runtime(
+        &fake_runtime,
+        r#"#!/bin/sh
+case " $* " in
+  *" -w "*) exit 1 ;;
+  *) exit 0 ;;
+esac
+"#,
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |_| {});
+    let prepared = prepared_test_host_socket_exposure(&dir, "root");
+
+    let err = runtime
+        .validate_container_exposure_endpoints_with_timing(
+            &prepared,
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "host socket exposure \"traffic\" container endpoint failed the accessible check as configured readiness user \"root\""
+        ),
+        "{err:#}"
+    );
+}
+
+#[tokio::test]
+async fn socket_exposure_endpoint_probe_retries_until_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let counter = dir.path().join("exec.count");
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+count=0
+if [ -f "{0}" ]; then
+  count=$(cat "{0}")
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "{0}"
+if [ "$count" -le 2 ]; then
+  exit 1
+fi
+exit 0
+"#,
+            counter.display()
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |_| {});
+    let prepared = prepared_test_host_socket_exposure(&dir, "root");
+
+    runtime
+        .validate_container_exposure_endpoints_with_timing(
+            &prepared,
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "4");
+}
+
+#[tokio::test]
+async fn terminal_probe_timeout_retains_the_last_readiness_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    write_fake_runtime(
+        &fake_runtime,
+        r#"#!/bin/sh
+sleep 0.06
+exit 1
+"#,
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |_| {});
+    let prepared = prepared_test_host_socket_exposure(&dir, "root");
+
+    let err = runtime
+        .validate_container_exposure_endpoints_with_timing(
+            &prepared,
+            Duration::from_millis(200),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "host socket exposure \"traffic\" container endpoint failed the a Unix socket check as configured readiness user \"root\""
+        ),
+        "{err:#}"
+    );
+    assert!(
+        format!("{err:#}").contains("timed out"),
+        "terminal execution timeout must remain in the error chain: {err:#}"
     );
 }
 

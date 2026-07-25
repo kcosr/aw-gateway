@@ -265,6 +265,14 @@ AW_REPO=$(canonical_repo aw-repo "$AW_REPO")
 require_expected_sha acl-proxy "$ACL_REPO" "$EXPECTED_ACL_SHA"
 require_expected_sha access-runtime "$ACCESS_RUNTIME_REPO" "$EXPECTED_ACCESS_RUNTIME_SHA"
 require_expected_sha aw-gateway "$AW_REPO" "$EXPECTED_AW_SHA"
+PINNED_ACCESS_RUNTIME_SHA=$(
+    python3 "$AW_REPO/scripts/validate-access-runtime-pin.py" \
+        "$AW_REPO/Cargo.toml" \
+        "$AW_REPO/Cargo.lock" \
+        https://github.com/kcosr/access-runtime.git
+)
+[[ $PINNED_ACCESS_RUNTIME_SHA == "$EXPECTED_ACCESS_RUNTIME_SHA" ]] \
+    || fail "AW Gateway Access Runtime pin does not match access-runtime-repo"
 [[ -z $(git -C "$ACL_REPO" status --porcelain --untracked-files=all) ]] \
     || fail "acl-repo must be clean for provenance-bound release builds"
 [[ -z $(git -C "$ACCESS_RUNTIME_REPO" status --porcelain --untracked-files=all) ]] \

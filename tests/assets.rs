@@ -230,6 +230,8 @@ fn transparent_uds_stack_smoke_structural_contract_is_explicit() {
         "--expected-acl-sha",
         "--expected-access-runtime-sha",
         "--expected-aw-sha",
+        "validate-access-runtime-pin.py",
+        "PINNED_ACCESS_RUNTIME_SHA == \"$EXPECTED_ACCESS_RUNTIME_SHA\"",
         "status --porcelain --untracked-files=all",
         "--relay-consumer",
         "--acl-proxy-bin",
