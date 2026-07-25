@@ -5,8 +5,10 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
 if [[ -n ${AW_ADVISORY_DB:-} ]]; then
-    advisory_root=$(git -C "$AW_ADVISORY_DB" rev-parse --show-toplevel)
-    [[ $(realpath -e -- "$AW_ADVISORY_DB") == $(realpath -e -- "$advisory_root") ]] \
+    advisory_path=$(cd -- "$AW_ADVISORY_DB" && pwd -P)
+    advisory_root=$(git -C "$advisory_path" rev-parse --show-toplevel)
+    advisory_root=$(cd -- "$advisory_root" && pwd -P)
+    [[ $advisory_path == "$advisory_root" ]] \
         || {
             printf '%s\n' 'AW_ADVISORY_DB must name one complete Git repository' >&2
             exit 1
