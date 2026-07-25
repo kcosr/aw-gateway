@@ -145,7 +145,10 @@ impl Runtime {
                 let exit = match result {
                     Ok(exit) => exit,
                     Err(error) => {
-                        if tokio::time::Instant::now() >= deadline
+                        if error
+                            .chain()
+                            .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+                            && tokio::time::Instant::now() >= deadline
                             && let Some(description) = last_failed_check
                         {
                             return Err(error).context(format!(

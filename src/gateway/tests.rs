@@ -6967,13 +6967,13 @@ exit 1
     let err = runtime
         .validate_container_exposure_endpoints_with_timing(
             &prepared,
-            Duration::from_millis(250),
+            Duration::from_secs(1),
             Duration::from_secs(5),
         )
         .await
         .unwrap_err();
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_secs(2),
         "retry sleep exceeded the shared endpoint-check deadline"
     );
     assert!(
@@ -7003,7 +7003,7 @@ esac
     let err = runtime
         .validate_container_exposure_endpoints_with_timing(
             &prepared,
-            Duration::from_millis(100),
+            Duration::from_secs(1),
             Duration::from_secs(5),
         )
         .await
@@ -7057,12 +7057,24 @@ exit 0
 async fn terminal_probe_timeout_retains_the_last_readiness_failure() {
     let dir = tempfile::tempdir().unwrap();
     let fake_runtime = dir.path().join("runtime");
+    let counter = dir.path().join("exec.count");
     write_fake_runtime(
         &fake_runtime,
-        r#"#!/bin/sh
-sleep 0.06
-exit 1
+        &format!(
+            r#"#!/bin/sh
+count=0
+if [ -f "{0}" ]; then
+  count=$(cat "{0}")
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "{0}"
+if [ "$count" -eq 1 ]; then
+  exit 1
+fi
+exec sleep 5
 "#,
+            counter.display()
+        ),
     );
     let runtime = test_runtime(&dir, fake_runtime, |_| {});
     let prepared = prepared_test_host_socket_exposure(&dir, "root");
@@ -7070,7 +7082,7 @@ exit 1
     let err = runtime
         .validate_container_exposure_endpoints_with_timing(
             &prepared,
-            Duration::from_millis(200),
+            Duration::from_secs(1),
             Duration::from_millis(100),
         )
         .await
@@ -7084,6 +7096,38 @@ exit 1
     assert!(
         format!("{err:#}").contains("timed out"),
         "terminal execution timeout must remain in the error chain: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn terminal_non_timeout_execution_error_is_not_a_readiness_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    write_fake_runtime(
+        &fake_runtime,
+        r#"#!/bin/sh
+rm -f -- "$0"
+exit 1
+"#,
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |_| {});
+    let prepared = prepared_test_host_socket_exposure(&dir, "root");
+
+    let err = runtime
+        .validate_container_exposure_endpoints_with_timing(
+            &prepared,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        !err.to_string().contains("container endpoint failed the"),
+        "execution failures must not be relabeled as guest readiness: {err:#}"
+    );
+    assert!(
+        format!("{err:#}").contains("No such file or directory"),
+        "missing runtime executable must remain in the error chain: {err:#}"
     );
 }
 
