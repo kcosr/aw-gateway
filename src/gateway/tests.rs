@@ -6965,14 +6965,19 @@ exit 1
         exposure_manifest: Some("sha256:test".into()),
     };
 
+    let started = tokio::time::Instant::now();
     let err = runtime
         .validate_container_exposure_endpoints_with_timing(
             &prepared,
-            Duration::from_millis(20),
-            Duration::from_millis(1),
+            Duration::from_millis(250),
+            Duration::from_secs(5),
         )
         .await
         .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "retry sleep exceeded the shared endpoint-check deadline"
+    );
     assert!(
         err.to_string().contains(
             "host socket exposure \"traffic\" container endpoint failed the a Unix socket check as configured readiness user \"root\""
