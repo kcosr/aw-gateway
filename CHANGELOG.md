@@ -10,6 +10,11 @@
 
 ### Breaking Changes
 
+- Existing generated identity-token files are now validated byte-for-byte as
+  32-4096 RFC 9110 `tchar` bytes. Files from older releases that end in a
+  newline, or otherwise contain non-bearer bytes, fail container startup.
+  Remove the invalid per-user token file so AW Gateway can regenerate it, or
+  provision an exact valid bearer through `AW_IDENTITY_TOKEN`.
 - Generic `container_mounts` now reject Unix socket, symlink, FIFO, and device
   sources. Existing host socket integrations must use the typed
   `host_socket_exposures` target map.
