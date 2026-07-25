@@ -55,11 +55,20 @@ fn shutdown_phases(has_relay: bool) -> &'static [ShutdownPhase] {
 }
 
 pub(super) async fn shutdown_agent(state: Arc<AgentState>) -> bool {
-    if state.shutting_down.swap(true, Ordering::SeqCst) {
+    let started = !state.shutting_down.swap(true, Ordering::SeqCst);
+    if started {
+        let shutdown_state = state.clone();
+        tokio::spawn(async move {
+            perform_shutdown(shutdown_state).await;
+        });
+    } else {
         tracing::debug!("container agent shutdown already in progress");
-        wait_for_shutdown_complete(&state).await;
-        return false;
     }
+    wait_for_shutdown_complete(&state).await;
+    started
+}
+
+async fn perform_shutdown(state: Arc<AgentState>) {
     tracing::info!("container agent shutdown starting");
     state.accepting_bridge.store(false, Ordering::SeqCst);
     for phase in shutdown_phases(state.access_flow_relay.is_some()) {
@@ -92,7 +101,6 @@ pub(super) async fn shutdown_agent(state: Arc<AgentState>) -> bool {
     tracing::info!("container agent shutdown completed");
     state.shutdown_complete.store(true, Ordering::SeqCst);
     state.shutdown_complete_notify.notify_waiters();
-    true
 }
 
 pub(super) async fn shutdown_watchdog_delay(state: &AgentState, minimum: Duration) -> Duration {
@@ -195,9 +203,13 @@ async fn stop_relay_dependents(state: &AgentState) {
 mod tests {
     use super::{ForcedExitStatus, ShutdownPhase, effective_forced_exit_status, shutdown_phases};
     use crate::agent::relay::RelayFatalKind;
+    use crate::agent::service::ManagedService;
     use crate::agent::state::AgentState;
+    use crate::config::{LoggingConfig, RestartPolicy, ServiceConfig};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     #[test]
@@ -242,6 +254,53 @@ mod tests {
             None,
             None,
         ))
+    }
+
+    #[tokio::test]
+    async fn shutdown_continues_when_the_first_waiter_is_cancelled() {
+        let state = test_state();
+        let service = Arc::new(ManagedService::new(
+            ServiceConfig {
+                name: "blocked-stop".into(),
+                required: true,
+                user: "root".into(),
+                command: vec!["sleep".into(), "infinity".into()],
+                cwd: None,
+                restart: RestartPolicy::Never,
+                restart_backoff: None,
+                restart_backoff_max: None,
+                startup_timeout: None,
+                shutdown_timeout: Some("50ms".into()),
+                depends_on: Vec::new(),
+                env: BTreeMap::new(),
+                health_check: None,
+            },
+            PathBuf::from("/tmp"),
+            LoggingConfig::default(),
+        ));
+        *state.services.lock().await = vec![service.clone()];
+        let child_guard = service.child.lock().await;
+
+        let first_state = state.clone();
+        let first_waiter = tokio::spawn(async move { super::shutdown_agent(first_state).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !service.stopping.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        first_waiter.abort();
+        assert!(first_waiter.await.unwrap_err().is_cancelled());
+
+        drop(child_guard);
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), super::shutdown_agent(state.clone()))
+                .await
+                .expect("detached shutdown coordinator did not complete")
+        );
+        assert!(state.shutdown_complete.load(Ordering::SeqCst));
+        assert!(service.stopping.load(Ordering::SeqCst));
     }
 
     #[test]

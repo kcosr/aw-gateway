@@ -67,6 +67,8 @@ pub(super) struct RelayControl {
     command_tx: mpsc::Sender<RelayCommand>,
     startup_cancellation: RelayCancellation,
     drain_timeout: Duration,
+    #[cfg(test)]
+    activation_pause: Mutex<Option<ActivationPause>>,
 }
 
 impl RelayControl {
@@ -89,6 +91,8 @@ impl RelayControl {
                 command_tx,
                 startup_cancellation,
                 drain_timeout,
+                #[cfg(test)]
+                activation_pause: Mutex::new(None),
             }),
             RelayCommandReceiver(command_rx),
         )
@@ -178,9 +182,44 @@ impl RelayControl {
     async fn set_state(&self, state: AccessFlowRelayStateName) {
         *self.state.lock().await = state;
     }
+
+    #[cfg(test)]
+    async fn pause_before_activation(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, wait_for_reached) = oneshot::channel();
+        let (resume, wait_for_resume) = oneshot::channel();
+        let previous = self.activation_pause.lock().await.replace(ActivationPause {
+            reached,
+            resume: wait_for_resume,
+        });
+        assert!(previous.is_none(), "activation pause already installed");
+        (wait_for_reached, resume)
+    }
+
+    #[cfg(test)]
+    async fn wait_for_activation_pause(&self) {
+        let Some(pause) = self.activation_pause.lock().await.take() else {
+            return;
+        };
+        let _ = pause.reached.send(());
+        let _ = pause.resume.await;
+    }
 }
 
 pub(super) struct RelayCommandReceiver(mpsc::Receiver<RelayCommand>);
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ActivationPause {
+    reached: oneshot::Sender<()>,
+    resume: oneshot::Receiver<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupDisposition {
+    Ready,
+    Cancelled,
+    ShutdownCompleted,
+}
 
 #[derive(Clone, Debug, Default)]
 struct RelayCancellation(CancellationToken);
@@ -271,8 +310,12 @@ async fn run_relay(
     control: &RelayControl,
     commands: &mut mpsc::Receiver<RelayCommand>,
 ) -> anyhow::Result<()> {
-    if !wait_for_start_dependencies(config, services, state, control, commands).await? {
-        return finish_cancelled_start(control, commands).await;
+    match wait_for_start_dependencies(config, services, state, control, commands).await? {
+        StartupDisposition::Ready => {}
+        StartupDisposition::Cancelled => {
+            return finish_cancelled_start(control, commands).await;
+        }
+        StartupDisposition::ShutdownCompleted => return Ok(()),
     }
     let compiled = config
         .compile_with_presentation(
@@ -296,14 +339,27 @@ async fn run_relay(
         memory_bytes = relay.resource_projection().total_memory_bytes,
         "access flow relay resource preflight passed"
     );
-    let prepared = relay
+    let prepared = match relay
         .prepare(Arc::new(control.startup_cancellation.clone()))
         .await
-        .context("prepare access flow relay")?;
-    let running = prepared
-        .activate()
-        .await
-        .context("activate access flow relay")?;
+    {
+        Ok(prepared) => prepared,
+        Err(err) if ordered_startup_cancelled(state, control) => {
+            tracing::debug!(error = %err, "access flow relay prepare cancelled by shutdown");
+            return finish_cancelled_start(control, commands).await;
+        }
+        Err(err) => return Err(err).context("prepare access flow relay"),
+    };
+    #[cfg(test)]
+    control.wait_for_activation_pause().await;
+    let running = match prepared.activate().await {
+        Ok(running) => running,
+        Err(err) if ordered_startup_cancelled(state, control) => {
+            tracing::debug!(error = %err, "access flow relay activation cancelled by shutdown");
+            return finish_cancelled_start(control, commands).await;
+        }
+        Err(err) => return Err(err).context("activate access flow relay"),
+    };
     control.accepting.store(true, Ordering::Release);
     if control
         .phase
@@ -328,12 +384,12 @@ async fn wait_for_start_dependencies(
     state: &AgentState,
     control: &RelayControl,
     commands: &mut mpsc::Receiver<RelayCommand>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<StartupDisposition> {
     loop {
         if state.shutting_down.load(Ordering::Acquire)
             || control.startup_cancellation.is_cancelled()
         {
-            return Ok(false);
+            return Ok(StartupDisposition::Cancelled);
         }
         let mut missing = Vec::new();
         for name in &config.start_after_services {
@@ -346,12 +402,12 @@ async fn wait_for_start_dependencies(
             }
         }
         if missing.is_empty() {
-            return Ok(true);
+            return Ok(StartupDisposition::Ready);
         }
         tokio::select! {
             command = commands.recv() => {
-                if handle_start_command(command, control).await {
-                    return Ok(false);
+                if let Some(disposition) = handle_start_command(command, control).await {
+                    return Ok(disposition);
                 }
             }
             () = sleep(Duration::from_millis(250)) => {}
@@ -359,29 +415,36 @@ async fn wait_for_start_dependencies(
     }
 }
 
-async fn handle_start_command(command: Option<RelayCommand>, control: &RelayControl) -> bool {
+async fn handle_start_command(
+    command: Option<RelayCommand>,
+    control: &RelayControl,
+) -> Option<StartupDisposition> {
     match command {
         Some(RelayCommand::CloseAdmission(completed)) => {
             control.startup_cancellation.cancel();
             control.accepting.store(false, Ordering::Release);
             control.set_state(AccessFlowRelayStateName::Draining).await;
             let _ = completed.send(());
-            true
+            Some(StartupDisposition::Cancelled)
         }
         Some(RelayCommand::Shutdown { completed, .. }) => {
             control.startup_cancellation.cancel();
             control.accepting.store(false, Ordering::Release);
             control.set_state(AccessFlowRelayStateName::Stopped).await;
             let _ = completed.send(());
-            true
+            Some(StartupDisposition::ShutdownCompleted)
         }
         #[cfg(test)]
         Some(RelayCommand::InjectFailure { observed, .. }) => {
             let _ = observed.send(());
-            false
+            None
         }
-        None => true,
+        None => Some(StartupDisposition::Cancelled),
     }
+}
+
+fn ordered_startup_cancelled(state: &AgentState, control: &RelayControl) -> bool {
+    state.shutting_down.load(Ordering::Acquire) || control.startup_cancellation.is_cancelled()
 }
 
 async fn finish_cancelled_start(
@@ -630,9 +693,11 @@ fn soft_nofile_limit() -> anyhow::Result<u64> {
 mod tests {
     use super::*;
     use crate::config::{
-        AccessFlowRelayPresentation, AccessFlowRelayRoute, AccessFlowRelayTransport,
+        AccessFlowRelayPresentation, AccessFlowRelayRoute, AccessFlowRelayTransport, LoggingConfig,
+        RestartPolicy, ServiceConfig,
     };
     use access_flow_relay::AccessFlowRelayFailureKind;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -672,6 +737,28 @@ mod tests {
             bytes_to_source: 0,
             active_flows,
         }
+    }
+
+    fn dependency_service(name: &str) -> Arc<ManagedService> {
+        Arc::new(ManagedService::new(
+            ServiceConfig {
+                name: name.into(),
+                required: true,
+                user: "root".into(),
+                command: vec!["sleep".into(), "infinity".into()],
+                cwd: None,
+                restart: RestartPolicy::Never,
+                restart_backoff: None,
+                restart_backoff_max: None,
+                startup_timeout: None,
+                shutdown_timeout: None,
+                depends_on: Vec::new(),
+                env: BTreeMap::new(),
+                health_check: None,
+            },
+            PathBuf::from("/tmp"),
+            LoggingConfig::default(),
+        ))
     }
 
     #[test]
@@ -958,6 +1045,116 @@ mod tests {
             .await;
         assert!(supervisor.await.unwrap().is_err());
         assert_eq!(control.active_flows(), 0);
+    }
+
+    #[tokio::test]
+    async fn ordered_shutdown_cancellation_during_activation_stops_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = dir.path().join("access-flow.sock");
+        let _endpoint_listener = std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
+        let source = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen = source.local_addr().unwrap();
+        drop(source);
+        let config = test_config(listen.to_string(), endpoint.display().to_string());
+        let (control, commands) = RelayControl::configured(&config);
+        let state = Arc::new(AgentState::new(
+            PathBuf::from("/tmp"),
+            None,
+            false,
+            None,
+            None,
+            Some(control.clone()),
+        ));
+        let (activation_reached, resume_activation) = control.pause_before_activation().await;
+        let supervisor = tokio::spawn(run_relay_supervisor(
+            config,
+            IdentityPresentation::Disabled,
+            Vec::new(),
+            state.clone(),
+            control.clone(),
+            commands,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), activation_reached)
+            .await
+            .unwrap()
+            .unwrap();
+        let closing_control = control.clone();
+        let close = tokio::spawn(async move {
+            closing_control.close_admission().await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !control.startup_cancellation.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        resume_activation.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), close)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !supervisor.is_finished(),
+            "ordered close must keep the supervisor available for shutdown"
+        );
+
+        control
+            .shutdown(Instant::now() + Duration::from_millis(100))
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.relay_fatal(), None);
+        assert_eq!(
+            control.status().await.state,
+            AccessFlowRelayStateName::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_shutdown_during_dependency_wait_terminates_supervisor() {
+        let mut config = test_config("127.0.0.1:3128".into(), "/unused/access-flow.sock".into());
+        config.start_after_services = vec!["dependency".into()];
+        let dependency = dependency_service("dependency");
+        let (control, commands) = RelayControl::configured(&config);
+        let state = Arc::new(AgentState::new(
+            PathBuf::from("/tmp"),
+            None,
+            false,
+            None,
+            None,
+            Some(control.clone()),
+        ));
+        let supervisor = tokio::spawn(run_relay_supervisor(
+            config,
+            IdentityPresentation::Disabled,
+            vec![dependency],
+            state.clone(),
+            control.clone(),
+            commands,
+        ));
+        tokio::task::yield_now().await;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            control.shutdown(Instant::now() + Duration::from_millis(100)),
+        )
+        .await
+        .expect("relay did not acknowledge direct startup shutdown");
+        tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .expect("relay supervisor parked after direct startup shutdown")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.relay_fatal(), None);
+        assert_eq!(
+            control.status().await.state,
+            AccessFlowRelayStateName::Stopped
+        );
     }
 
     #[tokio::test]
