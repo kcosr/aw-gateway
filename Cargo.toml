@@ -26,7 +26,7 @@ access-async-contracts = { git = "https://github.com/kcosr/access-runtime.git", 
 access-flow-relay = { git = "https://github.com/kcosr/access-runtime.git", rev = "d571d88011923b0d639d1c3ea88ce43cfcfe1a3f" }
 access-flow-unix = { git = "https://github.com/kcosr/access-runtime.git", rev = "d571d88011923b0d639d1c3ea88ce43cfcfe1a3f" }
 access-identity = { git = "https://github.com/kcosr/access-runtime.git", rev = "d571d88011923b0d639d1c3ea88ce43cfcfe1a3f" }
-anyhow = "1.0.100"
+anyhow = "1.0.103"
 axum = { version = "0.8.7", features = ["ws"] }
 clap = { version = "4.5.53", features = ["derive", "env"] }
 form_urlencoded = "1.2.2"
