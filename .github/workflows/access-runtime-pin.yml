@@ -15,6 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Reject dependency advisories
+        run: scripts/check-advisories.sh
       - name: Test Access Runtime pin validator
         run: python3 scripts/test-access-runtime-pin.py
       - name: Reproduce pinned Access Runtime build
