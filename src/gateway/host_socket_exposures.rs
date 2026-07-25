@@ -149,6 +149,8 @@ impl Runtime {
             let Some(description) = failed else {
                 return Ok(());
             };
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(retry_interval.min(remaining)).await;
             if tokio::time::Instant::now() >= deadline {
                 anyhow::bail!(
                     "host socket exposure {:?} container endpoint failed the {description} check as configured readiness user {:?}",
@@ -156,7 +158,6 @@ impl Runtime {
                     exposure.readiness_user
                 );
             }
-            tokio::time::sleep(retry_interval).await;
         }
     }
 
@@ -989,7 +990,6 @@ mod tests {
         )
         .unwrap()
         .exposure_manifest;
-        drop(listener);
         std::fs::remove_file(&socket).unwrap();
         let _replacement = UnixListener::bind(&socket).unwrap();
         let linux_after = prepare(
@@ -1011,6 +1011,7 @@ mod tests {
 
         assert_ne!(linux_before, linux_after);
         assert_eq!(apple_before, apple_after);
+        drop(listener);
     }
 
     #[test]
