@@ -145,12 +145,11 @@ impl Runtime {
                 let exit = match result {
                     Ok(exit) => exit,
                     Err(error) => {
-                        if error
-                            .chain()
-                            .any(|cause| cause.is::<tokio::time::error::Elapsed>())
-                            && tokio::time::Instant::now() >= deadline
-                            && let Some(description) = last_failed_check
-                        {
+                        if let Some(description) = terminal_readiness_description(
+                            &error,
+                            tokio::time::Instant::now() >= deadline,
+                            last_failed_check,
+                        ) {
                             return Err(error).context(format!(
                                 "host socket exposure {:?} container endpoint failed the {description} check as configured readiness user {:?}",
                                 exposure.name, exposure.readiness_user
@@ -300,6 +299,19 @@ impl Runtime {
         }
         statuses
     }
+}
+
+fn terminal_readiness_description<'a>(
+    error: &anyhow::Error,
+    deadline_expired: bool,
+    last_failed_check: Option<&'a str>,
+) -> Option<&'a str> {
+    (deadline_expired
+        && error
+            .chain()
+            .any(|cause| cause.is::<tokio::time::error::Elapsed>()))
+    .then_some(last_failed_check)
+    .flatten()
 }
 
 fn removed_config_manifest_status(
@@ -732,6 +744,30 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn terminal_readiness_classification_requires_all_three_conditions() {
+        let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let timeout = anyhow::Error::new(elapsed).context("outer timeout context");
+        let execution = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("outer execution context");
+
+        assert_eq!(
+            terminal_readiness_description(&timeout, true, Some("a Unix socket")),
+            Some("a Unix socket")
+        );
+        assert_eq!(
+            terminal_readiness_description(&timeout, false, Some("a Unix socket")),
+            None
+        );
+        assert_eq!(terminal_readiness_description(&timeout, true, None), None);
+        assert_eq!(
+            terminal_readiness_description(&execution, true, Some("a Unix socket")),
+            None
+        );
     }
 
     #[test]
