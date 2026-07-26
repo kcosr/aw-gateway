@@ -4801,15 +4801,21 @@ exit 0
     async fn exec_capture_truncates_oversized_stdout() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
-        std::fs::write(
-            &runtime_program,
-            format!(
-                "#!/bin/sh\nif [ \"$1\" = exec ]; then dd if=/dev/zero bs={} count=1 2>/dev/null; fi\n",
-                MAX_CAPTURED_STREAM_BYTES + 1
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let staging = dir.path().join("fake-runtime.staging");
+        let mut runtime_file = std::fs::File::create(&staging).unwrap();
+        runtime_file
+            .write_all(
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = exec ]; then dd if=/dev/zero bs={} count=1 2>/dev/null; fi\n",
+                    MAX_CAPTURED_STREAM_BYTES + 1
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        runtime_file.sync_all().unwrap();
+        drop(runtime_file);
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(staging, &runtime_program).unwrap();
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::Podman,
             program: runtime_program.display().to_string(),

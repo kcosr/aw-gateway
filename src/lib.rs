@@ -19,6 +19,7 @@ mod secret;
 pub mod ssh_dispatch;
 pub mod ssh_filter;
 pub mod template;
+mod unix_account;
 mod unix_priv;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

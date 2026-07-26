@@ -435,8 +435,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     #[cfg(target_os = "linux")]
     use std::path::Path;
-    use std::sync::atomic::Ordering;
-    use tokio::io::AsyncWriteExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
     #[cfg(target_os = "linux")]
@@ -771,7 +771,7 @@ AW_IDENTITY_TOKEN = { inherit = "AW_IDENTITY_TOKEN" }
             assert!(!error.contains("invalid bearer"), "{error}");
         }
     }
-    use tokio::time::{Duration, Instant, sleep};
+    use tokio::time::{Duration, sleep};
 
     #[test]
     fn sample_agent_config_validates() {
@@ -990,17 +990,61 @@ AW_IDENTITY_TOKEN = { inherit = "AW_IDENTITY_TOKEN" }
 
     #[tokio::test]
     async fn dependency_wait_can_exceed_startup_timeout_until_dependency_is_healthy() {
-        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = reserved.local_addr().unwrap().port();
-        drop(reserved);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let healthy = Arc::new(AtomicBool::new(false));
+        let server_healthy = Arc::clone(&healthy);
+        let (first_unhealthy_tx, first_unhealthy_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first_unhealthy_tx = Some(first_unhealthy_tx);
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 256];
+                loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+
+                let is_healthy = server_healthy.load(Ordering::Acquire);
+                let status = if is_healthy {
+                    "200 OK"
+                } else {
+                    "503 Service Unavailable"
+                };
+                let response =
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                if stream.write_all(response.as_bytes()).await.is_ok()
+                    && !is_healthy
+                    && let Some(sender) = first_unhealthy_tx.take()
+                {
+                    let _ = sender.send(());
+                }
+            }
+        });
+        let controller_healthy = Arc::clone(&healthy);
+        let controller = tokio::spawn(async move {
+            first_unhealthy_rx.await.unwrap();
+            sleep(Duration::from_millis(150)).await;
+            controller_healthy.store(true, Ordering::Release);
+        });
 
         let proxy = Arc::new(ManagedService::new(
             ServiceConfig {
-                health_check: Some(HealthCheck::Tcp {
-                    host: "127.0.0.1".into(),
-                    port,
+                health_check: Some(HealthCheck::Http {
+                    url: format!("http://127.0.0.1:{port}/ready"),
+                    expect_status: Some(200),
+                    expect_json: BTreeMap::new(),
                     interval: Some("10ms".into()),
-                    timeout: Some("10ms".into()),
+                    timeout: Some("250ms".into()),
                 }),
                 ..test_service("proxy", Vec::new())
             },
@@ -1015,17 +1059,9 @@ AW_IDENTITY_TOKEN = { inherit = "AW_IDENTITY_TOKEN" }
             PathBuf::from("/tmp"),
             LoggingConfig::default(),
         );
-        let listener = tokio::spawn(async move {
-            sleep(Duration::from_millis(150)).await;
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-                .await
-                .unwrap();
-            let _ = listener.accept().await;
-        });
 
-        let started_at = Instant::now();
         let ready = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             wait_for_dependencies(&sshd, &[proxy], None),
         )
         .await
@@ -1033,9 +1069,11 @@ AW_IDENTITY_TOKEN = { inherit = "AW_IDENTITY_TOKEN" }
         .unwrap();
 
         assert!(ready);
-        assert!(started_at.elapsed() >= Duration::from_millis(100));
+        controller.await.unwrap();
+        assert!(healthy.load(Ordering::Acquire));
         assert!(sshd.last_error.lock().await.is_none());
-        listener.abort();
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

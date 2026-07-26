@@ -5,6 +5,7 @@ use crate::config::{
 use crate::health_probe::{JsonFieldCheck, check_json_fields, http_get};
 use crate::rotating_log::{RotationState, RotationStep};
 use crate::template::{self, Vars};
+use crate::unix_account::passwd_by_name;
 use access_identity::SensitiveBearer;
 use anyhow::Context;
 use std::collections::{BTreeMap, BTreeSet};
@@ -641,17 +642,11 @@ pub(super) struct ServiceUser {
 }
 
 pub(super) fn resolve_service_user(name: &str) -> anyhow::Result<ServiceUser> {
-    let c_name = CString::new(name).context("service user contains NUL byte")?;
-    unsafe {
-        let pw = libc::getpwnam(c_name.as_ptr());
-        if pw.is_null() {
-            anyhow::bail!("service user {name:?} does not exist");
-        }
-        Ok(ServiceUser {
-            uid: (*pw).pw_uid,
-            gid: (*pw).pw_gid,
-        })
-    }
+    let passwd = passwd_by_name(name)?;
+    Ok(ServiceUser {
+        uid: passwd.uid,
+        gid: passwd.gid,
+    })
 }
 
 fn resolve_env(value: &EnvValue, vars: &Vars) -> anyhow::Result<Option<String>> {

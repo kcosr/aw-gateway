@@ -1,8 +1,8 @@
 use crate::cli::BootstrapArgs;
 use crate::config::{ContainerBootstrapFile, RenderedContainerBootstrapStep, parse_duration};
 use crate::fileutil::{self, AtomicWritePolicy};
+use crate::unix_account::passwd_by_name;
 use anyhow::Context;
-use std::ffi::CStr;
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -260,33 +260,21 @@ struct UserHome {
 }
 
 fn resolve_user(name: &str) -> anyhow::Result<UserIdentity> {
-    let c_name = CString::new(name).context("user contains NUL byte")?;
-    unsafe {
-        libc::endpwent();
-        libc::endgrent();
-        let pw = libc::getpwnam(c_name.as_ptr());
-        if pw.is_null() {
-            anyhow::bail!("user {name:?} does not exist");
-        }
-        Ok(UserIdentity {
-            uid: (*pw).pw_uid,
-            gid: (*pw).pw_gid,
-        })
-    }
+    let passwd = passwd_by_name(name)?;
+    Ok(UserIdentity {
+        uid: passwd.uid,
+        gid: passwd.gid,
+    })
 }
 
 fn resolve_user_home(name: &str) -> anyhow::Result<UserHome> {
-    let c_name = CString::new(name).context("user contains NUL byte")?;
-    unsafe {
-        libc::endpwent();
-        let pw = libc::getpwnam(c_name.as_ptr());
-        if pw.is_null() {
-            anyhow::bail!("user {name:?} does not exist");
-        }
-        Ok(UserHome {
-            home: CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned(),
-        })
-    }
+    let passwd = passwd_by_name(name)?;
+    let home = passwd
+        .home
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("home directory for user {name:?} is not valid UTF-8"))?;
+    Ok(UserHome { home })
 }
 
 fn step_home(user: &str, cfg: &ContainerBootstrapFile) -> anyhow::Result<String> {
