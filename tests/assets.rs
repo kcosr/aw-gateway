@@ -4,6 +4,9 @@ use std::path::Path;
 use std::process::Command as StdCommand;
 use tempfile::tempdir;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 fn asset(name: &str) -> String {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("assets")
@@ -898,8 +901,7 @@ fn start_container_sshd_dry_run_keeps_forcecommand_global_when_base_has_match_bl
         )
         .unwrap();
         std::fs::write(&policy, "sftp = \"deny\"\nlegacy_scp = \"deny\"\n").unwrap();
-        std::fs::write(&filter, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        test_support::write_executable_fixture(&filter, "#!/bin/sh\nexit 0\n");
 
         let output = StdCommand::new(&script)
             .env("AW_SSHD_BASE_CONFIG", &base_config)
@@ -1070,8 +1072,7 @@ fn start_container_sshd_dry_run_disables_transfer_policy() {
     )
     .unwrap();
     std::fs::write(&policy, "sftp = \"deny\"\nlegacy_scp = \"deny\"\n").unwrap();
-    std::fs::write(&filter, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+    test_support::write_executable_fixture(&filter, "#!/bin/sh\nexit 0\n");
 
     let output = StdCommand::new(asset("start-container-sshd"))
         .env("AW_SSHD_BASE_CONFIG", &base_config)
@@ -1108,8 +1109,7 @@ fn start_container_sshd_dry_run_installs_forcecommand_for_sftp_deny() {
         )
         .unwrap();
         std::fs::write(&policy, "sftp = \"deny\"\nlegacy_scp = \"allow\"\n").unwrap();
-        std::fs::write(&filter, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        test_support::write_executable_fixture(&filter, "#!/bin/sh\nexit 0\n");
 
         let output = StdCommand::new(&script)
             .env("AW_SSHD_BASE_CONFIG", &base_config)
@@ -1158,8 +1158,7 @@ fn start_container_sshd_dry_run_installs_forcecommand_for_directional_legacy_scp
             format!("sftp = \"allow\"\nlegacy_scp = \"{mode}\"\n"),
         )
         .unwrap();
-        std::fs::write(&filter, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        test_support::write_executable_fixture(&filter, "#!/bin/sh\nexit 0\n");
 
         let output = StdCommand::new(asset("start-container-sshd"))
             .env("AW_SSHD_BASE_CONFIG", &base_config)

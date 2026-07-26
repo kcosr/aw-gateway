@@ -21,20 +21,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tower::ServiceExt;
 
 fn write_fake_runtime(path: &std::path::Path, script: &str) {
-    let staging = path.with_extension("staging");
-    let mut file = std::fs::File::create(&staging).unwrap();
-    file.write_all(script.as_bytes()).unwrap();
-    file.sync_all().unwrap();
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut permissions = std::fs::metadata(&staging).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&staging, permissions).unwrap();
-    }
-    std::fs::rename(staging, path).unwrap();
+    crate::test_support::write_executable_fixture(path, script);
 }
 
 fn fake_running_runtime_script(log: &std::path::Path) -> String {

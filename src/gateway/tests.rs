@@ -3,15 +3,7 @@ use crate::agent_control::{AgentStatus, SessionHoldResult};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 fn write_fake_runtime(path: &Path, script: &str) {
-    std::fs::write(path, script).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut permissions = std::fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).unwrap();
-    }
+    crate::test_support::write_executable_fixture(path, script);
 }
 
 #[cfg(unix)]

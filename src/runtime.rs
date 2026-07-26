@@ -2887,17 +2887,7 @@ mod tests {
     use tokio::net::UnixListener;
 
     fn write_executable(path: &Path, contents: impl AsRef<[u8]>) {
-        let staging = path.with_extension("staging");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staging)
-            .unwrap();
-        file.write_all(contents.as_ref()).unwrap();
-        file.sync_all().unwrap();
-        drop(file);
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::rename(staging, path).unwrap();
+        crate::test_support::write_executable_fixture(path, contents);
     }
 
     fn test_exposure(relabel: SelinuxRelabel) -> HostSocketExposureSpec {

@@ -12,3 +12,5 @@ mod launches;
 mod ssh;
 #[path = "cli/targets.rs"]
 mod targets;
+#[path = "../src/test_support.rs"]
+mod test_support;
