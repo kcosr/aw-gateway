@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use aw_gateway::paths::UserContext;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
@@ -244,6 +245,7 @@ fn launch_cli_splices_passthrough_args_after_separator() {
     let config = dir.path().join("gateway.toml");
     let fake_runtime = dir.path().join("runtime");
     let runtime_log = dir.path().join("runtime.log");
+    let user = UserContext::current().unwrap();
     write_executable(
         &fake_runtime,
         &format!(
@@ -266,8 +268,8 @@ JSON
 esac
 exit 0
 "#,
-            user = std::env::var("USER").unwrap_or_else(|_| "unknown".into()),
-            uid = unsafe { libc::geteuid() },
+            user = user.user,
+            uid = user.uid,
             runtime_log = runtime_log.display(),
         ),
     );
@@ -329,6 +331,7 @@ fn launch_cli_inherits_allowed_session_env_into_exec_argv() {
     let config = dir.path().join("gateway.toml");
     let fake_runtime = dir.path().join("runtime");
     let runtime_log = dir.path().join("runtime.log");
+    let user = UserContext::current().unwrap();
     write_executable(
         &fake_runtime,
         &format!(
@@ -351,8 +354,8 @@ JSON
 esac
 exit 0
 "#,
-            user = std::env::var("USER").unwrap_or_else(|_| "unknown".into()),
-            uid = unsafe { libc::geteuid() },
+            user = user.user,
+            uid = user.uid,
             runtime_log = runtime_log.display(),
         ),
     );
