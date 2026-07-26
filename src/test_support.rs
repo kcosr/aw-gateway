@@ -49,6 +49,24 @@ pub(crate) fn write_executable_fixture(path: &Path, contents: impl AsRef<[u8]>) 
         "executable fixture writer failed for {}: {status}",
         path.display()
     );
+    assert!(
+        !input.exists(),
+        "executable fixture writer entrypoint did not consume its input for {}",
+        path.display()
+    );
+    let metadata = std::fs::symlink_metadata(path).unwrap_or_else(|error| {
+        panic!(
+            "executable fixture writer did not publish {}: {error}",
+            path.display()
+        )
+    });
+    assert!(
+        metadata.file_type().is_file(),
+        "executable fixture writer published a non-file: {}",
+        path.display()
+    );
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
+    assert_eq!(std::fs::read(path).unwrap(), contents.as_ref());
 }
 
 fn write_executable_fixture_in_writer_process(path: &Path, input: &Path) {
@@ -74,12 +92,21 @@ mod tests {
     #[test]
     #[ignore = "entry point for the bounded fixture writer subprocess"]
     fn executable_fixture_writer_process() {
-        let target = std::env::var_os("AW_GATEWAY_FIXTURE_WRITER_TARGET").unwrap();
-        let input = std::env::var_os("AW_GATEWAY_FIXTURE_WRITER_INPUT").unwrap();
+        let target = std::env::var_os("AW_GATEWAY_FIXTURE_WRITER_TARGET");
+        let input = std::env::var_os("AW_GATEWAY_FIXTURE_WRITER_INPUT");
+        let (Some(target), Some(input)) = (target, input) else {
+            assert!(
+                std::env::var_os("AW_GATEWAY_FIXTURE_WRITER_TARGET").is_none()
+                    && std::env::var_os("AW_GATEWAY_FIXTURE_WRITER_INPUT").is_none(),
+                "fixture writer subprocess requires both target and input"
+            );
+            return;
+        };
         write_executable_fixture_in_writer_process(
             Path::new(target.as_os_str()),
             Path::new(input.as_os_str()),
         );
+        std::fs::remove_file(input).unwrap();
     }
 
     #[test]
@@ -103,7 +130,7 @@ mod tests {
                 .unwrap()
                 .file_name()
                 .as_bytes()
-                .starts_with(b".aw-gateway-test-executable.")
+                .starts_with(b".aw-gateway-test-executable")
         }));
     }
 
