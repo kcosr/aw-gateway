@@ -2,8 +2,19 @@
 
 ## [Unreleased]
 
+- Embedded the shared Access Flow relay in `aw-container-agent` behind strict
+  typed Unix-route configuration, synthetic dependency readiness, checked
+  process resource budgets, and admission-first bounded shutdown. The
+  integrated Apple host-proxy profile no longer mounts or supervises a
+  standalone relay executable or JSON file.
+
 ### Breaking Changes
 
+- Existing generated identity-token files are now validated byte-for-byte as
+  32-4096 RFC 9110 `tchar` bytes. Files from older releases that end in a
+  newline, or otherwise contain non-bearer bytes, fail container startup.
+  Remove the invalid per-user token file so AW Gateway can regenerate it, or
+  provision an exact valid bearer through `AW_IDENTITY_TOKEN`.
 - Generic `container_mounts` now reject Unix socket, symlink, FIFO, and device
   sources. Existing host socket integrations must use the typed
   `host_socket_exposures` target map.
@@ -15,16 +26,30 @@
 
 ### Added
 
+- Access Flow relay presentation now supports strict `disabled`, `anonymous`,
+  and environment-backed bearer modes. Container bootstrap and agent startup
+  suppress core/dump capture before sensitive work, bearer activation is
+  read-once and clearing, and relay source names are barred from child and
+  workload environments. Custom sources are constrained to the
+  `AW_ACCESS_FLOW_` product namespace, service inheritance is activated into
+  clearing state before runtime threads, and authored container/session
+  environments cannot shadow or expose the deployment identity token.
+- Effective targets now reject `access.method = "runtime_exec"` when the
+  container agent consumes a deployment identity bearer, because runtime
+  metadata can retain the launch environment and runtime-exec sessions can
+  inherit it beyond the agent's read-and-clear boundary.
 - Added typed host-to-container Unix socket exposure for Apple Container 1.1+
   and native local Linux Docker/Podman, including strict source validation,
   backend-specific realization, existing-container manifests, and readiness
-  status. Added an optional Apple host-proxy example with a supervised
-  transparent relay and fail-closed IPv4/IPv6 firewall policy.
+  status. Added an optional Apple host-proxy example with the shared Access
+  Flow relay embedded in `aw-container-agent` and fail-closed IPv4/IPv6
+  firewall policy.
 - Host socket targets can optionally select the in-container readiness identity
   used only for bounded endpoint probes; it defaults to root and does not alter
   realization or container reuse identity. The host-proxy profile reuses
   required container bootstrap steps for fail-closed firewall installation and
-  ordinary service dependencies for watcher, relay, and SSH startup ordering.
+  combines ordinary watcher service dependencies with the synthetic
+  `@access-flow-relay` readiness node for SSH startup ordering.
 - Added an opt-in privileged Linux stack smoke that pins the reviewed
   Access Runtime, ACL Proxy, and AW Gateway commits and exercises real
   HTTP/HTTPS transparent redirects through the release relay, host UDS proxy,
@@ -40,6 +65,9 @@
 
 ### Fixed
 
+- Host socket exposure readiness retries now stop at their shared endpoint
+  deadline instead of sleeping a full retry interval beyond it, while terminal
+  probe timeouts retain the last completed readiness failure.
 - Managed state and SSH authorized keys now resolve consistently on both sides
   of custom workspace mounts. The conventional `container-sshd` service
   receives the resolved key path, and the SSHD helper installs it as a global

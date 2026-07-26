@@ -1327,6 +1327,128 @@ method = "runtime_exec"
     );
 }
 
+const RUNTIME_EXEC_INHERITED_AGENT_CONFIG: &str = r#"
+schema_version = "1"
+
+[target_defaults.access]
+method = "runtime_exec"
+
+# IDENTITY_CONSUMER
+
+[targets.default]
+use = ["identity-consumer"]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+"#;
+
+fn runtime_exec_with_inherited_agent(fragment: &str) -> GatewayConfig {
+    let raw = RUNTIME_EXEC_INHERITED_AGENT_CONFIG.replace("# IDENTITY_CONSUMER", fragment);
+    toml::from_str(&raw).unwrap()
+}
+
+fn inherited_access_flow_relay(presentation: &str) -> String {
+    format!(
+        r#"
+[target_templates.identity-consumer.container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 32
+copy_buffer_bytes_per_direction = 16384
+
+[target_templates.identity-consumer.container_agent.access_flow_relay.presentation]
+{presentation}
+
+[[target_templates.identity-consumer.container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[target_templates.identity-consumer.container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/acl-proxy/transparent-http.sock"
+"#
+    )
+}
+
+const INHERITED_IDENTITY_SERVICE: &str = r#"
+[[target_templates.identity-consumer.container_agent.services]]
+name = "identity-consumer"
+command = ["/bin/true"]
+
+[target_templates.identity-consumer.container_agent.services.env]
+AW_IDENTITY_TOKEN = { inherit = "AW_IDENTITY_TOKEN" }
+"#;
+
+#[test]
+fn runtime_exec_rejects_every_effective_deployment_identity_consumer_mode() {
+    let canonical_relay = inherited_access_flow_relay(
+        "kind = \"bearer_environment\"\nvariable = \"AW_IDENTITY_TOKEN\"",
+    );
+    let custom_relay = inherited_access_flow_relay(
+        "kind = \"bearer_environment\"\nvariable = \"AW_ACCESS_FLOW_TEST_TOKEN\"",
+    );
+    let combined = format!("{canonical_relay}\n{INHERITED_IDENTITY_SERVICE}");
+
+    for (case, fragment) in [
+        ("relay-canonical", canonical_relay),
+        ("relay-custom", custom_relay),
+        ("service-only", INHERITED_IDENTITY_SERVICE.to_string()),
+        ("combined", combined),
+    ] {
+        let config = runtime_exec_with_inherited_agent(&fragment);
+        for error in [
+            config.effective_target("default").unwrap_err().to_string(),
+            config.validate().unwrap_err().to_string(),
+        ] {
+            assert!(error.contains("runtime_exec"), "{case}: {error}");
+            assert!(
+                error.contains("deployment identity bearer consumers"),
+                "{case}: {error}"
+            );
+            assert!(!error.contains("AW_IDENTITY_TOKEN"), "{case}: {error}");
+            assert!(
+                !error.contains("AW_ACCESS_FLOW_TEST_TOKEN"),
+                "{case}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn runtime_exec_accepts_effective_agent_without_deployment_identity_consumers() {
+    let disabled_relay = inherited_access_flow_relay("kind = \"disabled\"");
+    let anonymous_relay = inherited_access_flow_relay("kind = \"anonymous\"");
+    let ordinary_service = r#"
+[[target_templates.identity-consumer.container_agent.services]]
+name = "ordinary"
+command = ["/bin/true"]
+
+[target_templates.identity-consumer.container_agent.services.env]
+ORDINARY = { value = "not-an-identity-token" }
+"#;
+
+    for (case, fragment) in [
+        (
+            "no-relay-or-service",
+            "[target_templates.identity-consumer]".to_string(),
+        ),
+        ("disabled-relay", disabled_relay),
+        ("anonymous-relay", anonymous_relay),
+        ("ordinary-service", ordinary_service.to_string()),
+    ] {
+        let config = runtime_exec_with_inherited_agent(&fragment);
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+        let target = config
+            .effective_target("default")
+            .unwrap_or_else(|error| panic!("{case}: {error}"));
+        assert_eq!(target.access.method, TargetAccessMethod::RuntimeExec);
+        assert!(!target.container_agent.needs_identity_token(), "{case}");
+    }
+}
+
 #[test]
 fn runtime_exec_access_rejects_same_layer_local_ssh() {
     let cfg: GatewayConfig = toml::from_str(
@@ -5643,6 +5765,529 @@ depends_on = ["acl-proxy"]
     assert!(err.contains("dependency cycle"), "{err}");
 }
 
+const AGENT_ACCESS_FLOW_RELAY: &str = r#"
+schema_version = "1"
+
+[container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 32
+copy_buffer_bytes_per_direction = 16384
+start_after_services = ["transparent-firewall"]
+
+[container_agent.access_flow_relay.presentation]
+kind = "disabled"
+
+[[container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/acl-proxy/transparent-http.sock"
+
+[[container_agent.services]]
+name = "transparent-firewall"
+command = ["/bin/true"]
+
+[[container_agent.services]]
+name = "workload"
+command = ["/bin/true"]
+depends_on = ["@access-flow-relay"]
+"#;
+
+#[test]
+fn container_agent_accepts_strict_access_flow_relay_and_absence() {
+    let configured: ContainerAgentFile = toml::from_str(AGENT_ACCESS_FLOW_RELAY).unwrap();
+    configured.validate().unwrap();
+    let relay = configured.container_agent.access_flow_relay.unwrap();
+    assert_eq!(relay.routes.len(), 1);
+    assert_eq!(relay.routes[0].name, "http");
+
+    let absent: ContainerAgentFile = toml::from_str("schema_version = \"1\"").unwrap();
+    absent.validate().unwrap();
+    assert!(absent.container_agent.access_flow_relay.is_none());
+}
+
+#[test]
+fn container_agent_accepts_all_typed_relay_presentations() {
+    let disabled: ContainerAgentFile = toml::from_str(AGENT_ACCESS_FLOW_RELAY).unwrap();
+    assert!(!disabled.container_agent.needs_identity_token());
+
+    let anonymous_raw =
+        AGENT_ACCESS_FLOW_RELAY.replace("kind = \"disabled\"", "kind = \"anonymous\"");
+    let anonymous: ContainerAgentFile = toml::from_str(&anonymous_raw).unwrap();
+    anonymous.validate().unwrap();
+    assert!(!anonymous.container_agent.needs_identity_token());
+
+    let bearer_raw = AGENT_ACCESS_FLOW_RELAY.replace(
+        "kind = \"disabled\"",
+        "kind = \"bearer_environment\"\nvariable = \"AW_ACCESS_FLOW_TEST_TOKEN\"",
+    );
+    let bearer: ContainerAgentFile = toml::from_str(&bearer_raw).unwrap();
+    bearer.validate().unwrap();
+    assert!(bearer.container_agent.needs_identity_token());
+    assert_eq!(
+        bearer.container_agent.access_flow_presentation_source(),
+        Some("AW_ACCESS_FLOW_TEST_TOKEN")
+    );
+}
+
+#[test]
+fn relay_presentation_debug_redacts_bearer_environment_source() {
+    let source = "AW_ACCESS_FLOW_TEST_TOKEN";
+    let bearer_raw = AGENT_ACCESS_FLOW_RELAY.replace(
+        "kind = \"disabled\"",
+        &format!("kind = \"bearer_environment\"\nvariable = \"{source}\""),
+    );
+    let bearer: ContainerAgentFile = toml::from_str(&bearer_raw).unwrap();
+
+    let debug = format!("{bearer:?}");
+    assert!(debug.contains("BearerEnvironment"), "{debug}");
+    assert!(debug.contains("<redacted>"), "{debug}");
+    assert!(!debug.contains(source), "{debug}");
+}
+
+#[test]
+fn service_only_parent_presentation_still_requests_host_identity_token() {
+    let config: ContainerAgentFile = toml::from_str(crate::agent::DEFAULT_AGENT_CONFIG).unwrap();
+    assert!(config.container_agent.access_flow_relay.is_none());
+    assert!(config.container_agent.services_need_identity_token());
+    assert!(config.container_agent.needs_identity_token());
+}
+
+#[test]
+fn container_agent_rejects_partial_legacy_and_invalid_relay_presentations() {
+    for invalid in [
+        AGENT_ACCESS_FLOW_RELAY.replace("kind = \"disabled\"", "kind = \"bearer_environment\""),
+        AGENT_ACCESS_FLOW_RELAY.replace(
+            "kind = \"disabled\"",
+            "kind = \"bearer_environment\"\nvariable = \"bad-name\"",
+        ),
+        AGENT_ACCESS_FLOW_RELAY.replace("kind = \"disabled\"", "kind = \"bearer\""),
+        AGENT_ACCESS_FLOW_RELAY.replace(
+            "[container_agent.access_flow_relay.presentation]",
+            "[container_agent.access_flow_relay.identity]",
+        ),
+        AGENT_ACCESS_FLOW_RELAY.replace(
+            "kind = \"disabled\"",
+            "kind = \"disabled\"\nvariable = \"AW_IDENTITY_TOKEN\"",
+        ),
+    ] {
+        let rejected = match toml::from_str::<ContainerAgentFile>(&invalid) {
+            Ok(config) => config.validate().is_err(),
+            Err(_) => true,
+        };
+        assert!(rejected, "unexpectedly accepted:\n{invalid}");
+    }
+}
+
+#[test]
+fn relay_presentation_source_uses_exact_common_grammar_and_bound() {
+    for variable in [
+        "AW_IDENTITY_TOKEN",
+        "AW_ACCESS_FLOW_a",
+        "AW_ACCESS_FLOW_lower_and_UPPER_09",
+        &format!("AW_ACCESS_FLOW_{}", "b".repeat(241)),
+    ] {
+        let raw = AGENT_ACCESS_FLOW_RELAY.replace(
+            "kind = \"disabled\"",
+            &format!("kind = \"bearer_environment\"\nvariable = \"{variable}\""),
+        );
+        let config: ContainerAgentFile = toml::from_str(&raw).unwrap();
+        config.validate().unwrap();
+    }
+
+    for variable in [
+        "",
+        "9starts_with_digit",
+        "contains-hyphen",
+        "contains.non_ascii_\u{e9}",
+        &format!("AW_ACCESS_FLOW_{}", "b".repeat(242)),
+    ] {
+        let raw = AGENT_ACCESS_FLOW_RELAY.replace(
+            "kind = \"disabled\"",
+            &format!("kind = \"bearer_environment\"\nvariable = \"{variable}\""),
+        );
+        let config: ContainerAgentFile = toml::from_str(&raw).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("[A-Za-z_]"), "{variable:?}: {error}");
+        if !variable.is_empty() {
+            assert!(!error.contains(variable), "{variable:?}: {error}");
+        }
+    }
+}
+
+#[test]
+fn relay_presentation_source_rejects_every_name_outside_product_namespace() {
+    for variable in [
+        "AW_ACCESS_FLOW_",
+        "PATH",
+        "GCONV_PATH",
+        "GLIBC_TUNABLES",
+        "SSLKEYLOGFILE",
+        "HTTPS_PROXY",
+        "RUST_BACKTRACE",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_ARBITRARY_FUTURE_CONTROL",
+        "DYLD_ARBITRARY_FUTURE_CONTROL",
+        "BASH_ENV",
+        "HOME",
+        "XDG_STATE_HOME",
+        "DOCKER_HOST",
+        "CONTAINER_HOST",
+        "AW_CONTAINER_CONTROL_TOKEN",
+        "AW_AUTHENTICATED_UID",
+        "AW_AUTHENTICATED_GID",
+        "AW_CONTAINER_STATE_DIR",
+        "AW_CONTAINER_AGENT_CONFIG",
+        "AW_CONTAINER_BOOTSTRAP_CONFIG",
+        "AW_CONTAINER_AGENT_LOG_LEVEL",
+        "AW_GATEWAY_CONFIG",
+        "AW_GATEWAY_CONFIG_HOME",
+        "AW_GATEWAY_STATE_HOME",
+        "AW_GATEWAY_LOG_LEVEL",
+        "AW_SSHD_POLICY_CONFIG",
+        "SHELL",
+        "SSH_ORIGINAL_COMMAND",
+        "TERM",
+    ] {
+        let raw = AGENT_ACCESS_FLOW_RELAY.replace(
+            "kind = \"disabled\"",
+            &format!("kind = \"bearer_environment\"\nvariable = \"{variable}\""),
+        );
+        let config: ContainerAgentFile = toml::from_str(&raw).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("AW Access Flow source namespace"), "{error}");
+        assert!(!error.contains(variable), "{variable:?}: {error}");
+    }
+}
+
+#[test]
+fn service_identity_inheritance_requires_the_canonical_entry_name() {
+    let invalid = r#"
+schema_version = "1"
+
+[[container_agent.services]]
+name = "service"
+command = ["/bin/true"]
+
+[container_agent.services.env]
+OTHER = { inherit = "AW_IDENTITY_TOKEN" }
+"#;
+    let config: ContainerAgentFile = toml::from_str(invalid).unwrap();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("identity environment contract"), "{error}");
+    assert!(!error.contains("AW_IDENTITY_TOKEN"), "{error}");
+}
+
+#[test]
+fn service_identity_destination_accepts_only_canonical_inheritance() {
+    let valid = r#"
+schema_version = "1"
+
+[[container_agent.services]]
+name = "service"
+command = ["/bin/true"]
+
+[container_agent.services.env]
+AW_IDENTITY_TOKEN = { inherit = "AW_IDENTITY_TOKEN" }
+"#;
+    let config: ContainerAgentFile = toml::from_str(valid).unwrap();
+    config.validate().unwrap();
+    assert!(config.container_agent.services_need_identity_token());
+
+    for invalid_entry in [
+        r#"{ value = "literal-bearer-secret" }"#,
+        r#"{ file = "/private/identity-token-secret" }"#,
+        r#"{ inherit = "OTHER_SECRET_SOURCE" }"#,
+        r#"{ inherit = "AW_IDENTITY_TOKEN", required = false }"#,
+        r#"{ inherit = "AW_IDENTITY_TOKEN", interpolate = false }"#,
+    ] {
+        let raw = valid.replace(r#"{ inherit = "AW_IDENTITY_TOKEN" }"#, invalid_entry);
+        let config: ContainerAgentFile = toml::from_str(&raw).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("identity environment contract"),
+            "{invalid_entry}: {error}"
+        );
+        for sensitive in [
+            "literal-bearer-secret",
+            "/private/identity-token-secret",
+            "OTHER_SECRET_SOURCE",
+            "AW_IDENTITY_TOKEN",
+        ] {
+            assert!(!error.contains(sensitive), "{invalid_entry}: {error}");
+        }
+    }
+}
+
+#[test]
+fn identity_environment_debug_redacts_env_value_service_and_agent_file() {
+    let canonical = r#"
+schema_version = "1"
+
+[[container_agent.services]]
+name = "service"
+command = ["/bin/true"]
+
+[container_agent.services.env]
+AW_IDENTITY_TOKEN = { inherit = "AW_IDENTITY_TOKEN" }
+"#;
+    let invalid_source = canonical.replace(
+        r#"{ inherit = "AW_IDENTITY_TOKEN" }"#,
+        r#"{ inherit = "private-token.locator" }"#,
+    );
+    for raw in [canonical.to_string(), invalid_source] {
+        let config: ContainerAgentFile = toml::from_str(&raw).unwrap();
+        let service = &config.container_agent.services[0];
+        let value = service.env.values().next().unwrap();
+        for debug in [
+            format!("{value:?}"),
+            format!("{service:?}"),
+            format!("{config:?}"),
+        ] {
+            assert!(
+                debug.contains("<redacted>") || debug.contains("env_entry_count: 1"),
+                "{debug}"
+            );
+            for sensitive in ["AW_IDENTITY_TOKEN", "private-token.locator"] {
+                assert!(!debug.contains(sensitive), "{debug}");
+            }
+        }
+    }
+}
+
+#[test]
+fn identity_environment_preflight_redacts_malformed_keys_and_sources() {
+    for (raw, sensitive) in [
+        (
+            r#"
+schema_version = "1"
+
+[[container_agent.services]]
+name = "service"
+command = ["/bin/true"]
+
+[container_agent.services.env]
+AW_IDENTITY_TOKEN = { inherit = "private-token.locator" }
+"#,
+            "private-token.locator",
+        ),
+        (
+            r#"
+schema_version = "1"
+
+[[container_agent.services]]
+name = "service"
+command = ["/bin/true"]
+
+[container_agent.services.env]
+"private-token.locator" = { inherit = "AW_IDENTITY_TOKEN" }
+"#,
+            "private-token.locator",
+        ),
+    ] {
+        let config: ContainerAgentFile = toml::from_str(raw).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("identity environment contract"), "{error}");
+        assert!(!error.contains(sensitive), "{error}");
+        assert!(!error.contains("AW_IDENTITY_TOKEN"), "{error}");
+    }
+}
+
+#[test]
+fn canonical_relay_and_service_identity_rejects_additional_alias_inheritance() {
+    let invalid = AGENT_ACCESS_FLOW_RELAY
+        .replace(
+            "kind = \"disabled\"",
+            "kind = \"bearer_environment\"\nvariable = \"AW_IDENTITY_TOKEN\"",
+        )
+        .replace(
+            "name = \"transparent-firewall\"\ncommand = [\"/bin/true\"]",
+            r#"name = "transparent-firewall"
+command = ["/bin/true"]
+
+[container_agent.services.env]
+AW_IDENTITY_TOKEN = { inherit = "AW_IDENTITY_TOKEN" }
+OTHER = { inherit = "AW_IDENTITY_TOKEN" }"#,
+        );
+    let config: ContainerAgentFile = toml::from_str(&invalid).unwrap();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("identity environment contract"), "{error}");
+    assert!(!error.contains("AW_IDENTITY_TOKEN"), "{error}");
+}
+
+#[test]
+fn container_agent_rejects_relay_source_in_service_environments() {
+    let bearer = AGENT_ACCESS_FLOW_RELAY.replace(
+        "kind = \"disabled\"",
+        "kind = \"bearer_environment\"\nvariable = \"AW_ACCESS_FLOW_TEST_TOKEN\"",
+    );
+    let service_marker = "name = \"transparent-firewall\"\ncommand = [\"/bin/true\"]";
+    for environment in [
+        "[container_agent.services.env]\nAW_ACCESS_FLOW_TEST_TOKEN = { value = \"literal\" }",
+        "[container_agent.services.env]\nOTHER = { inherit = \"AW_ACCESS_FLOW_TEST_TOKEN\" }",
+    ] {
+        let invalid = bearer.replace(
+            service_marker,
+            &format!("{service_marker}\n\n{environment}"),
+        );
+        let config: ContainerAgentFile = toml::from_str(&invalid).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("access flow presentation source"), "{error}");
+        assert!(!error.contains("AW_ACCESS_FLOW_TEST_TOKEN"), "{error}");
+    }
+}
+
+#[test]
+fn gateway_relay_templates_render_to_strict_agent_literals() {
+    let raw = AGENT_ACCESS_FLOW_RELAY.replace(
+        "/run/acl-proxy/transparent-http.sock",
+        "{container_state_dir_in_container}/transparent-http.sock",
+    );
+    let mut config: ContainerAgentFile = toml::from_str(&raw).unwrap();
+    let relay = config.container_agent.access_flow_relay.as_mut().unwrap();
+    relay
+        .render(&BTreeMap::from([(
+            "container_state_dir_in_container".into(),
+            "/run/aw-gateway".into(),
+        )]))
+        .unwrap();
+    config.validate().unwrap();
+    let encoded = toml::to_string(&config).unwrap();
+    assert!(encoded.contains("/run/aw-gateway/transparent-http.sock"));
+    assert!(!encoded.contains('{'));
+}
+
+#[test]
+fn container_agent_rejects_unknown_partial_and_removed_relay_shapes() {
+    for invalid in [
+        AGENT_ACCESS_FLOW_RELAY.replace("kind = \"unix\"", "kind = \"tls_tcp\""),
+        AGENT_ACCESS_FLOW_RELAY.replace(
+            "path = \"/run/acl-proxy/transparent-http.sock\"",
+            "path = \"/run/acl-proxy/transparent-http.sock\"\ncertificate = \"/tmp/cert\"",
+        ),
+        AGENT_ACCESS_FLOW_RELAY.replace(
+            "[container_agent.access_flow_relay.presentation]\nkind = \"disabled\"\n",
+            "",
+        ),
+        AGENT_ACCESS_FLOW_RELAY.replace("access_flow_relay", "local_flow_relay"),
+        AGENT_ACCESS_FLOW_RELAY.replace("@access-flow-relay", "@local-flow-relay"),
+    ] {
+        let rejected = match toml::from_str::<ContainerAgentFile>(&invalid) {
+            Ok(config) => config.validate().is_err(),
+            Err(_) => true,
+        };
+        assert!(rejected, "unexpectedly accepted:\n{invalid}");
+    }
+}
+
+#[test]
+fn container_agent_relay_participates_in_dependency_cycle_validation() {
+    let cyclic = AGENT_ACCESS_FLOW_RELAY.replace(
+        "name = \"transparent-firewall\"\ncommand = [\"/bin/true\"]",
+        "name = \"transparent-firewall\"\ncommand = [\"/bin/true\"]\ndepends_on = [\"@access-flow-relay\"]",
+    );
+    let config: ContainerAgentFile = toml::from_str(&cyclic).unwrap();
+    let error = config.validate().unwrap_err().to_string();
+    assert!(error.contains("dependency cycle"), "{error}");
+    assert!(error.contains("@access-flow-relay"), "{error}");
+}
+
+#[test]
+fn gateway_relay_overlay_is_whole_table_replacement() {
+    let config: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[target_defaults.container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 32
+copy_buffer_bytes_per_direction = 16384
+
+[target_defaults.container_agent.access_flow_relay.presentation]
+kind = "disabled"
+
+[[target_defaults.container_agent.access_flow_relay.routes]]
+name = "default-http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[target_defaults.container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/default.sock"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "default"
+
+[targets.default.container_agent.access_flow_relay]
+setup_timeout = "3s"
+drain_timeout = "11s"
+max_connections = 8
+copy_buffer_bytes_per_direction = 8192
+
+[targets.default.container_agent.access_flow_relay.presentation]
+kind = "disabled"
+
+[[targets.default.container_agent.access_flow_relay.routes]]
+name = "target-https"
+listen = "127.0.0.1:3129"
+allowed_destination_ports = [443]
+
+[targets.default.container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/target.sock"
+"#,
+    )
+    .unwrap();
+    config.validate().unwrap();
+    let target = config.effective_target("default").unwrap();
+    let relay = target.container_agent.access_flow_relay.unwrap();
+    assert_eq!(relay.setup_timeout, "3s");
+    assert_eq!(relay.routes.len(), 1);
+    assert_eq!(relay.routes[0].name, "target-https");
+}
+
+#[test]
+fn gateway_incomplete_relay_replacement_does_not_borrow_inherited_fields() {
+    let invalid = r#"
+schema_version = "1"
+
+[target_defaults.container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 32
+copy_buffer_bytes_per_direction = 16384
+
+[target_defaults.container_agent.access_flow_relay.presentation]
+kind = "disabled"
+
+[[target_defaults.container_agent.access_flow_relay.routes]]
+name = "default-http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[target_defaults.container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/default.sock"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "default"
+
+[targets.default.container_agent.access_flow_relay]
+setup_timeout = "3s"
+"#;
+    assert!(toml::from_str::<GatewayConfig>(invalid).is_err());
+}
+
 #[test]
 fn standalone_container_agent_rejects_gateway_service_user_templates() {
     let cfg: ContainerAgentFile = toml::from_str(
@@ -5954,4 +6599,54 @@ container_path = "/run/child.sock"
 
     let err = format!("{:#}", GatewayConfig::load(&child).unwrap_err());
     assert!(err.contains("selinux_relabel"), "{err}");
+}
+
+#[test]
+fn root_extends_replaces_access_flow_relay_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.toml");
+    let child = dir.path().join("child.toml");
+    std::fs::write(
+        &base,
+        r#"
+schema_version = "1"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "{image_slug}"
+
+[targets.default.container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 32
+copy_buffer_bytes_per_direction = 16384
+
+[targets.default.container_agent.access_flow_relay.presentation]
+kind = "disabled"
+
+[[targets.default.container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[targets.default.container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/base.sock"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &child,
+        r#"
+extends = "base.toml"
+
+[targets.default.container_agent.access_flow_relay]
+setup_timeout = "3s"
+"#,
+    )
+    .unwrap();
+
+    let error = format!("{:#}", GatewayConfig::load(&child).unwrap_err());
+    assert!(error.contains("drain_timeout"), "{error}");
 }

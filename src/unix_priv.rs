@@ -1,5 +1,9 @@
 use std::ffi::CStr;
+#[cfg(test)]
+use std::ffi::CString;
 use std::io;
+#[cfg(test)]
+use std::os::unix::ffi::OsStrExt;
 
 #[cfg(target_vendor = "apple")]
 type GroupListEntry = libc::c_int;
@@ -190,12 +194,11 @@ mod tests {
     fn resolves_current_user_groups() {
         let uid = unsafe { libc::geteuid() };
         let gid = unsafe { libc::getegid() };
-        let passwd = unsafe { libc::getpwuid(uid) };
-        assert!(!passwd.is_null());
-        let user = unsafe { CStr::from_ptr((*passwd).pw_name) };
+        let passwd = crate::unix_account::passwd_by_uid(uid).unwrap();
+        let user = CString::new(passwd.name.as_bytes()).unwrap();
         let gid: u32 = gid;
 
-        let groups = resolve_user_groups(user, gid).unwrap();
+        let groups = resolve_user_groups(&user, gid).unwrap();
 
         assert!(groups.contains(&gid_to_gid_t(gid).unwrap()));
     }

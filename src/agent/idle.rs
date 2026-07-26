@@ -7,8 +7,8 @@ use std::sync::atomic::Ordering;
 use tokio::time::{Duration, Instant, sleep};
 
 use super::lifecycle::{
-    exit_pid1_agent_process_success, schedule_forced_exit_after, shutdown_agent,
-    shutdown_watchdog_delay,
+    ForcedExitStatus, exit_pid1_agent_process_for_state, schedule_forced_exit_after,
+    shutdown_agent, shutdown_watchdog_delay,
 };
 use super::process::{
     ProcInfo, current_uid, read_process_table, signal_matching_processes, signal_number,
@@ -50,9 +50,14 @@ pub(super) async fn run_idle_cleanup(state: Arc<AgentState>) {
                     force_after_ms = force_after.as_millis(),
                     "idle cleanup is shutting down container"
                 );
-                schedule_forced_exit_after(force_after, "idle-cleanup");
+                schedule_forced_exit_after(
+                    state.clone(),
+                    force_after,
+                    "idle-cleanup",
+                    ForcedExitStatus::Success,
+                );
                 shutdown_agent(state.clone()).await;
-                exit_pid1_agent_process_success();
+                exit_pid1_agent_process_for_state(&state, ForcedExitStatus::Success);
             }
             IdleTransition::ReapProcesses => {
                 let managed = managed_service_pids(&state).await;
@@ -83,6 +88,10 @@ async fn evaluate_idle_state(
     idle_grace: Duration,
 ) -> IdleTransition {
     let active_streams = state.active_streams.load(Ordering::SeqCst);
+    let active_relay_flows = state
+        .access_flow_relay
+        .as_ref()
+        .map_or(0, |relay| relay.active_flows());
     let active_sessions = state.active_sessions.load(Ordering::SeqCst);
     let process_table = read_process_table(Path::new("/proc"));
     let matched_processes = find_preserve_processes(&process_table, &config.preserve_processes);
@@ -90,7 +99,7 @@ async fn evaluate_idle_state(
     let now = Instant::now();
     let mut idle = state.idle_state.lock().await;
 
-    if active_streams > 0 || active_sessions > 0 {
+    if has_active_attachments(active_streams, active_relay_flows, active_sessions) {
         idle.state = IdleStateName::Attached;
         idle.idle_since = None;
         idle.preserve = false;
@@ -128,6 +137,14 @@ async fn evaluate_idle_state(
         IdleCleanupAction::ReapProcesses => IdleTransition::ReapProcesses,
         IdleCleanupAction::None => IdleTransition::None,
     }
+}
+
+pub(super) fn has_active_attachments(
+    active_streams: usize,
+    active_relay_flows: usize,
+    active_sessions: usize,
+) -> bool {
+    active_streams > 0 || active_relay_flows > 0 || active_sessions > 0
 }
 
 fn find_preserve_processes(processes: &[ProcInfo], names: &[String]) -> Vec<ProcessMatch> {

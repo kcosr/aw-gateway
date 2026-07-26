@@ -450,7 +450,12 @@ config, and do not support SCP, SFTP, VS Code Remote-SSH, `connect`,
 `add-host-key` remains available because it only mutates the host user's SSH
 configuration. Runtime-exec targets do support `up`, `run`, `shell`, `launch`,
 `launches`, `status`, `status --all`, `targets`, `stop`, and `remove` through
-the host container runtime.
+the host container runtime. They cannot be used when the effective
+`container_agent` configuration consumes a deployment identity bearer because
+container runtimes retain launch environments in metadata and runtime-exec
+sessions can inherit them, bypassing the agent's read-and-clear boundary. Use
+SSH access for targets with bearer-authenticated Access Flow presentation or
+approved service identity inheritance.
 
 Start a no-SSH target and open an interactive shell with the configured
 `identity.session_shell`:
@@ -625,9 +630,55 @@ timeout = "1s"
 Supported service health checks include process, TCP, and HTTP checks. HTTP
 checks can require status codes and top-level JSON field matches.
 
+The optional Access Flow relay runs inside `aw-container-agent`; it is not a
+supervised child process. Every route listens on IPv4 loopback, recovers the
+original redirected destination, publishes an AW Access Flow preface, and
+connects to one Unix socket. Presentation is a strict tagged choice of
+`disabled`, `anonymous`, or `bearer_environment`:
+
+```toml
+[target_defaults.container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 1024
+copy_buffer_bytes_per_direction = 16384
+start_after_services = ["transparent-firewall"]
+
+[target_defaults.container_agent.access_flow_relay.presentation]
+kind = "bearer_environment"
+variable = "AW_IDENTITY_TOKEN"
+
+[[target_defaults.container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[target_defaults.container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/acl-proxy/transparent-http.sock"
+```
+
+`bearer_environment` makes the gateway provision its existing host identity
+token under the configured agent variable. Bootstrap disables core/dump
+capture before any work and runs bootstrap steps with cleared environments.
+The agent reapplies that hardening, consumes and removes the variable before
+starting runtime threads, and does not expose the source or bearer through
+status, logs, managed services, or workload sessions. A missing or invalid
+bearer fails agent startup. The source name must match
+`[A-Za-z_][A-Za-z0-9_]*` and be at most 256 bytes. AW Gateway accepts only
+`AW_IDENTITY_TOKEN` or a nonempty application-owned name beginning
+`AW_ACCESS_FLOW_`; all other names are rejected.
+
+Services may depend on the reserved `@access-flow-relay` node. Relay activation
+waits until every required service named by `start_after_services` is healthy.
+The relay joins the same cycle validation, aggregate readiness, status, idle
+activity, fatal shutdown, and reverse dependency ordering as managed services.
+On shutdown the agent closes relay admission, stops relay-dependent services,
+drains established flows for the configured bound, then stops prerequisites.
+
 Services do not inherit sensitive gateway environment by default. A service
-receives values such as `AW_IDENTITY_TOKEN` only when explicitly configured in
-the service `env` table:
+receives `AW_IDENTITY_TOKEN` only when explicitly configured in the service
+`env` table, such as an ACL Proxy using typed HTTP parent presentation:
 
 ```toml
 [target_defaults.container_agent.services.env]
@@ -640,6 +691,15 @@ Service env entries can use literal `value`, inherit from the agent
 environment, or read a file. Template interpolation applies to literal `value`
 strings and `file` paths when `interpolate = true`; values loaded from files or
 inherited environment variables are passed through literally.
+`AW_IDENTITY_TOKEN` inheritance is the narrow exception: it must use the exact
+canonical key and source shown above. The agent consumes and removes that
+source before creating runtime threads, retains it in clearing sensitive
+storage, and materializes it only for each start or restart of an approved
+service.
+When either a relay or service requests the host identity token, target
+`container_env`, `session_env`, and `session_env_inherit` cannot author or
+expose `AW_IDENTITY_TOKEN`. The gateway's typed relay/service injection is the
+only container boundary for that deployment token.
 
 ## Gateway Config Shape
 
@@ -885,6 +945,10 @@ Gateway configs commonly include:
   `[targets.<name>.container_ssh.transfer]`.
 - `[target_defaults.container_agent]`: optional in-container supervision and SSH bridge
   support.
+- `[target_defaults.container_agent.access_flow_relay]`: optional embedded
+  transparent TCP-to-Access-Flow relay with strict Unix routes. The relay table
+  replaces as one object in target overlays; an omitted table inherits, while
+  a present incomplete table is invalid and never borrows omitted fields.
 - `[[target_defaults.container_agent.services]]`: in-container services supervised by
   `aw-container-agent`. Use `depends_on` and dependency health checks to order
   managed services. Required `container_bootstrap_steps` perform privileged
@@ -1247,6 +1311,9 @@ Root inheritance uses these merge rules:
   inherited value as a whole.
 - Each same-key `host_socket_exposures` entry replaces the inherited entry as a
   whole rather than merging individual path or relabel fields.
+- `container_agent.access_flow_relay` replaces as a whole typed component when
+  a later target layer supplies it. Its routes and lifecycle bounds never merge
+  piecemeal.
 - Scalars and ordinary arrays replace the inherited value. This includes
   `container_mounts`, runtime argument arrays, command arrays, dependency
   arrays, allow-list arrays, and launch variable value arrays.
@@ -1950,8 +2017,9 @@ The `assets/` directory contains deployable helpers and image files:
 The gateway and container agent coordinate through environment variables and
 private state files:
 
-- `AW_IDENTITY_TOKEN`: generated or inherited by the gateway and exposed only
-  to services that explicitly request it.
+- `AW_IDENTITY_TOKEN`: generated or inherited by the gateway. It is provisioned
+  only when a bearer Access Flow relay or an explicit service inheritance
+  requires it; the relay may map it to its configured agent variable.
 - `AW_CONTAINER_CONTROL_TOKEN`: generated per container and passed only to the
   container agent for mutating control-socket requests. Mutating requests fail
   closed when this token is absent.

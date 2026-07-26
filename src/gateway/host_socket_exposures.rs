@@ -114,6 +114,7 @@ impl Runtime {
         deadline: tokio::time::Instant,
         retry_interval: Duration,
     ) -> anyhow::Result<()> {
+        let mut last_failed_check = None;
         loop {
             let mut failed = None;
             for (flag, description) in [("-S", "a Unix socket"), ("-w", "accessible")] {
@@ -131,7 +132,7 @@ impl Runtime {
                     ],
                 };
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                let exit = self
+                let result = self
                     .container_runtime
                     .exec_discard_with_timeout(&spec, Some(remaining))
                     .await
@@ -140,15 +141,37 @@ impl Runtime {
                             "check host socket exposure {:?} container endpoint as {:?}",
                             exposure.name, exposure.readiness_user
                         )
-                    })?;
+                    });
+                let exit = match result {
+                    Ok(exit) => exit,
+                    Err(error) => {
+                        if let Some(description) = terminal_readiness_description(
+                            &error,
+                            tokio::time::Instant::now() >= deadline,
+                            last_failed_check,
+                        ) {
+                            return Err(error).context(format!(
+                                "host socket exposure {:?} container endpoint failed the {description} check as configured readiness user {:?}",
+                                exposure.name, exposure.readiness_user
+                            ));
+                        }
+                        return Err(error);
+                    }
+                };
                 if exit != 0 {
                     failed = Some(description);
+                    last_failed_check = Some(description);
                     break;
+                }
+                if last_failed_check == Some(description) {
+                    last_failed_check = None;
                 }
             }
             let Some(description) = failed else {
                 return Ok(());
             };
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(retry_interval.min(remaining)).await;
             if tokio::time::Instant::now() >= deadline {
                 anyhow::bail!(
                     "host socket exposure {:?} container endpoint failed the {description} check as configured readiness user {:?}",
@@ -156,7 +179,6 @@ impl Runtime {
                     exposure.readiness_user
                 );
             }
-            tokio::time::sleep(retry_interval).await;
         }
     }
 
@@ -277,6 +299,19 @@ impl Runtime {
         }
         statuses
     }
+}
+
+fn terminal_readiness_description<'a>(
+    error: &anyhow::Error,
+    deadline_expired: bool,
+    last_failed_check: Option<&'a str>,
+) -> Option<&'a str> {
+    (deadline_expired
+        && error
+            .chain()
+            .any(|cause| cause.is::<tokio::time::error::Elapsed>()))
+    .then_some(last_failed_check)
+    .flatten()
 }
 
 fn removed_config_manifest_status(
@@ -711,6 +746,30 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn terminal_readiness_classification_requires_all_three_conditions() {
+        let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        let timeout = anyhow::Error::new(elapsed).context("outer timeout context");
+        let execution = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("outer execution context");
+
+        assert_eq!(
+            terminal_readiness_description(&timeout, true, Some("a Unix socket")),
+            Some("a Unix socket")
+        );
+        assert_eq!(
+            terminal_readiness_description(&timeout, false, Some("a Unix socket")),
+            None
+        );
+        assert_eq!(terminal_readiness_description(&timeout, true, None), None);
+        assert_eq!(
+            terminal_readiness_description(&execution, true, Some("a Unix socket")),
+            None
+        );
+    }
+
     #[test]
     fn real_socket_prepares_without_mutating_source_metadata() {
         let dir = tempfile::tempdir().unwrap();
@@ -989,7 +1048,6 @@ mod tests {
         )
         .unwrap()
         .exposure_manifest;
-        drop(listener);
         std::fs::remove_file(&socket).unwrap();
         let _replacement = UnixListener::bind(&socket).unwrap();
         let linux_after = prepare(
@@ -1011,6 +1069,7 @@ mod tests {
 
         assert_ne!(linux_before, linux_after);
         assert_eq!(apple_before, apple_after);
+        drop(listener);
     }
 
     #[test]

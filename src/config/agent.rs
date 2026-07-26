@@ -3,6 +3,18 @@ use crate::template;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddrV4;
+use std::num::{NonZeroU16, NonZeroUsize};
+use std::time::Duration;
+
+use access_flow_relay::{
+    AccessFlowRelayPlan, AccessFlowRelayPlanError, AccessFlowRoute, AccessFlowRouteName,
+};
+use access_flow_unix::{NormalizedUnixSocketPath, UnixAccessFlowEndpoint, UnixExecutionTarget};
+use access_identity::{IdentityPresentation, SensitiveBearer};
+
+pub const ACCESS_FLOW_RELAY_NODE: &str = "@access-flow-relay";
+const REMOVED_LOCAL_FLOW_RELAY_NODE: &str = "@local-flow-relay";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -14,6 +26,7 @@ pub struct ContainerAgentConfig {
     pub ssh_bridge: Option<SshBridgeConfig>,
     pub control_socket: Option<ControlSocketConfig>,
     pub idle_cleanup: Option<IdleCleanupConfig>,
+    pub access_flow_relay: Option<AccessFlowRelayConfig>,
 }
 
 impl Default for ContainerAgentConfig {
@@ -24,6 +37,7 @@ impl Default for ContainerAgentConfig {
             ssh_bridge: None,
             control_socket: None,
             idle_cleanup: None,
+            access_flow_relay: None,
         }
     }
 }
@@ -42,6 +56,9 @@ impl ContainerAgentConfig {
         if let Some(bridge) = &self.ssh_bridge {
             bridge.validate_gateway()?;
         }
+        if let Some(relay) = &self.access_flow_relay {
+            relay.validate(AccessFlowRelayValidationMode::Gateway)?;
+        }
         self.validate_common(ServiceUserTemplateMode::GatewayManaged)
     }
 
@@ -59,6 +76,9 @@ impl ContainerAgentConfig {
                 control_socket,
                 AGENT_TEMPLATE_VARS,
             )?;
+        }
+        if let Some(relay) = &self.access_flow_relay {
+            relay.validate(AccessFlowRelayValidationMode::Agent)?;
         }
         self.validate_common(ServiceUserTemplateMode::Literal)
     }
@@ -92,18 +112,43 @@ impl ContainerAgentConfig {
                     "container_agent.idle_cleanup requires container_agent.enabled = true"
                 );
             }
+            if self.access_flow_relay.is_some() {
+                anyhow::bail!(
+                    "container_agent.access_flow_relay requires container_agent.enabled = true"
+                );
+            }
             return Ok(());
         }
         let mut names = BTreeSet::new();
+        let presentation_source = self
+            .access_flow_relay
+            .as_ref()
+            .and_then(|relay| relay.presentation.environment_variable());
         for service in &self.services {
             service.validate(service_user_template_mode)?;
+            if let Some(source) = presentation_source {
+                validate_service_presentation_source(service, source)?;
+            }
             if !names.insert(service.name.clone()) {
                 anyhow::bail!("duplicate container_agent service {:?}", service.name);
             }
         }
         for service in &self.services {
             for dep in &service.depends_on {
-                if !names.contains(dep) {
+                if dep == REMOVED_LOCAL_FLOW_RELAY_NODE {
+                    anyhow::bail!(
+                        "service {:?} uses removed dependency {REMOVED_LOCAL_FLOW_RELAY_NODE:?}; use {ACCESS_FLOW_RELAY_NODE:?}",
+                        service.name
+                    );
+                }
+                if dep == ACCESS_FLOW_RELAY_NODE {
+                    if self.access_flow_relay.is_none() {
+                        anyhow::bail!(
+                            "service {:?} depends on {ACCESS_FLOW_RELAY_NODE:?} but container_agent.access_flow_relay is not configured",
+                            service.name
+                        );
+                    }
+                } else if !names.contains(dep) {
                     anyhow::bail!(
                         "service {:?} depends on unknown service {:?}",
                         service.name,
@@ -112,7 +157,25 @@ impl ContainerAgentConfig {
                 }
             }
         }
-        validate_service_dependency_graph(&self.services)?;
+        if let Some(relay) = &self.access_flow_relay {
+            for dependency in &relay.start_after_services {
+                let Some(service) = self
+                    .services
+                    .iter()
+                    .find(|service| service.name == *dependency)
+                else {
+                    anyhow::bail!(
+                        "container_agent.access_flow_relay.start_after_services references unknown service {dependency:?}"
+                    );
+                };
+                if !service.required {
+                    anyhow::bail!(
+                        "container_agent.access_flow_relay.start_after_services requires service {dependency:?} to be required"
+                    );
+                }
+            }
+        }
+        validate_service_dependency_graph(&self.services, self.access_flow_relay.as_ref())?;
         if let Some(cleanup) = &self.idle_cleanup {
             cleanup.validate()?;
         }
@@ -120,20 +183,43 @@ impl ContainerAgentConfig {
     }
 
     pub fn needs_identity_token(&self) -> bool {
-        // The gateway provisions AW_IDENTITY_TOKEN only for container-agent
-        // services that explicitly inherit that variable. New token consumers
-        // must either use the same EnvValue::inherit mechanism or update this
-        // predicate and the container run environment together.
         self.enabled
-            && self.services.iter().any(|service| {
-                service.env.values().any(|value| {
-                    value
-                        .inherit
-                        .as_deref()
-                        .is_some_and(|name| name == "AW_IDENTITY_TOKEN")
-                })
-            })
+            && (self.access_flow_presentation_source().is_some()
+                || self.services_need_identity_token())
     }
+
+    pub fn access_flow_presentation_source(&self) -> Option<&str> {
+        self.enabled
+            .then_some(self.access_flow_relay.as_ref())
+            .flatten()
+            .and_then(|relay| relay.presentation.environment_variable())
+    }
+
+    pub fn services_need_identity_token(&self) -> bool {
+        self.enabled
+            && self
+                .services
+                .iter()
+                .any(ServiceConfig::needs_identity_token)
+    }
+}
+
+fn validate_service_presentation_source(
+    service: &ServiceConfig,
+    source: &str,
+) -> anyhow::Result<()> {
+    for (key, value) in &service.env {
+        let approved_identity_entry = source == "AW_IDENTITY_TOKEN"
+            && key == "AW_IDENTITY_TOKEN"
+            && value.inherit.as_deref() == Some("AW_IDENTITY_TOKEN");
+        if !approved_identity_entry && (key == source || value.inherit.as_deref() == Some(source)) {
+            anyhow::bail!(
+                "container_agent service {:?} cannot use the access flow presentation source in this environment entry",
+                service.name
+            );
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -151,6 +237,7 @@ pub struct ContainerAgentConfigInput {
     pub ssh_bridge: Option<SshBridgeConfigInput>,
     pub control_socket: Option<ControlSocketConfig>,
     pub idle_cleanup: Option<IdleCleanupConfigInput>,
+    pub access_flow_relay: Option<AccessFlowRelayConfig>,
 }
 
 impl ContainerAgentConfigInput {
@@ -178,6 +265,9 @@ impl ContainerAgentConfigInput {
                     .overlay(idle_cleanup),
             );
         }
+        if let Some(access_flow_relay) = &later.access_flow_relay {
+            self.access_flow_relay = Some(access_flow_relay.clone());
+        }
         Ok(self)
     }
 
@@ -191,6 +281,7 @@ impl ContainerAgentConfigInput {
                 .idle_cleanup
                 .map(IdleCleanupConfigInput::into_effective)
                 .transpose()?,
+            access_flow_relay: self.access_flow_relay,
         };
         cfg.validate_gateway()?;
         Ok(cfg)
@@ -206,7 +297,7 @@ impl ContainerAgentConfigInput {
         }
         for service in &self.services {
             for dep in &service.depends_on {
-                if !names.contains(dep) {
+                if dep != ACCESS_FLOW_RELAY_NODE && !names.contains(dep) {
                     anyhow::bail!(
                         "service {:?} depends on unknown service {:?}",
                         service.name,
@@ -215,7 +306,7 @@ impl ContainerAgentConfigInput {
                 }
             }
         }
-        validate_service_dependency_graph(&self.services)?;
+        validate_service_dependency_graph(&self.services, self.access_flow_relay.as_ref())?;
         if let Some(ssh_bridge) = &self.ssh_bridge {
             ssh_bridge.validate_partial_gateway()?;
         }
@@ -230,6 +321,9 @@ impl ContainerAgentConfigInput {
         }
         if let Some(idle_cleanup) = &self.idle_cleanup {
             idle_cleanup.clone().into_effective()?;
+        }
+        if let Some(relay) = &self.access_flow_relay {
+            relay.validate(AccessFlowRelayValidationMode::Gateway)?;
         }
         Ok(())
     }
@@ -255,11 +349,29 @@ impl ControlSocketConfig {
     }
 }
 
-fn validate_service_dependency_graph(services: &[ServiceConfig]) -> anyhow::Result<()> {
-    let services_by_name: BTreeMap<&str, &ServiceConfig> = services
+fn validate_service_dependency_graph(
+    services: &[ServiceConfig],
+    relay: Option<&AccessFlowRelayConfig>,
+) -> anyhow::Result<()> {
+    let mut graph: BTreeMap<&str, Vec<&str>> = services
         .iter()
-        .map(|service| (service.name.as_str(), service))
+        .map(|service| {
+            (
+                service.name.as_str(),
+                service.depends_on.iter().map(String::as_str).collect(),
+            )
+        })
         .collect();
+    if let Some(relay) = relay {
+        graph.insert(
+            ACCESS_FLOW_RELAY_NODE,
+            relay
+                .start_after_services
+                .iter()
+                .map(String::as_str)
+                .collect(),
+        );
+    }
     let mut visiting = BTreeSet::new();
     let mut visited = BTreeSet::new();
     let mut stack = Vec::new();
@@ -267,7 +379,16 @@ fn validate_service_dependency_graph(services: &[ServiceConfig]) -> anyhow::Resu
     for service in services {
         visit_service_dependency(
             service.name.as_str(),
-            &services_by_name,
+            &graph,
+            &mut visiting,
+            &mut visited,
+            &mut stack,
+        )?;
+    }
+    if relay.is_some() {
+        visit_service_dependency(
+            ACCESS_FLOW_RELAY_NODE,
+            &graph,
             &mut visiting,
             &mut visited,
             &mut stack,
@@ -278,7 +399,7 @@ fn validate_service_dependency_graph(services: &[ServiceConfig]) -> anyhow::Resu
 
 fn visit_service_dependency<'a>(
     name: &'a str,
-    services_by_name: &BTreeMap<&'a str, &'a ServiceConfig>,
+    graph: &BTreeMap<&'a str, Vec<&'a str>>,
     visiting: &mut BTreeSet<&'a str>,
     visited: &mut BTreeSet<&'a str>,
     stack: &mut Vec<&'a str>,
@@ -298,9 +419,9 @@ fn visit_service_dependency<'a>(
 
     visiting.insert(name);
     stack.push(name);
-    if let Some(service) = services_by_name.get(name) {
-        for dep in &service.depends_on {
-            visit_service_dependency(dep.as_str(), services_by_name, visiting, visited, stack)?;
+    if let Some(dependencies) = graph.get(name) {
+        for dep in dependencies {
+            visit_service_dependency(dep, graph, visiting, visited, stack)?;
         }
     }
     stack.pop();
@@ -309,7 +430,7 @@ fn visit_service_dependency<'a>(
     Ok(())
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     pub name: String,
@@ -332,14 +453,43 @@ pub struct ServiceConfig {
     pub health_check: Option<HealthCheck>,
 }
 
+impl std::fmt::Debug for ServiceConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServiceConfig")
+            .field("name", &self.name)
+            .field("required", &self.required)
+            .field("user", &self.user)
+            .field("command", &self.command)
+            .field("cwd", &self.cwd)
+            .field("restart", &self.restart)
+            .field("restart_backoff", &self.restart_backoff)
+            .field("restart_backoff_max", &self.restart_backoff_max)
+            .field("startup_timeout", &self.startup_timeout)
+            .field("shutdown_timeout", &self.shutdown_timeout)
+            .field("depends_on", &self.depends_on)
+            .field("env_entry_count", &self.env.len())
+            .field("health_check", &self.health_check)
+            .finish()
+    }
+}
+
 impl ServiceConfig {
     fn validate(&self, user_template_mode: ServiceUserTemplateMode) -> anyhow::Result<()> {
         validate_name("service", &self.name)?;
         validate_service_user(&self.user, user_template_mode)?;
         validate_command("service.command", &self.command)?;
         for dep in &self.depends_on {
-            validate_name("depends_on", dep)?;
+            if dep == REMOVED_LOCAL_FLOW_RELAY_NODE {
+                anyhow::bail!(
+                    "depends_on uses removed node {REMOVED_LOCAL_FLOW_RELAY_NODE:?}; use {ACCESS_FLOW_RELAY_NODE:?}"
+                );
+            }
+            if dep != ACCESS_FLOW_RELAY_NODE {
+                validate_name("depends_on", dep)?;
+            }
         }
+        self.validate_identity_environment_contract()?;
         for key in self.env.keys() {
             validate_env_key(key)?;
         }
@@ -371,6 +521,327 @@ impl ServiceConfig {
         }
         Ok(())
     }
+
+    fn validate_identity_environment_contract(&self) -> anyhow::Result<()> {
+        for (key, value) in &self.env {
+            let reserved_destination = key == "AW_IDENTITY_TOKEN";
+            let canonical_source = value.inherit.as_deref() == Some("AW_IDENTITY_TOKEN");
+            if (reserved_destination && !value.is_canonical_identity_inheritance())
+                || (!reserved_destination && canonical_source)
+            {
+                anyhow::bail!(
+                    "container_agent service deployment identity environment contract is invalid"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn needs_identity_token(&self) -> bool {
+        self.env
+            .get("AW_IDENTITY_TOKEN")
+            .is_some_and(EnvValue::is_canonical_identity_inheritance)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessFlowRelayConfig {
+    pub setup_timeout: String,
+    pub drain_timeout: String,
+    pub max_connections: usize,
+    pub copy_buffer_bytes_per_direction: usize,
+    #[serde(default)]
+    pub start_after_services: Vec<String>,
+    pub presentation: AccessFlowRelayPresentation,
+    pub routes: Vec<AccessFlowRelayRoute>,
+}
+
+impl AccessFlowRelayConfig {
+    fn validate(&self, mode: AccessFlowRelayValidationMode) -> anyhow::Result<()> {
+        self.presentation.validate()?;
+        let _ = self.compile(mode)?;
+        Ok(())
+    }
+
+    pub(crate) fn compile(
+        &self,
+        mode: AccessFlowRelayValidationMode,
+    ) -> anyhow::Result<CompiledAccessFlowRelayConfig> {
+        self.compile_with_presentation(mode, self.presentation.validation_value()?)
+    }
+
+    pub(crate) fn compile_with_presentation(
+        &self,
+        mode: AccessFlowRelayValidationMode,
+        presentation: IdentityPresentation,
+    ) -> anyhow::Result<CompiledAccessFlowRelayConfig> {
+        let setup_timeout = parse_duration(&self.setup_timeout)
+            .context("container_agent.access_flow_relay.setup_timeout")?;
+        let drain_timeout = parse_duration(&self.drain_timeout)
+            .context("container_agent.access_flow_relay.drain_timeout")?;
+        if drain_timeout.is_zero() || drain_timeout > Duration::from_secs(300) {
+            anyhow::bail!(
+                "container_agent.access_flow_relay.drain_timeout must be between 1ms and 5m"
+            );
+        }
+        let max_connections = NonZeroUsize::new(self.max_connections).ok_or_else(|| {
+            anyhow::anyhow!("container_agent.access_flow_relay.max_connections must be nonzero")
+        })?;
+        let copy_buffer_bytes_per_direction = NonZeroUsize::new(
+            self.copy_buffer_bytes_per_direction,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "container_agent.access_flow_relay.copy_buffer_bytes_per_direction must be nonzero"
+            )
+        })?;
+
+        let mut dependencies = BTreeSet::new();
+        for dependency in &self.start_after_services {
+            validate_name(
+                "container_agent.access_flow_relay.start_after_services",
+                dependency,
+            )?;
+            if !dependencies.insert(dependency) {
+                anyhow::bail!(
+                    "container_agent.access_flow_relay.start_after_services contains duplicate {dependency:?}"
+                );
+            }
+        }
+
+        let mut routes = Vec::with_capacity(self.routes.len());
+        for route in &self.routes {
+            routes.push(route.compile(mode)?);
+        }
+        let plan = AccessFlowRelayPlan::new(
+            routes,
+            presentation,
+            setup_timeout,
+            max_connections,
+            copy_buffer_bytes_per_direction,
+        )
+        .map_err(map_relay_plan_error)?;
+        Ok(CompiledAccessFlowRelayConfig {
+            plan,
+            drain_timeout,
+        })
+    }
+
+    pub(crate) fn render(&mut self, vars: &BTreeMap<String, String>) -> anyhow::Result<()> {
+        for route in &mut self.routes {
+            route.listen = template::render(&route.listen, vars)?;
+            match &mut route.transport {
+                AccessFlowRelayTransport::Unix { path } => {
+                    *path = template::render(path, vars)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AccessFlowRelayValidationMode {
+    Gateway,
+    Agent,
+}
+
+pub(crate) struct CompiledAccessFlowRelayConfig {
+    pub(crate) plan: AccessFlowRelayPlan<UnixAccessFlowEndpoint>,
+    pub(crate) drain_timeout: Duration,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AccessFlowRelayPresentation {
+    Disabled {},
+    Anonymous {},
+    BearerEnvironment { variable: String },
+}
+
+impl std::fmt::Debug for AccessFlowRelayPresentation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled {} => formatter.write_str("Disabled"),
+            Self::Anonymous {} => formatter.write_str("Anonymous"),
+            Self::BearerEnvironment { .. } => formatter
+                .debug_struct("BearerEnvironment")
+                .field("variable", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
+impl AccessFlowRelayPresentation {
+    pub fn environment_variable(&self) -> Option<&str> {
+        match self {
+            Self::BearerEnvironment { variable } => Some(variable),
+            Self::Disabled {} | Self::Anonymous {} => None,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if let Some(variable) = self.environment_variable() {
+            validate_presentation_source(variable)?;
+        }
+        Ok(())
+    }
+
+    fn validation_value(&self) -> anyhow::Result<IdentityPresentation> {
+        match self {
+            Self::Disabled {} => Ok(IdentityPresentation::Disabled),
+            Self::Anonymous {} => Ok(IdentityPresentation::Anonymous),
+            Self::BearerEnvironment { .. } => Ok(IdentityPresentation::Bearer(
+                SensitiveBearer::new(b"abcdefghijklmnopqrstuvwxyzABCDEF")
+                    .context("construct access flow bearer validation value")?,
+            )),
+        }
+    }
+}
+
+fn validate_presentation_source(variable: &str) -> anyhow::Result<()> {
+    let bytes = variable.as_bytes();
+    let valid_start = bytes
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_');
+    if bytes.len() > 256
+        || !valid_start
+        || !bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        anyhow::bail!(
+            "container_agent.access_flow_relay.presentation.variable must match [A-Za-z_][A-Za-z0-9_]* and be at most 256 bytes"
+        );
+    }
+    if variable != "AW_IDENTITY_TOKEN"
+        && variable
+            .strip_prefix("AW_ACCESS_FLOW_")
+            .is_none_or(str::is_empty)
+    {
+        anyhow::bail!(
+            "container_agent.access_flow_relay.presentation.variable must use the AW Access Flow source namespace"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessFlowRelayRoute {
+    pub name: String,
+    pub listen: String,
+    pub allowed_destination_ports: Vec<u16>,
+    pub transport: AccessFlowRelayTransport,
+}
+
+impl AccessFlowRelayRoute {
+    fn compile(
+        &self,
+        mode: AccessFlowRelayValidationMode,
+    ) -> anyhow::Result<AccessFlowRoute<UnixAccessFlowEndpoint>> {
+        let (listen, path) = match mode {
+            AccessFlowRelayValidationMode::Gateway => {
+                validate_template(
+                    "container_agent.access_flow_relay.routes.listen",
+                    &self.listen,
+                    GATEWAY_TEMPLATE_VARS,
+                )?;
+                let path = match &self.transport {
+                    AccessFlowRelayTransport::Unix { path } => {
+                        validate_template(
+                            "container_agent.access_flow_relay.routes.transport.path",
+                            path,
+                            GATEWAY_TEMPLATE_VARS,
+                        )?;
+                        path
+                    }
+                };
+                if self.listen.contains('{') {
+                    anyhow::bail!(
+                        "container_agent.access_flow_relay.routes.listen must be a literal IPv4 loopback address"
+                    );
+                }
+                let listen = self.listen.parse::<SocketAddrV4>()?;
+                if path.contains('{') {
+                    return self.compile_placeholder(listen);
+                }
+                (listen, path)
+            }
+            AccessFlowRelayValidationMode::Agent => {
+                validate_template(
+                    "container_agent.access_flow_relay.routes.listen",
+                    &self.listen,
+                    &[],
+                )?;
+                let path = match &self.transport {
+                    AccessFlowRelayTransport::Unix { path } => {
+                        validate_template(
+                            "container_agent.access_flow_relay.routes.transport.path",
+                            path,
+                            &[],
+                        )?;
+                        path
+                    }
+                };
+                (self.listen.parse::<SocketAddrV4>()?, path)
+            }
+        };
+        self.compile_values(listen, path)
+    }
+
+    fn compile_placeholder(
+        &self,
+        listen: SocketAddrV4,
+    ) -> anyhow::Result<AccessFlowRoute<UnixAccessFlowEndpoint>> {
+        let name = AccessFlowRouteName::new(self.name.clone()).map_err(map_relay_plan_error)?;
+        let placeholder_path = format!("/run/aw-gateway/{}.sock", name.as_str());
+        self.compile_values(listen, &placeholder_path)
+    }
+
+    fn compile_values(
+        &self,
+        listen: SocketAddrV4,
+        path: &str,
+    ) -> anyhow::Result<AccessFlowRoute<UnixAccessFlowEndpoint>> {
+        let endpoint = UnixAccessFlowEndpoint::new(
+            NormalizedUnixSocketPath::new(path)
+                .context("container_agent.access_flow_relay.routes.transport.path is invalid")?,
+        );
+        endpoint.validate_for(UnixExecutionTarget::Linux).context(
+            "container_agent.access_flow_relay.routes.transport.path exceeds Linux pathname capacity",
+        )?;
+        let ports = self
+            .allowed_destination_ports
+            .iter()
+            .copied()
+            .map(|port| {
+                NonZeroU16::new(port).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "container_agent.access_flow_relay.routes.allowed_destination_ports cannot contain zero"
+                    )
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        AccessFlowRoute::new(
+            AccessFlowRouteName::new(self.name.clone()).map_err(map_relay_plan_error)?,
+            listen,
+            ports,
+            endpoint,
+        )
+        .map_err(map_relay_plan_error)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AccessFlowRelayTransport {
+    Unix { path: String },
+}
+
+fn map_relay_plan_error(error: AccessFlowRelayPlanError) -> anyhow::Error {
+    anyhow::anyhow!("invalid container_agent.access_flow_relay: {error}")
 }
 
 fn validate_service_user(user: &str, template_mode: ServiceUserTemplateMode) -> anyhow::Result<()> {
@@ -391,7 +862,7 @@ pub enum RestartPolicy {
     Always,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnvValue {
     pub value: Option<String>,
@@ -403,7 +874,28 @@ pub struct EnvValue {
     pub required: bool,
 }
 
+impl std::fmt::Debug for EnvValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnvValue")
+            .field("value", &self.value.as_ref().map(|_| "<redacted>"))
+            .field("file", &self.file.as_ref().map(|_| "<redacted>"))
+            .field("inherit", &self.inherit.as_ref().map(|_| "<redacted>"))
+            .field("interpolate", &self.interpolate)
+            .field("required", &self.required)
+            .finish()
+    }
+}
+
 impl EnvValue {
+    fn is_canonical_identity_inheritance(&self) -> bool {
+        self.value.is_none()
+            && self.file.is_none()
+            && self.inherit.as_deref() == Some("AW_IDENTITY_TOKEN")
+            && self.interpolate
+            && self.required
+    }
+
     pub fn resolve(&self, vars: &BTreeMap<String, String>) -> anyhow::Result<Option<String>> {
         self.validate()?;
         let value = if let Some(value) = &self.value {

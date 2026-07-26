@@ -25,6 +25,16 @@ pub(super) async fn status_payload(state: &AgentState) -> AgentStatus {
     {
         ready = false;
     }
+    let access_flow_relay = match &state.access_flow_relay {
+        Some(relay) => {
+            let status = relay.status().await;
+            if !status.ready {
+                ready = false;
+            }
+            Some(status)
+        }
+        None => None,
+    };
     AgentStatus {
         ready,
         version: VERSION.to_string(),
@@ -37,6 +47,7 @@ pub(super) async fn status_payload(state: &AgentState) -> AgentStatus {
             active_streams: state.active_streams.load(Ordering::SeqCst),
             active_sessions: state.active_sessions.load(Ordering::SeqCst),
         },
+        access_flow_relay,
         idle_cleanup: idle_cleanup_status(state).await,
         shutting_down: state.shutting_down.load(Ordering::SeqCst),
     }

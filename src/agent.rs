@@ -3,6 +3,7 @@ mod control;
 mod idle;
 mod lifecycle;
 mod process;
+mod relay;
 mod service;
 mod socket;
 mod state;
@@ -13,18 +14,26 @@ use crate::config::{ContainerAgentFile, ControlSocketConfig};
 use crate::fileutil;
 use crate::paths;
 use crate::template::{self, Vars};
+use access_identity::{IdentityPresentation, SensitiveBearer};
+#[cfg(test)]
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(test)]
+use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use bridge::run_bridge;
 use control::{run_control_socket, wait_for_shutdown_signal};
 use idle::run_idle_cleanup;
+use relay::{RelayControl, run_relay_supervisor};
 use service::{ManagedService, service_supervisor};
 use state::{AgentState, SocketOwner};
 
 pub const DEFAULT_AGENT_CONFIG: &str = include_str!("../container-agent.sample.toml");
 
-pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
+pub fn run(args: AgentArgs) -> anyhow::Result<()> {
     match args.command {
         Some(AgentCommand::Config(AgentConfigCommand::Validate)) => {
             let path = paths::agent_config_path(args.config);
@@ -49,12 +58,126 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
             println!("{}", path.display());
             Ok(())
         }
-        Some(AgentCommand::Run) | None => run_agent(args.config).await,
+        Some(AgentCommand::Run) | None => {
+            let prepared = prepare_agent(args.config)?;
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(run_agent(prepared))
+        }
     }
 }
 
-async fn run_agent(config_path: Option<PathBuf>) -> anyhow::Result<()> {
+struct PreparedAgent {
+    cfg: ContainerAgentFile,
+    relay_presentation: Option<IdentityPresentation>,
+    service_identity_token: Option<Arc<SensitiveBearer>>,
+}
+
+fn prepare_agent(config_path: Option<PathBuf>) -> anyhow::Result<PreparedAgent> {
     let cfg = ContainerAgentFile::load(&paths::agent_config_path(config_path))?;
+    let (relay_presentation, service_identity_token) =
+        activate_identity_environment(&cfg.container_agent)?;
+    Ok(PreparedAgent {
+        cfg,
+        relay_presentation,
+        service_identity_token,
+    })
+}
+
+fn activate_identity_environment(
+    config: &crate::config::ContainerAgentConfig,
+) -> anyhow::Result<(Option<IdentityPresentation>, Option<Arc<SensitiveBearer>>)> {
+    activate_identity_environment_with(config, take_identity_environment)
+}
+
+fn activate_identity_environment_with(
+    config: &crate::config::ContainerAgentConfig,
+    mut take_environment: impl FnMut(&str) -> Option<Zeroizing<Vec<u8>>>,
+) -> anyhow::Result<(Option<IdentityPresentation>, Option<Arc<SensitiveBearer>>)> {
+    const CANONICAL_SOURCE: &str = "AW_IDENTITY_TOKEN";
+
+    let relay_source = config
+        .access_flow_relay
+        .as_ref()
+        .and_then(|relay| relay.presentation.environment_variable());
+    let custom_relay_source = relay_source.filter(|source| *source != CANONICAL_SOURCE);
+    let canonical_required =
+        config.services_need_identity_token() || relay_source == Some(CANONICAL_SOURCE);
+
+    // Consume every required locator before validating any value so an error
+    // cannot leave another required bearer in the process environment.
+    let canonical_value = if canonical_required {
+        take_environment(CANONICAL_SOURCE)
+    } else {
+        None
+    };
+    let custom_relay_value = custom_relay_source.and_then(&mut take_environment);
+
+    let relay_presentation = config
+        .access_flow_relay
+        .as_ref()
+        .map(|relay| match &relay.presentation {
+            crate::config::AccessFlowRelayPresentation::Disabled {} => {
+                Ok(IdentityPresentation::Disabled)
+            }
+            crate::config::AccessFlowRelayPresentation::Anonymous {} => {
+                Ok(IdentityPresentation::Anonymous)
+            }
+            crate::config::AccessFlowRelayPresentation::BearerEnvironment { variable } => {
+                let value = if variable == CANONICAL_SOURCE {
+                    canonical_value.as_deref()
+                } else {
+                    custom_relay_value.as_deref()
+                }
+                .ok_or_else(|| anyhow::anyhow!("required agent identity environment is missing"))?;
+                validated_sensitive_bearer(value).map(IdentityPresentation::Bearer)
+            }
+        })
+        .transpose()?;
+
+    let service_identity_token = config
+        .services_need_identity_token()
+        .then(|| {
+            let value = canonical_value
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("required agent identity environment is missing"))?;
+            validated_sensitive_bearer(value).map(Arc::new)
+        })
+        .transpose()?;
+
+    Ok((relay_presentation, service_identity_token))
+}
+
+fn take_identity_environment(variable: &str) -> Option<Zeroizing<Vec<u8>>> {
+    let value = std::env::var_os(variable);
+    // SAFETY: agent preparation runs before the Tokio runtime or any worker
+    // thread is constructed.
+    unsafe {
+        std::env::remove_var(variable);
+    }
+    value.map(|value| Zeroizing::new(value.into_vec()))
+}
+
+fn validated_sensitive_bearer(value: &[u8]) -> anyhow::Result<SensitiveBearer> {
+    SensitiveBearer::new(value)
+        .map_err(|_| anyhow::anyhow!("required agent identity environment is invalid"))
+}
+
+#[cfg(test)]
+fn sensitive_bearer_from_environment(value: OsString) -> anyhow::Result<IdentityPresentation> {
+    let mut bytes = value.into_vec();
+    let bearer = validated_sensitive_bearer(&bytes);
+    bytes.zeroize();
+    bearer.map(IdentityPresentation::Bearer)
+}
+
+async fn run_agent(prepared: PreparedAgent) -> anyhow::Result<()> {
+    let PreparedAgent {
+        cfg,
+        relay_presentation,
+        service_identity_token,
+    } = prepared;
     let state_dir = std::env::var_os("AW_CONTAINER_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(paths::DEFAULT_AGENT_STATE_DIR));
@@ -65,12 +188,21 @@ async fn run_agent(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         .as_ref()
         .is_some_and(|bridge| bridge.enabled);
     let socket_owner = SocketOwner::from_env()?;
+    let (access_flow_relay, relay_commands) = cfg
+        .container_agent
+        .access_flow_relay
+        .as_ref()
+        .map(RelayControl::configured)
+        .map_or((None, None), |(control, commands)| {
+            (Some(control), Some(commands))
+        });
     let state = Arc::new(AgentState::new(
         state_dir.clone(),
         cfg.container_agent.idle_cleanup.clone(),
         bridge_enabled,
         std::env::var("AW_CONTAINER_CONTROL_TOKEN").ok(),
         socket_owner,
+        access_flow_relay.clone(),
     ));
 
     let services: Vec<_> = cfg
@@ -79,17 +211,39 @@ async fn run_agent(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         .clone()
         .into_iter()
         .map(|service| {
-            Arc::new(ManagedService::new(
+            let identity_token = service
+                .needs_identity_token()
+                .then(|| service_identity_token.clone())
+                .flatten();
+            Arc::new(ManagedService::new_with_identity_token(
                 service,
                 state_dir.clone(),
                 cfg.logging.clone(),
+                identity_token,
             ))
         })
         .collect();
     *state.services.lock().await = services.clone();
     for service in services.clone() {
-        tokio::spawn(service_supervisor(service, services.clone()));
+        tokio::spawn(service_supervisor(service, services.clone(), state.clone()));
     }
+    let relay_task = if let (Some(config), Some(presentation), Some(control), Some(commands)) = (
+        cfg.container_agent.access_flow_relay.clone(),
+        relay_presentation,
+        access_flow_relay,
+        relay_commands,
+    ) {
+        Some(tokio::spawn(run_relay_supervisor(
+            config,
+            presentation,
+            services.clone(),
+            state.clone(),
+            control,
+            commands,
+        )))
+    } else {
+        None
+    };
 
     if let Some(bridge) = cfg
         .container_agent
@@ -115,16 +269,123 @@ async fn run_agent(config_path: Option<PathBuf>) -> anyhow::Result<()> {
         });
     }
 
-    if let Some(control_socket) = configured_control_socket(&cfg.container_agent.control_socket) {
-        let mut vars = Vars::new();
-        vars.insert(
-            "container_state_dir".into(),
-            state_dir.display().to_string(),
-        );
-        let control_socket = PathBuf::from(template::render(&control_socket, &vars)?);
-        run_control_socket(state, &control_socket).await
+    let control: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>> =
+        if let Some(control_socket) = configured_control_socket(&cfg.container_agent.control_socket)
+        {
+            let mut vars = Vars::new();
+            vars.insert(
+                "container_state_dir".into(),
+                state_dir.display().to_string(),
+            );
+            let control_socket = PathBuf::from(template::render(&control_socket, &vars)?);
+            let state = state.clone();
+            Box::pin(async move { run_control_socket(state, &control_socket).await })
+        } else {
+            Box::pin(wait_for_shutdown_signal(state.clone()))
+        };
+    tokio::pin!(control);
+    if let Some(mut relay_task) = relay_task {
+        enum AgentEvent {
+            Control(anyhow::Result<()>),
+            RelayFatal(relay::RelayFatalKind),
+            RelayTerminated(Result<anyhow::Result<()>, tokio::task::JoinError>),
+        }
+        let event = tokio::select! {
+            result = &mut control => AgentEvent::Control(result),
+            fatal = wait_for_relay_fatal(&state) => AgentEvent::RelayFatal(fatal),
+            result = &mut relay_task => AgentEvent::RelayTerminated(result),
+        };
+        match event {
+            AgentEvent::Control(result) => {
+                if !state
+                    .shutting_down
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    lifecycle::shutdown_agent(state.clone()).await;
+                }
+                let relay_result = relay_task.await;
+                if let Some(fatal) = state.relay_fatal() {
+                    return finish_relay_fatal_shutdown(state, fatal).await;
+                }
+                if let Some(fatal) = relay_termination_fatal_kind(
+                    &relay_result,
+                    state
+                        .shutting_down
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ) {
+                    return finish_relay_fatal_shutdown(state, fatal).await;
+                }
+                result
+            }
+            AgentEvent::RelayFatal(fatal) => {
+                let result = finish_relay_fatal_shutdown(state, fatal).await;
+                let _ = relay_task.await;
+                result
+            }
+            AgentEvent::RelayTerminated(result) => {
+                let shutting_down = state
+                    .shutting_down
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if let Some(fatal) = state
+                    .relay_fatal()
+                    .or_else(|| relay_termination_fatal_kind(&result, shutting_down))
+                {
+                    finish_relay_fatal_shutdown(state, fatal).await
+                } else {
+                    control.await
+                }
+            }
+        }
     } else {
-        wait_for_shutdown_signal(state).await
+        control.await
+    }
+}
+
+fn relay_termination_fatal_kind(
+    result: &Result<anyhow::Result<()>, tokio::task::JoinError>,
+    shutting_down: bool,
+) -> Option<relay::RelayFatalKind> {
+    match result {
+        Err(_) => Some(relay::RelayFatalKind::ManagerPanic),
+        Ok(result) => relay_manager_completion_fatal_kind(result, shutting_down),
+    }
+}
+
+fn relay_manager_completion_fatal_kind(
+    result: &anyhow::Result<()>,
+    shutting_down: bool,
+) -> Option<relay::RelayFatalKind> {
+    match result {
+        Err(_) => Some(relay::RelayFatalKind::ManagerFailure),
+        Ok(()) if !shutting_down => Some(relay::RelayFatalKind::UnexpectedExit),
+        Ok(()) => None,
+    }
+}
+
+async fn finish_relay_fatal_shutdown(
+    state: Arc<AgentState>,
+    fatal: relay::RelayFatalKind,
+) -> anyhow::Result<()> {
+    state.publish_relay_fatal(fatal);
+    let delay =
+        lifecycle::shutdown_watchdog_delay(&state, std::time::Duration::from_secs(30)).await;
+    lifecycle::schedule_forced_exit_after(
+        state.clone(),
+        delay,
+        "access-flow-relay-failure",
+        lifecycle::ForcedExitStatus::Fatal,
+    );
+    lifecycle::shutdown_agent(state).await;
+    anyhow::bail!("access flow relay terminated unexpectedly ({fatal:?})")
+}
+
+async fn wait_for_relay_fatal(state: &AgentState) -> relay::RelayFatalKind {
+    loop {
+        let notified = state.relay_fatal_notify.notified();
+        if let Some(fatal) = state.relay_fatal() {
+            return fatal;
+        }
+        notified.await;
     }
 }
 
@@ -143,30 +404,401 @@ mod tests {
     use super::*;
     use crate::agent::control::unauthorized_if_needed;
     use crate::agent::idle::build_reap_plan;
-    use crate::agent::lifecycle::{shutdown_agent, shutdown_watchdog_delay};
+    use crate::agent::lifecycle::{ForcedExitStatus, shutdown_agent, shutdown_watchdog_delay};
     use crate::agent::process::{ProcInfo, current_uid, process_exists};
     use crate::agent::service::{
-        RotatingServiceLog, health_check_interval, health_check_timeout, resolve_service_user,
-        service_stop_order, should_restart, wait_for_dependencies,
+        RotatingServiceLog, health_check_interval, health_check_timeout,
+        relay_dependent_service_stop_order, resolve_service_user, service_stop_order,
+        should_restart, wait_for_dependencies,
     };
     use crate::agent::socket::validate_control_peer;
     use crate::agent::status::status_payload;
     use crate::agent_control::ControlRequest;
+    #[cfg(target_os = "linux")]
     use crate::config::{
-        HealthCheck, IdleCleanupAction, IdleCleanupConfig, LoggingConfig, RestartPolicy,
-        ServiceConfig,
+        AccessFlowRelayPresentation, AccessFlowRelayValidationMode, GatewayConfig,
+    };
+    use crate::config::{
+        ContainerAgentConfig, ContainerAgentFile, HealthCheck, IdleCleanupAction,
+        IdleCleanupConfig, LoggingConfig, RestartPolicy, ServiceConfig,
     };
     use crate::health_probe::{JsonFieldCheck, check_json_fields};
+    #[cfg(target_os = "linux")]
+    use access_flow::write_access_flow_preface;
+    #[cfg(target_os = "linux")]
+    use access_flow_conformance::{
+        FixturePresentationKind, NormalizedAccessFlowTransport, load_adapter_parity_fixture,
+        load_awaf_vector_suite, project_relay_plan,
+    };
+    #[cfg(target_os = "linux")]
+    use access_flow_unix::{NormalizedUnixSocketPath, UnixAccessFlowEndpoint};
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::atomic::Ordering;
-    use tokio::io::AsyncWriteExt;
+    #[cfg(target_os = "linux")]
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
-    use tokio::time::{Duration, Instant, sleep};
+
+    #[cfg(target_os = "linux")]
+    const PRODUCT_HTTP_ENDPOINT: &str = "/run/acl-proxy/transparent-http.sock";
+    #[cfg(target_os = "linux")]
+    const PRODUCT_HTTPS_ENDPOINT: &str = "/run/acl-proxy/transparent-https.sock";
+    #[cfg(target_os = "linux")]
+    const CONFORMANCE_HTTP_ENDPOINT: &str = "/run/access-flow/conformance-http.sock";
+    #[cfg(target_os = "linux")]
+    const CONFORMANCE_HTTPS_ENDPOINT: &str = "/run/access-flow/conformance-https.sock";
+
+    #[cfg(target_os = "linux")]
+    fn product_gateway_config() -> GatewayConfig {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/apple-container/gateway-host-proxy.toml");
+        let config = GatewayConfig::load(&path).unwrap();
+        config.validate().unwrap();
+        config
+    }
+
+    #[cfg(target_os = "linux")]
+    fn normalize_product_endpoint(
+        endpoint: &UnixAccessFlowEndpoint,
+    ) -> anyhow::Result<NormalizedAccessFlowTransport> {
+        let normalized = match endpoint.path().as_str() {
+            PRODUCT_HTTP_ENDPOINT => CONFORMANCE_HTTP_ENDPOINT,
+            PRODUCT_HTTPS_ENDPOINT => CONFORMANCE_HTTPS_ENDPOINT,
+            _ => anyhow::bail!("unrecognized AW Gateway Access Flow endpoint"),
+        };
+        Ok(NormalizedAccessFlowTransport::unix(normalized)?)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn product_access_flow_relay_matches_shared_adapter_fixture() {
+        let config = product_gateway_config();
+        let target = config.effective_target("ubuntu-host-proxy").unwrap();
+        let relay = target.container_agent.access_flow_relay.unwrap();
+        let AccessFlowRelayPresentation::BearerEnvironment { variable } = &relay.presentation
+        else {
+            panic!("shipped host-proxy relay must use bearer_environment");
+        };
+        assert_eq!(variable, "AW_IDENTITY_TOKEN");
+        let compiled = relay
+            .compile_with_presentation(
+                AccessFlowRelayValidationMode::Agent,
+                IdentityPresentation::Disabled,
+            )
+            .unwrap();
+
+        let product_paths = compiled
+            .plan
+            .routes()
+            .iter()
+            .map(|route| route.endpoint().path().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            product_paths,
+            [PRODUCT_HTTP_ENDPOINT, PRODUCT_HTTPS_ENDPOINT]
+        );
+
+        let projected = project_relay_plan(&compiled.plan, compiled.drain_timeout, |endpoint| {
+            normalize_product_endpoint(endpoint).unwrap()
+        });
+        assert_eq!(
+            projected,
+            *load_adapter_parity_fixture().unwrap().relay_plan()
+        );
+
+        let unknown_path = "/run/acl-proxy/unrecognized-sensitive-name.sock";
+        let unknown =
+            UnixAccessFlowEndpoint::new(NormalizedUnixSocketPath::new(unknown_path).unwrap());
+        let error = normalize_product_endpoint(&unknown)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "unrecognized AW Gateway Access Flow endpoint");
+        assert!(!error.contains(unknown_path), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn product_access_flow_wire_matches_shared_named_vectors() {
+        const IDENTITY_SOURCE: &str = "AW_IDENTITY_TOKEN";
+        const BEARER: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyzABCDEF";
+
+        let config = product_gateway_config();
+        let target = config.effective_target("ubuntu-host-proxy").unwrap();
+        let suite = load_awaf_vector_suite().unwrap();
+        let adapter_fixture = load_adapter_parity_fixture().unwrap();
+        let vector_names = suite
+            .vectors()
+            .iter()
+            .map(|vector| vector.name())
+            .collect::<Vec<_>>();
+        let required_vector_names = adapter_fixture
+            .required_awaf_vectors()
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>();
+        assert_eq!(vector_names, required_vector_names);
+        assert_eq!(
+            suite
+                .vectors()
+                .iter()
+                .map(|vector| vector.name())
+                .collect::<Vec<_>>(),
+            [
+                "absent",
+                "anonymous",
+                "bearer",
+                "unicast-before-multicast",
+                "reserved-after-multicast",
+                "high-unicast-before-broadcast",
+            ]
+        );
+
+        for vector in suite.vectors() {
+            let bearer_expected = vector.presentation() == FixturePresentationKind::Bearer;
+            let presentation_config = match vector.presentation() {
+                FixturePresentationKind::Disabled => AccessFlowRelayPresentation::Disabled {},
+                FixturePresentationKind::Anonymous => AccessFlowRelayPresentation::Anonymous {},
+                FixturePresentationKind::Bearer => AccessFlowRelayPresentation::BearerEnvironment {
+                    variable: IDENTITY_SOURCE.to_string(),
+                },
+            };
+            let mut agent_config = target.container_agent.clone();
+            agent_config
+                .access_flow_relay
+                .as_mut()
+                .unwrap()
+                .presentation = presentation_config;
+
+            let mut identity_requests = Vec::new();
+            let (presentation, service_identity) =
+                activate_identity_environment_with(&agent_config, |variable| {
+                    identity_requests.push(variable.to_string());
+                    assert!(bearer_expected);
+                    assert_eq!(variable, IDENTITY_SOURCE);
+                    Some(Zeroizing::new(BEARER.to_vec()))
+                })
+                .unwrap();
+            assert!(service_identity.is_none());
+            if bearer_expected {
+                assert_eq!(identity_requests, [IDENTITY_SOURCE]);
+            } else {
+                assert!(identity_requests.is_empty());
+            }
+
+            let relay = agent_config.access_flow_relay.unwrap();
+            let compiled = relay
+                .compile_with_presentation(
+                    AccessFlowRelayValidationMode::Agent,
+                    presentation.unwrap(),
+                )
+                .unwrap();
+            let matching_routes = compiled
+                .plan
+                .routes()
+                .iter()
+                .filter(|route| {
+                    route
+                        .allowed_destination_ports()
+                        .contains(&vector.destination().port())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching_routes.len(),
+                1,
+                "{} must map to one product route",
+                vector.name()
+            );
+            let mapped_destination = access_flow::AccessFlowDestination::new(
+                vector.destination().address(),
+                matching_routes[0]
+                    .allowed_destination_ports()
+                    .iter()
+                    .find(|port| **port == vector.destination().port())
+                    .expect("matching route contains the vector port")
+                    .get(),
+            )
+            .unwrap();
+            assert_eq!(
+                mapped_destination,
+                vector.destination(),
+                "{}",
+                vector.name()
+            );
+            let mut wire = Zeroizing::new(Vec::<u8>::new());
+            write_access_flow_preface(&mut *wire, mapped_destination, compiled.plan.presentation())
+                .await
+                .unwrap();
+            assert_eq!(wire.as_slice(), vector.wire(), "vector {}", vector.name());
+        }
+    }
+
+    fn identity_activation_config(
+        relay_source: Option<&str>,
+        service_identity: bool,
+    ) -> ContainerAgentConfig {
+        let mut raw =
+            "schema_version = \"1\"\n[container_agent]\ncontrol_socket = false\n".to_string();
+        if let Some(source) = relay_source {
+            raw.push_str(&format!(
+                r#"
+[container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 4
+copy_buffer_bytes_per_direction = 4096
+
+[container_agent.access_flow_relay.presentation]
+kind = "bearer_environment"
+variable = "{source}"
+
+[[container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/tmp/access-flow.sock"
+"#
+            ));
+        }
+        if service_identity {
+            raw.push_str(
+                r#"
+[[container_agent.services]]
+name = "approved"
+command = ["/bin/true"]
+restart = "never"
+
+[container_agent.services.env]
+AW_IDENTITY_TOKEN = { inherit = "AW_IDENTITY_TOKEN" }
+"#,
+            );
+        }
+        toml::from_str::<ContainerAgentFile>(&raw)
+            .unwrap()
+            .container_agent
+    }
+
+    #[test]
+    fn identity_activation_matrix_reads_each_locator_once_into_independent_sensitive_state() {
+        const CANONICAL: &str = "AW_IDENTITY_TOKEN";
+        const CUSTOM: &str = "AW_ACCESS_FLOW_TEST_TOKEN";
+        let canonical_bearer = b"canonicalABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let custom_bearer = b"custom-bearer-ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+        for (relay_source, service_identity, expected_locators) in [
+            (Some(CANONICAL), false, vec![CANONICAL]),
+            (Some(CUSTOM), false, vec![CUSTOM]),
+            (None, true, vec![CANONICAL]),
+            (Some(CANONICAL), true, vec![CANONICAL]),
+            (Some(CUSTOM), true, vec![CANONICAL, CUSTOM]),
+        ] {
+            let config = identity_activation_config(relay_source, service_identity);
+            let mut values = BTreeMap::from([
+                (CANONICAL.to_string(), canonical_bearer.to_vec()),
+                (CUSTOM.to_string(), custom_bearer.to_vec()),
+            ]);
+            let mut locators = Vec::new();
+            let (relay, service) = activate_identity_environment_with(&config, |locator| {
+                locators.push(locator.to_string());
+                values.remove(locator).map(Zeroizing::new)
+            })
+            .unwrap();
+            locators.sort();
+            let mut expected: Vec<_> = expected_locators.into_iter().map(str::to_string).collect();
+            expected.sort();
+            assert_eq!(locators, expected);
+
+            match (relay_source, relay.as_ref()) {
+                (Some(CANONICAL), Some(IdentityPresentation::Bearer(bearer))) => {
+                    bearer.expose(|value| assert_eq!(value, canonical_bearer));
+                }
+                (Some(CUSTOM), Some(IdentityPresentation::Bearer(bearer))) => {
+                    bearer.expose(|value| assert_eq!(value, custom_bearer));
+                }
+                (None, None) => {}
+                _ => panic!("unexpected relay presentation"),
+            }
+            match (service_identity, service.as_ref()) {
+                (true, Some(bearer)) => {
+                    bearer.expose(|value| assert_eq!(value, canonical_bearer));
+                }
+                (false, None) => {}
+                _ => panic!("unexpected service identity state"),
+            }
+
+            if relay_source == Some(CANONICAL) && service_identity {
+                let relay_pointer = match relay.as_ref().unwrap() {
+                    IdentityPresentation::Bearer(bearer) => bearer.expose(|value| value.as_ptr()),
+                    _ => unreachable!(),
+                };
+                let service_pointer = service.as_ref().unwrap().expose(|value| value.as_ptr());
+                assert_ne!(relay_pointer, service_pointer);
+            }
+        }
+    }
+
+    #[test]
+    fn identity_activation_consumes_all_required_locators_before_sanitized_failure() {
+        const CANONICAL: &str = "AW_IDENTITY_TOKEN";
+        const CUSTOM: &str = "AW_ACCESS_FLOW_TEST_TOKEN";
+        let config = identity_activation_config(Some(CUSTOM), true);
+
+        for values in [
+            BTreeMap::new(),
+            BTreeMap::from([(CUSTOM.to_string(), b"invalid bearer".to_vec())]),
+            BTreeMap::from([(
+                CANONICAL.to_string(),
+                b"canonicalABCDEFGHIJKLMNOPQRSTUVWXYZ".to_vec(),
+            )]),
+        ] {
+            let mut values = values;
+            let mut locators = Vec::new();
+            let error = match activate_identity_environment_with(&config, |locator| {
+                locators.push(locator.to_string());
+                values.remove(locator).map(Zeroizing::new)
+            }) {
+                Ok(_) => panic!("identity activation unexpectedly succeeded"),
+                Err(error) => error.to_string(),
+            };
+            locators.sort();
+            let mut expected = vec![CANONICAL.to_string(), CUSTOM.to_string()];
+            expected.sort();
+            assert_eq!(locators, expected);
+            assert!(!error.contains(CANONICAL), "{error}");
+            assert!(!error.contains(CUSTOM), "{error}");
+            assert!(!error.contains("invalid bearer"), "{error}");
+        }
+    }
+    use tokio::time::{Duration, sleep};
 
     #[test]
     fn sample_agent_config_validates() {
         let cfg: ContainerAgentFile = toml::from_str(DEFAULT_AGENT_CONFIG).unwrap();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn bearer_environment_value_is_validated_into_sensitive_storage() {
+        let presentation =
+            sensitive_bearer_from_environment(OsString::from("abcdefghijklmnopqrstuvwxyzABCDEF"))
+                .unwrap();
+        let IdentityPresentation::Bearer(bearer) = presentation else {
+            panic!("expected bearer presentation");
+        };
+        assert_eq!(bearer.len(), 32);
+        bearer.expose(|value| assert_eq!(value, b"abcdefghijklmnopqrstuvwxyzABCDEF"));
+    }
+
+    #[test]
+    fn invalid_bearer_environment_error_is_secret_free() {
+        let error = sensitive_bearer_from_environment(OsString::from("short-secret"))
+            .err()
+            .expect("short bearer must fail")
+            .to_string();
+        assert_eq!(error, "required agent identity environment is invalid");
+        assert!(!error.contains("short-secret"));
     }
 
     #[test]
@@ -259,12 +891,13 @@ mod tests {
 
     #[test]
     fn control_auth_helper_requires_token_for_mutating_methods() {
-        let no_token_state = AgentState::new(PathBuf::from("/tmp"), None, false, None, None);
+        let no_token_state = AgentState::new(PathBuf::from("/tmp"), None, false, None, None, None);
         let token_state = AgentState::new(
             PathBuf::from("/tmp"),
             None,
             false,
             Some("secret".into()),
+            None,
             None,
         );
         let id = serde_json::Value::String("request".into());
@@ -357,17 +990,61 @@ mod tests {
 
     #[tokio::test]
     async fn dependency_wait_can_exceed_startup_timeout_until_dependency_is_healthy() {
-        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = reserved.local_addr().unwrap().port();
-        drop(reserved);
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let healthy = Arc::new(AtomicBool::new(false));
+        let server_healthy = Arc::clone(&healthy);
+        let (first_unhealthy_tx, first_unhealthy_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first_unhealthy_tx = Some(first_unhealthy_tx);
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 256];
+                loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+
+                let is_healthy = server_healthy.load(Ordering::Acquire);
+                let status = if is_healthy {
+                    "200 OK"
+                } else {
+                    "503 Service Unavailable"
+                };
+                let response =
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                if stream.write_all(response.as_bytes()).await.is_ok()
+                    && !is_healthy
+                    && let Some(sender) = first_unhealthy_tx.take()
+                {
+                    let _ = sender.send(());
+                }
+            }
+        });
+        let controller_healthy = Arc::clone(&healthy);
+        let controller = tokio::spawn(async move {
+            first_unhealthy_rx.await.unwrap();
+            sleep(Duration::from_millis(150)).await;
+            controller_healthy.store(true, Ordering::Release);
+        });
 
         let proxy = Arc::new(ManagedService::new(
             ServiceConfig {
-                health_check: Some(HealthCheck::Tcp {
-                    host: "127.0.0.1".into(),
-                    port,
+                health_check: Some(HealthCheck::Http {
+                    url: format!("http://127.0.0.1:{port}/ready"),
+                    expect_status: Some(200),
+                    expect_json: BTreeMap::new(),
                     interval: Some("10ms".into()),
-                    timeout: Some("10ms".into()),
+                    timeout: Some("250ms".into()),
                 }),
                 ..test_service("proxy", Vec::new())
             },
@@ -382,27 +1059,21 @@ mod tests {
             PathBuf::from("/tmp"),
             LoggingConfig::default(),
         );
-        let listener = tokio::spawn(async move {
-            sleep(Duration::from_millis(150)).await;
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-                .await
-                .unwrap();
-            let _ = listener.accept().await;
-        });
 
-        let started_at = Instant::now();
         let ready = tokio::time::timeout(
-            Duration::from_secs(2),
-            wait_for_dependencies(&sshd, &[proxy]),
+            Duration::from_secs(5),
+            wait_for_dependencies(&sshd, &[proxy], None),
         )
         .await
         .unwrap()
         .unwrap();
 
         assert!(ready);
-        assert!(started_at.elapsed() >= Duration::from_millis(100));
+        controller.await.unwrap();
+        assert!(healthy.load(Ordering::Acquire));
         assert!(sshd.last_error.lock().await.is_none());
-        listener.abort();
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -427,7 +1098,7 @@ mod tests {
         );
         sshd.stopping.store(true, Ordering::SeqCst);
 
-        let ready = wait_for_dependencies(&sshd, &[proxy]).await.unwrap();
+        let ready = wait_for_dependencies(&sshd, &[proxy], None).await.unwrap();
 
         assert!(!ready);
     }
@@ -471,7 +1142,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_is_not_ready_when_agent_is_shutting_down() {
-        let state = AgentState::new(PathBuf::from("/tmp"), None, true, None, None);
+        let state = AgentState::new(PathBuf::from("/tmp"), None, true, None, None, None);
         state.bridge_ready.store(true, Ordering::SeqCst);
         state.shutting_down.store(true, Ordering::SeqCst);
 
@@ -487,6 +1158,7 @@ mod tests {
             PathBuf::from("/tmp"),
             None,
             true,
+            None,
             None,
             None,
         ));
@@ -506,6 +1178,7 @@ mod tests {
             true,
             None,
             None,
+            None,
         ));
 
         assert!(shutdown_agent(state.clone()).await);
@@ -518,6 +1191,7 @@ mod tests {
             PathBuf::from("/tmp"),
             None,
             true,
+            None,
             None,
             None,
         ));
@@ -550,6 +1224,7 @@ mod tests {
             PathBuf::from("/tmp"),
             None,
             true,
+            None,
             None,
             None,
         ));
@@ -657,6 +1332,66 @@ mod tests {
             .map(|service| service.config.name.clone())
             .collect();
         assert_eq!(ordered, vec!["proxy", "sshd", "metrics"]);
+    }
+
+    #[test]
+    fn relay_dependent_stop_order_excludes_prerequisites_and_unrelated_services() {
+        let services = vec![
+            Arc::new(ManagedService::new(
+                test_service("transparent-firewall", Vec::new()),
+                PathBuf::from("/tmp"),
+                LoggingConfig::default(),
+            )),
+            Arc::new(ManagedService::new(
+                test_service("workload", vec!["@access-flow-relay"]),
+                PathBuf::from("/tmp"),
+                LoggingConfig::default(),
+            )),
+            Arc::new(ManagedService::new(
+                test_service("dependent", vec!["workload"]),
+                PathBuf::from("/tmp"),
+                LoggingConfig::default(),
+            )),
+            Arc::new(ManagedService::new(
+                test_service("unrelated", Vec::new()),
+                PathBuf::from("/tmp"),
+                LoggingConfig::default(),
+            )),
+        ];
+        let names: Vec<_> = relay_dependent_service_stop_order(&services)
+            .into_iter()
+            .map(|service| service.config.name.clone())
+            .collect();
+        assert_eq!(names, ["dependent", "workload"]);
+    }
+
+    #[test]
+    fn relay_manager_termination_and_watchdog_status_are_fail_closed() {
+        assert_eq!(
+            relay_manager_completion_fatal_kind(&Ok(()), false),
+            Some(relay::RelayFatalKind::UnexpectedExit)
+        );
+        assert_eq!(relay_manager_completion_fatal_kind(&Ok(()), true), None);
+        assert_eq!(
+            relay_manager_completion_fatal_kind(&Err(anyhow::anyhow!("failed")), true),
+            Some(relay::RelayFatalKind::ManagerFailure)
+        );
+        assert_eq!(ForcedExitStatus::Success.code(), 0);
+        assert_ne!(ForcedExitStatus::Fatal.code(), 0);
+    }
+
+    #[tokio::test]
+    async fn relay_manager_join_panic_is_classified_as_fatal() {
+        let task = tokio::spawn(async {
+            panic!("injected relay manager panic");
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        });
+        let result = task.await;
+        assert_eq!(
+            relay_termination_fatal_kind(&result, false),
+            Some(relay::RelayFatalKind::ManagerPanic)
+        );
     }
 
     fn test_service(name: &str, depends_on: Vec<&str>) -> ServiceConfig {

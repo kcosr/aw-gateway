@@ -4,6 +4,9 @@ use std::path::Path;
 use std::process::Command as StdCommand;
 use tempfile::tempdir;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+
 fn asset(name: &str) -> String {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("assets")
@@ -230,18 +233,38 @@ fn transparent_uds_stack_smoke_structural_contract_is_explicit() {
         "--expected-acl-sha",
         "--expected-access-runtime-sha",
         "--expected-aw-sha",
+        "validate-access-runtime-pin.py",
+        "PINNED_ACCESS_RUNTIME_SHA == \"$EXPECTED_ACCESS_RUNTIME_SHA\"",
         "status --porcelain --untracked-files=all",
-        "cargo build --quiet --locked --release",
-        "endpoint.mode = \"0600\"",
-        "endpoint.proxy_header_timeout = \"2s\"",
-        "endpoint.allowed_destination_ports = [80]",
-        "endpoint.allowed_destination_ports = [443]",
+        "--relay-consumer",
+        "--acl-proxy-bin",
+        "--agent-bin",
+        "--relay-bin",
+        "require_absolute_file",
+        "canonical_private_temp_base",
+        "AW_UDS_STACK_SMOKE_TEMP_BASE",
+        "smoke temporary base is group/other writable",
+        "printf '%s' \"$IDENTITY_TOKEN\" >\"$IDENTITY_TOKEN_FILE\"",
+        "printf '%s' \"$NEXT_IDENTITY_TOKEN\" >\"$IDENTITY_TOKEN_FILE.next\"",
+        "assert_workload_launcher_bearer_removed",
+        "[listeners.transparent_http.endpoint]",
+        "kind = \"access_flow\"",
+        "admission_timeout = \"2s\"",
+        "[listeners.transparent_http.endpoint.transport]",
+        "allowed_destination_ports = [80]",
+        "allowed_destination_ports = [443]",
         "%{num_connects}",
-        "access-path=iptables-redirect-so-original-dst-proxy-v2-unix",
+        "access-path=iptables-redirect-so-original-dst-awaf-unix",
         "https-mitm=passed",
         "proxy-loss-fail-closed=passed",
         "incremental-streaming=passed",
         "active-stream-proxy-loss=passed",
+        "identity-authentication=passed",
+        "token-rotation-resolver-reload=passed",
+        "observable-secret-scan=passed",
+        "could not capture required workload output",
+        "docker stop --time 15",
+        "stop_acl_proxy\ncapture_workload_observations final-workload\nscan_observable_secrets",
         "workload-isolation=passed",
         "linux-socket-realization=pinned_inode",
         "pinned-inode-rebind=passed",
@@ -265,7 +288,7 @@ fn transparent_uds_stack_smoke_structural_contract_is_explicit() {
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("smoke/README.md"))
             .unwrap();
     assert!(readme.contains("Transparent UDS Privileged Gate"));
-    assert!(readme.contains("Linux-only T04"));
+    assert!(readme.contains("Linux-only privileged"));
     assert!(readme.contains("structural contract and shell syntax"));
     assert!(readme.contains("privileged gate."));
 }
@@ -297,51 +320,50 @@ fn apple_host_proxy_profile_reuses_bootstrap_and_service_dependencies() {
             "NODE_EXTRA_CA_CERTS = \"/usr/local/share/ca-certificates/acl-proxy-ca.crt\""
         )
     );
-    assert!(profile.contains("target = \"/etc/acl-proxy/transparent-uds-relay.json\""));
-    assert!(profile.contains("\"--config\", \"/etc/acl-proxy/transparent-uds-relay.json\""));
-    assert!(profile.contains("name = \"transparent-relay\"\nrequired = true\nuser = \"root\""));
+    assert!(profile.contains("[target_defaults.container_agent.access_flow_relay]"));
+    assert!(profile.contains("start_after_services = [\"transparent-firewall\"]"));
+    assert!(profile.contains("kind = \"bearer_environment\""));
+    assert!(profile.contains("variable = \"AW_IDENTITY_TOKEN\""));
+    assert!(profile.contains("kind = \"unix\""));
+    assert!(profile.contains("allowed_destination_ports = [80]"));
+    assert!(profile.contains("allowed_destination_ports = [443]"));
     assert!(profile.contains("name = \"transparent-firewall\"\nrequired = true\nuser = \"root\""));
     assert!(profile.contains("type = \"process\""));
-    assert!(profile.contains("depends_on = [\"transparent-firewall\"]"));
-    assert!(profile.contains("depends_on = [\"transparent-relay\"]"));
+    assert!(profile.contains("depends_on = [\"@access-flow-relay\"]"));
+    assert!(!profile.contains("transparent-relay"));
+    assert!(!profile.contains("transparent-uds-relay.json"));
+    assert!(!profile.contains("acl-proxy-transparent-uds-relay"));
     assert!(!profile.contains("/opt/acl-proxy/bin/acl-proxy"));
     assert!(!profile.contains("mitm-ca.key"));
-    assert!(!profile.contains("AW_IDENTITY_TOKEN"));
 }
 
 #[test]
-fn transparent_relay_example_is_the_canonical_unversioned_contract() {
-    let path = example_asset("apple-container", "transparent-uds-relay.json");
-    let raw = std::fs::read_to_string(&path).unwrap();
-    let config: serde_json::Value = serde_json::from_str(&raw).unwrap();
-
-    assert!(config.get("schemaVersion").is_none());
-    assert_eq!(config["setupTimeout"], "2s");
-    assert_eq!(
-        config["routes"][0]["upstreamSocket"],
-        "/run/acl-proxy/transparent-http.sock"
-    );
-    assert_eq!(
-        config["routes"][1]["upstreamSocket"],
-        "/run/acl-proxy/transparent-https.sock"
-    );
-
+fn transparent_stack_smoke_covers_both_access_flow_relay_consumers() {
     let smoke = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("smoke/scripts/run-transparent-uds-stack-smoke.sh"),
     )
     .unwrap();
-    assert!(smoke.contains("examples/apple-container/transparent-uds-relay.json"));
-    assert!(smoke.contains("cp -- \"$RELAY_CONFIG\" \"$TMP_DIR/relay.json\""));
-    assert!(!smoke.contains("cat >\"$TMP_DIR/relay.json\""));
+    assert!(smoke.contains("[container_agent.access_flow_relay]"));
+    assert!(smoke.contains("/opt/aw-gateway/bin/aw-container-agent"));
+    assert!(smoke.contains("/etc/aw-gateway/container-agent.toml"));
+    assert!(smoke.contains("standalone-relay"));
+    assert!(smoke.contains("integrated-agent"));
+    assert!(smoke.contains("/opt/acl-proxy/bin/acl-proxy-access-flow-relay"));
+    assert!(smoke.contains("/etc/acl-proxy/access-flow-relay.json"));
+    assert!(smoke.contains("kind = \"bearer_environment\""));
+    assert!(smoke.contains("variable = \"AW_IDENTITY_TOKEN\""));
+    assert!(smoke.contains("mode = \"required\""));
+    assert!(smoke.contains("identity_states = [\"authenticated\"]"));
+    assert!(smoke.contains("token-rotation-resolver-reload=passed"));
+    assert!(smoke.contains("kind = \"unix\""));
+    assert!(!smoke.contains("acl-proxy-transparent-uds-relay"));
+    assert!(!smoke.contains("transparent-uds-relay.json"));
     assert!(!smoke.contains("setpriv --reuid"));
-    assert!(smoke.contains("/etc/acl-proxy/transparent-uds-relay.json"));
-    assert!(!smoke.contains("/etc/aw-gateway/transparent-uds-relay.json"));
-
-    let max_connections = config["maxConnections"].as_u64().unwrap();
-    let route_count = config["routes"].as_array().unwrap().len() as u64;
-    const RELAY_RESERVED_FILE_DESCRIPTORS: u64 = 64;
-    let required_descriptors = RELAY_RESERVED_FILE_DESCRIPTORS + route_count + 2 * max_connections;
+    let max_connections = 1024_u64;
+    let route_count = 2_u64;
+    const NO_BRIDGE_AGENT_RESERVE: u64 = 273 + 3;
+    let required_descriptors = NO_BRIDGE_AGENT_RESERVE + 2 * route_count + 2 * max_connections;
     let smoke_nofile = smoke
         .lines()
         .find_map(|line| line.split_once("nofile=").map(|(_, value)| value))
@@ -353,6 +375,42 @@ fn transparent_relay_example_is_the_canonical_unversioned_contract() {
         smoke_nofile >= required_descriptors,
         "Docker smoke nofile limit does not satisfy the shipped relay projection"
     );
+}
+
+#[test]
+fn embedded_relay_uses_shared_runtime_engine_without_a_copied_data_plane() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cargo = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let relay = std::fs::read_to_string(root.join("src/agent/relay.rs")).unwrap();
+    let production = relay.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+
+    for dependency in ["access-flow-relay", "access-flow-unix", "access-identity"] {
+        assert!(
+            cargo.contains(dependency),
+            "missing shared Runtime dependency {dependency:?}"
+        );
+    }
+    for required in [
+        "AccessFlowRelay::new(",
+        "UnixAccessFlowConnector::new()",
+        "RunningAccessFlowRelay",
+    ] {
+        assert!(
+            production.contains(required),
+            "missing shared relay ownership marker {required:?}"
+        );
+    }
+    for copied_engine_marker in [
+        "struct RunningAccessFlowRelay",
+        "TcpListener::bind(",
+        "copy_bidirectional(",
+        "write_all(b\"AWAF",
+    ] {
+        assert!(
+            !production.contains(copied_engine_marker),
+            "copied relay engine marker found: {copied_engine_marker:?}"
+        );
+    }
 }
 
 #[test]
@@ -843,8 +901,7 @@ fn start_container_sshd_dry_run_keeps_forcecommand_global_when_base_has_match_bl
         )
         .unwrap();
         std::fs::write(&policy, "sftp = \"deny\"\nlegacy_scp = \"deny\"\n").unwrap();
-        std::fs::write(&filter, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        test_support::write_executable_fixture(&filter, "#!/bin/sh\nexit 0\n");
 
         let output = StdCommand::new(&script)
             .env("AW_SSHD_BASE_CONFIG", &base_config)
@@ -1015,8 +1072,7 @@ fn start_container_sshd_dry_run_disables_transfer_policy() {
     )
     .unwrap();
     std::fs::write(&policy, "sftp = \"deny\"\nlegacy_scp = \"deny\"\n").unwrap();
-    std::fs::write(&filter, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+    test_support::write_executable_fixture(&filter, "#!/bin/sh\nexit 0\n");
 
     let output = StdCommand::new(asset("start-container-sshd"))
         .env("AW_SSHD_BASE_CONFIG", &base_config)
@@ -1053,8 +1109,7 @@ fn start_container_sshd_dry_run_installs_forcecommand_for_sftp_deny() {
         )
         .unwrap();
         std::fs::write(&policy, "sftp = \"deny\"\nlegacy_scp = \"allow\"\n").unwrap();
-        std::fs::write(&filter, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        test_support::write_executable_fixture(&filter, "#!/bin/sh\nexit 0\n");
 
         let output = StdCommand::new(&script)
             .env("AW_SSHD_BASE_CONFIG", &base_config)
@@ -1103,8 +1158,7 @@ fn start_container_sshd_dry_run_installs_forcecommand_for_directional_legacy_scp
             format!("sftp = \"allow\"\nlegacy_scp = \"{mode}\"\n"),
         )
         .unwrap();
-        std::fs::write(&filter, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        test_support::write_executable_fixture(&filter, "#!/bin/sh\nexit 0\n");
 
         let output = StdCommand::new(asset("start-container-sshd"))
             .env("AW_SSHD_BASE_CONFIG", &base_config)

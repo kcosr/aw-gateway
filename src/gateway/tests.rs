@@ -3,15 +3,7 @@ use crate::agent_control::{AgentStatus, SessionHoldResult};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 fn write_fake_runtime(path: &Path, script: &str) {
-    std::fs::write(path, script).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut permissions = std::fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).unwrap();
-    }
+    crate::test_support::write_executable_fixture(path, script);
 }
 
 #[cfg(unix)]
@@ -275,6 +267,8 @@ fn disable_default_container_agent(cfg: &mut GatewayConfig) {
         ssh_bridge: None,
         control_socket: None,
         idle_cleanup: None,
+
+        access_flow_relay: None,
     });
 }
 
@@ -290,6 +284,8 @@ fn enable_default_ssh_bridge(cfg: &mut GatewayConfig) {
         }),
         control_socket: None,
         idle_cleanup: None,
+
+        access_flow_relay: None,
     });
 }
 
@@ -340,6 +336,8 @@ fn enable_default_agent_services(cfg: &mut GatewayConfig) {
         }),
         control_socket: None,
         idle_cleanup: None,
+
+        access_flow_relay: None,
     });
 }
 
@@ -353,6 +351,8 @@ fn configure_apple_published_port_target(cfg: &mut GatewayConfig) {
         ssh_bridge: None,
         control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
         idle_cleanup: None,
+
+        access_flow_relay: None,
     });
     cfg.targets.get_mut("default").unwrap().local_ssh = Some(crate::config::LocalSshConfigInput {
         backend: Some(LocalSshBackend::PublishedPort),
@@ -373,6 +373,8 @@ fn configure_direct_published_port_target(
         ssh_bridge: None,
         control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
         idle_cleanup: None,
+
+        access_flow_relay: None,
     });
     cfg.targets.get_mut("default").unwrap().local_ssh = Some(crate::config::LocalSshConfigInput {
         mode: Some(LocalSshMode::Direct),
@@ -3050,6 +3052,8 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
             Some(crate::config::LocalSshConfigInput {
@@ -3098,6 +3102,8 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
             Some(crate::config::LocalSshConfigInput {
@@ -3178,6 +3184,8 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
             Some(crate::config::LocalSshConfigInput {
@@ -3231,6 +3239,8 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
             Some(crate::config::LocalSshConfigInput {
@@ -3549,6 +3559,8 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
             Some(crate::config::LocalSshConfigInput {
@@ -3601,6 +3613,8 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
             Some(crate::config::LocalSshConfigInput {
@@ -5250,7 +5264,7 @@ fn rendered_default_control_socket_host_dir_is_marked_default() {
 }
 
 #[test]
-fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
+fn podman_run_args_start_agent_as_root_without_unrequested_identity_token() {
     let dir = tempfile::tempdir().unwrap();
     let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
     let target = cfg.effective_target("default").unwrap();
@@ -5292,7 +5306,6 @@ fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
         "{}:/home/alice:Z",
         runtime.paths.workspace.display()
     )));
-    assert!(args.contains(&"AW_IDENTITY_TOKEN".to_string()));
     assert!(args.contains(&"AW_CONTAINER_CONTROL_TOKEN".to_string()));
     assert!(args.contains(&"AW_AUTHENTICATED_UID".to_string()));
     assert!(args.contains(&"AW_AUTHENTICATED_GID".to_string()));
@@ -5306,10 +5319,7 @@ fn podman_run_args_start_agent_as_root_with_workspace_and_tokens() {
             .iter()
             .any(|arg| arg == "AW_CONTAINER_CONTROL_TOKEN=control-token")
     );
-    assert_eq!(
-        env.get("AW_IDENTITY_TOKEN").map(String::as_str),
-        Some("identity-token")
-    );
+    assert!(!env.contains_key("AW_IDENTITY_TOKEN"));
     assert_eq!(
         env.get("AW_CONTAINER_CONTROL_TOKEN").map(String::as_str),
         Some("control-token")
@@ -6003,6 +6013,8 @@ async fn typed_agent_status_ready_drives_wait_and_runtime_status() {
             ssh_bridge: None,
             control_socket: None,
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
     });
     let agent_server = bind_fake_agent_control(
@@ -6033,6 +6045,8 @@ async fn malformed_typed_agent_status_is_agent_unavailable() {
             ssh_bridge: None,
             control_socket: None,
             idle_cleanup: None,
+
+            access_flow_relay: None,
         });
     });
     let agent_server = bind_fake_agent_control(
@@ -6154,6 +6168,299 @@ fn container_run_env_does_not_include_target_session_env() {
     assert!(!env_config.contains("AW_GATEWAY_TEST_INHERITED_SESSION_ENV"));
     assert!(env_config.contains("AW_GATEWAY_TEST_SESSION_OVERRIDE_ENV=explicit"));
     assert!(!env_config.contains("inherited-value"));
+}
+
+#[test]
+fn service_only_parent_presentation_inherits_identity_token_without_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let mut target = cfg.effective_target("default").unwrap();
+    let agent: crate::config::ContainerAgentFile =
+        toml::from_str(crate::agent::DEFAULT_AGENT_CONFIG).unwrap();
+    target.container_agent = agent.container_agent;
+    assert!(target.container_agent.access_flow_relay.is_none());
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+
+    std::fs::create_dir_all(&runtime.paths.container_state_dir).unwrap();
+    let agent_config_path = runtime.write_container_agent_config().unwrap();
+    let agent_config = std::fs::read_to_string(agent_config_path).unwrap();
+    assert!(agent_config.contains("inherit = \"AW_IDENTITY_TOKEN\""));
+    assert!(!agent_config.contains("bearer_environment"));
+    assert!(!agent_config.contains("AW_ACCESS_FLOW_TEST_TOKEN"));
+    assert!(!agent_config.contains("abcdefghijklmnopqrstuvwxyzABCDEF"));
+
+    let spec = runtime
+        .container_run_spec(Some("abcdefghijklmnopqrstuvwxyzABCDEF"), None)
+        .unwrap();
+    let args = runtime.container_runtime.run_args(&spec);
+    let env = runtime.container_runtime.run_env(&spec);
+    assert_eq!(
+        env.get("AW_IDENTITY_TOKEN").map(String::as_str),
+        Some("abcdefghijklmnopqrstuvwxyzABCDEF")
+    );
+    assert!(args.contains(&"AW_IDENTITY_TOKEN".to_string()));
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.contains("abcdefghijklmnopqrstuvwxyzABCDEF"))
+    );
+    assert!(
+        !runtime
+            .session_env_with_lookup(|_| Some("must-not-be-read".into()))
+            .unwrap()
+            .contains_key("AW_IDENTITY_TOKEN")
+    );
+}
+
+#[test]
+fn bearer_relay_injects_host_identity_only_under_configured_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let mut target = cfg.effective_target("default").unwrap();
+    target.container_agent.access_flow_relay = Some(test_access_flow_relay(
+        crate::config::AccessFlowRelayPresentation::BearerEnvironment {
+            variable: "AW_ACCESS_FLOW_TEST_TOKEN".into(),
+        },
+    ));
+    let container_runtime =
+        ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+    let container_state_dir = dir
+        .path()
+        .join("workspace/.aw-gateway/containers/ubuntu-dev");
+    let runtime = test_alice_runtime(cfg, target, container_runtime, &dir, container_state_dir);
+
+    std::fs::create_dir_all(&runtime.paths.container_state_dir).unwrap();
+    let agent_config_path = runtime.write_container_agent_config().unwrap();
+    let agent_config = std::fs::read_to_string(agent_config_path).unwrap();
+    assert!(agent_config.contains("kind = \"bearer_environment\""));
+    assert!(agent_config.contains("variable = \"AW_ACCESS_FLOW_TEST_TOKEN\""));
+    assert!(!agent_config.contains("abcdefghijklmnopqrstuvwxyzABCDEF"));
+
+    let spec = runtime
+        .container_run_spec(Some("abcdefghijklmnopqrstuvwxyzABCDEF"), None)
+        .unwrap();
+    let args = runtime.container_runtime.run_args(&spec);
+    let env = runtime.container_runtime.run_env(&spec);
+
+    assert_eq!(
+        env.get("AW_ACCESS_FLOW_TEST_TOKEN").map(String::as_str),
+        Some("abcdefghijklmnopqrstuvwxyzABCDEF")
+    );
+    assert!(!env.contains_key("AW_IDENTITY_TOKEN"));
+    assert!(args.contains(&"AW_ACCESS_FLOW_TEST_TOKEN".to_string()));
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.contains("abcdefghijklmnopqrstuvwxyzABCDEF"))
+    );
+}
+
+#[test]
+fn bearer_relay_source_is_rejected_from_container_and_session_environments() {
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let target = cfg.effective_target("default").unwrap();
+
+    for kind in ["container", "session", "session_inherit"] {
+        let mut candidate = target.clone();
+        candidate.container_agent.access_flow_relay = Some(test_access_flow_relay(
+            crate::config::AccessFlowRelayPresentation::BearerEnvironment {
+                variable: "AW_ACCESS_FLOW_TEST_TOKEN".into(),
+            },
+        ));
+        match kind {
+            "container" => {
+                candidate
+                    .container_env
+                    .insert("AW_ACCESS_FLOW_TEST_TOKEN".into(), "literal".into());
+            }
+            "session" => {
+                candidate
+                    .session_env
+                    .insert("AW_ACCESS_FLOW_TEST_TOKEN".into(), "literal".into());
+            }
+            "session_inherit" => candidate
+                .session_env_inherit
+                .push("AW_ACCESS_FLOW_TEST_TOKEN".into()),
+            _ => unreachable!(),
+        }
+        let error = candidate.validate("default").unwrap_err().to_string();
+        assert!(
+            error.contains("access flow presentation source"),
+            "{kind}: {error}"
+        );
+        assert!(
+            !error.contains("AW_ACCESS_FLOW_TEST_TOKEN"),
+            "{kind}: {error}"
+        );
+    }
+}
+
+#[test]
+fn identity_token_name_is_rejected_from_authored_environments_for_every_consumer_mode() {
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let base = cfg.effective_target("default").unwrap();
+
+    for consumer in ["relay", "service"] {
+        for environment in ["container", "session", "session_inherit"] {
+            let mut candidate = base.clone();
+            if consumer == "relay" {
+                candidate.container_agent.access_flow_relay = Some(test_access_flow_relay(
+                    crate::config::AccessFlowRelayPresentation::BearerEnvironment {
+                        variable: "AW_ACCESS_FLOW_TEST_TOKEN".into(),
+                    },
+                ));
+            } else {
+                let mut agent: crate::config::ContainerAgentFile =
+                    toml::from_str(crate::agent::DEFAULT_AGENT_CONFIG).unwrap();
+                agent.container_agent.ssh_bridge = None;
+                candidate.container_agent = agent.container_agent;
+            }
+            match environment {
+                "container" => {
+                    candidate
+                        .container_env
+                        .insert("AW_IDENTITY_TOKEN".into(), "authored-value".into());
+                }
+                "session" => {
+                    candidate
+                        .session_env
+                        .insert("AW_IDENTITY_TOKEN".into(), "authored-value".into());
+                }
+                "session_inherit" => candidate
+                    .session_env_inherit
+                    .push("AW_IDENTITY_TOKEN".into()),
+                _ => unreachable!(),
+            }
+
+            let error = candidate.validate("default").unwrap_err().to_string();
+            assert!(error.contains("deployment identity token"), "{error}");
+            assert!(
+                !error.contains("AW_IDENTITY_TOKEN"),
+                "{consumer}/{environment}: {error}"
+            );
+            assert!(!error.contains("authored-value"), "{error}");
+        }
+    }
+}
+
+#[test]
+fn run_spec_rejects_non_product_source_and_identity_environment_overwrites() {
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let base = cfg.effective_target("default").unwrap();
+
+    for (source, collide_identity_environment) in [
+        ("AW_CONTAINER_CONTROL_TOKEN", false),
+        ("AW_ACCESS_FLOW_TEST_TOKEN", true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut target = base.clone();
+        target.container_agent.access_flow_relay = Some(test_access_flow_relay(
+            crate::config::AccessFlowRelayPresentation::BearerEnvironment {
+                variable: source.into(),
+            },
+        ));
+        if collide_identity_environment {
+            target
+                .container_env
+                .insert("AW_IDENTITY_TOKEN".into(), "authored-value".into());
+        }
+        let container_runtime =
+            ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+        let runtime = test_alice_runtime(
+            cfg.clone(),
+            target,
+            container_runtime,
+            &dir,
+            dir.path().join("container-state"),
+        );
+
+        let error = runtime
+            .container_run_spec(
+                Some("abcdefghijklmnopqrstuvwxyzABCDEF"),
+                Some("control-value-must-not-overwrite-bearer"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("AW Access Flow source namespace")
+                || error.contains("deployment identity token"),
+            "{error}"
+        );
+        for secret in [
+            source,
+            "AW_IDENTITY_TOKEN",
+            "authored-value",
+            "abcdefghijklmnopqrstuvwxyzABCDEF",
+            "control-value-must-not-overwrite-bearer",
+        ] {
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
+}
+
+#[test]
+fn identity_token_provenance_cannot_bypass_run_spec_environment_boundaries() {
+    let cfg: GatewayConfig = toml::from_str(DEFAULT_GATEWAY_CONFIG).unwrap();
+    let base = cfg.effective_target("default").unwrap();
+    let token_dir = tempfile::tempdir().unwrap();
+    let file_token = ensure_identity_token_file(&token_dir.path().join("identity-token")).unwrap();
+
+    for host_token in ["abcdefghijklmnopqrstuvwxyzABCDEF".to_string(), file_token] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut target = base.clone();
+        target.container_agent.access_flow_relay = Some(test_access_flow_relay(
+            crate::config::AccessFlowRelayPresentation::BearerEnvironment {
+                variable: "AW_ACCESS_FLOW_TEST_TOKEN".into(),
+            },
+        ));
+        target
+            .session_env
+            .insert("AW_IDENTITY_TOKEN".into(), "session-value".into());
+        let container_runtime =
+            ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
+        let runtime = test_alice_runtime(
+            cfg.clone(),
+            target,
+            container_runtime,
+            &dir,
+            dir.path().join("container-state"),
+        );
+
+        let error = runtime
+            .container_run_spec(Some(&host_token), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("deployment identity token"), "{error}");
+        assert!(!error.contains("AW_IDENTITY_TOKEN"), "{error}");
+        assert!(!error.contains(&host_token), "{error}");
+        assert!(!error.contains("session-value"), "{error}");
+    }
+}
+
+fn test_access_flow_relay(
+    presentation: crate::config::AccessFlowRelayPresentation,
+) -> crate::config::AccessFlowRelayConfig {
+    crate::config::AccessFlowRelayConfig {
+        setup_timeout: "2s".into(),
+        drain_timeout: "10s".into(),
+        max_connections: 32,
+        copy_buffer_bytes_per_direction: 16_384,
+        start_after_services: Vec::new(),
+        presentation,
+        routes: vec![crate::config::AccessFlowRelayRoute {
+            name: "http".into(),
+            listen: "127.0.0.1:3128".into(),
+            allowed_destination_ports: vec![80],
+            transport: crate::config::AccessFlowRelayTransport::Unix {
+                path: "/run/acl-proxy/transparent-http.sock".into(),
+            },
+        }],
+    }
 }
 
 #[test]
@@ -6572,6 +6879,31 @@ fn runtime_exec_without_agent_control_omits_control_socket_mount() {
     );
 }
 
+fn prepared_test_host_socket_exposure(
+    dir: &tempfile::TempDir,
+    readiness_user: &str,
+) -> host_socket_exposures::PreparedContainerInputs {
+    host_socket_exposures::PreparedContainerInputs {
+        mounts: Vec::new(),
+        host_socket_exposures: vec![crate::runtime::HostSocketExposureSpec {
+            name: "traffic".into(),
+            host_path: dir.path().join("traffic.sock"),
+            container_path: PathBuf::from("/run/acl-proxy/traffic.sock"),
+            readiness_user: readiness_user.into(),
+            selinux_relabel: crate::config::SelinuxRelabel::None,
+            realization: crate::runtime::HostSocketExposureRealization::PinnedInode,
+            source_identity: crate::runtime::UnixSourceIdentity {
+                device: 1,
+                inode: 2,
+                uid: 0,
+                gid: 0,
+                mode: 0o600,
+            },
+        }],
+        exposure_manifest: Some("sha256:test".into()),
+    }
+}
+
 #[tokio::test]
 async fn socket_exposure_endpoint_probe_runs_as_configured_readiness_user() {
     let dir = tempfile::tempdir().unwrap();
@@ -6588,35 +6920,26 @@ exit 0
         ),
     );
     let runtime = test_runtime(&dir, fake_runtime, |_| {});
-    let prepared = host_socket_exposures::PreparedContainerInputs {
-        mounts: Vec::new(),
-        host_socket_exposures: vec![crate::runtime::HostSocketExposureSpec {
-            name: "traffic".into(),
-            host_path: dir.path().join("traffic.sock"),
-            container_path: PathBuf::from("/run/acl-proxy/traffic.sock"),
-            readiness_user: "acl-relay".into(),
-            selinux_relabel: crate::config::SelinuxRelabel::None,
-            realization: crate::runtime::HostSocketExposureRealization::PinnedInode,
-            source_identity: crate::runtime::UnixSourceIdentity {
-                device: 1,
-                inode: 2,
-                uid: 1000,
-                gid: 1000,
-                mode: 0o600,
-            },
-        }],
-        exposure_manifest: Some("sha256:test".into()),
-    };
+    let prepared = prepared_test_host_socket_exposure(&dir, "acl-relay");
 
     runtime
         .validate_container_exposure_endpoints(&prepared)
         .await
         .unwrap();
     let calls = std::fs::read_to_string(log).unwrap();
-    assert_eq!(calls.lines().count(), 2, "{calls}");
-    for call in calls.lines() {
+    let calls = calls.lines().collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    for call in &calls {
         assert!(call.contains("--user acl-relay"), "{call}");
     }
+    assert!(
+        calls[0].contains("/bin/test -S /run/acl-proxy/traffic.sock"),
+        "{calls:?}"
+    );
+    assert!(
+        calls[1].contains("/bin/test -w /run/acl-proxy/traffic.sock"),
+        "{calls:?}"
+    );
 }
 
 #[tokio::test]
@@ -6630,31 +6953,129 @@ exit 1
 "#,
     );
     let runtime = test_runtime(&dir, fake_runtime, |_| {});
-    let prepared = host_socket_exposures::PreparedContainerInputs {
-        mounts: Vec::new(),
-        host_socket_exposures: vec![crate::runtime::HostSocketExposureSpec {
-            name: "traffic".into(),
-            host_path: dir.path().join("traffic.sock"),
-            container_path: PathBuf::from("/run/acl-proxy/traffic.sock"),
-            readiness_user: "root".into(),
-            selinux_relabel: crate::config::SelinuxRelabel::None,
-            realization: crate::runtime::HostSocketExposureRealization::PinnedInode,
-            source_identity: crate::runtime::UnixSourceIdentity {
-                device: 1,
-                inode: 2,
-                uid: 0,
-                gid: 0,
-                mode: 0o600,
-            },
-        }],
-        exposure_manifest: Some("sha256:test".into()),
-    };
+    let prepared = prepared_test_host_socket_exposure(&dir, "root");
+
+    let started = tokio::time::Instant::now();
+    let err = runtime
+        .validate_container_exposure_endpoints_with_timing(
+            &prepared,
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "retry sleep exceeded the shared endpoint-check deadline"
+    );
+    assert!(
+        err.to_string().contains(
+            "host socket exposure \"traffic\" container endpoint failed the a Unix socket check as configured readiness user \"root\""
+        ),
+        "{err:#}"
+    );
+}
+
+#[tokio::test]
+async fn socket_exposure_endpoint_probe_reports_accessibility_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    write_fake_runtime(
+        &fake_runtime,
+        r#"#!/bin/sh
+case " $* " in
+  *" -w "*) exit 1 ;;
+  *) exit 0 ;;
+esac
+"#,
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |_| {});
+    let prepared = prepared_test_host_socket_exposure(&dir, "root");
 
     let err = runtime
         .validate_container_exposure_endpoints_with_timing(
             &prepared,
-            Duration::from_millis(20),
-            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "host socket exposure \"traffic\" container endpoint failed the accessible check as configured readiness user \"root\""
+        ),
+        "{err:#}"
+    );
+}
+
+#[tokio::test]
+async fn socket_exposure_endpoint_probe_retries_until_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let counter = dir.path().join("exec.count");
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+count=0
+if [ -f "{0}" ]; then
+  count=$(cat "{0}")
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "{0}"
+if [ "$count" -le 2 ]; then
+  exit 1
+fi
+exit 0
+"#,
+            counter.display()
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |_| {});
+    let prepared = prepared_test_host_socket_exposure(&dir, "root");
+
+    runtime
+        .validate_container_exposure_endpoints_with_timing(
+            &prepared,
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "4");
+}
+
+#[tokio::test]
+async fn terminal_probe_timeout_retains_the_last_readiness_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    let counter = dir.path().join("exec.count");
+    write_fake_runtime(
+        &fake_runtime,
+        &format!(
+            r#"#!/bin/sh
+count=0
+if [ -f "{0}" ]; then
+  count=$(cat "{0}")
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "{0}"
+if [ "$count" -eq 1 ]; then
+  exit 1
+fi
+exec sleep 5
+"#,
+            counter.display()
+        ),
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |_| {});
+    let prepared = prepared_test_host_socket_exposure(&dir, "root");
+
+    let err = runtime
+        .validate_container_exposure_endpoints_with_timing(
+            &prepared,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
         )
         .await
         .unwrap_err();
@@ -6663,6 +7084,42 @@ exit 1
             "host socket exposure \"traffic\" container endpoint failed the a Unix socket check as configured readiness user \"root\""
         ),
         "{err:#}"
+    );
+    assert!(
+        format!("{err:#}").contains("timed out"),
+        "terminal execution timeout must remain in the error chain: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn terminal_non_timeout_execution_error_is_not_a_readiness_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_runtime = dir.path().join("runtime");
+    write_fake_runtime(
+        &fake_runtime,
+        r#"#!/bin/sh
+rm -f -- "$0"
+exit 1
+"#,
+    );
+    let runtime = test_runtime(&dir, fake_runtime, |_| {});
+    let prepared = prepared_test_host_socket_exposure(&dir, "root");
+
+    let err = runtime
+        .validate_container_exposure_endpoints_with_timing(
+            &prepared,
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        !err.to_string().contains("container endpoint failed the"),
+        "execution failures must not be relabeled as guest readiness: {err:#}"
+    );
+    assert!(
+        format!("{err:#}").contains("No such file or directory"),
+        "missing runtime executable must remain in the error chain: {err:#}"
     );
 }
 
@@ -6722,8 +7179,8 @@ esac
         .current_prepared_host_socket_exposure_statuses_with_timing(
             Some(&inspect),
             &prepared,
-            Duration::from_millis(20),
-            Duration::from_millis(1),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
         )
         .await;
 
@@ -6788,14 +7245,14 @@ sleep 1
         .current_prepared_host_socket_exposure_statuses_with_timing(
             Some(&inspect),
             &prepared,
-            Duration::from_millis(40),
+            Duration::from_secs(1),
             Duration::from_millis(1),
         )
         .await;
     let elapsed = started.elapsed();
 
     assert!(
-        elapsed < Duration::from_millis(100),
+        elapsed < Duration::from_secs(2),
         "status probes exceeded one shared deadline: {elapsed:?}"
     );
     assert_eq!(
@@ -7004,15 +7461,35 @@ fn public_key_validation_accepts_known_types() {
 }
 
 #[test]
-fn identity_token_validation_requires_single_non_empty_line() {
+fn identity_token_validation_enforces_exact_canonical_bearer_bytes() {
     let path = PathBuf::from("/tmp/token");
+    let valid = "abcdefghijklmnopqrstuvwxyzABCDEF";
     assert_eq!(
-        validate_identity_token_content("abc\n", &path).unwrap(),
-        "abc"
+        validate_identity_token_content(valid, &path).unwrap(),
+        valid
     );
     assert!(validate_identity_token_content("", &path).is_err());
-    assert!(validate_identity_token_content("a\nb", &path).is_err());
+    assert!(validate_identity_token_content("short", &path).is_err());
+    assert!(validate_identity_token_content(&format!("{valid}\n"), &path).is_err());
+    assert!(validate_identity_token_content(&format!("{valid}\r\n"), &path).is_err());
+    assert!(validate_identity_token_content(&format!("{valid}\0"), &path).is_err());
+    assert!(validate_identity_token_content(&format!(" {valid}"), &path).is_err());
+    assert!(validate_identity_token_content(&format!("{valid} "), &path).is_err());
+    assert!(validate_identity_token_content(&format!("é{valid}"), &path).is_err());
     assert!(validate_identity_token_content(&"x".repeat(4097), &path).is_err());
+}
+
+#[test]
+#[cfg(unix)]
+fn identity_token_environment_rejects_present_non_unicode_bytes() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let error = super::identity::validate_identity_token_environment(std::ffi::OsString::from_vec(
+        vec![0xff; 32],
+    ))
+    .unwrap_err()
+    .to_string();
+    assert_eq!(error, "identity token environment source is invalid");
 }
 
 #[test]
@@ -7053,6 +7530,7 @@ fn identity_token_is_generated_once_with_private_permissions() {
     let second = ensure_identity_token_file(&path).unwrap();
 
     assert_eq!(first, second);
+    assert_eq!(std::fs::read(&path).unwrap(), first.as_bytes());
     assert_eq!(first.len(), 36);
     assert_eq!(&first[14..15], "4");
     assert!(matches!(&first[19..20], "8" | "9" | "a" | "b"));

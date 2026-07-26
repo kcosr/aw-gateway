@@ -1,6 +1,7 @@
 use tempfile::TempDir;
 use toml::Value;
 
+use crate::test_support;
 use aw_gateway::paths::UserContext;
 
 const GATEWAY_CLI_FIXTURE: &str = r#"
@@ -250,15 +251,7 @@ pub(crate) fn wait_for_file(path: &std::path::Path) {
 }
 
 pub(crate) fn write_executable(path: &std::path::Path, contents: &str) {
-    std::fs::write(path, contents).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut permissions = std::fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).unwrap();
-    }
+    test_support::write_executable_fixture(path, contents);
 }
 
 struct GatewaySampleFixture {

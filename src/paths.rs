@@ -1,5 +1,5 @@
+use crate::unix_account::passwd_by_uid;
 use serde::Serialize;
-use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_AGENT_STATE_DIR: &str = "/tmp/aw-gateway/container";
@@ -16,28 +16,24 @@ pub struct UserContext {
 
 impl UserContext {
     pub fn current() -> anyhow::Result<Self> {
-        unsafe {
-            let uid = libc::geteuid();
-            let pw = libc::getpwuid(uid);
-            if pw.is_null() {
-                anyhow::bail!("could not resolve passwd entry for uid {uid}");
-            }
-            let pw = *pw;
-            let user = CStr::from_ptr(pw.pw_name).to_string_lossy().into_owned();
-            let home = CStr::from_ptr(pw.pw_dir).to_string_lossy().into_owned();
-            #[cfg(debug_assertions)]
-            let home = std::env::var_os("AW_GATEWAY_TEST_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(home));
-            #[cfg(not(debug_assertions))]
-            let home = PathBuf::from(home);
-            Ok(Self {
-                uid,
-                gid: pw.pw_gid,
-                user,
-                home,
-            })
-        }
+        let uid = unsafe { libc::geteuid() };
+        let passwd = passwd_by_uid(uid)?;
+        let user = passwd
+            .name
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("passwd user name for uid {uid} is not valid UTF-8"))?;
+        #[cfg(debug_assertions)]
+        let home = std::env::var_os("AW_GATEWAY_TEST_HOME")
+            .map(PathBuf::from)
+            .unwrap_or(passwd.home);
+        #[cfg(not(debug_assertions))]
+        let home = passwd.home;
+        Ok(Self {
+            uid,
+            gid: passwd.gid,
+            user,
+            home,
+        })
     }
 
     pub fn config_dir(&self) -> PathBuf {
@@ -226,4 +222,36 @@ pub fn expand_home(home: &Path, input: &str) -> PathBuf {
 pub fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
     // Keep `paths` as the public boundary while the shared implementation stays crate-private.
     crate::fileutil::ensure_private_dir(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passwd_lookup_is_stable_under_parallel_uid_and_name_load() {
+        let current_uid = unsafe { libc::geteuid() };
+        let expected = passwd_by_uid(current_uid).unwrap();
+        let name = expected.name.clone().into_string().unwrap();
+
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let expected = &expected;
+                let name = &name;
+                scope.spawn(move || {
+                    for iteration in 0..100 {
+                        let actual = if (worker + iteration) % 2 == 0 {
+                            passwd_by_uid(current_uid).unwrap()
+                        } else {
+                            crate::unix_account::passwd_by_name(name).unwrap()
+                        };
+                        assert_eq!(actual.uid, expected.uid);
+                        assert_eq!(actual.gid, expected.gid);
+                        assert_eq!(actual.name, expected.name);
+                        assert_eq!(actual.home, expected.home);
+                    }
+                });
+            }
+        });
+    }
 }

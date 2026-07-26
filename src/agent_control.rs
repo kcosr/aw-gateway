@@ -227,8 +227,34 @@ pub(crate) struct AgentStatus {
     pub(crate) version: String,
     pub(crate) services: Vec<ServiceStatus>,
     pub(crate) ssh_bridge: BridgeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) access_flow_relay: Option<AccessFlowRelayStatus>,
     pub(crate) idle_cleanup: Option<IdleCleanupStatus>,
     pub(crate) shutting_down: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct AccessFlowRelayStatus {
+    pub(crate) state: AccessFlowRelayStateName,
+    pub(crate) ready: bool,
+    pub(crate) active_flows: usize,
+    pub(crate) routes: Vec<AccessFlowRelayRouteStatus>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct AccessFlowRelayRouteStatus {
+    pub(crate) name: String,
+    pub(crate) accepting: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AccessFlowRelayStateName {
+    Preparing,
+    Accepting,
+    Draining,
+    Failed,
+    Stopped,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]

@@ -3,6 +3,72 @@
 version = 4
 
 [[package]]
+name = "access-async-contracts"
+version = "0.1.0"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=71bee2c6d3f3c70d7f4b79f77b99eafd8ef2b039#71bee2c6d3f3c70d7f4b79f77b99eafd8ef2b039"
+
+[[package]]
+name = "access-flow"
+version = "0.1.0"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=71bee2c6d3f3c70d7f4b79f77b99eafd8ef2b039#71bee2c6d3f3c70d7f4b79f77b99eafd8ef2b039"
+dependencies = [
+ "access-async-contracts",
+ "access-identity",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "access-flow-conformance"
+version = "0.1.0"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=71bee2c6d3f3c70d7f4b79f77b99eafd8ef2b039#71bee2c6d3f3c70d7f4b79f77b99eafd8ef2b039"
+dependencies = [
+ "access-flow",
+ "access-flow-relay",
+ "access-flow-unix",
+ "access-identity",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "access-flow-relay"
+version = "0.1.0"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=71bee2c6d3f3c70d7f4b79f77b99eafd8ef2b039#71bee2c6d3f3c70d7f4b79f77b99eafd8ef2b039"
+dependencies = [
+ "access-async-contracts",
+ "access-flow",
+ "access-identity",
+ "rustix",
+ "tokio",
+]
+
+[[package]]
+name = "access-flow-unix"
+version = "0.1.0"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=71bee2c6d3f3c70d7f4b79f77b99eafd8ef2b039#71bee2c6d3f3c70d7f4b79f77b99eafd8ef2b039"
+dependencies = [
+ "access-async-contracts",
+ "access-flow",
+ "access-flow-relay",
+ "rustix",
+ "tokio",
+]
+
+[[package]]
+name = "access-identity"
+version = "0.1.0"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=71bee2c6d3f3c70d7f4b79f77b99eafd8ef2b039#71bee2c6d3f3c70d7f4b79f77b99eafd8ef2b039"
+dependencies = [
+ "access-async-contracts",
+ "hmac",
+ "rand 0.8.6",
+ "sha2",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -63,9 +129,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "assert_cmd"
@@ -98,6 +164,12 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 name = "aw-gateway"
 version = "0.9.0"
 dependencies = [
+ "access-async-contracts",
+ "access-flow",
+ "access-flow-conformance",
+ "access-flow-relay",
+ "access-flow-unix",
+ "access-identity",
  "anyhow",
  "assert_cmd",
  "axum",
@@ -122,6 +194,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -344,6 +417,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -473,6 +547,17 @@ dependencies = [
 
 [[package]]
 name = "getrandom"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "wasi",
+]
+
+[[package]]
+name = "getrandom"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
@@ -522,6 +607,15 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
 
 [[package]]
 name = "http"
@@ -875,12 +969,33 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
+dependencies = [
+ "libc",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
+]
+
+[[package]]
+name = "rand"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
 dependencies = [
- "rand_chacha",
- "rand_core",
+ "rand_chacha 0.9.0",
+ "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -890,7 +1005,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
 dependencies = [
  "ppv-lite86",
- "rand_core",
+ "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+dependencies = [
+ "getrandom 0.2.17",
 ]
 
 [[package]]
@@ -1126,6 +1250,12 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "subtle"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "symlink"
@@ -1467,7 +1597,7 @@ dependencies = [
  "http",
  "httparse",
  "log",
- "rand",
+ "rand 0.9.4",
  "sha1",
  "thiserror 2.0.18",
 ]
@@ -1746,6 +1876,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 
 [[package]]
 name = "zmij"

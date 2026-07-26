@@ -1,0 +1,27 @@
+name: Access Runtime Pin
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Reject dependency advisories
+        run: scripts/check-advisories.sh
+      - name: Test Access Runtime pin validator
+        run: python3 scripts/test-access-runtime-pin.py
+      - name: Reproduce pinned Access Runtime build
+        run: scripts/check-access-runtime-pin.sh

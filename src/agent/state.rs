@@ -2,10 +2,12 @@ use crate::agent_control::{IdleStateName, ProcessMatch, ReapResult};
 use crate::config::{IdleCleanupAction, IdleCleanupConfig, IdleCleanupOwner};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use tokio::sync::{Mutex, Notify};
 use tokio::time::Instant;
 
+use super::relay::{RelayControl, RelayFatalKind};
 use super::service::ManagedService;
 
 #[derive(Debug)]
@@ -18,6 +20,9 @@ pub(super) struct AgentState {
     pub(super) bridge_ready: AtomicBool,
     pub(super) active_streams: AtomicUsize,
     pub(super) active_sessions: AtomicUsize,
+    pub(super) access_flow_relay: Option<Arc<RelayControl>>,
+    pub(super) exit_arbitration: StdMutex<Option<RelayFatalKind>>,
+    pub(super) relay_fatal_notify: Notify,
     pub(super) accepting_bridge: AtomicBool,
     pub(super) shutting_down: AtomicBool,
     pub(super) shutdown_complete: AtomicBool,
@@ -33,6 +38,7 @@ impl AgentState {
         bridge_enabled: bool,
         control_token: Option<String>,
         socket_owner: Option<SocketOwner>,
+        access_flow_relay: Option<Arc<RelayControl>>,
     ) -> Self {
         let idle_cleanup = idle_cleanup.filter(|config| {
             config.owner == IdleCleanupOwner::Agent && config.action != IdleCleanupAction::None
@@ -46,6 +52,9 @@ impl AgentState {
             bridge_ready: AtomicBool::new(!bridge_enabled),
             active_streams: AtomicUsize::new(0),
             active_sessions: AtomicUsize::new(0),
+            access_flow_relay,
+            exit_arbitration: StdMutex::new(None),
+            relay_fatal_notify: Notify::new(),
             accepting_bridge: AtomicBool::new(true),
             shutting_down: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
@@ -53,6 +62,24 @@ impl AgentState {
             control_token,
             socket_owner,
         }
+    }
+
+    pub(super) fn publish_relay_fatal(&self, fatal: RelayFatalKind) {
+        let mut current = self
+            .exit_arbitration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.is_none() {
+            *current = Some(fatal);
+            self.relay_fatal_notify.notify_waiters();
+        }
+    }
+
+    pub(super) fn relay_fatal(&self) -> Option<RelayFatalKind> {
+        *self
+            .exit_arbitration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 

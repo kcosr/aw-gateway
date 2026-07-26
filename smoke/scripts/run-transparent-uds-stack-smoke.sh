@@ -4,11 +4,12 @@ set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 FIREWALL="$ROOT/assets/aw-transparent-uds-firewall"
-RELAY_CONFIG="$ROOT/examples/apple-container/transparent-uds-relay.json"
 BASE_IMAGE=${AW_UDS_STACK_SMOKE_IMAGE:-ubuntu:24.04}
 
 ACL_PROXY_BIN=
+AGENT_BIN=
 RELAY_BIN=
+RELAY_CONSUMER=
 ACL_REPO=
 ACCESS_RUNTIME_REPO=
 AW_REPO=
@@ -23,6 +24,7 @@ WORKLOAD_CONTAINER=
 WORKLOAD_IMAGE=
 ACL_PID=
 ACTIVE_CLIENT_PID=
+IDENTITY_WRITER_PID=
 SUCCESS=0
 
 fail() {
@@ -33,7 +35,9 @@ fail() {
 usage() {
     cat >&2 <<'EOF'
 Usage: run-transparent-uds-stack-smoke.sh \
+  --relay-consumer <standalone-relay|integrated-agent> \
   --acl-proxy-bin <absolute-path> \
+  --agent-bin <absolute-path> \
   --relay-bin <absolute-path> \
   --acl-repo <absolute-path> \
   --access-runtime-repo <absolute-path> \
@@ -55,6 +59,25 @@ require_absolute_file() {
     [[ -f $path && ! -L $path && -x $path ]] || fail "$label is not an executable regular file: $path"
 }
 
+sanitize_diagnostics() {
+    if [[ -n ${BEARER_HISTORY:-} && -f $BEARER_HISTORY ]]; then
+        python3 -c '
+import pathlib
+import sys
+
+secrets = [
+    line for line in pathlib.Path(sys.argv[1]).read_bytes().splitlines() if line
+]
+data = sys.stdin.buffer.read()
+for secret in secrets:
+    data = data.replace(secret, b"[REDACTED]")
+sys.stdout.buffer.write(data)
+' "$BEARER_HISTORY"
+    else
+        cat
+    fi
+}
+
 cleanup() {
     local status=$?
     trap - EXIT
@@ -68,12 +91,13 @@ cleanup() {
             for log in "$TMP_DIR"/acl-proxy.*.stderr; do
                 [[ -s $log ]] || continue
                 printf '%s\n' "--- $log ---" >&2
-                tail -n 80 "$log" >&2
+                tail -n 80 "$log" | sanitize_diagnostics >&2
             done
         fi
         for container in "$WORKLOAD_CONTAINER" "$PARENT_CONTAINER" "$ORIGIN_CONTAINER"; do
             [[ -n $container ]] || continue
-            docker logs --tail 80 "$container" >&2 2>/dev/null || true
+            docker logs --tail 80 "$container" 2>&1 \
+                | sanitize_diagnostics >&2 || true
         done
     fi
     if (( status != 0 )) && [[ ${AW_UDS_STACK_SMOKE_KEEP_FAILED:-0} == 1 ]]; then
@@ -94,6 +118,10 @@ cleanup() {
         kill -TERM "$ACTIVE_CLIENT_PID" 2>/dev/null || true
         wait "$ACTIVE_CLIENT_PID" 2>/dev/null || true
     fi
+    if [[ -n $IDENTITY_WRITER_PID ]] && kill -0 "$IDENTITY_WRITER_PID" 2>/dev/null; then
+        kill -TERM "$IDENTITY_WRITER_PID" 2>/dev/null || true
+        wait "$IDENTITY_WRITER_PID" 2>/dev/null || true
+    fi
     for container in "$WORKLOAD_CONTAINER" "$PARENT_CONTAINER" "$ORIGIN_CONTAINER"; do
         [[ -n $container ]] || continue
         docker rm -f "$container" >/dev/null 2>&1 || true
@@ -112,6 +140,16 @@ while (($#)); do
         --acl-proxy-bin)
             (($# >= 2)) || usage
             ACL_PROXY_BIN=$2
+            shift 2
+            ;;
+        --relay-consumer)
+            (($# >= 2)) || usage
+            RELAY_CONSUMER=$2
+            shift 2
+            ;;
+        --agent-bin)
+            (($# >= 2)) || usage
+            AGENT_BIN=$2
             shift 2
             ;;
         --relay-bin)
@@ -153,11 +191,13 @@ while (($#)); do
     esac
 done
 
-[[ -n $ACL_PROXY_BIN && -n $RELAY_BIN && -n $ACL_REPO \
+[[ $RELAY_CONSUMER == standalone-relay || $RELAY_CONSUMER == integrated-agent ]] \
+    || usage
+[[ -n $ACL_PROXY_BIN && -n $AGENT_BIN && -n $RELAY_BIN && -n $ACL_REPO \
     && -n $ACCESS_RUNTIME_REPO && -n $AW_REPO && -n $EXPECTED_ACL_SHA \
     && -n $EXPECTED_ACCESS_RUNTIME_SHA && -n $EXPECTED_AW_SHA ]] || usage
 
-for command in awk cargo curl docker git openssl python3 sha256sum stat timeout; do
+for command in awk curl docker git openssl python3 sha256sum stat timeout; do
     require_command "$command"
 done
 
@@ -171,6 +211,41 @@ canonical_repo() {
         || fail "$label must be an absolute Git worktree"
     [[ $top_level == "$canonical" ]] || fail "$label must name the Git worktree root"
     printf '%s\n' "$canonical"
+}
+
+canonical_private_temp_base() {
+    local candidate=$1
+    [[ $candidate == /* ]] || fail "smoke temporary base must be absolute"
+    python3 - "$candidate" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+candidate = pathlib.Path(sys.argv[1])
+try:
+    base = candidate.resolve(strict=True)
+except OSError as error:
+    raise SystemExit(f"smoke temporary base is unavailable: {error}")
+if not base.is_dir():
+    raise SystemExit("smoke temporary base is not a directory")
+
+def require_trusted_directory(current: pathlib.Path) -> None:
+    metadata = current.lstat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(f"smoke temporary base has a non-directory ancestor: {current}")
+    if metadata.st_uid not in (0, os.geteuid()):
+        raise SystemExit(f"smoke temporary base has an untrusted owner: {current}")
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise SystemExit(f"smoke temporary base is group/other writable: {current}")
+
+current = pathlib.Path("/")
+require_trusted_directory(current)
+for component in base.parts[1:]:
+    current /= component
+    require_trusted_directory(current)
+print(base)
+PY
 }
 
 require_expected_sha() {
@@ -190,6 +265,14 @@ AW_REPO=$(canonical_repo aw-repo "$AW_REPO")
 require_expected_sha acl-proxy "$ACL_REPO" "$EXPECTED_ACL_SHA"
 require_expected_sha access-runtime "$ACCESS_RUNTIME_REPO" "$EXPECTED_ACCESS_RUNTIME_SHA"
 require_expected_sha aw-gateway "$AW_REPO" "$EXPECTED_AW_SHA"
+PINNED_ACCESS_RUNTIME_SHA=$(
+    python3 "$AW_REPO/scripts/validate-access-runtime-pin.py" \
+        "$AW_REPO/Cargo.toml" \
+        "$AW_REPO/Cargo.lock" \
+        https://github.com/kcosr/access-runtime.git
+)
+[[ $PINNED_ACCESS_RUNTIME_SHA == "$EXPECTED_ACCESS_RUNTIME_SHA" ]] \
+    || fail "AW Gateway Access Runtime pin does not match access-runtime-repo"
 [[ -z $(git -C "$ACL_REPO" status --porcelain --untracked-files=all) ]] \
     || fail "acl-repo must be clean for provenance-bound release builds"
 [[ -z $(git -C "$ACCESS_RUNTIME_REPO" status --porcelain --untracked-files=all) ]] \
@@ -197,26 +280,10 @@ require_expected_sha aw-gateway "$AW_REPO" "$EXPECTED_AW_SHA"
 [[ -z $(git -C "$AW_REPO" status --porcelain --untracked-files=all) ]] \
     || fail "aw-repo must be clean for provenance-bound smoke evidence"
 
-EXPECTED_ACL_PROXY_BIN="$ACL_REPO/target/release/acl-proxy"
-EXPECTED_RELAY_BIN="$ACL_REPO/target/release/acl-proxy-transparent-uds-relay"
-[[ $(readlink -m -- "$ACL_PROXY_BIN") == "$EXPECTED_ACL_PROXY_BIN" ]] \
-    || fail "acl-proxy-bin must be $EXPECTED_ACL_PROXY_BIN"
-[[ $(readlink -m -- "$RELAY_BIN") == "$EXPECTED_RELAY_BIN" ]] \
-    || fail "relay-bin must be $EXPECTED_RELAY_BIN"
-cargo build --quiet --locked --release --manifest-path "$ACL_REPO/Cargo.toml" \
-    --bin acl-proxy \
-    || fail "locked ACL Proxy release build failed"
-cargo build --quiet --locked --release --manifest-path "$ACL_REPO/Cargo.toml" \
-    --package acl-proxy-transparent-uds-relay \
-    --bin acl-proxy-transparent-uds-relay \
-    || fail "locked ACL Proxy release build failed"
-require_absolute_file acl-proxy "$EXPECTED_ACL_PROXY_BIN"
-require_absolute_file relay "$EXPECTED_RELAY_BIN"
-ACL_PROXY_BIN=$EXPECTED_ACL_PROXY_BIN
-RELAY_BIN=$EXPECTED_RELAY_BIN
+require_absolute_file acl-proxy "$ACL_PROXY_BIN"
+require_absolute_file agent "$AGENT_BIN"
+require_absolute_file relay "$RELAY_BIN"
 [[ -x $FIREWALL && ! -L $FIREWALL ]] || fail "firewall asset is missing or not executable"
-[[ -f $RELAY_CONFIG && ! -L $RELAY_CONFIG ]] \
-    || fail "checked-in relay config is missing: $RELAY_CONFIG"
 
 docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable"
 docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 \
@@ -225,11 +292,25 @@ docker image inspect python:3.12-slim >/dev/null 2>&1 \
     || fail "required local image is unavailable (refusing an implicit pull): python:3.12-slim"
 
 umask 077
-TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/aw-transparent-uds-stack.XXXXXX")
+TEMP_BASE_INPUT=${AW_UDS_STACK_SMOKE_TEMP_BASE:-${HOME:-}}
+[[ -n $TEMP_BASE_INPUT ]] || fail "HOME or AW_UDS_STACK_SMOKE_TEMP_BASE is required"
+SMOKE_TEMP_BASE=$(canonical_private_temp_base "$TEMP_BASE_INPUT")
+TMP_DIR=$(mktemp -d "$SMOKE_TEMP_BASE/.aw-transparent-uds-stack.XXXXXX")
 mkdir -m 0700 "$TMP_DIR/home" "$TMP_DIR/socket-runtime" "$TMP_DIR/config" \
     "$TMP_DIR/logs" "$TMP_DIR/parent-logs"
 touch "$TMP_DIR/parent-logs/events.jsonl"
 chmod 0666 "$TMP_DIR/parent-logs/events.jsonl"
+IDENTITY_TOKEN=$(openssl rand -hex 24)
+[[ $IDENTITY_TOKEN =~ ^[0-9a-f]{48}$ ]] || fail "could not create the workload bearer"
+IDENTITY_TOKEN_FILE="$TMP_DIR/config/identity-token"
+IDENTITY_FIFO="$TMP_DIR/identity-token.fifo"
+BEARER_HISTORY="$TMP_DIR/.bearer-history"
+printf '%s' "$IDENTITY_TOKEN" >"$IDENTITY_TOKEN_FILE"
+chmod 0600 "$IDENTITY_TOKEN_FILE"
+printf '%s\n' "$IDENTITY_TOKEN" >"$BEARER_HISTORY"
+chmod 0600 "$BEARER_HISTORY"
+mkfifo -m 0600 "$IDENTITY_FIFO"
+ACTIVE_BEARER=$IDENTITY_TOKEN
 
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
     -out "$TMP_DIR/config/mitm-ca-key.pem" >/dev/null 2>&1
@@ -302,7 +383,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         identity = self.headers.get("x-aw-identity-token", "absent")
-        if self.path in ("/stream", "/active-stream"):
+        if self.path in ("/stream", "/active-stream", "/identity-rotation-stream"):
             chunk = b"0123456789abcdef" * 1024
             chunk_count = 64 if self.path == "/stream" else 512
             self.send_response(200)
@@ -495,28 +576,66 @@ base_path = "/_acl-proxy"
 request_body_timeout = "2s"
 
 [listeners.transparent_http]
-endpoint.kind = "unix_proxy_v2"
-endpoint.path = "$HTTP_SOCKET"
-endpoint.mode = "0600"
-endpoint.proxy_header_timeout = "2s"
-endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
 max_connections = 64
 
+[listeners.transparent_http.identity]
+mode = "required"
+
+[listeners.transparent_http.endpoint]
+kind = "access_flow"
+admission_timeout = "2s"
+allowed_destination_ports = [80]
+
+[listeners.transparent_http.endpoint.transport]
+kind = "unix"
+path = "$HTTP_SOCKET"
+mode = "0600"
+
 [listeners.transparent_https]
-endpoint.kind = "unix_proxy_v2"
-endpoint.path = "$HTTPS_SOCKET"
-endpoint.mode = "0600"
-endpoint.proxy_header_timeout = "2s"
-endpoint.allowed_destination_ports = [443]
 http_versions = ["http1"]
 max_connections = 64
+
+[listeners.transparent_https.identity]
+mode = "required"
+
+[listeners.transparent_https.endpoint]
+kind = "access_flow"
+admission_timeout = "2s"
+allowed_destination_ports = [443]
+
+[listeners.transparent_https.endpoint.transport]
+kind = "unix"
+path = "$HTTPS_SOCKET"
+mode = "0600"
 
 [mitm]
 mode = "files"
 ca_certificate = "$TMP_DIR/config/mitm-ca-cert.pem"
 ca_private_key = "$TMP_DIR/config/mitm-ca-key.pem"
 directory = "$TMP_DIR/config/generated-certs"
+
+[identity]
+max_pending_authentications = 32
+max_pending_authentications_per_connection = 4
+
+[identity.resolver]
+kind = "static"
+authority = "uds-stack-smoke"
+
+[[identity.resolver.principals]]
+id = "protected-workload"
+kind = "service_account"
+
+[[identity.resolver.groups]]
+id = "network-clients"
+members = ["protected-workload"]
+
+[[identity.resolver.tokens]]
+id = "protected-workload-primary"
+principal = "protected-workload"
+source = "file"
+path = "$IDENTITY_TOKEN_FILE"
 
 [egress]
 route = "parent_proxy"
@@ -530,12 +649,6 @@ trust = "custom"
 ca_certificate = "$TMP_DIR/config/origin-ca-cert.pem"
 http_versions = ["http1"]
 
-[[egress.credential_actions]]
-kind = "custom_header"
-transport_security = "cleartext_allowed"
-header = "x-aw-identity-token"
-credential = "workstation_identity"
-
 [policy]
 default = "deny"
 
@@ -548,13 +661,10 @@ urls = ["http://origin.test/denied"]
 id = "allow-fixture"
 decision = "allow"
 urls = ["http://origin.test/**", "https://origin.test/**"]
-
-[credentials]
-allowed_custom_headers = ["x-aw-identity-token"]
-
-[credentials.sources.workstation_identity]
-source = "environment"
-variable = "AW_IDENTITY_TOKEN"
+identity_states = ["authenticated"]
+identity_subjects = [
+  { kind = "group", authority = "uds-stack-smoke", id = "network-clients" },
+]
 
 [observation.logging]
 level = "info"
@@ -568,13 +678,13 @@ inject = true
 header = "x-acl-proxy-request-id"
 EOF
 
-env -i HOME="$TMP_DIR/home" PATH=/usr/bin:/bin AW_IDENTITY_TOKEN=host-only-identity \
+env -i HOME="$TMP_DIR/home" PATH=/usr/bin:/bin \
     "$ACL_PROXY_BIN" config validate --config "$ACL_CONFIG" \
     >"$TMP_DIR/acl-proxy.validate" 2>&1 \
     || fail "ephemeral ACL Proxy configuration did not validate"
 start_acl_proxy() {
     local generation=$1
-    env -i HOME="$TMP_DIR/home" PATH=/usr/bin:/bin AW_IDENTITY_TOKEN=host-only-identity \
+    env -i HOME="$TMP_DIR/home" PATH=/usr/bin:/bin \
         "$ACL_PROXY_BIN" run --config "$ACL_CONFIG" \
         >"$TMP_DIR/acl-proxy.$generation.stdout" \
         2>"$TMP_DIR/acl-proxy.$generation.stderr" &
@@ -607,10 +717,142 @@ stop_acl_proxy() {
 
 start_acl_proxy first
 
-cp -- "$RELAY_CONFIG" "$TMP_DIR/relay.json"
-chmod 0644 "$TMP_DIR/relay.json"
+cat >"$TMP_DIR/container-agent.toml" <<'EOF'
+schema_version = "1"
 
-cat >"$TMP_DIR/workload.sh" <<'SH'
+[container_agent]
+enabled = true
+control_socket = false
+
+[container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 1024
+copy_buffer_bytes_per_direction = 16384
+start_after_services = ["transparent-firewall"]
+
+[container_agent.access_flow_relay.presentation]
+kind = "bearer_environment"
+variable = "AW_IDENTITY_TOKEN"
+
+[[container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/acl-proxy/transparent-http.sock"
+
+[[container_agent.access_flow_relay.routes]]
+name = "https"
+listen = "127.0.0.1:3129"
+allowed_destination_ports = [443]
+
+[container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/acl-proxy/transparent-https.sock"
+
+[[container_agent.services]]
+name = "transparent-firewall"
+required = true
+user = "root"
+command = [
+  "/opt/aw-gateway/bin/aw-transparent-uds-firewall",
+  "watch",
+  "--dns-server", "SMOKE_DNS_REPLACED",
+  "--http-port", "3128",
+  "--https-port", "3129",
+]
+restart = "always"
+depends_on = []
+
+[container_agent.services.health_check]
+type = "process"
+EOF
+sed -i "s/SMOKE_DNS_REPLACED/$NETWORK_GATEWAY/" "$TMP_DIR/container-agent.toml"
+chmod 0600 "$TMP_DIR/container-agent.toml"
+
+cat >"$TMP_DIR/access-flow-relay.json" <<'EOF'
+{
+  "routes": [
+    {
+      "name": "http",
+      "listen": "127.0.0.1:3128",
+      "allowedDestinationPorts": [80],
+      "transport": {
+        "kind": "unix",
+        "path": "/run/acl-proxy/transparent-http.sock"
+      }
+    },
+    {
+      "name": "https",
+      "listen": "127.0.0.1:3129",
+      "allowedDestinationPorts": [443],
+      "transport": {
+        "kind": "unix",
+        "path": "/run/acl-proxy/transparent-https.sock"
+      }
+    }
+  ],
+  "presentation": {
+    "kind": "bearer_environment",
+    "variable": "AW_IDENTITY_TOKEN"
+  },
+  "setupTimeout": "2s",
+  "drainTimeout": "10s",
+  "maxConnections": 1024,
+  "copyBufferBytesPerDirection": 16384
+}
+EOF
+chmod 0600 "$TMP_DIR/access-flow-relay.json"
+
+if [[ $RELAY_CONSUMER == integrated-agent ]]; then
+    WORKLOAD_ARTIFACT=$AGENT_BIN
+    WORKLOAD_CONFIG="$TMP_DIR/container-agent.toml"
+    WORKLOAD_ARTIFACT_DEST=/opt/aw-gateway/bin/aw-container-agent
+    WORKLOAD_CONFIG_DEST=/etc/aw-gateway/container-agent.toml
+    cat >"$TMP_DIR/workload.sh" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+cleanup() {
+    local status=$?
+    set +e
+    if (( status != 0 )); then
+        [[ ! -s /tmp/relay.stdout ]] || cat /tmp/relay.stdout >&2
+        [[ ! -s /tmp/relay.stderr ]] || cat /tmp/relay.stderr >&2
+    fi
+    [[ -z ${RELAY_PID:-} ]] || kill "$RELAY_PID" 2>/dev/null || true
+    wait 2>/dev/null || true
+    exit "$status"
+}
+trap cleanup EXIT INT TERM
+IFS= read -r AW_IDENTITY_TOKEN </run/aw-gateway/identity-token.fifo
+export AW_IDENTITY_TOKEN
+/opt/aw-gateway/bin/aw-container-agent \
+    --config /etc/aw-gateway/container-agent.toml run \
+    >/tmp/relay.stdout 2>/tmp/relay.stderr &
+RELAY_PID=$!
+unset AW_IDENTITY_TOKEN
+printf '%s\n' "$RELAY_PID" >/tmp/relay.pid
+for _ in {1..100}; do
+    if timeout 0.2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3128' \
+        && timeout 0.2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3129'; then
+        touch /tmp/stack.ready
+        break
+    fi
+    kill -0 "$RELAY_PID"
+    sleep 0.05
+done
+[[ -f /tmp/stack.ready ]]
+wait "$RELAY_PID"
+SH
+else
+    WORKLOAD_ARTIFACT=$RELAY_BIN
+    WORKLOAD_CONFIG="$TMP_DIR/access-flow-relay.json"
+    WORKLOAD_ARTIFACT_DEST=/opt/acl-proxy/bin/acl-proxy-access-flow-relay
+    WORKLOAD_CONFIG_DEST=/etc/acl-proxy/access-flow-relay.json
+    cat >"$TMP_DIR/workload.sh" <<'SH'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 cleanup() {
@@ -626,19 +868,18 @@ cleanup() {
     exit "$status"
 }
 trap cleanup EXIT INT TERM
-/opt/aw-gateway/bin/aw-transparent-uds-firewall watch \
-    --dns-server "$SMOKE_DNS" --http-port 3128 --https-port 3129 &
+IFS= read -r AW_IDENTITY_TOKEN </run/aw-gateway/identity-token.fifo
+export AW_IDENTITY_TOKEN
+env -u AW_IDENTITY_TOKEN /opt/aw-gateway/bin/aw-transparent-uds-firewall \
+    watch --dns-server SMOKE_DNS_REPLACED --http-port 3128 --https-port 3129 \
+    >/tmp/firewall.stdout 2>/tmp/firewall.stderr &
 FIREWALL_PID=$!
-for _ in {1..100}; do
-    [[ -f /run/aw-gateway/transparent-uds-firewall.generation.ready ]] && break
-    kill -0 "$FIREWALL_PID"
-    sleep 0.05
-done
-[[ -f /run/aw-gateway/transparent-uds-firewall.generation.ready ]]
-/opt/aw-gateway/bin/acl-proxy-transparent-uds-relay \
-    --config /etc/acl-proxy/transparent-uds-relay.json \
+/opt/acl-proxy/bin/acl-proxy-access-flow-relay \
+    --config /etc/acl-proxy/access-flow-relay.json \
     >/tmp/relay.stdout 2>/tmp/relay.stderr &
 RELAY_PID=$!
+unset AW_IDENTITY_TOKEN
+printf '%s\n' "$RELAY_PID" >/tmp/relay.pid
 for _ in {1..100}; do
     if timeout 0.2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3128' \
         && timeout 0.2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3129'; then
@@ -646,26 +887,45 @@ for _ in {1..100}; do
         break
     fi
     kill -0 "$RELAY_PID"
+    kill -0 "$FIREWALL_PID"
     sleep 0.05
 done
 [[ -f /tmp/stack.ready ]]
 wait "$RELAY_PID"
 SH
+    sed -i "s/SMOKE_DNS_REPLACED/$NETWORK_GATEWAY/" "$TMP_DIR/workload.sh"
+fi
 chmod 0700 "$TMP_DIR/workload.sh"
 
 start_workload() {
-    # The shipped 1,024-connection config projects 2,114 descriptors.
+    local -a consumer_mounts=(
+        --mount "type=bind,src=$WORKLOAD_ARTIFACT,dst=$WORKLOAD_ARTIFACT_DEST,readonly"
+        --mount "type=bind,src=$WORKLOAD_CONFIG,dst=$WORKLOAD_CONFIG_DEST,readonly"
+    )
     docker run -d --name "$WORKLOAD_CONTAINER" --privileged --network "$NETWORK" \
         --ulimit nofile=4096:4096 \
-        --env "SMOKE_DNS=$NETWORK_GATEWAY" \
         --mount "type=bind,src=$HTTP_SOCKET,dst=/run/acl-proxy/transparent-http.sock" \
         --mount "type=bind,src=$HTTPS_SOCKET,dst=/run/acl-proxy/transparent-https.sock" \
         --mount "type=bind,src=$TMP_DIR/config/mitm-ca-cert.pem,dst=/etc/acl-proxy/mitm-ca-cert.pem,readonly" \
-        --mount "type=bind,src=$RELAY_BIN,dst=/opt/aw-gateway/bin/acl-proxy-transparent-uds-relay,readonly" \
+        --mount "type=bind,src=$IDENTITY_FIFO,dst=/run/aw-gateway/identity-token.fifo" \
         --mount "type=bind,src=$FIREWALL,dst=/opt/aw-gateway/bin/aw-transparent-uds-firewall,readonly" \
-        --mount "type=bind,src=$TMP_DIR/relay.json,dst=/etc/acl-proxy/transparent-uds-relay.json,readonly" \
         --mount "type=bind,src=$TMP_DIR/workload.sh,dst=/usr/local/bin/workload-smoke,readonly" \
+        "${consumer_mounts[@]}" \
         "$WORKLOAD_IMAGE" bash /usr/local/bin/workload-smoke >/dev/null
+    (printf '%s\n' "$ACTIVE_BEARER" >"$IDENTITY_FIFO") &
+    IDENTITY_WRITER_PID=$!
+    for _ in {1..100}; do
+        kill -0 "$IDENTITY_WRITER_PID" 2>/dev/null || break
+        sleep 0.05
+    done
+    if kill -0 "$IDENTITY_WRITER_PID" 2>/dev/null; then
+        kill -TERM "$IDENTITY_WRITER_PID" 2>/dev/null || true
+        wait "$IDENTITY_WRITER_PID" 2>/dev/null || true
+        IDENTITY_WRITER_PID=
+        fail "workload did not consume its one-time bearer"
+    fi
+    wait "$IDENTITY_WRITER_PID" || fail "one-time bearer delivery failed"
+    IDENTITY_WRITER_PID=
 
     for _ in {1..400}; do
         if ! docker inspect "$WORKLOAD_CONTAINER" --format '{{.State.Running}}' 2>/dev/null \
@@ -680,35 +940,117 @@ start_workload() {
     fail "workload relay did not become ready"
 }
 
+assert_workload_relay_alive() {
+    docker inspect "$WORKLOAD_CONTAINER" --format '{{.State.Running}}' \
+        | grep -qx true \
+        || fail "workload container is not running"
+    docker exec "$WORKLOAD_CONTAINER" sh -eu -c '
+        relay_pid=$(cat /tmp/relay.pid)
+        kill -0 "$relay_pid"
+    ' || fail "workload relay consumer is not running"
+}
+
+assert_workload_launcher_bearer_removed() {
+    docker exec "$WORKLOAD_CONTAINER" sh -eu -c '
+        test "${AW_IDENTITY_TOKEN+x}" != x
+        relay_pid=$(cat /tmp/relay.pid)
+        kill -0 "$relay_pid"
+    ' || fail "could not prove launcher bearer removal with a live relay"
+}
+
+capture_workload_observations() {
+    local label=$1
+    [[ $label =~ ^[a-z0-9-]+$ ]] || fail "invalid observation label"
+    local destination="$TMP_DIR/observable/$label"
+    mkdir -m 0700 -p "$destination"
+    docker inspect "$WORKLOAD_CONTAINER" >"$destination/docker-inspect.json" \
+        || fail "could not capture workload metadata"
+    docker logs "$WORKLOAD_CONTAINER" >"$destination/docker.stdout" \
+        2>"$destination/docker.stderr" \
+        || fail "could not capture workload container logs"
+    local -a required_outputs=(relay.stdout relay.stderr)
+    if [[ $RELAY_CONSUMER == standalone-relay ]]; then
+        required_outputs+=(firewall.stdout firewall.stderr)
+    fi
+    local source
+    for source in "${required_outputs[@]}"; do
+        docker cp "$WORKLOAD_CONTAINER:/tmp/$source" "$destination/$source" \
+            >/dev/null 2>&1 \
+            || fail "could not capture required workload output: $source"
+    done
+}
+
+scan_observable_secrets() {
+    python3 - "$TMP_DIR" "$IDENTITY_TOKEN_FILE" "$BEARER_HISTORY" \
+        3<"$BEARER_HISTORY" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+excluded = {pathlib.Path(value) for value in sys.argv[2:]}
+secrets = [line for line in os.fdopen(3, "rb").read().splitlines() if line]
+if not secrets:
+    raise SystemExit("observable secret scan has no bearer inputs")
+for path in root.rglob("*"):
+    if path in excluded:
+        continue
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        continue
+    if not stat.S_ISREG(metadata.st_mode):
+        continue
+    data = path.read_bytes()
+    if any(secret in data for secret in secrets):
+        raise SystemExit("generated bearer appeared in observable smoke evidence")
+PY
+}
+
 start_workload
+assert_workload_relay_alive
+assert_workload_launcher_bearer_removed
 
 python3 - "$WORKLOAD_CONTAINER" "$HTTP_SOCKET" "$HTTPS_SOCKET" \
-    "$TMP_DIR/config/mitm-ca-cert.pem" "$RELAY_BIN" "$FIREWALL" \
-    "$TMP_DIR/relay.json" "$TMP_DIR/workload.sh" <<'PY'
+    "$TMP_DIR/config/mitm-ca-cert.pem" "$WORKLOAD_ARTIFACT" "$FIREWALL" \
+    "$WORKLOAD_CONFIG" "$TMP_DIR/workload.sh" "$IDENTITY_FIFO" <<'PY'
 import json
 import pathlib
 import subprocess
 import sys
 
-container, http_socket, https_socket, public_ca, relay, firewall, config, script = sys.argv[1:]
+container, http_socket, https_socket, public_ca, consumer, firewall, config, script, fifo = sys.argv[1:]
 inspect = json.loads(subprocess.check_output(["docker", "inspect", container]))[0]
 sources = {mount["Source"] for mount in inspect["Mounts"]}
-expected = {http_socket, https_socket, public_ca, relay, firewall, config, script}
+expected = {http_socket, https_socket, public_ca, consumer, firewall, config, script, fifo}
 if sources != expected:
     raise SystemExit(f"unexpected workload mount inventory: {sources!r}")
 if any("acl-proxy.toml" in source or "key" in pathlib.Path(source).name.lower() for source in sources):
     raise SystemExit("workload received ACL Proxy configuration or private-key material")
 if any(item.startswith("AW_IDENTITY_TOKEN=") for item in inspect["Config"]["Env"]):
-    raise SystemExit("workload received AW_IDENTITY_TOKEN")
+    raise SystemExit("Docker launch metadata retained AW_IDENTITY_TOKEN")
 PY
-docker exec "$WORKLOAD_CONTAINER" sh -eu -c '
+docker exec "$WORKLOAD_CONTAINER" sh -eu -c "
     test ! -e /opt/aw-gateway/bin/acl-proxy
     test ! -e /etc/acl-proxy/acl-proxy.toml
+    test ! -e /etc/acl-proxy/identity-token
+    test ! -e /run/acl-proxy/authorization-provider.sock
     test -S /run/acl-proxy/transparent-http.sock
     test -S /run/acl-proxy/transparent-https.sock
     test -r /etc/acl-proxy/mitm-ca-cert.pem
-    test "${AW_IDENTITY_TOKEN+x}" != x
-'
+    test -p /run/aw-gateway/identity-token.fifo
+    case '$RELAY_CONSUMER' in
+        integrated-agent)
+            test -x /opt/aw-gateway/bin/aw-container-agent
+            test ! -e /opt/acl-proxy/bin/acl-proxy-access-flow-relay
+            ;;
+        standalone-relay)
+            test -x /opt/acl-proxy/bin/acl-proxy-access-flow-relay
+            test ! -e /opt/aw-gateway/bin/aw-container-agent
+            ;;
+    esac
+"
 
 request_http() {
     docker exec --user 65534:65534 "$WORKLOAD_CONTAINER" curl \
@@ -724,11 +1066,11 @@ request_https() {
 }
 
 body=$(request_http http://origin.test/allow)
-[[ $body == 'origin:/allow:identity=host-only-identity' ]] \
-    || fail "redirected HTTP response or identity injection was incorrect: $body"
+[[ $body == 'origin:/allow:identity=absent' ]] \
+    || fail "redirected HTTP response or protected identity stripping was incorrect"
 https_body=$(request_https https://origin.test/secure)
-[[ $https_body == 'origin:/secure:identity=host-only-identity' ]] \
-    || fail "redirected HTTPS response or identity injection was incorrect: $https_body"
+[[ $https_body == 'origin:/secure:identity=absent' ]] \
+    || fail "redirected HTTPS response or protected identity stripping was incorrect"
 
 keepalive_connects=$(docker exec --user 65534:65534 "$WORKLOAD_CONTAINER" curl \
     --fail --silent --show-error --connect-timeout 2 --max-time 10 \
@@ -747,8 +1089,8 @@ import pathlib
 import sys
 records = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()]
 matches = [record for record in records if record.get("target") == "http://origin.test/allow"]
-if len(matches) != 1 or matches[0].get("identity") != "host-only-identity":
-    raise SystemExit(f"parent proxy did not observe the injected identity once: {matches!r}")
+if len(matches) != 1 or matches[0].get("identity") != "absent":
+    raise SystemExit("parent proxy observed the protected identity carrier")
 connects = [record for record in records if record.get("event") == "connect"]
 if [record.get("target") for record in connects] != ["origin.test:443"]:
     raise SystemExit(f"parent proxy did not observe one HTTPS CONNECT: {connects!r}")
@@ -793,11 +1135,89 @@ wait "$STREAM_CLIENT_PID" || fail "incremental stream request failed"
 stream_sha=$(docker exec "$WORKLOAD_CONTAINER" sha256sum /tmp/stream.body | awk '{print $1}')
 [[ $stream_sha == "$expected_stream_sha" ]] || fail "streaming response digest mismatch"
 
+assert_workload_relay_alive
 if docker exec --user 65534:65534 "$WORKLOAD_CONTAINER" curl \
     --fail --silent --connect-timeout 1 --max-time 2 --noproxy '*' \
     "http://$ORIGIN_IP:8080/escape" >/dev/null 2>&1; then
     fail "direct non-protected egress bypassed the fail-closed firewall"
 fi
+assert_workload_relay_alive
+
+ROTATION_STREAM_SIZE=$((16 * 1024 * 512))
+docker exec "$WORKLOAD_CONTAINER" rm -f /tmp/identity-rotation-stream.body
+docker exec --user 65534:65534 "$WORKLOAD_CONTAINER" curl \
+    --fail --silent --show-error --connect-timeout 2 --max-time 30 \
+    --noproxy '*' --resolve "origin.test:80:$ORIGIN_IP" \
+    --output /tmp/identity-rotation-stream.body \
+    http://origin.test/identity-rotation-stream \
+    >"$TMP_DIR/identity-rotation-client.stdout" \
+    2>"$TMP_DIR/identity-rotation-client.stderr" &
+ACTIVE_CLIENT_PID=$!
+ROTATION_STREAM_STARTED=0
+for _ in {1..100}; do
+    rotation_size=$(docker exec "$WORKLOAD_CONTAINER" \
+        stat -c '%s' /tmp/identity-rotation-stream.body 2>/dev/null || printf '0\n')
+    if (( rotation_size > 0 && rotation_size < ROTATION_STREAM_SIZE )) \
+        && kill -0 "$ACTIVE_CLIENT_PID" 2>/dev/null; then
+        ROTATION_STREAM_STARTED=1
+        break
+    fi
+    kill -0 "$ACTIVE_CLIENT_PID" 2>/dev/null || break
+    sleep 0.05
+done
+(( ROTATION_STREAM_STARTED == 1 )) \
+    || fail "identity-bound stream did not start before resolver reload"
+
+NEXT_IDENTITY_TOKEN=$(openssl rand -hex 24)
+[[ $NEXT_IDENTITY_TOKEN =~ ^[0-9a-f]{48}$ ]] \
+    || fail "could not create the replacement workload bearer"
+printf '%s\n' "$NEXT_IDENTITY_TOKEN" >>"$BEARER_HISTORY"
+printf '%s' "$NEXT_IDENTITY_TOKEN" >"$IDENTITY_TOKEN_FILE.next"
+chmod 0600 "$IDENTITY_TOKEN_FILE.next"
+mv -f -- "$IDENTITY_TOKEN_FILE.next" "$IDENTITY_TOKEN_FILE"
+kill -HUP "$ACL_PID"
+for _ in {1..200}; do
+    grep -q 'configuration reload completed successfully' \
+        "$TMP_DIR/logs/acl-proxy.log" 2>/dev/null && break
+    kill -0 "$ACL_PID" 2>/dev/null || fail "ACL Proxy exited during resolver reload"
+    sleep 0.05
+done
+grep -q 'configuration reload completed successfully' \
+    "$TMP_DIR/logs/acl-proxy.log" 2>/dev/null \
+    || fail "ACL Proxy did not report successful resolver reload"
+assert_workload_relay_alive
+
+for _ in {1..100}; do
+    kill -0 "$ACTIVE_CLIENT_PID" 2>/dev/null || break
+    sleep 0.05
+done
+kill -0 "$ACTIVE_CLIENT_PID" 2>/dev/null \
+    && fail "old-generation stream survived resolver reload"
+if wait "$ACTIVE_CLIENT_PID"; then
+    fail "old-generation stream completed after resolver reload"
+fi
+ACTIVE_CLIENT_PID=
+rotation_size=$(docker exec "$WORKLOAD_CONTAINER" \
+    stat -c '%s' /tmp/identity-rotation-stream.body)
+(( rotation_size > 0 && rotation_size < ROTATION_STREAM_SIZE )) \
+    || fail "resolver reload did not interrupt the identity-bound stream"
+assert_workload_relay_alive
+if request_http http://origin.test/old-token-after-reload >/dev/null 2>&1; then
+    fail "old workload bearer remained valid after resolver reload"
+fi
+assert_workload_relay_alive
+capture_workload_observations old-bearer
+scan_observable_secrets
+
+docker rm -f "$WORKLOAD_CONTAINER" >/dev/null
+ACTIVE_BEARER=$NEXT_IDENTITY_TOKEN
+unset IDENTITY_TOKEN NEXT_IDENTITY_TOKEN
+start_workload
+assert_workload_relay_alive
+assert_workload_launcher_bearer_removed
+body=$(request_http http://origin.test/rotated)
+[[ $body == 'origin:/rotated:identity=absent' ]] \
+    || fail "replacement workload bearer did not authenticate"
 
 OLD_HOST_HTTP_ID=$(stat -Lc '%d:%i' "$HTTP_SOCKET")
 OLD_HOST_HTTPS_ID=$(stat -Lc '%d:%i' "$HTTPS_SOCKET")
@@ -845,6 +1265,7 @@ ACTIVE_CLIENT_PID=
 active_size=$(docker exec "$WORKLOAD_CONTAINER" stat -c '%s' /tmp/active-stream.body)
 (( active_size > 0 && active_size < ACTIVE_STREAM_SIZE )) \
     || fail "active stream was not observably incomplete after proxy shutdown"
+assert_workload_relay_alive
 
 if request_http http://origin.test/after-proxy-loss >/dev/null 2>&1; then
     fail "HTTP traffic succeeded after host ACL Proxy loss"
@@ -857,6 +1278,7 @@ if docker exec --user 65534:65534 "$WORKLOAD_CONTAINER" curl \
     "http://$ORIGIN_IP:8080/escape" >/dev/null 2>&1; then
     fail "host proxy loss enabled a direct-network fallback"
 fi
+assert_workload_relay_alive
 
 rm -f -- "$HTTP_SOCKET" "$HTTPS_SOCKET"
 start_acl_proxy second
@@ -873,15 +1295,21 @@ NEW_HOST_HTTPS_ID=$(stat -Lc '%d:%i' "$HTTPS_SOCKET")
 [[ $(docker exec "$WORKLOAD_CONTAINER" stat -Lc '%d:%i' \
     /run/acl-proxy/transparent-https.sock) == "$OLD_WORKLOAD_HTTPS_ID" ]] \
     || fail "running workload HTTPS mount stopped referencing its pinned inode"
+assert_workload_relay_alive
 if request_http http://origin.test/still-pinned >/dev/null 2>&1; then
     fail "running workload unexpectedly reconnected to the rebound HTTP socket"
 fi
 if request_https https://origin.test/still-pinned >/dev/null 2>&1; then
     fail "running workload unexpectedly reconnected to the rebound HTTPS socket"
 fi
+assert_workload_relay_alive
 
+capture_workload_observations pinned-workload
+scan_observable_secrets
 docker rm -f "$WORKLOAD_CONTAINER" >/dev/null
 start_workload
+assert_workload_relay_alive
+assert_workload_launcher_bearer_removed
 NEW_WORKLOAD_HTTP_ID=$(docker exec "$WORKLOAD_CONTAINER" \
     stat -Lc '%d:%i' /run/acl-proxy/transparent-http.sock)
 NEW_WORKLOAD_HTTPS_ID=$(docker exec "$WORKLOAD_CONTAINER" \
@@ -891,20 +1319,33 @@ NEW_WORKLOAD_HTTPS_ID=$(docker exec "$WORKLOAD_CONTAINER" \
 [[ $NEW_WORKLOAD_HTTPS_ID != "$OLD_WORKLOAD_HTTPS_ID" ]] \
     || fail "recreated workload retained the stale HTTPS socket inode"
 body=$(request_http http://origin.test/recovered)
-[[ $body == 'origin:/recovered:identity=host-only-identity' ]] \
-    || fail "HTTP did not recover after workload recreation: $body"
+[[ $body == 'origin:/recovered:identity=absent' ]] \
+    || fail "HTTP did not recover after workload recreation"
 https_body=$(request_https https://origin.test/recovered)
-[[ $https_body == 'origin:/recovered:identity=host-only-identity' ]] \
-    || fail "HTTPS did not recover after workload recreation: $https_body"
+[[ $https_body == 'origin:/recovered:identity=absent' ]] \
+    || fail "HTTPS did not recover after workload recreation"
+docker stop --time 15 "$WORKLOAD_CONTAINER" >"$TMP_DIR/final-workload.stop" \
+    || fail "final workload consumer did not stop cleanly"
+[[ $(docker inspect "$WORKLOAD_CONTAINER" --format '{{.State.Running}}') == false ]] \
+    || fail "final workload container remained running after stop"
+[[ $(docker inspect "$WORKLOAD_CONTAINER" --format '{{.State.ExitCode}}') != 137 ]] \
+    || fail "final workload consumer required forced termination"
+stop_acl_proxy
+capture_workload_observations final-workload
+scan_observable_secrets
 
 ACL_SHA=$(git -C "$ACL_REPO" rev-parse HEAD)
 printf '%s\n' \
-    "access-path=iptables-redirect-so-original-dst-proxy-v2-unix" \
+    "relay-consumer=$RELAY_CONSUMER" \
+    "access-path=iptables-redirect-so-original-dst-awaf-unix" \
     "http-allow=passed" \
     "https-mitm=passed" \
     "parent-proxy=passed" \
     "parent-connect=passed" \
-    "identity-injection=passed" \
+    "identity-authentication=passed" \
+    "protected-carrier-stripping=passed" \
+    "token-rotation-resolver-reload=passed" \
+    "observable-secret-scan=passed" \
     "http1-downstream-keepalive=passed" \
     "deny-before-parent=passed" \
     "incremental-streaming=passed" \
@@ -920,7 +1361,8 @@ printf '%s\n' \
     "base-image-id=$BASE_IMAGE_ID" \
     "workload-image-id=$WORKLOAD_IMAGE_ID" \
     "acl-proxy-sha256=$(sha256sum "$ACL_PROXY_BIN" | awk '{print $1}')" \
-    "relay-sha256=$(sha256sum "$RELAY_BIN" | awk '{print $1}')" \
+    "aw-container-agent-sha256=$(sha256sum "$AGENT_BIN" | awk '{print $1}')" \
+    "acl-access-flow-relay-sha256=$(sha256sum "$RELAY_BIN" | awk '{print $1}')" \
     "aw-firewall-sha256=$(sha256sum "$FIREWALL" | awk '{print $1}')"
 printf '%s\n' 'transparent-uds-stack-smoke=passed'
 SUCCESS=1

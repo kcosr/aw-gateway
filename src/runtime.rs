@@ -35,7 +35,7 @@ pub struct ContainerRuntime {
     env: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ContainerRunSpec {
     pub name: String,
     pub hostname: String,
@@ -54,6 +54,32 @@ pub struct ContainerRunSpec {
     pub published_ssh_host_port: Option<u16>,
     pub extra_run_args: Vec<String>,
     pub command: Vec<String>,
+}
+
+impl fmt::Debug for ContainerRunSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let env_keys = self.env.keys().collect::<Vec<_>>();
+        formatter
+            .debug_struct("ContainerRunSpec")
+            .field("name", &self.name)
+            .field("hostname", &self.hostname)
+            .field("image", &self.image)
+            .field("workspace", &self.workspace)
+            .field("workspace_container_path", &self.workspace_container_path)
+            .field("container_home", &self.container_home)
+            .field("container_user", &self.container_user)
+            .field("passwd_entry", &self.passwd_entry)
+            .field("state_dir_in_container", &self.state_dir_in_container)
+            .field("mounts", &self.mounts)
+            .field("host_socket_exposures", &self.host_socket_exposures)
+            .field("env_keys", &env_keys)
+            .field("labels", &self.labels)
+            .field("publish_ssh", &self.publish_ssh)
+            .field("published_ssh_host_port", &self.published_ssh_host_port)
+            .field("extra_run_args", &self.extra_run_args)
+            .field("command", &self.command)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2860,6 +2886,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::net::UnixListener;
 
+    fn write_executable(path: &Path, contents: impl AsRef<[u8]>) {
+        crate::test_support::write_executable_fixture(path, contents);
+    }
+
     fn test_exposure(relabel: SelinuxRelabel) -> HostSocketExposureSpec {
         HostSocketExposureSpec {
             name: "traffic".into(),
@@ -2898,6 +2928,23 @@ mod tests {
             extra_run_args: Vec::new(),
             command: vec!["sleep".into(), "infinity".into()],
         }
+    }
+
+    #[test]
+    fn container_run_spec_debug_redacts_environment_values() {
+        let mut spec = test_run_spec(Vec::new());
+        spec.env.insert(
+            "AW_IDENTITY_TOKEN".into(),
+            "abcdefghijklmnopqrstuvwxyzABCDEF".into(),
+        );
+        spec.env
+            .insert("AW_SAFE".into(), "visible-but-redacted".into());
+
+        let debug = format!("{spec:?}");
+        assert!(debug.contains("AW_IDENTITY_TOKEN"));
+        assert!(debug.contains("AW_SAFE"));
+        assert!(!debug.contains("abcdefghijklmnopqrstuvwxyzABCDEF"));
+        assert!(!debug.contains("visible-but-redacted"));
     }
 
     #[test]
@@ -3227,7 +3274,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
         let log = dir.path().join("runtime.log");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             format!(
                 r#"#!/bin/sh
@@ -3238,9 +3285,7 @@ exit 0
 "#,
                 log = log.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::Podman,
             program: runtime_program.display().to_string(),
@@ -3379,7 +3424,7 @@ exit 0
     fn apple_preflight_accepts_successful_system_version_and_status() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-container");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             r#"#!/bin/sh
 case "$*" in
@@ -3395,9 +3440,7 @@ case "$*" in
     ;;
 esac
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         run_apple_preflight_checks(
             &runtime_program.display().to_string(),
@@ -3466,7 +3509,7 @@ esac
     fn apple_preflight_rejects_system_status_failure_with_start_hint() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-container");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             r#"#!/bin/sh
 case "$*" in
@@ -3479,9 +3522,7 @@ case "$*" in
     ;;
 esac
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let err = run_apple_preflight_checks(
             &runtime_program.display().to_string(),
@@ -3500,7 +3541,7 @@ esac
         let runtime_program = dir.path().join("fake-container");
         let preflight_log = dir.path().join("preflight.log");
         let list_log = dir.path().join("list.log");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             format!(
                 r#"#!/bin/sh
@@ -3526,9 +3567,7 @@ esac
                 preflight_log = preflight_log.display(),
                 list_log = list_log.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::AppleContainer,
             program: runtime_program.display().to_string(),
@@ -3566,7 +3605,7 @@ esac
         let list_log = dir.path().join("list.log");
         let fail_status = dir.path().join("fail-status");
         std::fs::write(&fail_status, "").unwrap();
-        std::fs::write(
+        write_executable(
             &runtime_program,
             format!(
                 r#"#!/bin/sh
@@ -3598,9 +3637,7 @@ esac
                 list_log = list_log.display(),
                 fail_status = fail_status.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::AppleContainer,
             program: runtime_program.display().to_string(),
@@ -4374,12 +4411,10 @@ esac
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
         let log = dir.path().join("runtime.log");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             format!("#!/bin/sh\necho \"$@\" > \"{}\"\nexit 7\n", log.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::AppleContainer,
             program: runtime_program.display().to_string(),
@@ -4403,7 +4438,7 @@ esac
         let _apple_preflight_bypass = disable_apple_preflight_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             r#"#!/bin/sh
 case "$1" in
@@ -4415,9 +4450,7 @@ JSON
 esac
 exit 0
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::AppleContainer,
             program: runtime_program.display().to_string(),
@@ -4440,7 +4473,7 @@ exit 0
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
         let user = "alice";
-        std::fs::write(
+        write_executable(
             &runtime_program,
             format!(
                 r#"#!/bin/sh
@@ -4459,10 +4492,8 @@ esac
 exit 0
 "#,
                 user = user,
-            )
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            ),
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::AppleContainer,
             program: runtime_program.display().to_string(),
@@ -4487,7 +4518,7 @@ exit 0
         let _apple_preflight_bypass = disable_apple_preflight_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             r#"#!/bin/sh
 case "$1" in
@@ -4504,9 +4535,7 @@ JSON
 esac
 exit 0
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::AppleContainer,
             program: runtime_program.display().to_string(),
@@ -4642,12 +4671,10 @@ exit 0
     async fn exec_with_timeout_reports_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             "#!/bin/sh\nif [ \"$1\" = exec ]; then sleep 5; fi\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::Podman,
             program: runtime_program.display().to_string(),
@@ -4677,12 +4704,10 @@ exit 0
     async fn exec_capture_closes_stdin_for_noninteractive_wait() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             "#!/bin/sh\nif [ \"$1\" = exec ]; then read line || true; echo done; fi\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::Podman,
             program: runtime_program.display().to_string(),
@@ -4713,12 +4738,10 @@ exit 0
     async fn exec_capture_with_timeout_bounds_pipe_drain_after_child_exit() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             "#!/bin/sh\nif [ \"$1\" = exec ]; then (sleep 5) & echo done; exit 0; fi\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::Podman,
             program: runtime_program.display().to_string(),
@@ -4752,15 +4775,13 @@ exit 0
     async fn exec_capture_truncates_oversized_stdout() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             format!(
                 "#!/bin/sh\nif [ \"$1\" = exec ]; then dd if=/dev/zero bs={} count=1 2>/dev/null; fi\n",
                 MAX_CAPTURED_STREAM_BYTES + 1
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::Podman,
             program: runtime_program.display().to_string(),

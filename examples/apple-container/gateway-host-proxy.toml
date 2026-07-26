@@ -141,16 +141,6 @@ target = "/etc/ssh/sshd_config_agent"
 mode = "ro"
 
 [[target_defaults.container_mounts]]
-source = "/Users/example/aw-gateway/runtime/linux/acl-proxy-transparent-uds-relay"
-target = "/opt/aw-gateway/bin/acl-proxy-transparent-uds-relay"
-mode = "ro"
-
-[[target_defaults.container_mounts]]
-source = "/Users/example/aw-gateway/config/transparent-uds-relay.json"
-target = "/etc/acl-proxy/transparent-uds-relay.json"
-mode = "ro"
-
-[[target_defaults.container_mounts]]
 source = "/Users/example/aw-gateway/runtime/linux/aw-transparent-uds-firewall"
 target = "/opt/aw-gateway/bin/aw-transparent-uds-firewall"
 mode = "ro"
@@ -186,6 +176,35 @@ legacy_scp = "allow"
 enabled = true
 control_socket = false
 
+[target_defaults.container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 1024
+copy_buffer_bytes_per_direction = 16384
+start_after_services = ["transparent-firewall"]
+
+[target_defaults.container_agent.access_flow_relay.presentation]
+kind = "bearer_environment"
+variable = "AW_IDENTITY_TOKEN"
+
+[[target_defaults.container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[target_defaults.container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/acl-proxy/transparent-http.sock"
+
+[[target_defaults.container_agent.access_flow_relay.routes]]
+name = "https"
+listen = "127.0.0.1:3129"
+allowed_destination_ports = [443]
+
+[target_defaults.container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/acl-proxy/transparent-https.sock"
+
 [[target_defaults.container_agent.services]]
 name = "transparent-firewall"
 required = true
@@ -206,32 +225,12 @@ depends_on = []
 type = "process"
 
 [[target_defaults.container_agent.services]]
-name = "transparent-relay"
-required = true
-user = "root"
-command = [
-  "/opt/aw-gateway/bin/acl-proxy-transparent-uds-relay",
-  "--config", "/etc/acl-proxy/transparent-uds-relay.json",
-]
-restart = "always"
-restart_backoff = "1s"
-startup_timeout = "10s"
-depends_on = ["transparent-firewall"]
-
-[target_defaults.container_agent.services.health_check]
-type = "tcp"
-host = "127.0.0.1"
-port = 3128
-interval = "1s"
-timeout = "1s"
-
-[[target_defaults.container_agent.services]]
 name = "container-sshd"
 required = true
 user = "root"
 command = ["/opt/aw-gateway/bin/start-container-sshd"]
 restart = "always"
-depends_on = ["transparent-relay"]
+depends_on = ["@access-flow-relay"]
 
 [target_defaults.container_agent.services.health_check]
 type = "tcp"

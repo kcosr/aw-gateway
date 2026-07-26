@@ -192,14 +192,15 @@ See [Firewall Policy](firewall.md) for namespace and Colima placement details.
 `examples/apple-container/gateway-host-proxy.toml` is an additive deployment
 profile for keeping the policy proxy, MITM private key, and credential material
 on the trusted host. It exposes only the host proxy's HTTP and HTTPS Unix
-listeners, runs `acl-proxy-transparent-uds-relay` under the existing root
-supervisor identity, and makes SSH depend on relay readiness.
+listeners, embeds the shared Access Flow relay in `aw-container-agent`, and
+makes SSH depend on the synthetic `@access-flow-relay` readiness node. No relay
+child executable or relay JSON file is mounted into the container.
 
 The profile installs the repository asset
 `assets/aw-transparent-uds-firewall` in a required container bootstrap step
 before the agent starts. Its root-owned watcher then maintains the rules as an
-ordinary required service; the relay depends on that watcher, and SSH depends
-on relay readiness. AW Gateway probes both exposed sockets as root before
+ordinary required service; relay activation follows that watcher, and SSH
+depends on relay readiness. The agent probes both exposed sockets before
 reporting the target ready. The policy
 redirects TCP ports 80 and 443 to the relay, allows only loopback, established
 IPv4 traffic, and DNS to one explicit resolver, drops UDP/443, and denies all
@@ -227,10 +228,13 @@ For VS Code or other Node-based tools, also validate from an SSH session so
 
 ## Implementation Option
 
-One possible proxy implementation is
-[acl-proxy](https://github.com/kcosr/acl-proxy). `aw-gateway` does not require
-that project; any proxy with a stable command, config file, health check, CA
-bundle, and firewall policy can use the same integration pattern.
+The typed host-socket exposure is application-neutral, and the embedded relay
+connects to any Unix listener that implements AW Access Flow version 1. The
+provided host-local profile uses
+[acl-proxy](https://github.com/kcosr/acl-proxy-access-runtime) because it
+supplies the required Access Flow listeners plus transparent HTTP/HTTPS policy
+and MITM behavior. Another implementation must provide those same protocol and
+deployment contracts; a generic Unix socket alone is not sufficient.
 
 The repository includes `assets/acl-proxy.example.toml` as a small starter
 policy for common coding-agent egress: broad GitHub access, optional GitHub
