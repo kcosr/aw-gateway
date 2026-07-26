@@ -2886,6 +2886,20 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::net::UnixListener;
 
+    fn write_executable(path: &Path, contents: impl AsRef<[u8]>) {
+        let staging = path.with_extension("staging");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+            .unwrap();
+        file.write_all(contents.as_ref()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(staging, path).unwrap();
+    }
+
     fn test_exposure(relabel: SelinuxRelabel) -> HostSocketExposureSpec {
         HostSocketExposureSpec {
             name: "traffic".into(),
@@ -3270,7 +3284,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
         let log = dir.path().join("runtime.log");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             format!(
                 r#"#!/bin/sh
@@ -3281,9 +3295,7 @@ exit 0
 "#,
                 log = log.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::Podman,
             program: runtime_program.display().to_string(),
@@ -3422,7 +3434,7 @@ exit 0
     fn apple_preflight_accepts_successful_system_version_and_status() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-container");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             r#"#!/bin/sh
 case "$*" in
@@ -3438,9 +3450,7 @@ case "$*" in
     ;;
 esac
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         run_apple_preflight_checks(
             &runtime_program.display().to_string(),
@@ -3509,7 +3519,7 @@ esac
     fn apple_preflight_rejects_system_status_failure_with_start_hint() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-container");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             r#"#!/bin/sh
 case "$*" in
@@ -3522,9 +3532,7 @@ case "$*" in
     ;;
 esac
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let err = run_apple_preflight_checks(
             &runtime_program.display().to_string(),
@@ -3543,7 +3551,7 @@ esac
         let runtime_program = dir.path().join("fake-container");
         let preflight_log = dir.path().join("preflight.log");
         let list_log = dir.path().join("list.log");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             format!(
                 r#"#!/bin/sh
@@ -3569,9 +3577,7 @@ esac
                 preflight_log = preflight_log.display(),
                 list_log = list_log.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::AppleContainer,
             program: runtime_program.display().to_string(),
@@ -3609,7 +3615,7 @@ esac
         let list_log = dir.path().join("list.log");
         let fail_status = dir.path().join("fail-status");
         std::fs::write(&fail_status, "").unwrap();
-        std::fs::write(
+        write_executable(
             &runtime_program,
             format!(
                 r#"#!/bin/sh
@@ -3641,9 +3647,7 @@ esac
                 list_log = list_log.display(),
                 fail_status = fail_status.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::AppleContainer,
             program: runtime_program.display().to_string(),
@@ -4417,12 +4421,10 @@ esac
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
         let log = dir.path().join("runtime.log");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             format!("#!/bin/sh\necho \"$@\" > \"{}\"\nexit 7\n", log.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::AppleContainer,
             program: runtime_program.display().to_string(),
@@ -4446,7 +4448,7 @@ esac
         let _apple_preflight_bypass = disable_apple_preflight_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             r#"#!/bin/sh
 case "$1" in
@@ -4458,9 +4460,7 @@ JSON
 esac
 exit 0
 "#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::AppleContainer,
             program: runtime_program.display().to_string(),
@@ -4483,7 +4483,7 @@ exit 0
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
         let user = "alice";
-        std::fs::write(
+        write_executable(
             &runtime_program,
             format!(
                 r#"#!/bin/sh
@@ -4502,10 +4502,8 @@ esac
 exit 0
 "#,
                 user = user,
-            )
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+            ),
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::AppleContainer,
             program: runtime_program.display().to_string(),
@@ -4530,10 +4528,8 @@ exit 0
         let _apple_preflight_bypass = disable_apple_preflight_for_tests();
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
-        let staging = dir.path().join("fake-runtime.staging");
-        let mut runtime_file = std::fs::File::create(&staging).unwrap();
-        std::io::Write::write_all(
-            &mut runtime_file,
+        write_executable(
+            &runtime_program,
             r#"#!/bin/sh
 case "$1" in
   list)
@@ -4548,14 +4544,8 @@ JSON
     ;;
 esac
 exit 0
-"#
-            .as_bytes(),
-        )
-        .unwrap();
-        runtime_file.sync_all().unwrap();
-        drop(runtime_file);
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::rename(staging, &runtime_program).unwrap();
+"#,
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::AppleContainer,
             program: runtime_program.display().to_string(),
@@ -4691,12 +4681,10 @@ exit 0
     async fn exec_with_timeout_reports_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             "#!/bin/sh\nif [ \"$1\" = exec ]; then sleep 5; fi\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::Podman,
             program: runtime_program.display().to_string(),
@@ -4726,12 +4714,10 @@ exit 0
     async fn exec_capture_closes_stdin_for_noninteractive_wait() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             "#!/bin/sh\nif [ \"$1\" = exec ]; then read line || true; echo done; fi\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::Podman,
             program: runtime_program.display().to_string(),
@@ -4762,12 +4748,10 @@ exit 0
     async fn exec_capture_with_timeout_bounds_pipe_drain_after_child_exit() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
-        std::fs::write(
+        write_executable(
             &runtime_program,
             "#!/bin/sh\nif [ \"$1\" = exec ]; then (sleep 5) & echo done; exit 0; fi\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&runtime_program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::Podman,
             program: runtime_program.display().to_string(),
@@ -4801,21 +4785,13 @@ exit 0
     async fn exec_capture_truncates_oversized_stdout() {
         let dir = tempfile::tempdir().unwrap();
         let runtime_program = dir.path().join("fake-runtime");
-        let staging = dir.path().join("fake-runtime.staging");
-        let mut runtime_file = std::fs::File::create(&staging).unwrap();
-        runtime_file
-            .write_all(
-                format!(
-                    "#!/bin/sh\nif [ \"$1\" = exec ]; then dd if=/dev/zero bs={} count=1 2>/dev/null; fi\n",
-                    MAX_CAPTURED_STREAM_BYTES + 1
-                )
-                .as_bytes(),
-            )
-            .unwrap();
-        runtime_file.sync_all().unwrap();
-        drop(runtime_file);
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::rename(staging, &runtime_program).unwrap();
+        write_executable(
+            &runtime_program,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = exec ]; then dd if=/dev/zero bs={} count=1 2>/dev/null; fi\n",
+                MAX_CAPTURED_STREAM_BYTES + 1
+            ),
+        );
         let runtime = ContainerRuntime {
             kind: ContainerRuntimeType::Podman,
             program: runtime_program.display().to_string(),
