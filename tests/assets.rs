@@ -59,6 +59,7 @@ fn asset_scripts_are_shell_syntax_valid() {
 
     for script in [
         "run-host-socket-exposure-smoke.sh",
+        "run-tls-access-flow-stack-smoke.sh",
         "run-transparent-firewall-smoke.sh",
         "run-transparent-uds-stack-smoke.sh",
     ] {
@@ -375,6 +376,80 @@ fn transparent_stack_smoke_covers_both_access_flow_relay_consumers() {
         smoke_nofile >= required_descriptors,
         "Docker smoke nofile limit does not satisfy the shipped relay projection"
     );
+}
+
+fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
+    for required in [
+        "Usage: run-tls-access-flow-stack-smoke.sh",
+        "schema_version = 4",
+        "kind = \"tls_tcp\"",
+        "server_name = \"proxy.access-flow.test\"",
+        "kind = \"pem_bundle\"",
+        "[container_agent.access_flow_relay]",
+        "/opt/aw-gateway/bin/aw-container-agent",
+        "invalid bearer reached the authorization provider",
+        "delegate-allow-pass-deny=passed",
+        "private-inbound-field=passed",
+        "provider-client-sentinel=0.0.0.0",
+        "capture-client-sentinel=0.0.0.0:0",
+        "policy-log-client-sentinel=0.0.0.0",
+        "one-outer-connection-per-workload-flow=passed",
+        "websocket-upgrade-frame=passed",
+        "half-close=passed",
+        "low-concurrency-cancellation=passed",
+        "test ! -e /run/acl-proxy/transparent-http.sock",
+        "tls-access-flow-stack-smoke=passed",
+    ] {
+        if !script.contains(required) {
+            return Err(required);
+        }
+    }
+    for forbidden in [
+        "--relay-bin",
+        "--relay-consumer",
+        "--access-flow-transport",
+        "kind = \"unix\"",
+        "schema_version = 3",
+        "acl-proxy-access-flow-relay --config",
+        "token-rotation-resolver-reload=passed",
+        "proxy-loss-fail-closed=passed",
+        "pinned-inode-rebind=passed",
+    ] {
+        if script.contains(forbidden) {
+            return Err(forbidden);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn tls_access_flow_stack_smoke_is_integrated_non_vacuous_and_mutation_guarded() {
+    let smoke = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("smoke/scripts/run-tls-access-flow-stack-smoke.sh"),
+    )
+    .unwrap();
+    validate_tls_access_flow_smoke(&smoke).unwrap();
+
+    for marker in [
+        "invalid bearer reached the authorization provider",
+        "delegate-allow-pass-deny=passed",
+        "private-inbound-field=passed",
+        "provider-client-sentinel=0.0.0.0",
+        "capture-client-sentinel=0.0.0.0:0",
+        "policy-log-client-sentinel=0.0.0.0",
+        "one-outer-connection-per-workload-flow=passed",
+        "websocket-upgrade-frame=passed",
+        "half-close=passed",
+        "low-concurrency-cancellation=passed",
+        "tls-access-flow-stack-smoke=passed",
+    ] {
+        let mutated = smoke.replacen(marker, "removed-by-mutation", 1);
+        assert!(
+            validate_tls_access_flow_smoke(&mutated).is_err(),
+            "removing {marker:?} did not invalidate the smoke contract"
+        );
+    }
 }
 
 #[test]
