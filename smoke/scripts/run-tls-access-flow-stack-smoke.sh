@@ -1548,8 +1548,13 @@ wait_for_measurement_active_flows() {
 }
 
 assert_measurement_clients_alive() {
-    docker exec "$WORKLOAD_CONTAINER" test ! -f /tmp/measurement-clients.failed \
-        || fail "a measured HTTP/HTTPS client exited before the active epoch ended"
+    if ! docker exec "$WORKLOAD_CONTAINER" \
+        test ! -f /tmp/measurement-clients.failed; then
+        docker exec "$WORKLOAD_CONTAINER" \
+            cat /tmp/measurement-clients.failure 2>/dev/null \
+            | sanitize_diagnostics >&2 || true
+        fail "a measured HTTP/HTTPS client exited before the active epoch ended"
+    fi
     local client_pid
     client_pid=$(docker exec "$WORKLOAD_CONTAINER" cat /tmp/measurement-clients.pid \
         2>/dev/null || true)
@@ -1741,24 +1746,36 @@ origin_ip=$2
 http_count=$((load / 2))
 https_count=$((load - http_count))
 pids=()
+labels=()
 printf '%s\n' "$$" >/tmp/measurement-clients.pid
 for ((index = 0; index < http_count; index++)); do
     curl --fail --silent --show-error --noproxy '*' \
         --resolve "origin.test:80:$origin_ip" \
-        "http://origin.test/measurement-hold/http-$index" >/dev/null &
+        "http://origin.test/measurement-hold/http-$index" \
+        >/dev/null 2>"/tmp/measurement-client-http-$index.stderr" &
     pids+=("$!")
+    labels+=("http-$index")
 done
 for ((index = 0; index < https_count; index++)); do
     curl --fail --silent --show-error --noproxy '*' \
         --cacert /etc/acl-proxy/mitm-ca-cert.pem \
         --resolve "origin.test:443:$origin_ip" \
-        "https://origin.test/measurement-hold/https-$index" >/dev/null &
+        "https://origin.test/measurement-hold/https-$index" \
+        >/dev/null 2>"/tmp/measurement-client-https-$index.stderr" &
     pids+=("$!")
+    labels+=("https-$index")
 done
 touch /tmp/measurement-clients.ready
 while [[ ! -f /tmp/measurement.stop ]]; do
-    for pid in "${pids[@]}"; do
+    for index in "${!pids[@]}"; do
+        pid=${pids[$index]}
         if ! kill -0 "$pid" 2>/dev/null; then
+            status=0
+            wait "$pid" || status=$?
+            {
+                printf 'client=%s exit=%s\n' "${labels[$index]}" "$status"
+                cat "/tmp/measurement-client-${labels[$index]}.stderr"
+            } >/tmp/measurement-clients.failure
             touch /tmp/measurement-clients.failed
             exit 1
         fi
