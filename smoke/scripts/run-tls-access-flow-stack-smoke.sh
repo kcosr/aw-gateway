@@ -872,7 +872,6 @@ TLS_SOURCE_TABLE_CAPACITY=128
 LISTENER_MAX_CONNECTIONS=64
 RELAY_MAX_CONNECTIONS=64
 IDENTITY_MAX_PENDING=32
-WIRE_BODY_QUOTA_PER_KEY=2147483648
 if [[ -n $MEASUREMENT_CONTROL_DIR ]]; then
     TLS_MAX_HANDSHAKES=64
     TLS_MAX_CONNECTIONS_PER_SOURCE=64
@@ -880,7 +879,6 @@ if [[ -n $MEASUREMENT_CONTROL_DIR ]]; then
     LISTENER_MAX_CONNECTIONS=64
     RELAY_MAX_CONNECTIONS=128
     IDENTITY_MAX_PENDING=128
-    WIRE_BODY_QUOTA_PER_KEY=17179869184
 fi
 
 HTTP_TRANSPORT_CONFIG=$(cat <<EOF
@@ -923,7 +921,12 @@ schema_version = 4
 [service]
 request_timeout = "30s"
 shutdown_drain_timeout = "2s"
-max_inflight_wire_body_bytes_per_quota_key = $WIRE_BODY_QUOTA_PER_KEY
+
+[service.forwarding]
+max_request_wire_bytes = 1048576
+max_request_decoded_bytes = 1048576
+max_response_wire_bytes = 16777216
+max_response_decoded_bytes = 16777216
 
 [control]
 bind = "127.0.0.1:$CONTROL_PORT"
