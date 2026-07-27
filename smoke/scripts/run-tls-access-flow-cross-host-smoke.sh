@@ -13,6 +13,7 @@ EXPECTED_ACCESS_RUNTIME_SHA=
 EXPECTED_AW_SHA=
 REMOTE_HOST=
 REMOTE_ADDRESS=
+REMOTE_SOURCE_ADDRESSES_CSV=
 REMOTE_SOURCE_ADDRESS=
 REMOTE_INTERFACE=
 REMOTE_CONTAINER_BACKEND=
@@ -61,8 +62,8 @@ Usage: run-tls-access-flow-cross-host-smoke.sh \
   --workload-image <image> \
   --agent-image <image> \
   --remote-image <image> \
+  --remote-source-addresses <IPv4[,IPv4...]> \
   [--remote-address <IPv4>] \
-  [--remote-source-address <IPv4>] \
   [--remote-interface <interface>]
 EOF
     exit 2
@@ -85,6 +86,7 @@ validate_ipv4() {
     IFS=. read -r -a parts <<<"$value"
     for part in "${parts[@]}"; do
         [[ $part =~ ^[0-9]+$ ]] || return 1
+        [[ $part == 0 || $part != 0* ]] || return 1
         ((10#$part <= 255)) || return 1
     done
 }
@@ -277,7 +279,7 @@ while (($#)); do
         --agent-image) WORKLOAD_AGENT_IMAGE=$2 ;;
         --remote-image) REMOTE_IMAGE=$2 ;;
         --remote-address) REMOTE_ADDRESS=$2 ;;
-        --remote-source-address) REMOTE_SOURCE_ADDRESS=$2 ;;
+        --remote-source-addresses) REMOTE_SOURCE_ADDRESSES_CSV=$2 ;;
         --remote-interface) REMOTE_INTERFACE=$2 ;;
         *) usage ;;
     esac
@@ -288,7 +290,8 @@ done
     && -n $ACCESS_RUNTIME_REPO && -n $AW_REPO && -n $EXPECTED_ACL_SHA \
     && -n $EXPECTED_ACCESS_RUNTIME_SHA && -n $EXPECTED_AW_SHA \
     && -n $REMOTE_HOST && -n $WORKLOAD_BASE_IMAGE \
-    && -n $WORKLOAD_AGENT_IMAGE && -n $REMOTE_IMAGE ]] || usage
+    && -n $WORKLOAD_AGENT_IMAGE && -n $REMOTE_IMAGE \
+    && -n $REMOTE_SOURCE_ADDRESSES_CSV ]] || usage
 [[ $REMOTE_HOST =~ ^[A-Za-z0-9._@-]+$ ]] \
     || fail "remote-host contains unsupported SSH/scp characters"
 [[ ${REMOTE_HOST,,} != localhost && ${REMOTE_HOST,,} != localhost.* ]] \
@@ -489,20 +492,67 @@ if ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 \
     | grep -Fxq -- "$REMOTE_ADDRESS"; then
     fail "remote-address is assigned to the local machine"
 fi
-if [[ -z $REMOTE_SOURCE_ADDRESS ]]; then
-    REMOTE_SOURCE_ADDRESS=$SSH_SOURCE
-fi
-validate_ipv4 "$REMOTE_SOURCE_ADDRESS" \
-    || fail "remote-source-address must be IPv4"
 
-if [[ -z $REMOTE_INTERFACE ]]; then
-    REMOTE_ROUTE_INTERFACE=$(
+IFS=, read -r -a REMOTE_SOURCE_ADDRESSES <<<"$REMOTE_SOURCE_ADDRESSES_CSV"
+(( ${#REMOTE_SOURCE_ADDRESSES[@]} >= 1 \
+    && ${#REMOTE_SOURCE_ADDRESSES[@]} <= 16 )) \
+    || fail "remote-source-addresses must contain between one and sixteen IPv4 addresses"
+declare -A SEEN_REMOTE_SOURCE_ADDRESSES=()
+declare -A LOCAL_SOURCE_ADDRESSES=()
+LOCAL_SOURCE_INVENTORY=$(
+    ip -o -4 addr show scope global \
+        | awk '$2 != "lo" {split($4, address, "/"); print address[1]}'
+)
+if [[ -r /proc/sys/fs/binfmt_misc/WSLInterop ]]; then
+    readonly WINDOWS_POWERSHELL=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
+    [[ -x $WINDOWS_POWERSHELL ]] \
+        || fail "WSL outer-host IPv4 inventory requires Windows PowerShell"
+    WINDOWS_SOURCE_INVENTORY=$(
+        timeout --foreground --signal=TERM --kill-after=2s 10s \
+            "$WINDOWS_POWERSHELL" -NoProfile -NonInteractive -Command \
+            'Get-NetIPAddress -AddressFamily IPv4 | Where-Object { -not $_.SkipAsSource -and $_.AddressState -eq "Preferred" } | ForEach-Object { $_.IPAddress }' \
+            | tr -d '\r'
+    ) || fail "could not inventory WSL outer-host IPv4 addresses"
+    LOCAL_SOURCE_INVENTORY+=$'\n'"$WINDOWS_SOURCE_INVENTORY"
+fi
+while IFS= read -r local_source_address; do
+    validate_ipv4 "$local_source_address" || continue
+    [[ $local_source_address != 127.* ]] || continue
+    LOCAL_SOURCE_ADDRESSES[$local_source_address]=1
+done <<<"$LOCAL_SOURCE_INVENTORY"
+for source_address in "${REMOTE_SOURCE_ADDRESSES[@]}"; do
+    validate_ipv4 "$source_address" \
+        || fail "remote-source-addresses must contain only IPv4 addresses"
+    [[ $source_address != 127.* \
+        && -n ${LOCAL_SOURCE_ADDRESSES[$source_address]+x} ]] \
+        || fail "remote-source-addresses must belong to the initiating host"
+    [[ -z ${SEEN_REMOTE_SOURCE_ADDRESSES[$source_address]+x} ]] \
+        || fail "remote-source-addresses must not contain duplicates"
+    SEEN_REMOTE_SOURCE_ADDRESSES[$source_address]=1
+done
+REMOTE_SOURCE_ADDRESS=${REMOTE_SOURCE_ADDRESSES[0]}
+[[ $(IFS=,; printf '%s' "${REMOTE_SOURCE_ADDRESSES[*]}") \
+    == "$REMOTE_SOURCE_ADDRESSES_CSV" ]] \
+    || fail "remote-source-addresses must use canonical comma-separated form"
+
+REMOTE_ROUTE_INTERFACE=$(
+    ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" \
+        ip route get "$REMOTE_SOURCE_ADDRESS" \
+    | awk '{for (field = 1; field <= NF; field++) if ($field == "dev") {print $(field + 1); exit}}'
+)
+[[ $REMOTE_ROUTE_INTERFACE =~ ^[A-Za-z0-9._:-]+$ ]] \
+    || fail "remote route interface discovery was invalid"
+for source_address in "${REMOTE_SOURCE_ADDRESSES[@]:1}"; do
+    source_route_interface=$(
         ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" \
-            ip route get "$REMOTE_SOURCE_ADDRESS" \
+            ip route get "$source_address" \
         | awk '{for (field = 1; field <= NF; field++) if ($field == "dev") {print $(field + 1); exit}}'
     )
-    [[ $REMOTE_ROUTE_INTERFACE =~ ^[A-Za-z0-9._:-]+$ ]] \
-        || fail "remote route interface discovery was invalid"
+    [[ $source_route_interface == "$REMOTE_ROUTE_INTERFACE" ]] \
+        || fail "remote source allow-set spans multiple route interfaces"
+done
+
+if [[ -z $REMOTE_INTERFACE ]]; then
     REMOTE_INTERFACE=$(
         ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" sh -s -- \
             "$REMOTE_ROUTE_INTERFACE" <<'REMOTE_INTERFACE_DISCOVERY'
@@ -536,10 +586,17 @@ fi
 DENIED_SOURCE_ADDRESS=$(
     ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" \
         ip -o -4 addr show scope global \
-    | awk -v public="$REMOTE_ADDRESS" -v allowed="$REMOTE_SOURCE_ADDRESS" '
+    | awk -v public="$REMOTE_ADDRESS" \
+        -v allowed="$REMOTE_SOURCE_ADDRESSES_CSV" '
+        BEGIN {
+            count = split(allowed, values, ",")
+            for (item = 1; item <= count; item++) {
+                denied[values[item]] = 1
+            }
+        }
         {
             split($4, address, "/")
-            if (address[1] != public && address[1] != allowed) {
+            if (address[1] != public && !(address[1] in denied)) {
                 print address[1]
                 exit
             }
@@ -1064,18 +1121,22 @@ load_state() {
 remove_firewall() {
     [[ -f $STATE/runtime.env ]] || return 0
     load_state
-    local attempt firewall
-    for attempt in {1..5}; do
-        sudo -n iptables -w 5 -C INPUT \
-            -s "$SOURCE_ADDRESS/32" -d "$PUBLIC_ADDRESS/32" -p tcp \
-            -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
-            -m comment --comment "$TAG.allow" -j ACCEPT 2>/dev/null \
-            || break
-        sudo -n iptables -w 5 -D INPUT \
-            -s "$SOURCE_ADDRESS/32" -d "$PUBLIC_ADDRESS/32" -p tcp \
-            -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
-            -m comment --comment "$TAG.allow" -j ACCEPT 2>/dev/null \
-            || sleep 0.1
+    local attempt firewall source
+    local -a sources
+    IFS=, read -r -a sources <<<"$SOURCE_ADDRESSES"
+    for source in "${sources[@]}"; do
+        for attempt in {1..5}; do
+            sudo -n iptables -w 5 -C INPUT \
+                -s "$source/32" -d "$PUBLIC_ADDRESS/32" -p tcp \
+                -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
+                -m comment --comment "$TAG.allow" -j ACCEPT 2>/dev/null \
+                || break
+            sudo -n iptables -w 5 -D INPUT \
+                -s "$source/32" -d "$PUBLIC_ADDRESS/32" -p tcp \
+                -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
+                -m comment --comment "$TAG.allow" -j ACCEPT 2>/dev/null \
+                || sleep 0.1
+        done
     done
     for attempt in {1..5}; do
         sudo -n iptables -w 5 -C INPUT \
@@ -1181,26 +1242,49 @@ capture_counts() {
                 }
             }
         ' | sort -u >"$STATE/outer-tuples.txt"
-    http=$(awk -v source="$SOURCE_ADDRESS." \
+    http=$(awk -v sources="$SOURCE_ADDRESSES" \
         -v target="$PUBLIC_ADDRESS.$HTTP_PORT" '
+            BEGIN { source_count = split(sources, source, ",") }
             {
                 split($0, tuple, ">")
-                if (index(tuple[1], source) == 1 && tuple[2] == target) count++
+                for (item = 1; item <= source_count; item++) {
+                    if (index(tuple[1], source[item] ".") == 1 &&
+                            tuple[2] == target) count++
+                }
             }
             END {print count+0}
         ' \
         "$STATE/outer-tuples.txt")
-    https=$(awk -v source="$SOURCE_ADDRESS." \
+    https=$(awk -v sources="$SOURCE_ADDRESSES" \
         -v target="$PUBLIC_ADDRESS.$HTTPS_PORT" '
+            BEGIN { source_count = split(sources, source, ",") }
             {
                 split($0, tuple, ">")
-                if (index(tuple[1], source) == 1 && tuple[2] == target) count++
+                for (item = 1; item <= source_count; item++) {
+                    if (index(tuple[1], source[item] ".") == 1 &&
+                            tuple[2] == target) count++
+                }
             }
             END {print count+0}
         ' \
         "$STATE/outer-tuples.txt")
     printf 'http=%s\nhttps=%s\ntotal=%s\n' "$http" "$https" \
         "$((http + https))"
+}
+
+rejection_count() {
+    python3 - "$STATE/proxy-logs" <<'PY'
+import pathlib
+import sys
+
+message = b"TLS/TCP Access Flow preface or bearer was rejected"
+root = pathlib.Path(sys.argv[1])
+print(sum(
+    path.read_bytes().count(message)
+    for path in root.iterdir()
+    if path.is_file()
+))
+PY
 }
 
 verify_remote_topology_absent() {
@@ -1245,7 +1329,7 @@ case "$ACTION" in
     start)
         (($# == 7)) || exit 2
         PUBLIC_ADDRESS=$1
-        SOURCE_ADDRESS=$2
+        SOURCE_ADDRESSES=$2
         CAPTURE_INTERFACE=$3
         HTTP_PORT=$4
         HTTPS_PORT=$5
@@ -1267,7 +1351,7 @@ case "$ACTION" in
         TAG="aw-rt05-$SUFFIX"
         cat >"$STATE/runtime.env" <<EOF
 PUBLIC_ADDRESS=$PUBLIC_ADDRESS
-SOURCE_ADDRESS=$SOURCE_ADDRESS
+SOURCE_ADDRESSES=$SOURCE_ADDRESSES
 CAPTURE_INTERFACE=$CAPTURE_INTERFACE
 HTTP_PORT=$HTTP_PORT
 HTTPS_PORT=$HTTPS_PORT
@@ -1297,14 +1381,19 @@ EOF
             -d "$PUBLIC_ADDRESS/32" -p tcp \
             -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
             -m comment --comment "$TAG.deny" -j DROP
-        sudo -n iptables -w 5 -I INPUT 1 \
-            -s "$SOURCE_ADDRESS/32" -d "$PUBLIC_ADDRESS/32" -p tcp \
-            -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
-            -m comment --comment "$TAG.allow" -j ACCEPT
-        sudo -n iptables -w 5 -C INPUT \
-            -s "$SOURCE_ADDRESS/32" -d "$PUBLIC_ADDRESS/32" -p tcp \
-            -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
-            -m comment --comment "$TAG.allow" -j ACCEPT
+        IFS=, read -r -a sources <<<"$SOURCE_ADDRESSES"
+        ((${#sources[@]} >= 1 && ${#sources[@]} <= 16))
+        for source in "${sources[@]}"; do
+            [[ $source =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            sudo -n iptables -w 5 -I INPUT 1 \
+                -s "$source/32" -d "$PUBLIC_ADDRESS/32" -p tcp \
+                -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
+                -m comment --comment "$TAG.allow" -j ACCEPT
+            sudo -n iptables -w 5 -C INPUT \
+                -s "$source/32" -d "$PUBLIC_ADDRESS/32" -p tcp \
+                -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
+                -m comment --comment "$TAG.allow" -j ACCEPT
+        done
         sudo -n iptables -w 5 -C INPUT \
             -d "$PUBLIC_ADDRESS/32" -p tcp \
             -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
@@ -1433,17 +1522,18 @@ PY
         exec sudo -n sh -c '
             start_time=$(awk "{print \$22}" "/proc/$$/stat")
             printf "%s %s\n" "$$" "$start_time" >"$1"
-            printf "capture-filter=source:%s http:%s https:%s\n" \
+            printf "capture-filter=destination:%s http:%s https:%s\n" \
                 "$3" "$4" "$5" >&2
             exec tcpdump --immediate-mode -i "$2" -nn -U \
-                "host $3" \
+                "dst host $3 and (dst port $4 or dst port $5)" \
                 -w "$6"
-        ' sh "$STATE/tcpdump.pid" "$CAPTURE_INTERFACE" "$SOURCE_ADDRESS" \
+        ' sh "$STATE/tcpdump.pid" "$CAPTURE_INTERFACE" "$PUBLIC_ADDRESS" \
             "$HTTP_PORT" "$HTTPS_PORT" "$STATE/outer.pcap" \
             >"$STATE/tcpdump.log" 2>&1
         ;;
     capture-ready)
         (($# == 0)) || exit 2
+        load_state
         [[ -s $STATE/tcpdump.pid && -f $STATE/outer.pcap ]]
         read -r capture_pid capture_start_time <"$STATE/tcpdump.pid"
         [[ $capture_pid =~ ^[1-9][0-9]*$ \
@@ -1451,7 +1541,9 @@ PY
         [[ -r /proc/$capture_pid/stat ]]
         [[ $(awk '{print $22}' "/proc/$capture_pid/stat") \
             == "$capture_start_time" ]]
-        (( $(stat -c %s "$STATE/outer.pcap") > 24 ))
+        (( $(stat -c %s "$STATE/outer.pcap") >= 24 ))
+        grep -Fq -- "tcpdump: listening on $CAPTURE_INTERFACE," \
+            "$STATE/tcpdump.log"
         printf '%s\n' ready
         ;;
     capture-counts)
@@ -1499,6 +1591,34 @@ PY
         done
         printf '%s\n' "$executed_image_id"
         ;;
+    rejection-count)
+        (($# == 0)) || exit 2
+        load_state
+        rejection_count
+        ;;
+    verify-rejection-and-restart)
+        (($# == 0)) || exit 2
+        load_state
+        docker stop --time 5 "$PROXY_CONTAINER" >/dev/null
+        observed=$(rejection_count)
+        [[ $observed == 1 ]]
+        docker start "$PROXY_CONTAINER" >/dev/null
+        for _ in {1..200}; do
+            if docker exec -i "$PROXY_CONTAINER" python3 - <<'PY' 2>/dev/null
+import urllib.request
+with urllib.request.urlopen(
+    "http://127.0.0.1:9080/_acl-proxy/ready", timeout=.2
+) as response:
+    assert response.read() == b'{"status":"ready"}'
+PY
+            then
+                printf '%s\n' rejected-and-ready
+                exit 0
+            fi
+            sleep 0.05
+        done
+        exit 1
+        ;;
     diagnostics)
         if [[ -f $STATE/runtime.env ]]; then
             load_state
@@ -1518,6 +1638,11 @@ PY
             [[ ! -f $log ]] || cat "$log"
         done
         [[ ! -f $STATE/tcpdump.log ]] || cat "$STATE/tcpdump.log"
+        if [[ -f $STATE/runtime.env ]]; then
+            sudo -n iptables -w 5 -L INPUT -nvx \
+                | awk -v tag="$TAG." 'index($0, tag)' || true
+        fi
+        [[ ! -f $STATE/outer.pcap ]] || capture_counts || true
         [[ ! -f $STATE/outer-tuples.txt ]] || cat "$STATE/outer-tuples.txt"
         ;;
     stop)
@@ -1568,7 +1693,7 @@ LOCAL_ACL_SHA=$(sha256sum "$ACL_PROXY_BIN" | awk '{print $1}')
     || fail "remote ACL Proxy binary digest differs from local release artifact"
 
 REMOTE_STARTED=1
-remote_control_bounded 60s start "$REMOTE_ADDRESS" "$REMOTE_SOURCE_ADDRESS" \
+remote_control_bounded 60s start "$REMOTE_ADDRESS" "$REMOTE_SOURCE_ADDRESSES_CSV" \
     "$REMOTE_INTERFACE" "$TLS_HTTP_PORT" "$TLS_HTTPS_PORT" "$SUFFIX" \
     "$REMOTE_IMAGE" | grep -qx ready \
     || fail "remote Access Flow topology did not become ready"
@@ -1706,7 +1831,7 @@ install -D -o 0 -g 0 -m 0644 \
 IFS= read -r AW_IDENTITY_TOKEN </run/aw-gateway/identity-token.fifo
 export AW_IDENTITY_TOKEN
 /opt/aw-gateway/bin/aw-container-agent \
-    --config /etc/aw-gateway/container-agent.toml run \
+    --config /etc/aw-gateway/container-agent.toml --log-level debug run \
     >/tmp/agent.stdout 2>/tmp/agent.stderr &
 AGENT_PID=$!
 unset AW_IDENTITY_TOKEN
@@ -1772,10 +1897,11 @@ start_workload() {
         docker inspect "$AGENT_CONTAINER" --format '{{.State.Running}}' \
             | grep -qx true \
             || fail "agent carrier exited before relay readiness"
-        if timeout 0.2 docker exec "$WORKLOAD_CONTAINER" \
-            bash -c 'exec 3<>/dev/tcp/127.0.0.1/3128' >/dev/null 2>&1 \
-            && timeout 0.2 docker exec "$WORKLOAD_CONTAINER" \
-                bash -c 'exec 3<>/dev/tcp/127.0.0.1/3129' >/dev/null 2>&1; then
+        if timeout 1s docker exec "$WORKLOAD_CONTAINER" awk '
+            $2 == "0100007F:0C38" && $4 == "0A" { http = 1 }
+            $2 == "0100007F:0C39" && $4 == "0A" { https = 1 }
+            END { exit !(http && https) }
+        ' /proc/net/tcp >/dev/null 2>&1; then
             return
         fi
         sleep 0.05
@@ -1831,10 +1957,16 @@ request_https() {
 }
 
 INVALID_COUNTS_BEFORE=$(remote_control_bounded 10s counts)
+INVALID_REJECTIONS_BEFORE=$(remote_control_bounded 10s rejection-count)
+[[ $INVALID_REJECTIONS_BEFORE == 0 ]] \
+    || fail "invalid-bearer rejection baseline was not empty"
 start_workload "$INVALID_BEARER" invalid
 if request_http http://origin.test/invalid-bearer-marker >/dev/null 2>&1; then
     fail "an invalid bearer reached the HTTP application pipeline"
 fi
+remote_control_bounded 30s verify-rejection-and-restart \
+    | grep -qx rejected-and-ready \
+    || fail "invalid bearer did not reach Access Flow authentication"
 INVALID_COUNTS_AFTER=$(remote_control_bounded 10s counts)
 [[ $INVALID_COUNTS_AFTER == "$INVALID_COUNTS_BEFORE" ]] \
     || fail "invalid bearer changed origin, parent, provider, or capture counters"
@@ -1864,12 +1996,12 @@ docker exec "$AGENT_CONTAINER" sh -eu -c '
     kill -0 "$(cat /tmp/agent.pid)"
 ' || fail "agent carrier launcher retained the bearer or agent exited"
 
-remote_control capture-start &
+ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" \
+    "$REMOTE_DIR/bundle/remote-control.sh" capture-start &
 CAPTURE_CONTROLLER_PID=$!
 CAPTURE_READY=0
 for _ in {1..20}; do
-    if ssh_bounded 5s true \
-        && remote_control_bounded 5s capture-ready | grep -qx ready; then
+    if remote_control_bounded 5s capture-ready | grep -qx ready; then
         CAPTURE_READY=1
         break
     fi
@@ -1958,13 +2090,13 @@ remote_control_bounded 30s export-state \
     | tar -C "$TMP_DIR/remote-state" -xf - \
     || fail "could not retrieve sanitized remote evidence"
 
-python3 - "$TMP_DIR/remote-state" "$REMOTE_SOURCE_ADDRESS" <<'PY'
+python3 - "$TMP_DIR/remote-state" "$REMOTE_SOURCE_ADDRESSES_CSV" <<'PY'
 import json
 import pathlib
 import sys
 
 root = pathlib.Path(sys.argv[1])
-physical_source = sys.argv[2]
+physical_sources = sys.argv[2].split(",")
 provider = [
     json.loads(line)
     for line in (root / "provider.jsonl").read_text(encoding="utf-8").splitlines()
@@ -2015,7 +2147,7 @@ logs = b"".join(
 )
 if b"client_ip=0.0.0.0" not in logs:
     raise SystemExit("policy log lacks the fixed remote client sentinel")
-if physical_source.encode() in logs:
+if any(source.encode() in logs for source in physical_sources):
     raise SystemExit("policy/product logs exposed the physical remote source")
 PY
 
@@ -2085,7 +2217,7 @@ printf '%s\n' \
     "remote-address=$REMOTE_ADDRESS" \
     "remote-interface=$REMOTE_INTERFACE" \
     "remote-capture-interface=$REMOTE_INTERFACE" \
-    "remote-allowed-source-address=$REMOTE_SOURCE_ADDRESS" \
+    "remote-allowed-source-addresses=$REMOTE_SOURCE_ADDRESSES_CSV" \
     "remote-denied-source-address=$DENIED_SOURCE_ADDRESS" \
     "remote-container-backend=$REMOTE_CONTAINER_BACKEND" \
     'remote-container-security=selinux-label-disabled' \

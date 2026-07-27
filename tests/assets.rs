@@ -37,9 +37,16 @@ fn validate_cross_host_agent_carrier(smoke: &str) -> Result<(), String> {
         "\"$WORKLOAD_AGENT_IMAGE\" bash /usr/local/bin/agent-carrier",
         "[[ $executed_agent_image_id == \"$WORKLOAD_AGENT_IMAGE_ID\" ]]",
         "agent-carrier-inspect.json",
+        "--config /etc/aw-gateway/container-agent.toml --log-level debug run",
         "docker rm -f \"$agent_container\"",
         "agent carrier container remained after teardown",
         "workload container remained after teardown",
+        "$2 == \"0100007F:0C38\" && $4 == \"0A\" { http = 1 }",
+        "$2 == \"0100007F:0C39\" && $4 == \"0A\" { https = 1 }",
+        "END { exit !(http && https) }",
+        "/proc/net/tcp",
+        "docker network create \"$NETWORK\"",
+        "NETWORK_GATEWAY=$(docker network inspect \"$NETWORK\"",
         "docker network rm \"$NETWORK\"",
         "local workload network remained after teardown",
         "workload-agent-image=$WORKLOAD_AGENT_IMAGE",
@@ -47,11 +54,11 @@ fn validate_cross_host_agent_carrier(smoke: &str) -> Result<(), String> {
         "local-topology-cleanup=passed",
         "docker cp \"$AGENT_CONTAINER:$log\" -",
         "capture-ready)",
-        "remote_control capture-start &",
+        "capture-ready)\n        (($# == 0)) || exit 2\n        load_state",
+        "\"$REMOTE_DIR/bundle/remote-control.sh\" capture-start &",
         "CAPTURE_CONTROLLER_PID=$!",
         "wait_capture_controller",
         "timeout --foreground --signal=TERM --kill-after=2s \"$limit\"",
-        "ssh_bounded 5s true",
         "ssh_bounded 15s rm -rf -- \"$REMOTE_DIR\"",
         "remote_control_bounded 5s capture-counts",
         "remote_control_bounded 15s capture-stop",
@@ -63,23 +70,78 @@ fn validate_cross_host_agent_carrier(smoke: &str) -> Result<(), String> {
         "attached packet-capture controller survived bounded KILL teardown",
         "attached packet-capture controller exited unsuccessfully",
         "host $3",
-        "\"$SOURCE_ADDRESS\"",
         "\"/sys/class/net/$route_interface/bridge\"",
         "\"/sys/class/net/$route_interface/brif/\"*",
         "\"/sys/class/net/$member/device\"",
         "remote route bridge must have one physical member or --remote-interface must be specified",
-        "source=\"$SOURCE_ADDRESS.\"",
+        "-v sources=\"$SOURCE_ADDRESSES\"",
+        "http=$(awk -v sources=\"$SOURCE_ADDRESSES\"",
+        "--remote-source-addresses <IPv4[,IPv4...]>",
+        "--remote-source-addresses) REMOTE_SOURCE_ADDRESSES_CSV=$2",
+        "[[ $part == 0 || $part != 0* ]] || return 1",
+        "Get-NetIPAddress -AddressFamily IPv4",
+        "LOCAL_SOURCE_ADDRESSES[$local_source_address]=1",
+        "remote-source-addresses must belong to the initiating host",
+        "remote source allow-set spans multiple route interfaces",
+        "remote-allowed-source-addresses=$REMOTE_SOURCE_ADDRESSES_CSV",
+        "for source in \"${sources[@]}\"; do",
         "target=\"$PUBLIC_ADDRESS.$HTTP_PORT\"",
         "target=\"$PUBLIC_ADDRESS.$HTTPS_PORT\"",
         "remote packet capture did not become ready",
+        "tcpdump: listening on $CAPTURE_INTERFACE,",
+        "$(stat -c %s \"$STATE/outer.pcap\") >= 24",
         "exec tcpdump --immediate-mode -i \"$2\" -nn -U",
+        "\"dst host $3 and (dst port $4 or dst port $5)\"",
+        "' sh \"$STATE/tcpdump.pid\" \"$CAPTURE_INTERFACE\" \"$PUBLIC_ADDRESS\"",
         "capture-counts)",
+        "[[ ! -f $STATE/outer.pcap ]] || capture_counts || true",
+        "awk -v tag=\"$TAG.\" 'index($0, tag)'",
+        "    rejection-count)\n        (($# == 0)) || exit 2",
+        "    verify-rejection-and-restart)\n        (($# == 0)) || exit 2",
+        "remote_control_bounded 30s verify-rejection-and-restart",
+        "docker stop --time 5 \"$PROXY_CONTAINER\"",
+        "for path in root.iterdir()",
+        "observed=$(rejection_count)",
+        "[[ $observed == 1 ]]",
+        "docker start \"$PROXY_CONTAINER\"",
+        "TLS/TCP Access Flow preface or bearer was rejected",
+        "INVALID_REJECTIONS_BEFORE=$(remote_control_bounded 10s rejection-count)",
+        "grep -qx rejected-and-ready",
+        "fail \"invalid bearer did not reach Access Flow authentication\"",
         "remote packet capture did not drain the five expected outer connections",
         "remote-capture-interface=$REMOTE_INTERFACE",
     ] {
         if !smoke.contains(required) {
             return Err(format!("missing carrier contract {required:?}"));
         }
+    }
+    let capture_ready = smoke
+        .split_once("    capture-ready)")
+        .and_then(|(_, suffix)| suffix.split_once("\n        ;;\n"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| "missing packet-capture readiness action".to_owned())?;
+    for required in [
+        "load_state",
+        "tcpdump: listening on $CAPTURE_INTERFACE,",
+        "$(stat -c %s \"$STATE/outer.pcap\") >= 24",
+    ] {
+        if !capture_ready.contains(required) {
+            return Err(format!(
+                "missing packet-capture readiness contract {required:?}"
+            ));
+        }
+    }
+    if smoke.contains("REMOTE_SOURCE_ADDRESSES_CSV=$SSH_SOURCE") {
+        return Err("SSH source was reused as the workload firewall source".to_owned());
+    }
+    let source_parse = smoke
+        .find("IFS=, read -r -a REMOTE_SOURCE_ADDRESSES")
+        .ok_or_else(|| "missing bounded source allow-set parsing".to_owned())?;
+    let remote_start = smoke
+        .find("REMOTE_STARTED=1")
+        .ok_or_else(|| "missing remote topology start".to_owned())?;
+    if source_parse >= remote_start {
+        return Err("source allow-set was not validated before firewall publication".to_owned());
     }
     let capture_wait = smoke
         .split_once("wait_capture_controller() {")
@@ -114,6 +176,9 @@ fn validate_cross_host_agent_carrier(smoke: &str) -> Result<(), String> {
         || carrier_launch.contains(" -e ")
     {
         return Err("agent bearer was placed in container launch metadata".to_owned());
+    }
+    if start.contains("/dev/tcp/127.0.0.1/3128") || start.contains("/dev/tcp/127.0.0.1/3129") {
+        return Err("relay readiness opens application flows".to_owned());
     }
     if start.find("test -f /tmp/firewall.ready")
         >= start.find("docker run -d --pull=never --name \"$AGENT_CONTAINER\"")
@@ -602,10 +667,15 @@ fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() 
         "fail \"local workload network remained after teardown\"",
         "workload-agent-image-id=$WORKLOAD_AGENT_IMAGE_ID",
         "local-topology-cleanup=passed",
+        "$2 == \"0100007F:0C38\" && $4 == \"0A\" { http = 1 }",
+        "$2 == \"0100007F:0C39\" && $4 == \"0A\" { https = 1 }",
+        "END { exit !(http && https) }",
+        "/proc/net/tcp",
+        "NETWORK_GATEWAY=$(docker network inspect \"$NETWORK\"",
         "capture-ready)",
+        "capture-ready)\n        (($# == 0)) || exit 2\n        load_state",
         "remote packet capture did not become ready",
         "timeout --foreground --signal=TERM --kill-after=2s \"$limit\"",
-        "ssh_bounded 5s true",
         "ssh_bounded 15s rm -rf -- \"$REMOTE_DIR\"",
         "remote_control_bounded 5s capture-counts",
         "remote_control_bounded 15s capture-stop",
@@ -613,7 +683,25 @@ fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() 
         "for signal in none TERM KILL; do",
         "if wait \"$CAPTURE_CONTROLLER_PID\"; then",
         "if ((status != 0)); then",
+        "tcpdump: listening on $CAPTURE_INTERFACE,",
+        "$(stat -c %s \"$STATE/outer.pcap\") >= 24",
         "exec tcpdump --immediate-mode -i \"$2\" -nn -U",
+        "\"dst host $3 and (dst port $4 or dst port $5)\"",
+        "' sh \"$STATE/tcpdump.pid\" \"$CAPTURE_INTERFACE\" \"$PUBLIC_ADDRESS\"",
+        "--remote-source-addresses) REMOTE_SOURCE_ADDRESSES_CSV=$2",
+        "[[ $part == 0 || $part != 0* ]] || return 1",
+        "Get-NetIPAddress -AddressFamily IPv4",
+        "LOCAL_SOURCE_ADDRESSES[$local_source_address]=1",
+        "remote-source-addresses must belong to the initiating host",
+        "remote source allow-set spans multiple route interfaces",
+        "\"$REMOTE_DIR/bundle/remote-control.sh\" capture-start &",
+        "remote-allowed-source-addresses=$REMOTE_SOURCE_ADDRESSES_CSV",
+        "http=$(awk -v sources=\"$SOURCE_ADDRESSES\"",
+        "    rejection-count)\n        (($# == 0)) || exit 2",
+        "    verify-rejection-and-restart)\n        (($# == 0)) || exit 2",
+        "remote_control_bounded 30s verify-rejection-and-restart",
+        "for path in root.iterdir()",
+        "grep -qx rejected-and-ready",
         "remote-capture-interface=$REMOTE_INTERFACE",
     ] {
         let mutated = smoke.replacen(marker, "removed-by-mutation", 1);
@@ -625,6 +713,7 @@ fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() 
     assert!(!smoke.contains("for (index ="));
     assert!(!smoke.contains("$(index +"));
     assert!(!smoke.contains("trap stop_all ERR"));
+    assert!(!smoke.contains("remote_control capture-start &"));
     assert!(!smoke.contains("AW_TLS_CROSS_HOST_REMOTE_IMAGE"));
     assert!(!smoke.contains("AW_TLS_CROSS_HOST_SMOKE_IMAGE"));
     assert!(!smoke.contains("REMOTE_IMAGE:-"));
