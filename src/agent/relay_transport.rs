@@ -612,8 +612,7 @@ fn maximum_tls_channel_cost(
         .and_then(|bytes| bytes.checked_add(maximum_generation))
         .ok_or(AccessFlowChannelFailure::ResourceExhausted)?;
     let connecting_bytes = access_flow_tls::HANDSHAKE_BYTES
-        .checked_add(access_flow_tls::CLIENT_PEER_CHAIN_BYTES)
-        .and_then(|bytes| bytes.checked_add(access_flow_tls::CLIENT_DNS_ADDRESS_BYTES))
+        .checked_add(access_flow_tls::CLIENT_DNS_ADDRESS_BYTES)
         .ok_or(AccessFlowChannelFailure::ResourceExhausted)?;
     AccessFlowChannelResourceCost::new(
         retained_endpoint_bytes,
@@ -623,7 +622,8 @@ fn maximum_tls_channel_cost(
         // Established streams can retain policies from distinct prior reload
         // generations, so the maximum policy remains per active flow.
         ACTIVE_CHANNEL_BYTES
-            .checked_add(maximum_generation)
+            .checked_add(access_flow_tls::CLIENT_PEER_CHAIN_BYTES)
+            .and_then(|bytes| bytes.checked_add(maximum_generation))
             .ok_or(AccessFlowChannelFailure::ResourceExhausted)?,
     )
 }

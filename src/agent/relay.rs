@@ -1444,6 +1444,83 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rt06_tls_agent_resource_boundary_uses_exclusive_connection_phases() {
+        let mut authored: crate::config::ContainerAgentFile = toml::from_str(include_str!(
+            "../../examples/docker/container-agent-access-flow-tls.toml"
+        ))
+        .unwrap();
+        authored.validate().unwrap();
+        let relay_config = authored
+            .container_agent
+            .access_flow_relay
+            .as_mut()
+            .expect("shipped TLS relay");
+        assert_eq!(relay_config.routes.len(), 2);
+        assert_eq!(relay_config.copy_buffer_bytes_per_direction, 16 * 1024);
+        relay_config.max_connections = 128;
+
+        let dir = tempfile::Builder::new()
+            .prefix(".relay-rt06-boundary-")
+            .tempdir_in(std::env::var_os("HOME").unwrap())
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let trust_path = dir.path().join("roots.pem");
+        std::fs::write(&trust_path, TEST_ACCESS_FLOW_ROOT_PEM).unwrap();
+        std::fs::set_permissions(&trust_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for route in &mut relay_config.routes {
+            let AccessFlowRelayTransport::TlsTcp { trust, .. } = &mut route.transport else {
+                panic!("RT06 boundary relay contains a non-TLS route");
+            };
+            let AccessFlowRelayTrust::PemBundle { path } = trust;
+            *path = trust_path.display().to_string();
+        }
+
+        let bearer = vec![b'B'; access_identity::MAX_BEARER_LEN];
+        let compiled = relay_config
+            .compile_with_presentation(
+                crate::config::AccessFlowRelayValidationMode::Agent,
+                IdentityPresentation::Bearer(
+                    access_identity::SensitiveBearer::new(&bearer).unwrap(),
+                ),
+            )
+            .unwrap();
+        let transport_reserve = RelayTransportRuntime::resource_reserve(&compiled.plan).unwrap();
+        let budget = relay_resource_budget_with_nofile(
+            false,
+            1,
+            transport_reserve.descriptors,
+            transport_reserve.memory_bytes,
+            4096,
+        )
+        .unwrap();
+        let transport =
+            RelayTransportRuntime::prepare(&compiled.plan, Arc::new(AtomicBool::new(false)))
+                .unwrap();
+        let relay = AccessFlowRelay::new(
+            compiled.plan,
+            transport.connector(),
+            Arc::new(RelayObserver {
+                active_flows: Arc::new(AtomicUsize::new(0)),
+            }),
+            budget,
+        )
+        .expect("phase-aware RT06 resource projection must fit the product budget");
+        let projection = relay.resource_projection();
+        assert!(projection.total_descriptors <= budget.descriptors);
+        assert!(projection.total_memory_bytes <= budget.memory_bytes);
+
+        let obsolete_summed_phase_bytes = projection
+            .total_memory_bytes
+            .checked_add(projection.setup_bytes.min(projection.copy_buffer_bytes))
+            .unwrap();
+        assert!(
+            obsolete_summed_phase_bytes > budget.memory_bytes,
+            "the RT06 boundary must detect summing mutually exclusive connection phases"
+        );
+    }
+
     #[tokio::test]
     async fn relay_resource_projection_accounts_for_retained_bearer() {
         let config = test_config("127.0.0.1:3128".into(), "/tmp/access-flow.sock".into());
