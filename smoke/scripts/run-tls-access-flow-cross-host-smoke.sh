@@ -274,7 +274,7 @@ if [[ -z $REMOTE_INTERFACE ]]; then
     REMOTE_INTERFACE=$(
         ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" \
             ip route get "$REMOTE_SOURCE_ADDRESS" \
-        | awk '{for (index = 1; index <= NF; index++) if ($index == "dev") {print $(index + 1); exit}}'
+        | awk '{for (field = 1; field <= NF; field++) if ($field == "dev") {print $(field + 1); exit}}'
     )
 fi
 [[ $REMOTE_INTERFACE =~ ^[A-Za-z0-9._:-]+$ ]] \
@@ -974,10 +974,10 @@ PY
             2>/dev/null \
             | awk '
                 {
-                    for (index = 1; index <= NF; index++) {
-                        if ($index == "IP" && index + 3 <= NF) {
-                            source=$(index + 1)
-                            destination=$(index + 3)
+                    for (field = 1; field <= NF; field++) {
+                        if ($field == "IP" && field + 3 <= NF) {
+                            source=$(field + 1)
+                            destination=$(field + 3)
                             sub(/:$/, "", destination)
                             print source ">" destination
                             break

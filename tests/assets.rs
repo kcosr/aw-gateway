@@ -453,6 +453,17 @@ fn tls_access_flow_stack_smoke_is_integrated_non_vacuous_and_mutation_guarded() 
 }
 
 #[test]
+fn tls_access_flow_cross_host_smoke_avoids_reserved_awk_identifiers() {
+    let smoke = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("smoke/scripts/run-tls-access-flow-cross-host-smoke.sh"),
+    )
+    .unwrap();
+    assert!(!smoke.contains("for (index ="));
+    assert!(!smoke.contains("$(index +"));
+}
+
+#[test]
 fn embedded_relay_uses_shared_runtime_engine_without_a_copied_data_plane() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let cargo = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
