@@ -110,6 +110,11 @@ fn validate_cross_host_agent_carrier(smoke: &str) -> Result<(), String> {
         "fail \"invalid bearer did not reach Access Flow authentication\"",
         "remote packet capture did not drain the five expected outer connections",
         "remote-capture-interface=$REMOTE_INTERFACE",
+        "report_diagnostics()",
+        "require_empty_diagnostics()",
+        "tar -m -C \"$REMOTE_DIR/bundle\" -xf -",
+        "tar -m -C \"$TMP_DIR/remote-state\" -xf -",
+        "require_empty_diagnostics \\\n    \"remote evidence export\"",
     ] {
         if !smoke.contains(required) {
             return Err(format!("missing carrier contract {required:?}"));
@@ -703,6 +708,11 @@ fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() 
         "for path in root.iterdir()",
         "grep -qx rejected-and-ready",
         "remote-capture-interface=$REMOTE_INTERFACE",
+        "report_diagnostics()",
+        "require_empty_diagnostics()",
+        "tar -m -C \"$REMOTE_DIR/bundle\" -xf -",
+        "tar -m -C \"$TMP_DIR/remote-state\" -xf -",
+        "require_empty_diagnostics \\\n    \"remote evidence export\"",
     ] {
         let mutated = smoke.replacen(marker, "removed-by-mutation", 1);
         assert!(

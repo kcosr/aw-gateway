@@ -110,6 +110,25 @@ sys.stdout.buffer.write(data)
     fi
 }
 
+report_diagnostics() {
+    local path
+    for path in "$@"; do
+        [[ ! -s $path ]] || sanitize_diagnostics <"$path" >&2
+    done
+}
+
+require_empty_diagnostics() {
+    local label=$1
+    shift
+    local path
+    for path in "$@"; do
+        if [[ -s $path ]]; then
+            report_diagnostics "$@"
+            fail "$label emitted unexpected diagnostics"
+        fi
+    done
+}
+
 remote_control() {
     ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" \
         "$REMOTE_DIR/bundle/remote-control.sh" "$@"
@@ -1673,10 +1692,16 @@ REMOTE_DIR=$(
     || fail "remote temporary directory did not match its private contract"
 ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" \
     mkdir -m 0700 -- "$REMOTE_DIR/bundle" "$REMOTE_DIR/state"
-tar -C "$TMP_DIR/bundle" -cf - . \
+BUNDLE_TAR_STDERR="$TMP_DIR/bundle-tar.stderr"
+BUNDLE_SSH_STDERR="$TMP_DIR/bundle-ssh.stderr"
+if ! tar -C "$TMP_DIR/bundle" -cf - . 2>"$BUNDLE_TAR_STDERR" \
     | ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" \
-        tar -C "$REMOTE_DIR/bundle" -xf - \
-    || fail "could not transfer the exact remote fixture bundle"
+        tar -m -C "$REMOTE_DIR/bundle" -xf - 2>"$BUNDLE_SSH_STDERR"; then
+    report_diagnostics "$BUNDLE_TAR_STDERR" "$BUNDLE_SSH_STDERR"
+    fail "could not transfer the exact remote fixture bundle"
+fi
+require_empty_diagnostics \
+    "remote fixture bundle transfer" "$BUNDLE_TAR_STDERR" "$BUNDLE_SSH_STDERR"
 REMOTE_MANIFEST_SHA=$(
     ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" \
         "cd '$REMOTE_DIR/bundle' && sha256sum -c manifest.sha256 >/dev/null && sha256sum manifest.sha256" \
@@ -2086,9 +2111,16 @@ docker exec "$AGENT_CONTAINER" kill -0 "$(docker exec "$AGENT_CONTAINER" \
     cat /tmp/agent.pid)" || fail "relay exited after functional flows"
 capture_local_evidence valid-final
 
-remote_control_bounded 30s export-state \
-    | tar -C "$TMP_DIR/remote-state" -xf - \
-    || fail "could not retrieve sanitized remote evidence"
+REMOTE_EXPORT_STDERR="$TMP_DIR/remote-export.stderr"
+REMOTE_STATE_TAR_STDERR="$TMP_DIR/remote-state-tar.stderr"
+if ! remote_control_bounded 30s export-state 2>"$REMOTE_EXPORT_STDERR" \
+    | tar -m -C "$TMP_DIR/remote-state" -xf - \
+        2>"$REMOTE_STATE_TAR_STDERR"; then
+    report_diagnostics "$REMOTE_EXPORT_STDERR" "$REMOTE_STATE_TAR_STDERR"
+    fail "could not retrieve sanitized remote evidence"
+fi
+require_empty_diagnostics \
+    "remote evidence export" "$REMOTE_EXPORT_STDERR" "$REMOTE_STATE_TAR_STDERR"
 
 python3 - "$TMP_DIR/remote-state" "$REMOTE_SOURCE_ADDRESSES_CSV" <<'PY'
 import json
