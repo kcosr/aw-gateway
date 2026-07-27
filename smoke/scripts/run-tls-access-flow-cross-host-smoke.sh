@@ -859,7 +859,6 @@ PARENT_CONTAINER=$PARENT_CONTAINER
 PROXY_CONTAINER=$PROXY_CONTAINER
 TAG=$TAG
 EOF
-        trap stop_all ERR
         docker image inspect "$REMOTE_IMAGE" >/dev/null
         docker network create "$NETWORK" >/dev/null
         docker run -d --pull=never --name "$ORIGIN_CONTAINER" \
@@ -906,9 +905,9 @@ EOF
             "$REMOTE_IMAGE" /bundle/acl-proxy \
             run --config /bundle/acl-proxy.toml >/dev/null
         for _ in {1..200}; do
-            docker inspect "$PROXY_CONTAINER" --format '{{.State.Running}}' \
-                | grep -qx true
-            if docker exec -i "$PROXY_CONTAINER" python3 - <<'PY' 2>/dev/null
+            if docker inspect "$PROXY_CONTAINER" --format '{{.State.Running}}' \
+                    | grep -qx true \
+                && docker exec -i "$PROXY_CONTAINER" python3 - <<'PY' 2>/dev/null
 import urllib.request
 with urllib.request.urlopen(
     "http://127.0.0.1:9080/_acl-proxy/ready", timeout=.2
@@ -916,7 +915,6 @@ with urllib.request.urlopen(
     assert response.read() == b'{"status":"ready"}'
 PY
             then
-                trap - ERR
                 printf '%s\n' ready
                 exit 0
             fi
@@ -1013,6 +1011,8 @@ PY
                 docker logs --tail 100 "$container" 2>&1 || true
             done
         fi
+        [[ ! -f $STATE/config-validate.log ]] \
+            || cat "$STATE/config-validate.log"
         [[ ! -f $STATE/tcpdump.log ]] || cat "$STATE/tcpdump.log"
         ;;
     stop)

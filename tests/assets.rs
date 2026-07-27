@@ -453,7 +453,7 @@ fn tls_access_flow_stack_smoke_is_integrated_non_vacuous_and_mutation_guarded() 
 }
 
 #[test]
-fn tls_access_flow_cross_host_smoke_avoids_reserved_awk_identifiers() {
+fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() {
     let smoke = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("smoke/scripts/run-tls-access-flow-cross-host-smoke.sh"),
@@ -461,6 +461,9 @@ fn tls_access_flow_cross_host_smoke_avoids_reserved_awk_identifiers() {
     .unwrap();
     assert!(!smoke.contains("for (index ="));
     assert!(!smoke.contains("$(index +"));
+    assert!(!smoke.contains("trap stop_all ERR"));
+    assert!(smoke.contains("cat \"$STATE/config-validate.log\""));
+    assert!(smoke.contains("if docker inspect \"$PROXY_CONTAINER\""));
 }
 
 #[test]
