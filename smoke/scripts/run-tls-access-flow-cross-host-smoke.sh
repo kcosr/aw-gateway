@@ -1215,7 +1215,8 @@ SH
 chmod 0700 "$TMP_DIR/workload.sh"
 
 start_workload() {
-    local bearer=$1 label=$2 fifo="$TMP_DIR/$label.fifo"
+    local bearer=$1 label=$2 fifo
+    fifo="$TMP_DIR/$label.fifo"
     WORKLOAD_CONTAINER="aw-tls-cross-$label-$SUFFIX"
     mkfifo -m 0600 "$fifo"
     docker run -d --name "$WORKLOAD_CONTAINER" --privileged --network "$NETWORK" \

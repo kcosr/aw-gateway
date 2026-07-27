@@ -472,6 +472,7 @@ fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() 
     assert!(smoke.contains("retire_timeout = \"30s\""));
     assert!(smoke.contains("max_inflight_body_bytes = 134217728"));
     assert!(smoke.contains("command = \"$REMOTE_PROVIDER_PYTHON\""));
+    assert!(!smoke.contains("label=$2 fifo=\"$TMP_DIR/$label.fifo\""));
 }
 
 #[test]
