@@ -600,6 +600,9 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
         "client=%s exit=%s",
         "class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):",
         "request_queue_size = 256",
+        "measurement_hold_response_bytes = 16 * 1024 * 1024",
+        "str(measurement_hold_response_bytes)",
+        "class Server(socketserver.ThreadingTCPServer):",
         "--gateway-projection-probe <absolute-regular-file>",
         "gateway_projected_bytes\t$GATEWAY_PROJECTED_BYTES",
         "gateway_projected_descriptors\t$GATEWAY_PROJECTED_DESCRIPTORS",
@@ -633,7 +636,7 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
     {
         return Err("class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):");
     }
-    if script.matches("request_queue_size = 256").count() != 2 {
+    if script.matches("request_queue_size = 256").count() != 3 {
         return Err("request_queue_size = 256");
     }
     if script.matches("FixtureThreadingHttpServer((").count() != 4 {
@@ -702,6 +705,9 @@ fn tls_access_flow_stack_smoke_is_integrated_non_vacuous_and_mutation_guarded() 
         "class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):",
         "request_queue_size = 256",
         "FixtureThreadingHttpServer((",
+        "measurement_hold_response_bytes = 16 * 1024 * 1024",
+        "str(measurement_hold_response_bytes)",
+        "class Server(socketserver.ThreadingTCPServer):",
         "--gateway-projection-probe <absolute-regular-file>",
         "gateway_projected_bytes\t$GATEWAY_PROJECTED_BYTES",
         "gateway_projected_descriptors\t$GATEWAY_PROJECTED_DESCRIPTORS",

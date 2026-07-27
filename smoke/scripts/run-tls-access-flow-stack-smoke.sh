@@ -565,6 +565,9 @@ class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):
     request_queue_size = 256
 
 
+measurement_hold_response_bytes = 16 * 1024 * 1024
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -608,7 +611,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             chunk = b"x" * 1024
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(1024 * 1024 * 1024))
+            self.send_header("Content-Length", str(measurement_hold_response_bytes))
             self.end_headers()
             try:
                 while True:
@@ -1186,6 +1189,7 @@ class Forwarder(socketserver.BaseRequestHandler):
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
+    request_queue_size = 256
 
 
 servers = []
