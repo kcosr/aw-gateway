@@ -601,7 +601,9 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
         "wait_for_measurement_response_heads",
         "/tmp/measurement-clients.response-heads-ready",
         "--dump-header \"/tmp/measurement-client-http-$index.headers\"",
+        "--dump-header \"/tmp/measurement-client-https-$index.headers\"",
         "cleanup_clients()",
+        "trap 'exit 143' TERM",
         "class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):",
         "request_queue_size = 256",
         "measurement_hold_response_bytes = 16 * 1024 * 1024",
@@ -659,6 +661,9 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
         != 2
     {
         return Err("/tmp/measurement-clients.response-heads-ready");
+    }
+    if script.matches("trap 'exit 143' TERM").count() != 2 {
+        return Err("trap 'exit 143' TERM");
     }
     Ok(())
 }
@@ -723,7 +728,9 @@ fn tls_access_flow_stack_smoke_is_integrated_non_vacuous_and_mutation_guarded() 
         "wait_for_measurement_response_heads",
         "/tmp/measurement-clients.response-heads-ready",
         "--dump-header \"/tmp/measurement-client-http-$index.headers\"",
+        "--dump-header \"/tmp/measurement-client-https-$index.headers\"",
         "cleanup_clients()",
+        "trap 'exit 143' TERM",
         "class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):",
         "request_queue_size = 256",
         "FixtureThreadingHttpServer((",

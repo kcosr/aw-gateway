@@ -1777,7 +1777,7 @@ pids=()
 labels=()
 cleanup_clients() {
     local status=$?
-    trap - EXIT INT TERM
+    trap - EXIT
     set +e
     for pid in "${pids[@]}"; do
         kill -TERM "$pid" 2>/dev/null || true
@@ -1787,7 +1787,9 @@ cleanup_clients() {
     done
     exit "$status"
 }
-trap cleanup_clients EXIT INT TERM
+trap cleanup_clients EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 printf '%s\n' "$$" >/tmp/measurement-clients.pid
 for ((index = 0; index < http_count; index++)); do
     curl --fail --silent --show-error --noproxy '*' \
