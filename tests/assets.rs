@@ -430,6 +430,14 @@ fn tls_access_flow_stack_smoke_is_integrated_non_vacuous_and_mutation_guarded() 
     )
     .unwrap();
     validate_tls_access_flow_smoke(&smoke).unwrap();
+    assert_eq!(smoke.matches("/dev/tcp/").count(), 5);
+    for (offset, _) in smoke.match_indices("/dev/tcp/") {
+        let probe = &smoke[offset..smoke.len().min(offset + 180)];
+        assert!(
+            probe.contains(">/dev/null 2>&1"),
+            "readiness probe can leak expected connection diagnostics: {probe:?}"
+        );
+    }
 
     for marker in [
         "invalid bearer reached the authorization provider",
@@ -488,11 +496,24 @@ fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() 
     assert!(!smoke.contains("docker build"));
     assert!(!smoke.contains("apt-get"));
     assert!(smoke.contains("workload-image-material=cached-direct"));
+    assert!(smoke.contains("workload-image-tools=bash,curl,ip,iptables,nsenter"));
+    assert!(smoke.contains(
+        "workload-image-package-manifest-sha256=$WORKLOAD_IMAGE_PACKAGE_MANIFEST_SHA256"
+    ));
+    assert!(smoke.contains("apk info -vv"));
+    assert!(smoke.contains("remote container image must use an immutable sha256 digest"));
+    assert!(smoke.contains("executed-image-id)"));
+    assert!(
+        smoke.contains("container_image_id=$(docker inspect \"$container\" --format '{{.Image}}')")
+    );
+    assert!(smoke.contains("REMOTE_EXECUTED_IMAGE_ID=$(remote_control executed-image-id)"));
+    assert!(smoke.contains("[[ $REMOTE_EXECUTED_IMAGE_ID == \"$REMOTE_IMAGE_ID\" ]]"));
+    assert!(smoke.contains("[[ $WORKLOAD_IMAGE_PACKAGE_MANIFEST_SHA256 =~ ^[0-9a-f]{64}$ ]]"));
     assert!(smoke.contains("cat \"$STATE/config-validate.log\""));
     assert!(smoke.contains("if docker inspect \"$PROXY_CONTAINER\""));
-    assert_eq!(smoke.matches("--user 0:0").count(), 6);
-    assert_eq!(smoke.matches("$BUNDLE:/bundle:ro,z").count(), 2);
-    assert_eq!(smoke.matches("$STATE:/state:rw,z").count(), 2);
+    assert_eq!(smoke.matches("--user 0:0").count(), 7);
+    assert!(!smoke.contains("$BUNDLE:/bundle:"));
+    assert!(!smoke.contains("$STATE:/state:"));
     assert!(smoke.contains("$BUNDLE/origin.py:/fixture/origin.py:ro,z"));
     assert!(smoke.contains("$BUNDLE/origin-cert.pem:/fixture/origin-cert.pem:ro,z"));
     assert!(smoke.contains("$BUNDLE/origin-key.pem:/fixture/origin-key.pem:ro,z"));
@@ -500,6 +521,120 @@ fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() 
     assert!(smoke.contains("$BUNDLE/parent.py:/fixture/parent.py:ro,z"));
     assert!(smoke.contains("$STATE/parent.jsonl:/state/parent.jsonl:rw,z"));
     assert!(smoke.contains("tagged firewall rules remain after bounded removal"));
+    assert!(smoke.contains("could not verify tagged firewall cleanup"));
+    let remote_absence_check = smoke
+        .split_once("verify_remote_topology_absent() {")
+        .and_then(|(_, suffix)| suffix.split_once("\n}\n\nstop_all() {"))
+        .map(|(body, _)| body)
+        .expect("remote topology absence verifier");
+    assert!(remote_absence_check.contains("docker container ls -a --format '{{.Names}}'"));
+    assert!(remote_absence_check.contains("docker network ls --format '{{.Name}}'"));
+    assert!(remote_absence_check.contains("grep -Fxq -- \"$name\""));
+    assert!(remote_absence_check.contains("grep -Fxq -- \"$NETWORK\""));
+    let capture_stop = smoke
+        .split_once("stop_capture() {")
+        .and_then(|(_, suffix)| suffix.split_once("\n}\n\nverify_remote_topology_absent() {"))
+        .map(|(body, _)| body)
+        .expect("remote capture teardown");
+    assert!(capture_stop.contains("current_start_time=$(awk '{print $22}'"));
+    assert!(capture_stop.contains("for signal in INT TERM KILL; do"));
+    assert!(capture_stop.contains("tcpdump capture remains after bounded teardown"));
+    assert!(!capture_stop.contains("kill -INT \"$pid\" 2>/dev/null || true"));
+    assert!(!capture_stop.contains("kill -TERM \"$pid\" 2>/dev/null || true"));
+    assert!(smoke.contains("printf \"%s %s\\n\" \"$$\" \"$start_time\" >\"$1\""));
+    let stop_all = smoke
+        .split_once("stop_all() {")
+        .and_then(|(_, suffix)| suffix.split_once("\n}\n\ncase \"$ACTION\" in"))
+        .map(|(body, _)| body)
+        .expect("remote stop_all body");
+    let absence_offset = stop_all
+        .find("verify_remote_topology_absent")
+        .expect("remote absence verification");
+    let firewall_offset = stop_all
+        .find("remove_firewall")
+        .expect("remote firewall removal");
+    assert!(
+        absence_offset < firewall_offset,
+        "remote firewall is removed before topology absence is verified"
+    );
+    assert!(
+        stop_all.contains(
+            "remote topology teardown is unverified; retaining protective firewall rules"
+        )
+    );
+    assert!(
+        smoke.contains("remote firewall cleanup failed; host=%s tag=%s control_dir=%s (preserved)")
+    );
+    assert!(smoke.contains("REMOTE_CLEANUP_FAILED=1"));
+    assert!(smoke.contains("if [[ -n $REMOTE_DIR && $REMOTE_CLEANUP_FAILED == 0 ]]; then"));
+    assert!(!smoke.contains("remote_control stop >/dev/null 2>&1 || true"));
+    assert!(smoke.contains("stop_remote || fail \"remote topology cleanup did not complete\""));
+    let proxy_mounts = smoke
+        .split_once("PROXY_INPUT_MOUNTS=(")
+        .and_then(|(_, suffix)| suffix.split_once("\n        )"))
+        .map(|(mounts, _)| mounts)
+        .expect("proxy input mount array");
+    for required in [
+        "acl-proxy:/bundle/acl-proxy:ro",
+        "acl-proxy.toml:/bundle/acl-proxy.toml:ro",
+        "access-flow-server-chain.pem:/bundle/access-flow-server-chain.pem:ro",
+        "access-flow-server-key.pem:/bundle/access-flow-server-key.pem:ro",
+        "mitm-ca-cert.pem:/bundle/mitm-ca-cert.pem:ro",
+        "mitm-ca-key.pem:/bundle/mitm-ca-key.pem:ro",
+        "identity-token:/bundle/identity-token:ro",
+        "provider.py:/bundle/provider.py:ro",
+        "private-expected:/bundle/private-expected:ro",
+        "origin-root.pem:/bundle/origin-root.pem:ro",
+    ] {
+        assert!(
+            proxy_mounts.contains(required),
+            "missing proxy mount {required:?}"
+        );
+    }
+    for forbidden in [
+        "access-flow-root-key.pem",
+        "origin-root-key.pem",
+        "origin-key.pem",
+        "origin.jsonl",
+        "parent.jsonl",
+    ] {
+        assert!(
+            !proxy_mounts.contains(forbidden),
+            "proxy input mounts expose {forbidden:?}"
+        );
+    }
+    let proxy_launches = smoke
+        .split_once("PROXY_INPUT_MOUNTS=(")
+        .map(|(_, suffix)| {
+            suffix
+                .split_once("        for _ in {1..200};")
+                .map(|(launches, _)| launches)
+                .unwrap()
+        })
+        .unwrap();
+    assert!(!proxy_launches.contains("/state/origin.jsonl"));
+    assert!(!proxy_launches.contains("/state/parent.jsonl"));
+    assert_eq!(
+        proxy_launches
+            .matches("\"${PROXY_INPUT_MOUNTS[@]}\"")
+            .count(),
+        2
+    );
+    for required in [
+        "$STATE/validate/generated-certs:/state/generated-certs:rw",
+        "$STATE/validate/captures:/state/captures:rw",
+        "$STATE/validate/proxy-logs:/state/proxy-logs:rw",
+        "$STATE/validate/provider.jsonl:/state/provider.jsonl:rw",
+        "$STATE/generated-certs:/state/generated-certs:rw",
+        "$STATE/captures:/state/captures:rw",
+        "$STATE/proxy-logs:/state/proxy-logs:rw",
+        "$STATE/provider.jsonl:/state/provider.jsonl:rw",
+    ] {
+        assert!(
+            proxy_launches.contains(required),
+            "missing isolated proxy state mount {required:?}"
+        );
+    }
     assert!(!smoke.contains("http = http.server.ThreadingHTTPServer"));
     assert!(!smoke.contains("retire_timeout = \"2s\""));
     assert!(smoke.contains("retire_timeout = \"30s\""));

@@ -906,7 +906,9 @@ start_acl_proxy() {
             "http://127.0.0.1:$CONTROL_PORT/_acl-proxy/ready" \
             | grep -qx '{"status":"ready"}'; then
             if timeout 0.2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$TLS_HTTP_PORT" \
-                && timeout 0.2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$TLS_HTTPS_PORT"; then
+                >/dev/null 2>&1 \
+                && timeout 0.2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$TLS_HTTPS_PORT" \
+                    >/dev/null 2>&1; then
                 return
             fi
         fi
@@ -995,7 +997,8 @@ FORWARDER_PID=$!
 for port in "$AGENT_TLS_HTTP_PORT" "$AGENT_TLS_HTTPS_PORT"; do
     for _ in {1..100}; do
         kill -0 "$FORWARDER_PID" 2>/dev/null || fail "TLS accept counter exited"
-        timeout 0.2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" && break
+        timeout 0.2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" \
+            >/dev/null 2>&1 && break
         sleep 0.02
     done
 done
@@ -1137,7 +1140,9 @@ unset AW_IDENTITY_TOKEN
 printf '%s\n' "$RELAY_PID" >/tmp/relay.pid
 for _ in {1..100}; do
     if timeout 0.2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3128' \
-        && timeout 0.2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3129'; then
+        >/dev/null 2>&1 \
+        && timeout 0.2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3129' \
+            >/dev/null 2>&1; then
         touch /tmp/stack.ready
         break
     fi

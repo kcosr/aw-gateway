@@ -21,6 +21,7 @@ REMOTE_MACHINE_ID_SHA256=
 DENIED_SOURCE_ADDRESS=
 WORKLOAD_BASE_IMAGE=
 WORKLOAD_BASE_IMAGE_ID=
+WORKLOAD_IMAGE_PACKAGE_MANIFEST_SHA256=
 REMOTE_IMAGE=
 REMOTE_IMAGE_ID=
 
@@ -31,6 +32,7 @@ WORKLOAD_IMAGE=
 WORKLOAD_CONTAINER=
 IDENTITY_WRITER_PID=
 REMOTE_STARTED=0
+REMOTE_CLEANUP_FAILED=0
 SUCCESS=0
 
 SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout=10)
@@ -106,6 +108,21 @@ remote_control() {
         "$REMOTE_DIR/bundle/remote-control.sh" "$@"
 }
 
+stop_remote() {
+    local output tag
+    ((REMOTE_STARTED == 1)) || return 0
+    tag=${SUFFIX:+aw-rt05-$SUFFIX}
+    if output=$(remote_control stop 2>&1); then
+        REMOTE_STARTED=0
+        return 0
+    fi
+    printf '%s\n' "$output" | sanitize_diagnostics >&2
+    printf 'remote firewall cleanup failed; host=%s tag=%s control_dir=%s (preserved)\n' \
+        "$REMOTE_HOST" "${tag:-unknown}" "$REMOTE_DIR" >&2
+    REMOTE_CLEANUP_FAILED=1
+    return 1
+}
+
 cleanup() {
     local status=$?
     trap - EXIT
@@ -137,12 +154,17 @@ cleanup() {
     [[ -z $WORKLOAD_CONTAINER ]] \
         || docker rm -f "$WORKLOAD_CONTAINER" >/dev/null 2>&1 || true
     [[ -z $NETWORK ]] || docker network rm "$NETWORK" >/dev/null 2>&1 || true
-    if ((REMOTE_STARTED == 1)) && [[ -n $REMOTE_DIR ]]; then
-        remote_control stop >/dev/null 2>&1 || true
+    if ((REMOTE_STARTED == 1 && REMOTE_CLEANUP_FAILED == 0)) \
+        && [[ -n $REMOTE_DIR ]]; then
+        stop_remote || status=1
     fi
-    if [[ -n $REMOTE_DIR ]]; then
-        ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" \
-            rm -rf -- "$REMOTE_DIR" >/dev/null 2>&1 || true
+    if [[ -n $REMOTE_DIR && $REMOTE_CLEANUP_FAILED == 0 ]]; then
+        if ! ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" \
+            rm -rf -- "$REMOTE_DIR" >/dev/null 2>&1; then
+            printf 'could not remove remote control directory; host=%s control_dir=%s\n' \
+                "$REMOTE_HOST" "$REMOTE_DIR" >&2
+            status=1
+        fi
     fi
     [[ -z $TMP_DIR ]] || rm -rf -- "$TMP_DIR"
     exit "$status"
@@ -186,8 +208,8 @@ done
     || fail "remote-interface contains unsupported characters"
 [[ $WORKLOAD_BASE_IMAGE =~ ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ ]] \
     || fail "workload container image reference contains unsupported characters"
-[[ $REMOTE_IMAGE =~ ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ ]] \
-    || fail "remote container image reference contains unsupported characters"
+[[ $REMOTE_IMAGE =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]] \
+    || fail "remote container image must use an immutable sha256 digest"
 
 for command in awk curl docker git ip openssl python3 sha256sum ssh tar timeout; do
     require_command "$command"
@@ -247,7 +269,15 @@ docker run --rm --pull=never --user 0:0 "$WORKLOAD_BASE_IMAGE" sh -eu -c '
 for command in bash curl ip iptables nsenter; do
     command -v "$command" >/dev/null
 done
+command -v apk >/dev/null
 ' || fail "explicit workload image lacks a required cached tool"
+WORKLOAD_IMAGE_PACKAGE_MANIFEST_SHA256=$(
+    docker run --rm --pull=never --user 0:0 "$WORKLOAD_BASE_IMAGE" \
+        sh -eu -c 'apk info -vv' \
+        | LC_ALL=C sort | sha256sum | awk '{print $1}'
+) || fail "could not inventory the explicit workload image packages"
+[[ $WORKLOAD_IMAGE_PACKAGE_MANIFEST_SHA256 =~ ^[0-9a-f]{64}$ ]] \
+    || fail "workload image package manifest digest is not canonical sha256"
 [[ -r /etc/machine-id ]] || fail "local machine identity is unavailable"
 LOCAL_MACHINE_ID_SHA256=$(sha256sum /etc/machine-id | awk '{print $1}')
 ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" true \
@@ -902,7 +932,7 @@ load_state() {
 remove_firewall() {
     [[ -f $STATE/runtime.env ]] || return 0
     load_state
-    local attempt
+    local attempt firewall
     for attempt in {1..5}; do
         sudo -n iptables -w 5 -C INPUT \
             -s "$SOURCE_ADDRESS/32" -d "$PUBLIC_ADDRESS/32" -p tcp \
@@ -927,15 +957,11 @@ remove_firewall() {
             -m comment --comment "$TAG.deny" -j DROP 2>/dev/null \
             || sleep 0.1
     done
-    ! sudo -n iptables -w 5 -C INPUT \
-        -s "$SOURCE_ADDRESS/32" -d "$PUBLIC_ADDRESS/32" -p tcp \
-        -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
-        -m comment --comment "$TAG.allow" -j ACCEPT 2>/dev/null
-    ! sudo -n iptables -w 5 -C INPUT \
-        -d "$PUBLIC_ADDRESS/32" -p tcp \
-        -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
-        -m comment --comment "$TAG.deny" -j DROP 2>/dev/null
-    if sudo -n iptables-save | grep -Fq -- "$TAG."; then
+    firewall=$(sudo -n iptables-save) || {
+        printf 'could not verify tagged firewall cleanup: %s\n' "$TAG" >&2
+        return 1
+    }
+    if grep -Fq -- "$TAG." <<<"$firewall"; then
         printf 'tagged firewall rules remain after bounded removal: %s\n' \
             "$TAG" >&2
         return 1
@@ -944,15 +970,89 @@ remove_firewall() {
 
 stop_capture() {
     [[ -f $STATE/tcpdump.pid ]] || return 0
-    local pid
-    pid=$(<"$STATE/tcpdump.pid")
-    sudo -n kill -INT "$pid" 2>/dev/null || true
-    for _ in {1..100}; do
-        sudo -n kill -0 "$pid" 2>/dev/null || break
-        sleep 0.05
+    local pid start_time current_start_time signal capture_status
+    read -r pid start_time <"$STATE/tcpdump.pid"
+    [[ $pid =~ ^[1-9][0-9]*$ && $start_time =~ ^[1-9][0-9]*$ ]] || {
+        printf 'invalid tcpdump process identity during teardown\n' >&2
+        return 1
+    }
+    capture_is_running() {
+        [[ -r /proc/$pid/stat ]] || return 1
+        current_start_time=$(awk '{print $22}' "/proc/$pid/stat") || return 2
+        [[ $current_start_time == "$start_time" ]] || return 1
+        sudo -n kill -0 "$pid" 2>/dev/null && return 0
+        [[ -r /proc/$pid/stat ]] || return 1
+        current_start_time=$(awk '{print $22}' "/proc/$pid/stat") || return 2
+        [[ $current_start_time == "$start_time" ]] || return 1
+        return 2
+    }
+    if capture_is_running; then
+        :
+    else
+        capture_status=$?
+        ((capture_status == 1)) || {
+            printf 'could not verify tcpdump process identity during teardown\n' >&2
+            return 1
+        }
+        rm -f "$STATE/tcpdump.pid"
+        return 0
+    fi
+    for signal in INT TERM KILL; do
+        if ! sudo -n kill "-$signal" "$pid" 2>/dev/null; then
+            if capture_is_running; then
+                printf 'could not signal tcpdump during teardown: %s\n' \
+                    "$signal" >&2
+                return 1
+            else
+                capture_status=$?
+            fi
+            ((capture_status == 1)) || {
+                printf 'could not verify tcpdump exit during teardown\n' >&2
+                return 1
+            }
+            rm -f "$STATE/tcpdump.pid"
+            return 0
+        fi
+        for _ in {1..100}; do
+            if capture_is_running; then
+                sleep 0.05
+                continue
+            else
+                capture_status=$?
+            fi
+            ((capture_status == 1)) || {
+                printf 'could not verify tcpdump exit during teardown\n' >&2
+                return 1
+            }
+            rm -f "$STATE/tcpdump.pid"
+            return 0
+        done
     done
-    sudo -n kill -TERM "$pid" 2>/dev/null || true
-    rm -f "$STATE/tcpdump.pid"
+    printf 'tcpdump capture remains after bounded teardown\n' >&2
+    return 1
+}
+
+verify_remote_topology_absent() {
+    local containers networks name failed=0
+    containers=$(docker container ls -a --format '{{.Names}}') || {
+        printf 'could not inventory remote containers during teardown\n' >&2
+        return 1
+    }
+    for name in "$PROXY_CONTAINER" "$PARENT_CONTAINER" "$ORIGIN_CONTAINER"; do
+        if grep -Fxq -- "$name" <<<"$containers"; then
+            printf 'remote container remains after teardown: %s\n' "$name" >&2
+            failed=1
+        fi
+    done
+    networks=$(docker network ls --format '{{.Name}}') || {
+        printf 'could not inventory remote networks during teardown\n' >&2
+        return 1
+    }
+    if grep -Fxq -- "$NETWORK" <<<"$networks"; then
+        printf 'remote network remains after teardown: %s\n' "$NETWORK" >&2
+        failed=1
+    fi
+    ((failed == 0))
 }
 
 stop_all() {
@@ -962,6 +1062,10 @@ stop_all() {
         docker rm -f "$PROXY_CONTAINER" "$PARENT_CONTAINER" \
             "$ORIGIN_CONTAINER" >/dev/null 2>&1 || true
         docker network rm "$NETWORK" >/dev/null 2>&1 || true
+        verify_remote_topology_absent || {
+            printf 'remote topology teardown is unverified; retaining protective firewall rules\n' >&2
+            return 1
+        }
     fi
     remove_firewall
 }
@@ -977,11 +1081,14 @@ case "$ACTION" in
         SUFFIX=$6
         REMOTE_IMAGE=$7
         [[ $SUFFIX =~ ^[0-9a-f]{12}$ ]] || exit 2
-        mkdir -m 0700 -p "$STATE" "$STATE/home" "$STATE/captures" \
+        mkdir -m 0700 -p "$STATE" "$STATE/captures" \
             "$STATE/proxy-logs" "$STATE/generated-certs"
         : >"$STATE/origin.jsonl"
         : >"$STATE/parent.jsonl"
         : >"$STATE/provider.jsonl"
+        mkdir -m 0700 -p "$STATE/validate/generated-certs" \
+            "$STATE/validate/captures" "$STATE/validate/proxy-logs"
+        : >"$STATE/validate/provider.jsonl"
         NETWORK="aw-rt05-$SUFFIX"
         ORIGIN_CONTAINER="aw-rt05-origin-$SUFFIX"
         PARENT_CONTAINER="aw-rt05-parent-$SUFFIX"
@@ -1031,12 +1138,27 @@ EOF
             -d "$PUBLIC_ADDRESS/32" -p tcp \
             -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
             -m comment --comment "$TAG.deny" -j DROP
+        PROXY_INPUT_MOUNTS=(
+            --volume "$BUNDLE/acl-proxy:/bundle/acl-proxy:ro"
+            --volume "$BUNDLE/acl-proxy.toml:/bundle/acl-proxy.toml:ro"
+            --volume "$BUNDLE/access-flow-server-chain.pem:/bundle/access-flow-server-chain.pem:ro"
+            --volume "$BUNDLE/access-flow-server-key.pem:/bundle/access-flow-server-key.pem:ro"
+            --volume "$BUNDLE/mitm-ca-cert.pem:/bundle/mitm-ca-cert.pem:ro"
+            --volume "$BUNDLE/mitm-ca-key.pem:/bundle/mitm-ca-key.pem:ro"
+            --volume "$BUNDLE/identity-token:/bundle/identity-token:ro"
+            --volume "$BUNDLE/provider.py:/bundle/provider.py:ro"
+            --volume "$BUNDLE/private-expected:/bundle/private-expected:ro"
+            --volume "$BUNDLE/origin-root.pem:/bundle/origin-root.pem:ro"
+        )
         docker run --rm --pull=never --user 0:0 \
             --security-opt label=disable \
             --network "$NETWORK" \
-            --volume "$BUNDLE:/bundle:ro,z" \
-            --volume "$STATE:/state:rw,z" \
-            --env HOME=/state/home \
+            "${PROXY_INPUT_MOUNTS[@]}" \
+            --volume "$STATE/validate/generated-certs:/state/generated-certs:rw" \
+            --volume "$STATE/validate/captures:/state/captures:rw" \
+            --volume "$STATE/validate/proxy-logs:/state/proxy-logs:rw" \
+            --volume "$STATE/validate/provider.jsonl:/state/provider.jsonl:rw" \
+            --env HOME=/tmp \
             "$REMOTE_IMAGE" /bundle/acl-proxy \
             config validate --config /bundle/acl-proxy.toml \
             >"$STATE/config-validate.log" 2>&1
@@ -1045,9 +1167,12 @@ EOF
             --network "$NETWORK" \
             --publish "$PUBLIC_ADDRESS:$HTTP_PORT:$HTTP_PORT/tcp" \
             --publish "$PUBLIC_ADDRESS:$HTTPS_PORT:$HTTPS_PORT/tcp" \
-            --volume "$BUNDLE:/bundle:ro,z" \
-            --volume "$STATE:/state:rw,z" \
-            --env HOME=/state/home \
+            "${PROXY_INPUT_MOUNTS[@]}" \
+            --volume "$STATE/generated-certs:/state/generated-certs:rw" \
+            --volume "$STATE/captures:/state/captures:rw" \
+            --volume "$STATE/proxy-logs:/state/proxy-logs:rw" \
+            --volume "$STATE/provider.jsonl:/state/provider.jsonl:rw" \
+            --env HOME=/tmp \
             "$REMOTE_IMAGE" /bundle/acl-proxy \
             run --config /bundle/acl-proxy.toml >/dev/null
         for _ in {1..200}; do
@@ -1135,7 +1260,8 @@ PY
         stop_capture
         rm -f "$STATE/outer.pcap" "$STATE/tcpdump.log"
         sudo -n sh -c '
-            echo "$$" >"$1"
+            start_time=$(awk "{print \$22}" "/proc/$$/stat")
+            printf "%s %s\n" "$$" "$start_time" >"$1"
             exec tcpdump -Q in -i "$2" -nn -U \
                 "dst host $3 and tcp and (dst port $4 or dst port $5)" \
                 -w "$6"
@@ -1187,6 +1313,30 @@ PY
             origin.jsonl parent.jsonl provider.jsonl captures proxy-logs \
             outer-tuples.txt config-validate.log proxy-container.stdout \
             proxy-container.stderr proxy-container-inspect.json
+        ;;
+    executed-image-id)
+        (($# == 0)) || exit 2
+        load_state
+        executed_image_id=
+        for container in "$PROXY_CONTAINER" "$PARENT_CONTAINER" \
+            "$ORIGIN_CONTAINER"; do
+            container_image_id=$(docker inspect "$container" --format '{{.Image}}')
+            case "$container_image_id" in
+                [0-9a-f][0-9a-f]*) container_image_id="sha256:$container_image_id" ;;
+            esac
+            [[ $container_image_id =~ ^sha256:[0-9a-f]{64}$ ]] || {
+                printf 'container has a noncanonical image ID: %s\n' \
+                    "$container" >&2
+                exit 1
+            }
+            if [[ -z $executed_image_id ]]; then
+                executed_image_id=$container_image_id
+            elif [[ $container_image_id != "$executed_image_id" ]]; then
+                printf 'remote topology used different container images\n' >&2
+                exit 1
+            fi
+        done
+        printf '%s\n' "$executed_image_id"
         ;;
     diagnostics)
         if [[ -f $STATE/runtime.env ]]; then
@@ -1260,6 +1410,11 @@ remote_control start "$REMOTE_ADDRESS" "$REMOTE_SOURCE_ADDRESS" \
     "$REMOTE_INTERFACE" "$TLS_HTTP_PORT" "$TLS_HTTPS_PORT" "$SUFFIX" \
     "$REMOTE_IMAGE" | grep -qx ready \
     || fail "remote Access Flow topology did not become ready"
+REMOTE_EXECUTED_IMAGE_ID=$(remote_control executed-image-id) \
+    || fail "could not inventory the executed remote container image"
+[[ $REMOTE_EXECUTED_IMAGE_ID == "$REMOTE_IMAGE_ID" ]] \
+    || fail "executed remote container image differs from preflight image"
+REMOTE_IMAGE_ID=$REMOTE_EXECUTED_IMAGE_ID
 remote_control probe-denied-source "$DENIED_SOURCE_ADDRESS" | grep -qx denied \
     || fail "remote firewall did not reject and count the disallowed source"
 
@@ -1647,8 +1802,7 @@ for path in root.rglob("*"):
 PY
 
 stop_workload
-remote_control stop
-REMOTE_STARTED=0
+stop_remote || fail "remote topology cleanup did not complete"
 
 printf '%s\n' \
     'transport=tls_tcp' \
@@ -1681,6 +1835,8 @@ printf '%s\n' \
     "remote-machine-id-sha256=$REMOTE_MACHINE_ID_SHA256" \
     "workload-base-image=$WORKLOAD_BASE_IMAGE" \
     "workload-base-image-id=$WORKLOAD_BASE_IMAGE_ID" \
+    'workload-image-tools=bash,curl,ip,iptables,nsenter' \
+    "workload-image-package-manifest-sha256=$WORKLOAD_IMAGE_PACKAGE_MANIFEST_SHA256" \
     'workload-image-material=cached-direct' \
     "remote-image=$REMOTE_IMAGE" \
     "remote-image-id=$REMOTE_IMAGE_ID" \
