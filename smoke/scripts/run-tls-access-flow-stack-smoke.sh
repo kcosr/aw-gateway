@@ -21,9 +21,18 @@ PARENT_CONTAINER=
 WORKLOAD_CONTAINER=
 WORKLOAD_IMAGE=
 ACL_PID=
+ACL_TIME_PID=
 ACTIVE_CLIENT_PID=
 IDENTITY_WRITER_PID=
 FORWARDER_PID=
+MEASUREMENT_CONTROL_DIR=
+MEASUREMENT_LOAD=
+PROXY_PROJECTION_PROBE=
+MEASUREMENT_SECRET_SCAN_FILE=
+PROXY_PROJECTED_BYTES=
+PROXY_PROJECTED_DESCRIPTORS=
+PROXY_MINIMUM_ACTIVE_BYTES_PER_FLOW=
+MEASUREMENT_CLIENTS_STARTED=0
 SUCCESS=0
 
 fail() {
@@ -41,7 +50,11 @@ Usage: run-tls-access-flow-stack-smoke.sh \
   --aw-repo <absolute-path> \
   --expected-acl-sha <full-sha> \
   --expected-access-runtime-sha <full-sha> \
-  --expected-aw-sha <full-sha>
+  --expected-aw-sha <full-sha> \
+  [--measurement-control-dir <absolute-empty-directory> \
+   --measurement-load <0|32|128> \
+   --proxy-projection-probe <absolute-regular-file> \
+   --measurement-secret-scan-file <absolute-new-file>]
 EOF
     exit 2
 }
@@ -102,6 +115,9 @@ cleanup() {
             "$TMP_DIR" "$NETWORK" "$WORKLOAD_CONTAINER" "$PARENT_CONTAINER" "$ORIGIN_CONTAINER" >&2
         exit "$status"
     fi
+    if (( MEASUREMENT_CLIENTS_STARTED == 1 )) && [[ -n $WORKLOAD_CONTAINER ]]; then
+        docker exec "$WORKLOAD_CONTAINER" touch /tmp/measurement.stop >/dev/null 2>&1 || true
+    fi
     if [[ -n $ACL_PID ]] && kill -0 "$ACL_PID" 2>/dev/null; then
         kill -TERM "$ACL_PID" 2>/dev/null || true
         for _ in {1..100}; do
@@ -109,7 +125,11 @@ cleanup() {
             sleep 0.05
         done
         kill -KILL "$ACL_PID" 2>/dev/null || true
-        wait "$ACL_PID" 2>/dev/null || true
+        if [[ -n $ACL_TIME_PID ]]; then
+            wait "$ACL_TIME_PID" 2>/dev/null || true
+        else
+            wait "$ACL_PID" 2>/dev/null || true
+        fi
     fi
     if [[ -n $ACTIVE_CLIENT_PID ]] && kill -0 "$ACTIVE_CLIENT_PID" 2>/dev/null; then
         kill -TERM "$ACTIVE_CLIENT_PID" 2>/dev/null || true
@@ -186,6 +206,30 @@ while (($#)); do
             EXPECTED_AW_SHA=$2
             shift 2
             ;;
+        --measurement-control-dir)
+            (($# >= 2)) || usage
+            [[ -z $MEASUREMENT_CONTROL_DIR ]] || usage
+            MEASUREMENT_CONTROL_DIR=$2
+            shift 2
+            ;;
+        --measurement-load)
+            (($# >= 2)) || usage
+            [[ -z $MEASUREMENT_LOAD ]] || usage
+            MEASUREMENT_LOAD=$2
+            shift 2
+            ;;
+        --proxy-projection-probe)
+            (($# >= 2)) || usage
+            [[ -z $PROXY_PROJECTION_PROBE ]] || usage
+            PROXY_PROJECTION_PROBE=$2
+            shift 2
+            ;;
+        --measurement-secret-scan-file)
+            (($# >= 2)) || usage
+            [[ -z $MEASUREMENT_SECRET_SCAN_FILE ]] || usage
+            MEASUREMENT_SECRET_SCAN_FILE=$2
+            shift 2
+            ;;
         *) usage ;;
     esac
 done
@@ -193,10 +237,72 @@ done
 [[ -n $ACL_PROXY_BIN && -n $AGENT_BIN && -n $ACL_REPO \
     && -n $ACCESS_RUNTIME_REPO && -n $AW_REPO && -n $EXPECTED_ACL_SHA \
     && -n $EXPECTED_ACCESS_RUNTIME_SHA && -n $EXPECTED_AW_SHA ]] || usage
+if [[ -n $MEASUREMENT_CONTROL_DIR || -n $MEASUREMENT_LOAD \
+    || -n $PROXY_PROJECTION_PROBE || -n $MEASUREMENT_SECRET_SCAN_FILE ]]; then
+    [[ -n $MEASUREMENT_CONTROL_DIR && $MEASUREMENT_LOAD =~ ^(0|32|128)$ \
+        && $PROXY_PROJECTION_PROBE == /* && -f $PROXY_PROJECTION_PROBE \
+        && ! -L $PROXY_PROJECTION_PROBE && $MEASUREMENT_SECRET_SCAN_FILE == /* \
+        && ! -e $MEASUREMENT_SECRET_SCAN_FILE && ! -L $MEASUREMENT_SECRET_SCAN_FILE \
+        && -d $(dirname -- "$MEASUREMENT_SECRET_SCAN_FILE") \
+        && ! -L $(dirname -- "$MEASUREMENT_SECRET_SCAN_FILE") ]] || usage
+    [[ $MEASUREMENT_CONTROL_DIR == /* && -d $MEASUREMENT_CONTROL_DIR \
+        && ! -L $MEASUREMENT_CONTROL_DIR ]] \
+        || fail "measurement control directory must be an absolute non-symlink directory"
+    MEASUREMENT_CONTROL_DIR=$(cd -- "$MEASUREMENT_CONTROL_DIR" && pwd -P)
+    [[ -z $(find "$MEASUREMENT_CONTROL_DIR" -mindepth 1 -print -quit) ]] \
+        || fail "measurement control directory must be empty"
+    command -v python3 >/dev/null 2>&1 \
+        || fail "required command is unavailable: python3"
+    PROXY_PROJECTION_PROBE=$(cd -- "$(dirname -- "$PROXY_PROJECTION_PROBE")" \
+        && pwd -P)/$(basename -- "$PROXY_PROJECTION_PROBE")
+    MEASUREMENT_SECRET_SCAN_FILE=$(cd -- "$(dirname -- "$MEASUREMENT_SECRET_SCAN_FILE")" \
+        && pwd -P)/$(basename -- "$MEASUREMENT_SECRET_SCAN_FILE")
+    read -r PROXY_PROJECTED_BYTES PROXY_PROJECTED_DESCRIPTORS \
+        PROXY_MINIMUM_ACTIVE_BYTES_PER_FLOW < <(
+        python3 - "$PROXY_PROJECTION_PROBE" <<'PY'
+import csv
+from pathlib import Path
+import sys
+
+with Path(sys.argv[1]).open(encoding="ascii", newline="") as source:
+    rows = list(csv.DictReader(source, delimiter="\t"))
+expected = {
+    "proxy_projected_bytes",
+    "proxy_projected_descriptors",
+    "proxy_minimum_active_bytes_per_flow",
+}
+if (
+    not rows
+    or set(rows[0]) != {"name", "value"}
+    or {row["name"] for row in rows} != expected
+    or len(rows) != len(expected)
+):
+    raise SystemExit("Proxy projection probe has an invalid contract")
+values = {}
+for row in rows:
+    try:
+        value = int(row["value"])
+    except ValueError:
+        raise SystemExit("Proxy projection probe contains a non-integer") from None
+    if value <= 0:
+        raise SystemExit("Proxy projection probe contains a nonpositive value")
+    values[row["name"]] = value
+print(
+    values["proxy_projected_bytes"],
+    values["proxy_projected_descriptors"],
+    values["proxy_minimum_active_bytes_per_flow"],
+)
+PY
+    ) || fail "could not consume the Proxy-owned RT06 projection probe"
+fi
 
 for command in awk curl docker git jq openssl python3 sha256sum stat timeout; do
     require_command "$command"
 done
+if [[ -n $MEASUREMENT_CONTROL_DIR ]]; then
+    require_command /usr/bin/time
+    require_command pgrep
+fi
 
 canonical_repo() {
     local label=$1 path=$2
@@ -384,7 +490,7 @@ FROM $BASE_IMAGE
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update -qq \
     && apt-get install -y -qq --no-install-recommends \
-        ca-certificates curl iproute2 iptables netcat-openbsd openssl util-linux \
+        ca-certificates curl iproute2 iptables netcat-openbsd openssl procps time util-linux \
     && rm -rf /var/lib/apt/lists/*
 EOF
 docker build --pull=false --quiet --tag "$WORKLOAD_IMAGE" \
@@ -446,6 +552,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
                 time.sleep(0.02)
+            return
+        if self.path.startswith("/measurement-hold/"):
+            chunk = b"x" * 1024
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(1024 * 1024 * 1024))
+            self.end_headers()
+            try:
+                while True:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    time.sleep(0.1)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
         private = "present" if self.headers.get("x-private-smoke") else "absent"
         body = f"origin:{self.path}:identity={identity}:private={private}".encode("ascii")
@@ -687,6 +807,22 @@ for line in sys.stdin:
 PY
 chmod 0700 "$TMP_DIR/config/provider.py"
 
+TLS_MAX_HANDSHAKES=32
+TLS_MAX_CONNECTIONS_PER_SOURCE=32
+TLS_HANDSHAKE_BURST=100
+TLS_SOURCE_TABLE_CAPACITY=128
+LISTENER_MAX_CONNECTIONS=64
+RELAY_MAX_CONNECTIONS=64
+IDENTITY_MAX_PENDING=32
+if [[ -n $MEASUREMENT_CONTROL_DIR ]]; then
+    TLS_MAX_HANDSHAKES=64
+    TLS_MAX_CONNECTIONS_PER_SOURCE=64
+    TLS_HANDSHAKE_BURST=200
+    LISTENER_MAX_CONNECTIONS=64
+    RELAY_MAX_CONNECTIONS=128
+    IDENTITY_MAX_PENDING=128
+fi
+
 HTTP_TRANSPORT_CONFIG=$(cat <<EOF
 kind = "tls_tcp"
 bind = "0.0.0.0:$TLS_HTTP_PORT"
@@ -697,11 +833,11 @@ certificate_chain = "$TMP_DIR/config/access-flow-server-chain.pem"
 private_key = "$TMP_DIR/config/access-flow-server-key.pem"
 
 [listeners.transparent_http.endpoint.transport.abuse_control]
-max_handshakes = 32
-max_connections_per_source = 32
+max_handshakes = $TLS_MAX_HANDSHAKES
+max_connections_per_source = $TLS_MAX_CONNECTIONS_PER_SOURCE
 handshakes_per_second = 100
-handshake_burst = 100
-source_table_capacity = 128
+handshake_burst = $TLS_HANDSHAKE_BURST
+source_table_capacity = $TLS_SOURCE_TABLE_CAPACITY
 EOF
 )
 HTTPS_TRANSPORT_CONFIG=$(cat <<EOF
@@ -714,11 +850,11 @@ certificate_chain = "$TMP_DIR/config/access-flow-server-chain.pem"
 private_key = "$TMP_DIR/config/access-flow-server-key.pem"
 
 [listeners.transparent_https.endpoint.transport.abuse_control]
-max_handshakes = 32
-max_connections_per_source = 32
+max_handshakes = $TLS_MAX_HANDSHAKES
+max_connections_per_source = $TLS_MAX_CONNECTIONS_PER_SOURCE
 handshakes_per_second = 100
-handshake_burst = 100
-source_table_capacity = 128
+handshake_burst = $TLS_HANDSHAKE_BURST
+source_table_capacity = $TLS_SOURCE_TABLE_CAPACITY
 EOF
 )
 cat >"$ACL_CONFIG" <<EOF
@@ -735,7 +871,7 @@ request_body_timeout = "2s"
 
 [listeners.transparent_http]
 http_versions = ["http1"]
-max_connections = 64
+max_connections = $LISTENER_MAX_CONNECTIONS
 
 [listeners.transparent_http.identity]
 mode = "required"
@@ -750,7 +886,7 @@ $HTTP_TRANSPORT_CONFIG
 
 [listeners.transparent_https]
 http_versions = ["http1"]
-max_connections = 64
+max_connections = $LISTENER_MAX_CONNECTIONS
 
 [listeners.transparent_https.identity]
 mode = "required"
@@ -770,7 +906,7 @@ ca_private_key = "$TMP_DIR/config/mitm-ca-key.pem"
 directory = "$TMP_DIR/config/generated-certs"
 
 [identity]
-max_pending_authentications = 32
+max_pending_authentications = $IDENTITY_MAX_PENDING
 max_pending_authentications_per_connection = 4
 
 [identity.resolver]
@@ -894,11 +1030,27 @@ env -i HOME="$TMP_DIR/home" PATH=/usr/bin:/bin \
     || fail "ephemeral ACL Proxy configuration did not validate"
 start_acl_proxy() {
     local generation=$1
-    env -i HOME="$TMP_DIR/home" PATH=/usr/bin:/bin \
-        "$ACL_PROXY_BIN" run --config "$ACL_CONFIG" \
-        >"$TMP_DIR/acl-proxy.$generation.stdout" \
-        2>"$TMP_DIR/acl-proxy.$generation.stderr" &
-    ACL_PID=$!
+    if [[ -n $MEASUREMENT_CONTROL_DIR ]]; then
+        LC_ALL=C /usr/bin/time -v -o "$TMP_DIR/acl-proxy.time-v" \
+            env -i HOME="$TMP_DIR/home" PATH=/usr/bin:/bin \
+            "$ACL_PROXY_BIN" run --config "$ACL_CONFIG" \
+            >"$TMP_DIR/acl-proxy.$generation.stdout" \
+            2>"$TMP_DIR/acl-proxy.$generation.stderr" &
+        ACL_TIME_PID=$!
+        for _ in {1..100}; do
+            ACL_PID=$(pgrep -P "$ACL_TIME_PID" -f -- "$ACL_PROXY_BIN" 2>/dev/null | head -n 1 || true)
+            [[ -z $ACL_PID ]] || break
+            kill -0 "$ACL_TIME_PID" 2>/dev/null || fail "ACL Proxy timing wrapper exited before spawn"
+            sleep 0.01
+        done
+        [[ -n $ACL_PID ]] || fail "could not resolve the measured ACL Proxy process"
+    else
+        env -i HOME="$TMP_DIR/home" PATH=/usr/bin:/bin \
+            "$ACL_PROXY_BIN" run --config "$ACL_CONFIG" \
+            >"$TMP_DIR/acl-proxy.$generation.stdout" \
+            2>"$TMP_DIR/acl-proxy.$generation.stderr" &
+        ACL_PID=$!
+    fi
     : >"$TMP_DIR/acl-proxy.stderr"
     for _ in {1..200}; do
         kill -0 "$ACL_PID" 2>/dev/null || fail "ACL Proxy exited before readiness"
@@ -925,7 +1077,12 @@ stop_acl_proxy() {
     done
     kill -0 "$ACL_PID" 2>/dev/null \
         && fail "ACL Proxy did not stop within the shutdown bound"
-    wait "$ACL_PID" || fail "ACL Proxy exited unsuccessfully"
+    if [[ -n $ACL_TIME_PID ]]; then
+        wait "$ACL_TIME_PID" || fail "ACL Proxy exited unsuccessfully"
+        ACL_TIME_PID=
+    else
+        wait "$ACL_PID" || fail "ACL Proxy exited unsuccessfully"
+    fi
     ACL_PID=
 }
 
@@ -1059,17 +1216,21 @@ done
 EOF
 chmod 0700 "$TMP_DIR/tls-firewall.sh"
 
+AGENT_CONTROL_SOCKET=false
+if [[ -n $MEASUREMENT_CONTROL_DIR ]]; then
+    AGENT_CONTROL_SOCKET='"/run/aw-gateway/agent.sock"'
+fi
 cat >"$TMP_DIR/container-agent.toml" <<EOF
 schema_version = "1"
 
 [container_agent]
 enabled = true
-control_socket = false
+control_socket = $AGENT_CONTROL_SOCKET
 
 [container_agent.access_flow_relay]
 setup_timeout = "2s"
 drain_timeout = "10s"
-max_connections = 64
+max_connections = $RELAY_MAX_CONNECTIONS
 copy_buffer_bytes_per_direction = 16384
 start_after_services = ["transparent-firewall"]
 
@@ -1123,7 +1284,11 @@ cleanup() {
         [[ ! -s /tmp/relay.stderr ]] || cat /tmp/relay.stderr >&2
     fi
     [[ -z ${RELAY_PID:-} ]] || kill "$RELAY_PID" 2>/dev/null || true
-    wait 2>/dev/null || true
+    if [[ -n ${RELAY_TIME_PID:-} ]]; then
+        wait "$RELAY_TIME_PID" 2>/dev/null || true
+    else
+        wait 2>/dev/null || true
+    fi
     exit "$status"
 }
 trap cleanup EXIT INT TERM
@@ -1132,10 +1297,26 @@ install -D -o 0 -g 0 -m 0644 \
     /run/aw-gateway/trust/access-flow-root.pem
 IFS= read -r AW_IDENTITY_TOKEN </run/aw-gateway/identity-token.fifo
 export AW_IDENTITY_TOKEN
-/opt/aw-gateway/bin/aw-container-agent \
-    --config /etc/aw-gateway/container-agent.toml run \
-    >/tmp/relay.stdout 2>/tmp/relay.stderr &
-RELAY_PID=$!
+if [[ ${AW_RESOURCE_MEASUREMENT:-0} == 1 ]]; then
+    LC_ALL=C /usr/bin/time -v -o /tmp/agent.time-v \
+        /opt/aw-gateway/bin/aw-container-agent \
+        --config /etc/aw-gateway/container-agent.toml run \
+        >/tmp/relay.stdout 2>/tmp/relay.stderr &
+    RELAY_TIME_PID=$!
+    for _ in $(seq 1 100); do
+        RELAY_PID=$(pgrep -P "$RELAY_TIME_PID" -f \
+            '/opt/aw-gateway/bin/aw-container-agent' 2>/dev/null | head -n 1 || true)
+        [[ -z $RELAY_PID ]] || break
+        kill -0 "$RELAY_TIME_PID"
+        sleep 0.01
+    done
+    [[ -n $RELAY_PID ]]
+else
+    /opt/aw-gateway/bin/aw-container-agent \
+        --config /etc/aw-gateway/container-agent.toml run \
+        >/tmp/relay.stdout 2>/tmp/relay.stderr &
+    RELAY_PID=$!
+fi
 unset AW_IDENTITY_TOKEN
 printf '%s\n' "$RELAY_PID" >/tmp/relay.pid
 for _ in {1..100}; do
@@ -1150,7 +1331,11 @@ for _ in {1..100}; do
     sleep 0.05
 done
 [[ -f /tmp/stack.ready ]]
-wait "$RELAY_PID"
+if [[ -n ${RELAY_TIME_PID:-} ]]; then
+    wait "$RELAY_TIME_PID"
+else
+    wait "$RELAY_PID"
+fi
 SH
 chmod 0700 "$TMP_DIR/workload.sh"
 
@@ -1163,11 +1348,16 @@ start_workload() {
         --mount "type=bind,src=$TMP_DIR/config/access-flow-root.pem,dst=/mnt/aw-gateway/access-flow-root.pem,readonly"
         --mount "type=bind,src=$TMP_DIR/tls-firewall.sh,dst=/opt/aw-gateway/bin/aw-transparent-tls-smoke-firewall,readonly"
     )
+    local -a measurement_environment=()
+    if [[ -n $MEASUREMENT_CONTROL_DIR ]]; then
+        measurement_environment=(-e AW_RESOURCE_MEASUREMENT=1)
+    fi
     docker run -d --name "$WORKLOAD_CONTAINER" --privileged --network "$NETWORK" \
         --ulimit nofile=4096:4096 \
         --mount "type=bind,src=$TMP_DIR/config/mitm-ca-cert.pem,dst=/etc/acl-proxy/mitm-ca-cert.pem,readonly" \
         --mount "type=bind,src=$IDENTITY_FIFO,dst=/run/aw-gateway/identity-token.fifo" \
         --mount "type=bind,src=$TMP_DIR/workload.sh,dst=/usr/local/bin/workload-smoke,readonly" \
+        "${measurement_environment[@]}" \
         "${transport_mounts[@]}" \
         "${consumer_mounts[@]}" \
         "$WORKLOAD_IMAGE" bash /usr/local/bin/workload-smoke >/dev/null
@@ -1276,6 +1466,423 @@ request_https() {
         --cacert /etc/acl-proxy/mitm-ca-cert.pem --noproxy '*' \
         --resolve "origin.test:443:$ORIGIN_IP" "$1"
 }
+
+wait_for_measurement_file() {
+    local path=$1 label=$2
+    for _ in {1..600}; do
+        [[ -f $path ]] && return
+        assert_workload_relay_alive
+        kill -0 "$ACL_PID" 2>/dev/null || fail "ACL Proxy exited while waiting for $label"
+        sleep 0.05
+    done
+    fail "timed out waiting for $label"
+}
+
+measurement_active_flows() {
+    docker exec "$WORKLOAD_CONTAINER" sh -eu -c \
+        "printf '%s' '{\"id\":\"measurement\",\"method\":\"status\"}' \
+            | nc -w 1 -U /run/aw-gateway/agent.sock" \
+        | jq -er '.result.access_flow_relay.active_flows'
+}
+
+wait_for_measurement_active_flows() {
+    local expected=$1 require_clients=${2:-0} observed
+    for _ in {1..600}; do
+        if ((require_clients == 1)); then
+            assert_measurement_clients_alive
+        fi
+        observed=$(measurement_active_flows 2>/dev/null || true)
+        [[ $observed == "$expected" ]] && return
+        assert_workload_relay_alive
+        kill -0 "$ACL_PID" 2>/dev/null || fail "ACL Proxy exited during measured flow admission"
+        sleep 0.05
+    done
+    fail "measured relay active-flow count did not reach $expected (last observed ${observed:-unavailable})"
+}
+
+assert_measurement_clients_alive() {
+    docker exec "$WORKLOAD_CONTAINER" test ! -f /tmp/measurement-clients.failed \
+        || fail "a measured HTTP/HTTPS client exited before the active epoch ended"
+    local client_pid
+    client_pid=$(docker exec "$WORKLOAD_CONTAINER" cat /tmp/measurement-clients.pid \
+        2>/dev/null || true)
+    [[ $client_pid =~ ^[1-9][0-9]*$ ]] \
+        || fail "measurement client supervisor did not publish its PID"
+    docker exec "$WORKLOAD_CONTAINER" kill -0 "$client_pid" 2>/dev/null \
+        || fail "measurement client supervisor exited before the active epoch ended"
+}
+
+wait_for_measurement_stop() {
+    local expected=$1 observed
+    for _ in {1..2400}; do
+        assert_measurement_clients_alive
+        observed=$(measurement_active_flows 2>/dev/null || true)
+        [[ $observed == "$expected" ]] \
+            || fail "measured relay active-flow count changed during active epoch (expected $expected, observed ${observed:-unavailable})"
+        if [[ -f $MEASUREMENT_CONTROL_DIR/stop ]]; then
+            assert_measurement_clients_alive
+            observed=$(measurement_active_flows 2>/dev/null || true)
+            [[ $observed == "$expected" ]] \
+                || fail "measured relay active-flow count changed before active stop"
+            return
+        fi
+        sleep 0.02
+    done
+    fail "timed out waiting for measurement stop"
+}
+
+write_measurement_phase() {
+    local epoch=$1 phase=$2 active=$3 http=$4 https=$5
+    printf '%s\t%s\n' "$epoch" "$phase" >"$MEASUREMENT_CONTROL_DIR/phase.tmp"
+    mv "$MEASUREMENT_CONTROL_DIR/phase.tmp" "$MEASUREMENT_CONTROL_DIR/phase"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$epoch" "$phase" "$active" "$http" "$https" \
+        "$((active * 3))" "$((active * 2))" "$((active * 98304))" \
+        "$((active * 327680))" >>"$MEASUREMENT_CONTROL_DIR/logical.tsv"
+}
+
+write_measurement_control_phase() {
+    local epoch=$1 phase=$2
+    printf '%s\t%s\n' "$epoch" "$phase" >"$MEASUREMENT_CONTROL_DIR/phase.tmp"
+    mv "$MEASUREMENT_CONTROL_DIR/phase.tmp" "$MEASUREMENT_CONTROL_DIR/phase"
+}
+
+write_measurement_projection() {
+    local relay_log gateway_memory gateway_descriptors
+    relay_log=$(docker exec "$WORKLOAD_CONTAINER" cat /tmp/relay.stderr)
+    read -r gateway_memory gateway_descriptors < <(
+        python3 -c '
+import json
+import re
+import sys
+
+for line in sys.stdin:
+    if "access flow relay resource preflight passed" not in line:
+        continue
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError:
+        record = None
+    if isinstance(record, dict):
+        fields = record.get("fields", record)
+        memory = fields.get("memory_bytes")
+        descriptors = fields.get("descriptors")
+        if isinstance(memory, int) and isinstance(descriptors, int):
+            print(memory, descriptors)
+            raise SystemExit
+    memory = re.search(r"\bmemory_bytes[=: ]+(\d+)", line)
+    descriptors = re.search(r"\bdescriptors[=: ]+(\d+)", line)
+    if memory and descriptors:
+        print(memory.group(1), descriptors.group(1))
+        raise SystemExit
+raise SystemExit("agent log omitted the resource preflight projection")
+' <<<"$relay_log"
+    ) || fail "could not recover the Gateway resource projection"
+
+    cat >"$MEASUREMENT_CONTROL_DIR/projection.tsv" <<EOF
+name	value
+proxy_feature_ceiling_bytes	268435456
+gateway_feature_ceiling_bytes	268435456
+proxy_projected_bytes	$PROXY_PROJECTED_BYTES
+gateway_projected_bytes	$gateway_memory
+proxy_projected_descriptors	$PROXY_PROJECTED_DESCRIPTORS
+gateway_projected_descriptors	$gateway_descriptors
+proxy_minimum_active_bytes_per_flow	$PROXY_MINIMUM_ACTIVE_BYTES_PER_FLOW
+gateway_minimum_active_bytes_per_flow	147456
+composed_minimum_active_bytes_per_flow	327680
+known_buffer_bytes_per_flow	98304
+logical_permits_per_flow	3
+logical_tasks_per_flow	2
+configured_max_flows	$RELAY_MAX_CONNECTIONS
+logical_permit_ceiling	$((RELAY_MAX_CONNECTIONS * 3))
+logical_task_ceiling	$((RELAY_MAX_CONNECTIONS * 2))
+known_buffer_ceiling_bytes	$((RELAY_MAX_CONNECTIONS * 98304))
+EOF
+}
+
+assert_measurement_diagnostics_secret_free() {
+    python3 - "$MEASUREMENT_SECRET_SCAN_FILE" \
+        "$MEASUREMENT_CONTROL_DIR/gateway.stderr" \
+        "$MEASUREMENT_CONTROL_DIR/proxy.stderr" \
+        "$MEASUREMENT_CONTROL_DIR/gateway.time-v" \
+        "$MEASUREMENT_CONTROL_DIR/proxy.time-v" <<'PY'
+from pathlib import Path
+import sys
+
+lines = Path(sys.argv[1]).read_bytes().splitlines()
+if lines[:1] != [b"contract_version=2"]:
+    raise SystemExit("ephemeral secret scan input has an invalid contract")
+secrets = []
+for line in lines[1:]:
+    if line.startswith((b"bearer=", b"key_b64=")):
+        secrets.append(line.partition(b"=")[2])
+    elif line.startswith(b"key_der_hex="):
+        value = line.removeprefix(b"key_der_hex=")
+        secrets.extend((bytes.fromhex(value.decode("ascii")), value.lower(), value.upper()))
+    else:
+        raise SystemExit("ephemeral secret scan input has an invalid field")
+for name in sys.argv[2:]:
+    diagnostic = Path(name).read_bytes()
+    if any(secret in diagnostic for secret in secrets):
+        raise SystemExit(f"retained diagnostic contains secret material: {Path(name).name}")
+PY
+}
+
+publish_measurement_secret_scan_input() {
+    python3 - "$MEASUREMENT_SECRET_SCAN_FILE" "$BEARER_HISTORY" \
+        "$TMP_DIR/config/access-flow-root-key.pem" \
+        "$TMP_DIR/config/access-flow-server-key.pem" \
+        "$TMP_DIR/config/mitm-ca-key.pem" <<'PY'
+import os
+import base64
+from pathlib import Path
+import sys
+
+output = Path(sys.argv[1])
+bearers = [value for value in Path(sys.argv[2]).read_bytes().splitlines() if value]
+if len(bearers) != 1:
+    raise SystemExit("measurement must have exactly one actual bearer")
+base64_chunks = []
+der_hex_chunks = []
+
+def regions(value, width):
+    if len(value) < width:
+        raise SystemExit("private-key fixture is shorter than a scan region")
+    return (
+        value[:width],
+        value[(len(value) - width) // 2:(len(value) - width) // 2 + width],
+        value[-width:],
+    )
+
+for name in sys.argv[3:]:
+    body = b"".join(
+        line
+        for line in Path(name).read_bytes().splitlines()
+        if line and not line.startswith(b"---")
+    )
+    try:
+        der = base64.b64decode(body, validate=True)
+    except ValueError:
+        raise SystemExit("private-key fixture body is not valid base64") from None
+    base64_chunks.extend(regions(body, 32))
+    der_hex_chunks.extend(chunk.hex().encode("ascii") for chunk in regions(der, 24))
+descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, "wb") as sink:
+    sink.write(b"contract_version=2\n")
+    for bearer in bearers:
+        sink.write(b"bearer=" + bearer + b"\n")
+    for chunk in base64_chunks:
+        sink.write(b"key_b64=" + chunk + b"\n")
+    for chunk in der_hex_chunks:
+        sink.write(b"key_der_hex=" + chunk + b"\n")
+    sink.flush()
+    os.fsync(sink.fileno())
+PY
+}
+
+run_resource_measurement() {
+    local load=$MEASUREMENT_LOAD
+    local http_count=$((load / 2))
+    local https_count=$((load - http_count))
+    local agent_namespace_pid agent_container_init_pid agent_host_pid
+    publish_measurement_secret_scan_input \
+        || fail "could not publish ephemeral measurement secret scan input"
+    agent_namespace_pid=$(docker exec "$WORKLOAD_CONTAINER" cat /tmp/relay.pid)
+    [[ $agent_namespace_pid =~ ^[1-9][0-9]*$ ]] \
+        || fail "measured agent did not publish a namespace PID"
+    agent_container_init_pid=$(docker inspect --format '{{.State.Pid}}' "$WORKLOAD_CONTAINER")
+    [[ $agent_container_init_pid =~ ^[1-9][0-9]*$ ]] \
+        || fail "could not resolve the workload container host PID"
+    agent_host_pid=$(python3 - "$agent_namespace_pid" "$agent_container_init_pid" \
+        "$AGENT_BIN" <<'PY'
+import os
+from pathlib import Path
+import sys
+
+namespace_pid = int(sys.argv[1])
+container_init = int(sys.argv[2])
+expected_exe = Path(sys.argv[3])
+
+def status_fields(pid):
+    fields = {}
+    for line in (Path("/proc") / str(pid) / "status").read_text(encoding="ascii").splitlines():
+        key, separator, value = line.partition(":")
+        if separator:
+            fields[key] = value.strip()
+    return fields
+
+def belongs_to_container(pid):
+    seen = set()
+    while pid > 1 and pid not in seen:
+        if pid == container_init:
+            return True
+        seen.add(pid)
+        pid = int(status_fields(pid)["PPid"])
+    return False
+
+matches = []
+for entry in Path("/proc").iterdir():
+    if not entry.name.isdigit():
+        continue
+    try:
+        pid = int(entry.name)
+        fields = status_fields(pid)
+        nspid = [int(value) for value in fields.get("NSpid", "").split()]
+        if nspid and nspid[-1] == namespace_pid and belongs_to_container(pid):
+            if os.path.samefile(entry / "exe", expected_exe):
+                matches.append(pid)
+    except (FileNotFoundError, PermissionError, ProcessLookupError, KeyError, ValueError):
+        continue
+if len(matches) != 1:
+    raise SystemExit(f"expected one namespace/executable-bound agent PID, found {len(matches)}")
+print(matches[0])
+PY
+    ) || fail "could not map the measured agent namespace PID to its exact host process"
+    [[ $agent_host_pid =~ ^[1-9][0-9]*$ ]] \
+        || fail "could not resolve the measured agent host PID"
+
+    python3 - "$ACL_PID" "$ACL_PROXY_BIN" "$agent_host_pid" "$AGENT_BIN" \
+        >"$MEASUREMENT_CONTROL_DIR/pids.tsv" <<'PY'
+import hashlib
+import os
+from pathlib import Path
+import sys
+
+def starttime(pid):
+    stat = (Path("/proc") / str(pid) / "stat").read_text(encoding="ascii")
+    end_name = stat.rfind(")")
+    fields = stat[end_name + 2:].split() if end_name >= 0 else []
+    if len(fields) < 20:
+        raise SystemExit("process stat is truncated")
+    return int(fields[19])
+
+print("process\tpid\tstarttime\texe_sha256")
+for name, pid_text, expected_text in (
+    ("proxy", sys.argv[1], sys.argv[2]),
+    ("gateway", sys.argv[3], sys.argv[4]),
+):
+    pid = int(pid_text)
+    exe = Path("/proc") / str(pid) / "exe"
+    if not os.path.samefile(exe, expected_text):
+        raise SystemExit(f"{name} executable does not match the built binary")
+    with exe.open("rb") as source:
+        digest = hashlib.file_digest(source, "sha256").hexdigest()
+    print(f"{name}\t{pid}\t{starttime(pid)}\t{digest}")
+PY
+    printf 'epoch\tphase\tactive_flows\thttp_flows\thttps_flows\tlogical_permits\tlogical_tasks\tknown_buffer_bytes\tminimum_active_projection_bytes\n' \
+        >"$MEASUREMENT_CONTROL_DIR/logical.tsv"
+    write_measurement_projection
+    write_measurement_phase 1 idle 0 0 0
+    touch "$MEASUREMENT_CONTROL_DIR/pids-ready"
+    wait_for_measurement_file "$MEASUREMENT_CONTROL_DIR/sampler-start" "measurement sampler start"
+    wait_for_measurement_file "$MEASUREMENT_CONTROL_DIR/idle-ready" "measured idle baseline"
+    write_measurement_control_phase 2 ramp
+
+    cat >"$TMP_DIR/measurement-clients.sh" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+load=$1
+origin_ip=$2
+http_count=$((load / 2))
+https_count=$((load - http_count))
+pids=()
+printf '%s\n' "$$" >/tmp/measurement-clients.pid
+for ((index = 0; index < http_count; index++)); do
+    curl --fail --silent --show-error --noproxy '*' \
+        --resolve "origin.test:80:$origin_ip" \
+        "http://origin.test/measurement-hold/http-$index" >/dev/null &
+    pids+=("$!")
+done
+for ((index = 0; index < https_count; index++)); do
+    curl --fail --silent --show-error --noproxy '*' \
+        --cacert /etc/acl-proxy/mitm-ca-cert.pem \
+        --resolve "origin.test:443:$origin_ip" \
+        "https://origin.test/measurement-hold/https-$index" >/dev/null &
+    pids+=("$!")
+done
+touch /tmp/measurement-clients.ready
+while [[ ! -f /tmp/measurement.stop ]]; do
+    for pid in "${pids[@]}"; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            touch /tmp/measurement-clients.failed
+            exit 1
+        fi
+    done
+    sleep 0.02
+done
+for pid in "${pids[@]}"; do
+    kill -TERM "$pid" 2>/dev/null || true
+done
+for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+done
+touch /tmp/measurement-clients.drained
+SH
+    chmod 0755 "$TMP_DIR/measurement-clients.sh"
+    docker cp "$TMP_DIR/measurement-clients.sh" \
+        "$WORKLOAD_CONTAINER:/tmp/measurement-clients.sh" >/dev/null
+    docker exec "$WORKLOAD_CONTAINER" chmod 0755 /tmp/measurement-clients.sh
+    docker exec -d --user 65534:65534 "$WORKLOAD_CONTAINER" \
+        /tmp/measurement-clients.sh "$load" "$ORIGIN_IP"
+    MEASUREMENT_CLIENTS_STARTED=1
+    for _ in {1..600}; do
+        docker exec "$WORKLOAD_CONTAINER" test -f /tmp/measurement-clients.ready \
+            2>/dev/null && break
+        sleep 0.05
+    done
+    docker exec "$WORKLOAD_CONTAINER" test -f /tmp/measurement-clients.ready \
+        || fail "measurement clients did not start"
+    wait_for_measurement_active_flows "$load" 1
+    write_measurement_phase 2 active "$load" "$http_count" "$https_count"
+    touch "$MEASUREMENT_CONTROL_DIR/active-ready"
+    wait_for_measurement_stop "$load"
+
+    docker exec "$WORKLOAD_CONTAINER" touch /tmp/measurement.stop
+    for _ in {1..600}; do
+        docker exec "$WORKLOAD_CONTAINER" test -f /tmp/measurement-clients.drained \
+            2>/dev/null && break
+        sleep 0.05
+    done
+    docker exec "$WORKLOAD_CONTAINER" test -f /tmp/measurement-clients.drained \
+        || fail "measurement clients did not drain"
+    MEASUREMENT_CLIENTS_STARTED=0
+    wait_for_measurement_active_flows 0
+    write_measurement_phase 3 drained 0 0 0
+    touch "$MEASUREMENT_CONTROL_DIR/drained-ready"
+    wait_for_measurement_file "$MEASUREMENT_CONTROL_DIR/finish" "measurement finish"
+
+    docker stop --time 15 "$WORKLOAD_CONTAINER" >/dev/null \
+        || fail "measured workload consumer did not stop cleanly"
+    docker cp "$WORKLOAD_CONTAINER:/tmp/agent.time-v" \
+        "$MEASUREMENT_CONTROL_DIR/gateway.time-v" >/dev/null \
+        || fail "measured agent did not publish GNU time evidence"
+    docker cp "$WORKLOAD_CONTAINER:/tmp/relay.stderr" \
+        "$TMP_DIR/relay.measurement.stderr" >/dev/null \
+        || fail "could not capture measured agent diagnostics after stop"
+    sanitize_diagnostics <"$TMP_DIR/relay.measurement.stderr" \
+        >"$MEASUREMENT_CONTROL_DIR/gateway.stderr" \
+        || fail "could not retain sanitized measured agent diagnostics"
+    stop_acl_proxy
+    cp "$TMP_DIR/acl-proxy.time-v" "$MEASUREMENT_CONTROL_DIR/proxy.time-v"
+    sanitize_diagnostics <"$TMP_DIR/acl-proxy.first.stderr" \
+        >"$MEASUREMENT_CONTROL_DIR/proxy.stderr"
+    assert_measurement_diagnostics_secret_free \
+        || fail "measured product diagnostics contain secret material"
+    printf 'load=%s\nhttp_flows=%s\nhttps_flows=%s\n' \
+        "$load" "$http_count" "$https_count" >"$MEASUREMENT_CONTROL_DIR/trial.txt"
+    touch "$MEASUREMENT_CONTROL_DIR/trial-complete"
+    printf '%s\n' "tls-access-flow-resource-trial=passed load=$load"
+    SUCCESS=1
+}
+
+if [[ -n $MEASUREMENT_CONTROL_DIR ]]; then
+    ACTIVE_BEARER=$IDENTITY_TOKEN
+    start_workload
+    assert_workload_relay_alive
+    assert_workload_launcher_bearer_removed
+    run_resource_measurement
+    exit 0
+fi
 
 VALID_BEARER=$ACTIVE_BEARER
 INVALID_BEARER=$(openssl rand -hex 24)
