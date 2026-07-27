@@ -598,6 +598,10 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
         "wait_for_measurement_file \"$MEASUREMENT_CONTROL_DIR/pids-bound\"",
         "cat /tmp/measurement-clients.failure",
         "client=%s exit=%s",
+        "wait_for_measurement_response_heads",
+        "/tmp/measurement-clients.response-heads-ready",
+        "--dump-header \"/tmp/measurement-client-http-$index.headers\"",
+        "cleanup_clients()",
         "class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):",
         "request_queue_size = 256",
         "measurement_hold_response_bytes = 16 * 1024 * 1024",
@@ -641,6 +645,20 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
     }
     if script.matches("FixtureThreadingHttpServer((").count() != 4 {
         return Err("FixtureThreadingHttpServer((");
+    }
+    if script
+        .matches("wait_for_measurement_response_heads")
+        .count()
+        != 2
+    {
+        return Err("wait_for_measurement_response_heads");
+    }
+    if script
+        .matches("/tmp/measurement-clients.response-heads-ready")
+        .count()
+        != 2
+    {
+        return Err("/tmp/measurement-clients.response-heads-ready");
     }
     Ok(())
 }
@@ -702,6 +720,10 @@ fn tls_access_flow_stack_smoke_is_integrated_non_vacuous_and_mutation_guarded() 
         "wait_for_measurement_file \"$MEASUREMENT_CONTROL_DIR/pids-bound\"",
         "cat /tmp/measurement-clients.failure",
         "client=%s exit=%s",
+        "wait_for_measurement_response_heads",
+        "/tmp/measurement-clients.response-heads-ready",
+        "--dump-header \"/tmp/measurement-client-http-$index.headers\"",
+        "cleanup_clients()",
         "class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):",
         "request_queue_size = 256",
         "FixtureThreadingHttpServer((",

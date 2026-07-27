@@ -1559,6 +1559,22 @@ wait_for_measurement_active_flows() {
     fail "measured relay active-flow count did not reach $expected (last observed ${observed:-unavailable})"
 }
 
+wait_for_measurement_response_heads() {
+    for _ in {1..600}; do
+        assert_measurement_clients_alive
+        if docker exec "$WORKLOAD_CONTAINER" \
+            test -f /tmp/measurement-clients.response-heads-ready \
+            2>/dev/null; then
+            return
+        fi
+        assert_workload_relay_alive
+        kill -0 "$ACL_PID" 2>/dev/null \
+            || fail "ACL Proxy exited before every measured response head arrived"
+        sleep 0.05
+    done
+    fail "not every measured HTTP/HTTPS client received a successful response head"
+}
+
 assert_measurement_clients_alive() {
     if ! docker exec "$WORKLOAD_CONTAINER" \
         test ! -f /tmp/measurement-clients.failed; then
@@ -1759,9 +1775,23 @@ http_count=$((load / 2))
 https_count=$((load - http_count))
 pids=()
 labels=()
+cleanup_clients() {
+    local status=$?
+    trap - EXIT INT TERM
+    set +e
+    for pid in "${pids[@]}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    exit "$status"
+}
+trap cleanup_clients EXIT INT TERM
 printf '%s\n' "$$" >/tmp/measurement-clients.pid
 for ((index = 0; index < http_count; index++)); do
     curl --fail --silent --show-error --noproxy '*' \
+        --dump-header "/tmp/measurement-client-http-$index.headers" \
         --resolve "origin.test:80:$origin_ip" \
         "http://origin.test/measurement-hold/http-$index" \
         >/dev/null 2>"/tmp/measurement-client-http-$index.stderr" &
@@ -1770,6 +1800,7 @@ for ((index = 0; index < http_count; index++)); do
 done
 for ((index = 0; index < https_count; index++)); do
     curl --fail --silent --show-error --noproxy '*' \
+        --dump-header "/tmp/measurement-client-https-$index.headers" \
         --cacert /etc/acl-proxy/mitm-ca-cert.pem \
         --resolve "origin.test:443:$origin_ip" \
         "https://origin.test/measurement-hold/https-$index" \
@@ -1778,6 +1809,7 @@ for ((index = 0; index < https_count; index++)); do
     labels+=("https-$index")
 done
 touch /tmp/measurement-clients.ready
+response_heads_ready=0
 while [[ ! -f /tmp/measurement.stop ]]; do
     for index in "${!pids[@]}"; do
         pid=${pids[$index]}
@@ -1792,6 +1824,20 @@ while [[ ! -f /tmp/measurement.stop ]]; do
             exit 1
         fi
     done
+    if ((response_heads_ready == 0)); then
+        all_ready=1
+        for label in "${labels[@]}"; do
+            if ! grep -Eq '^HTTP/[0-9.]+ 200([[:space:]]|$)' \
+                "/tmp/measurement-client-$label.headers"; then
+                all_ready=0
+                break
+            fi
+        done
+        if ((all_ready == 1)); then
+            touch /tmp/measurement-clients.response-heads-ready
+            response_heads_ready=1
+        fi
+    fi
     sleep 0.02
 done
 for pid in "${pids[@]}"; do
@@ -1817,6 +1863,7 @@ SH
     docker exec "$WORKLOAD_CONTAINER" test -f /tmp/measurement-clients.ready \
         || fail "measurement clients did not start"
     wait_for_measurement_active_flows "$load" 1
+    wait_for_measurement_response_heads
     write_measurement_phase 2 active "$load" "$http_count" "$https_count"
     touch "$MEASUREMENT_CONTROL_DIR/active-ready"
     wait_for_measurement_stop "$load"
