@@ -8,8 +8,8 @@ use access_flow_relay::{
 use access_identity::IdentityPresentation;
 use anyhow::Context;
 use std::os::unix::fs::FileTypeExt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Instant;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Duration, sleep};
@@ -46,7 +46,7 @@ pub(super) enum RelayFatalKind {
 }
 
 enum RelayCommand {
-    ReloadSecurity,
+    ReloadSecurity(PendingRelayTransportReload),
     CloseAdmission(oneshot::Sender<()>),
     Shutdown {
         deadline: Instant,
@@ -68,13 +68,21 @@ pub(super) struct RelayControl {
     security_healthy: Arc<AtomicBool>,
     reload_in_progress: AtomicBool,
     phase: AtomicU8,
+    lifecycle: StdMutex<()>,
     command_tx: mpsc::Sender<RelayCommand>,
+    transport: OnceLock<RelayTransportRuntime>,
     startup_cancellation: RelayCancellation,
     drain_timeout: Duration,
     #[cfg(test)]
     activation_pause: Mutex<Option<ActivationPause>>,
     #[cfg(test)]
-    reload_pause: Mutex<Option<ReloadWorkerPause>>,
+    reload_pause: StdMutex<Option<ReloadWorkerPause>>,
+    #[cfg(test)]
+    reload_command_pause: Mutex<Option<ActivationPause>>,
+    #[cfg(test)]
+    close_reload_join_reached: Mutex<Option<oneshot::Sender<()>>>,
+    #[cfg(test)]
+    close_reload_join_completed: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl RelayControl {
@@ -96,13 +104,21 @@ impl RelayControl {
                 security_healthy: Arc::new(AtomicBool::new(false)),
                 reload_in_progress: AtomicBool::new(false),
                 phase: AtomicU8::new(RELAY_PHASE_PREPARING),
+                lifecycle: StdMutex::new(()),
                 command_tx,
+                transport: OnceLock::new(),
                 startup_cancellation,
                 drain_timeout,
                 #[cfg(test)]
                 activation_pause: Mutex::new(None),
                 #[cfg(test)]
-                reload_pause: Mutex::new(None),
+                reload_pause: StdMutex::new(None),
+                #[cfg(test)]
+                reload_command_pause: Mutex::new(None),
+                #[cfg(test)]
+                close_reload_join_reached: Mutex::new(None),
+                #[cfg(test)]
+                close_reload_join_completed: Mutex::new(None),
             }),
             RelayCommandReceiver(command_rx),
         )
@@ -143,9 +159,16 @@ impl RelayControl {
     }
 
     pub(super) async fn close_admission(&self) {
-        let phase = self.phase.swap(RELAY_PHASE_CLOSING, Ordering::AcqRel);
-        self.accepting.store(false, Ordering::Release);
-        self.security_healthy.store(false, Ordering::Release);
+        let phase = {
+            let _lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let phase = self.phase.swap(RELAY_PHASE_CLOSING, Ordering::AcqRel);
+            self.accepting.store(false, Ordering::Release);
+            self.security_healthy.store(false, Ordering::Release);
+            phase
+        };
         let mut state = self.state.lock().await;
         if *state != AccessFlowRelayStateName::Failed {
             *state = AccessFlowRelayStateName::Draining;
@@ -166,6 +189,10 @@ impl RelayControl {
     }
 
     pub(super) fn initiate_security_reload(self: &Arc<Self>) -> Result<(), ()> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.phase.load(Ordering::Acquire) != RELAY_PHASE_ACTIVE {
             tracing::debug!(
                 category = "security_material",
@@ -184,22 +211,72 @@ impl RelayControl {
             );
             return Err(());
         }
-        if self
-            .command_tx
-            .try_send(RelayCommand::ReloadSecurity)
-            .is_err()
-        {
+        let command = match self.command_tx.try_reserve() {
+            Ok(command) => command,
+            Err(_) => {
+                self.reload_in_progress.store(false, Ordering::Release);
+                tracing::debug!(
+                    category = "security_material",
+                    "access flow relay trust reload was not started"
+                );
+                return Err(());
+            }
+        };
+        let Some(transport) = self.transport.get() else {
             self.reload_in_progress.store(false, Ordering::Release);
             tracing::debug!(
                 category = "security_material",
                 "access flow relay trust reload was not started"
             );
             return Err(());
-        }
+        };
+        #[cfg(test)]
+        let reload_pause = self
+            .reload_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        #[cfg(test)]
+        let reload = if let Some(reload_pause) = reload_pause {
+            transport.begin_reload_with_hook(move || {
+                let _ = reload_pause.reached.send(());
+                let _ = reload_pause.resume.recv();
+            })
+        } else {
+            transport.begin_reload()
+        };
+        #[cfg(not(test))]
+        let reload = transport.begin_reload();
+        let pending = match reload {
+            Ok(Some(pending)) => pending,
+            Ok(None) => {
+                drop(command);
+                finish_security_reload(self, ReloadFinish::Completed, Ok(()));
+                return Ok(());
+            }
+            Err(_) => {
+                drop(command);
+                finish_security_reload(self, ReloadFinish::Rejected, Err(()));
+                return Err(());
+            }
+        };
+        command.send(RelayCommand::ReloadSecurity(pending));
         Ok(())
     }
 
     pub(super) async fn shutdown(&self, deadline: Instant) {
+        {
+            let _lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let phase = self.phase.swap(RELAY_PHASE_CLOSING, Ordering::AcqRel);
+            self.accepting.store(false, Ordering::Release);
+            self.security_healthy.store(false, Ordering::Release);
+            if phase == RELAY_PHASE_PREPARING {
+                self.startup_cancellation.cancel();
+            }
+        }
         let (completed, wait) = oneshot::channel();
         if self
             .command_tx
@@ -253,17 +330,86 @@ impl RelayControl {
     }
 
     #[cfg(test)]
-    async fn pause_blocking_reload(
+    fn pause_blocking_reload(
         &self,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         let (reached, wait_for_reached) = std::sync::mpsc::channel();
         let (resume, wait_for_resume) = std::sync::mpsc::channel();
-        let previous = self.reload_pause.lock().await.replace(ReloadWorkerPause {
-            reached,
-            resume: wait_for_resume,
-        });
+        let previous = self
+            .reload_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(ReloadWorkerPause {
+                reached,
+                resume: wait_for_resume,
+            });
         assert!(previous.is_none(), "reload pause already installed");
         (wait_for_reached, resume)
+    }
+
+    #[cfg(test)]
+    async fn pause_before_reload_command(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, wait_for_reached) = oneshot::channel();
+        let (resume, wait_for_resume) = oneshot::channel();
+        let previous = self
+            .reload_command_pause
+            .lock()
+            .await
+            .replace(ActivationPause {
+                reached,
+                resume: wait_for_resume,
+            });
+        assert!(previous.is_none(), "reload command pause already installed");
+        (wait_for_reached, resume)
+    }
+
+    #[cfg(test)]
+    async fn wait_for_reload_command_pause(&self) {
+        let Some(pause) = self.reload_command_pause.lock().await.take() else {
+            return;
+        };
+        let _ = pause.reached.send(());
+        let _ = pause.resume.await;
+    }
+
+    #[cfg(test)]
+    async fn observe_close_before_reload_join(&self) -> oneshot::Receiver<()> {
+        let (reached, wait_for_reached) = oneshot::channel();
+        let previous = self.close_reload_join_reached.lock().await.replace(reached);
+        assert!(
+            previous.is_none(),
+            "close-before-reload-join observer already installed"
+        );
+        wait_for_reached
+    }
+
+    #[cfg(test)]
+    async fn publish_close_before_reload_join(&self) {
+        if let Some(reached) = self.close_reload_join_reached.lock().await.take() {
+            let _ = reached.send(());
+        }
+    }
+
+    #[cfg(test)]
+    async fn observe_close_after_reload_join(&self) -> oneshot::Receiver<()> {
+        let (completed, wait_for_completed) = oneshot::channel();
+        let previous = self
+            .close_reload_join_completed
+            .lock()
+            .await
+            .replace(completed);
+        assert!(
+            previous.is_none(),
+            "close-after-reload-join observer already installed"
+        );
+        wait_for_completed
+    }
+
+    #[cfg(test)]
+    async fn publish_close_after_reload_join(&self) {
+        if let Some(completed) = self.close_reload_join_completed.lock().await.take() {
+            let _ = completed.send(());
+        }
     }
 }
 
@@ -405,6 +551,10 @@ async fn run_relay(
     let transport =
         RelayTransportRuntime::prepare(&compiled.plan, Arc::clone(&control.security_healthy))
             .context("prepare access flow relay transport")?;
+    control
+        .transport
+        .set(transport.clone())
+        .map_err(|_| anyhow::anyhow!("access flow relay transport was already installed"))?;
     let relay = AccessFlowRelay::new(
         compiled.plan,
         transport.connector(),
@@ -522,7 +672,11 @@ async fn handle_start_command(
     control: &RelayControl,
 ) -> Option<StartupDisposition> {
     match command {
-        Some(RelayCommand::ReloadSecurity) => {
+        Some(RelayCommand::ReloadSecurity(pending)) => {
+            if let Some(transport) = control.transport.get() {
+                transport.close();
+            }
+            let _ = pending.complete().await;
             finish_security_reload(control, ReloadFinish::Rejected, Err(()));
             None
         }
@@ -560,7 +714,11 @@ async fn finish_cancelled_start(
     control.accepting.store(false, Ordering::Release);
     while let Some(command) = commands.recv().await {
         match command {
-            RelayCommand::ReloadSecurity => {
+            RelayCommand::ReloadSecurity(pending) => {
+                if let Some(transport) = control.transport.get() {
+                    transport.close();
+                }
+                let _ = pending.complete().await;
                 finish_security_reload(control, ReloadFinish::Rejected, Err(()));
             }
             RelayCommand::CloseAdmission(completed) => {
@@ -611,54 +769,39 @@ async fn run_active_relay(
             }
             command = commands.recv() => {
                 match command {
-                    Some(RelayCommand::ReloadSecurity) => {
+                    Some(RelayCommand::ReloadSecurity(reload)) => {
+                        #[cfg(test)]
+                        control.wait_for_reload_command_pause().await;
                         if pending_reload.is_some() {
                             tracing::debug!(
                                 category = "security_material",
                                 "access flow relay concurrent trust reload was rejected"
                             );
+                            let result = reload.complete().await.map_err(|_| ());
+                            finish_security_reload(
+                                control,
+                                ReloadFinish::Rejected,
+                                result,
+                            );
                         } else {
-                            #[cfg(test)]
-                            let reload_pause = control.reload_pause.lock().await.take();
-                            #[cfg(test)]
-                            let reload = if let Some(reload_pause) = reload_pause {
-                                transport.begin_reload_with_hook(move || {
-                                    let _ = reload_pause.reached.send(());
-                                    let _ = reload_pause.resume.recv();
-                                })
-                            } else {
-                                transport.begin_reload()
-                            };
-                            #[cfg(not(test))]
-                            let reload = transport.begin_reload();
-                            match reload {
-                                Ok(Some(reload)) => {
-                                    pending_reload = Some(reload);
-                                    tracing::debug!(
-                                        category = "security_material",
-                                        "access flow relay trust reload started"
-                                    );
-                                }
-                                Ok(None) => finish_security_reload(
-                                    control,
-                                    ReloadFinish::Completed,
-                                    Ok(()),
-                                ),
-                                Err(_) => finish_security_reload(
-                                    control,
-                                    ReloadFinish::Completed,
-                                    Err(()),
-                                ),
-                            }
+                            pending_reload = Some(reload);
+                            tracing::debug!(
+                                category = "security_material",
+                                "access flow relay trust reload started"
+                            );
                         }
                     }
                     Some(RelayCommand::CloseAdmission(completed)) => {
                         transport.close();
+                        #[cfg(test)]
+                        control.publish_close_before_reload_join().await;
                         finish_pending_reload(
                             control,
                             &mut pending_reload,
                             ReloadFinish::Shutdown,
                         ).await;
+                        #[cfg(test)]
+                        control.publish_close_after_reload_join().await;
                         control.accepting.store(false, Ordering::Release);
                         control.set_state(AccessFlowRelayStateName::Draining).await;
                         running.close_admission().await;
@@ -835,7 +978,11 @@ async fn await_failed_relay_shutdown(
 ) -> anyhow::Result<()> {
     while let Some(command) = commands.recv().await {
         match command {
-            RelayCommand::ReloadSecurity => {
+            RelayCommand::ReloadSecurity(pending) => {
+                if let Some(transport) = control.transport.get() {
+                    transport.close();
+                }
+                let _ = pending.complete().await;
                 finish_security_reload(control, ReloadFinish::Rejected, Err(()));
             }
             RelayCommand::CloseAdmission(completed) => {
@@ -1537,7 +1684,10 @@ O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
             access_identity::SensitiveBearer::new(TEST_ACCESS_FLOW_BEARER).unwrap(),
         );
         let (control, commands) = RelayControl::configured(&config);
-        let (reload_reached, resume_reload) = control.pause_blocking_reload().await;
+        let (reload_reached, resume_reload) = control.pause_blocking_reload();
+        let (command_reached, resume_command) = control.pause_before_reload_command().await;
+        let close_before_join = control.observe_close_before_reload_join().await;
+        let mut close_after_join = control.observe_close_after_reload_join().await;
         let state = Arc::new(AgentState::new(
             dir.path().join("state"),
             None,
@@ -1570,14 +1720,29 @@ O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
         .await
         .unwrap();
         control.initiate_security_reload().unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            tokio::task::spawn_blocking(move || reload_reached.recv()),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), command_reached)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !control.is_ready(),
+            "reload initiation did not synchronously close admission"
+        );
+        let mut rejected = tokio::net::TcpStream::connect(listen).await.unwrap();
+        let mut byte = [0_u8; 1];
+        let rejection = tokio::time::timeout(Duration::from_secs(1), rejected.read(&mut byte))
+            .await
+            .expect("reload-gated route did not close promptly");
+        assert!(
+            matches!(rejection, Ok(0) | Err(_)),
+            "reload-gated route admitted application bytes"
+        );
+        remote.set_nonblocking(true).unwrap();
+        assert_eq!(
+            remote.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "reload-gated route opened a stale-trust upstream connection"
+        );
         assert!(!control.is_ready());
         assert!(
             control.initiate_security_reload().is_err(),
@@ -1597,9 +1762,36 @@ O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
         .unwrap();
         assert!(
             !close.is_finished(),
-            "shutdown completed without joining the paused reload task"
+            "admission close passed a reload awaiting command consumption"
+        );
+        resume_command.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), close_before_join)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || reload_reached.recv()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(
+            !close.is_finished(),
+            "admission close completed after reaching but without awaiting the paused reload join"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut close_after_join)
+                .await
+                .is_err(),
+            "admission close crossed the reload join while its worker was paused"
         );
         resume_reload.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), close_after_join)
+            .await
+            .unwrap()
+            .unwrap();
         tokio::time::timeout(Duration::from_secs(1), close)
             .await
             .unwrap()
