@@ -3,9 +3,6 @@
 set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
-BASE_IMAGE=${AW_TLS_CROSS_HOST_SMOKE_IMAGE:-ubuntu:24.04}
-REMOTE_IMAGE=${AW_TLS_CROSS_HOST_REMOTE_IMAGE:-python:3.14-slim}
-
 ACL_PROXY_BIN=
 AGENT_BIN=
 ACL_REPO=
@@ -18,6 +15,14 @@ REMOTE_HOST=
 REMOTE_ADDRESS=
 REMOTE_SOURCE_ADDRESS=
 REMOTE_INTERFACE=
+REMOTE_CONTAINER_BACKEND=
+LOCAL_MACHINE_ID_SHA256=
+REMOTE_MACHINE_ID_SHA256=
+DENIED_SOURCE_ADDRESS=
+WORKLOAD_BASE_IMAGE=
+WORKLOAD_BASE_IMAGE_ID=
+REMOTE_IMAGE=
+REMOTE_IMAGE_ID=
 
 TMP_DIR=
 REMOTE_DIR=
@@ -47,6 +52,8 @@ Usage: run-tls-access-flow-cross-host-smoke.sh \
   --expected-access-runtime-sha <full-sha> \
   --expected-aw-sha <full-sha> \
   --remote-host <ssh-host> \
+  --workload-image <image> \
+  --remote-image <image> \
   [--remote-address <IPv4>] \
   [--remote-source-address <IPv4>] \
   [--remote-interface <interface>]
@@ -130,8 +137,6 @@ cleanup() {
     [[ -z $WORKLOAD_CONTAINER ]] \
         || docker rm -f "$WORKLOAD_CONTAINER" >/dev/null 2>&1 || true
     [[ -z $NETWORK ]] || docker network rm "$NETWORK" >/dev/null 2>&1 || true
-    [[ -z $WORKLOAD_IMAGE ]] \
-        || docker image rm -f "$WORKLOAD_IMAGE" >/dev/null 2>&1 || true
     if ((REMOTE_STARTED == 1)) && [[ -n $REMOTE_DIR ]]; then
         remote_control stop >/dev/null 2>&1 || true
     fi
@@ -158,6 +163,8 @@ while (($#)); do
         --expected-access-runtime-sha) EXPECTED_ACCESS_RUNTIME_SHA=$2 ;;
         --expected-aw-sha) EXPECTED_AW_SHA=$2 ;;
         --remote-host) REMOTE_HOST=$2 ;;
+        --workload-image) WORKLOAD_BASE_IMAGE=$2 ;;
+        --remote-image) REMOTE_IMAGE=$2 ;;
         --remote-address) REMOTE_ADDRESS=$2 ;;
         --remote-source-address) REMOTE_SOURCE_ADDRESS=$2 ;;
         --remote-interface) REMOTE_INTERFACE=$2 ;;
@@ -169,16 +176,20 @@ done
 [[ -n $ACL_PROXY_BIN && -n $AGENT_BIN && -n $ACL_REPO \
     && -n $ACCESS_RUNTIME_REPO && -n $AW_REPO && -n $EXPECTED_ACL_SHA \
     && -n $EXPECTED_ACCESS_RUNTIME_SHA && -n $EXPECTED_AW_SHA \
-    && -n $REMOTE_HOST ]] || usage
+    && -n $REMOTE_HOST && -n $WORKLOAD_BASE_IMAGE \
+    && -n $REMOTE_IMAGE ]] || usage
 [[ $REMOTE_HOST =~ ^[A-Za-z0-9._@-]+$ ]] \
     || fail "remote-host contains unsupported SSH/scp characters"
+[[ ${REMOTE_HOST,,} != localhost && ${REMOTE_HOST,,} != localhost.* ]] \
+    || fail "remote-host must not name the local loopback host"
 [[ -z $REMOTE_INTERFACE || $REMOTE_INTERFACE =~ ^[A-Za-z0-9._:-]+$ ]] \
     || fail "remote-interface contains unsupported characters"
-[[ $BASE_IMAGE =~ ^[A-Za-z0-9._:/@-]+$ \
-    && $REMOTE_IMAGE =~ ^[A-Za-z0-9._:/@-]+$ ]] \
-    || fail "container image references contain unsupported characters"
+[[ $WORKLOAD_BASE_IMAGE =~ ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ ]] \
+    || fail "workload container image reference contains unsupported characters"
+[[ $REMOTE_IMAGE =~ ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ ]] \
+    || fail "remote container image reference contains unsupported characters"
 
-for command in awk curl docker git openssl python3 sha256sum ssh tar timeout; do
+for command in awk curl docker git ip openssl python3 sha256sum ssh tar timeout; do
     require_command "$command"
 done
 require_absolute_executable acl-proxy "$ACL_PROXY_BIN"
@@ -225,24 +236,66 @@ PINNED_ACCESS_RUNTIME_SHA=$(
     || fail "AW Gateway Access Runtime pin does not match the accepted Runtime"
 
 docker info >/dev/null 2>&1 || fail "local Docker daemon is unavailable"
-docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 \
-    || fail "required local image is not cached: $BASE_IMAGE"
+docker image inspect "$WORKLOAD_BASE_IMAGE" >/dev/null 2>&1 \
+    || fail "required local image is not cached: $WORKLOAD_BASE_IMAGE"
+WORKLOAD_BASE_IMAGE_ID=$(
+    docker image inspect "$WORKLOAD_BASE_IMAGE" --format '{{.Id}}'
+)
+[[ $WORKLOAD_BASE_IMAGE_ID =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || fail "workload image ID is not a canonical sha256 image ID"
+docker run --rm --pull=never --user 0:0 "$WORKLOAD_BASE_IMAGE" sh -eu -c '
+for command in bash curl ip iptables nsenter; do
+    command -v "$command" >/dev/null
+done
+' || fail "explicit workload image lacks a required cached tool"
+[[ -r /etc/machine-id ]] || fail "local machine identity is unavailable"
+LOCAL_MACHINE_ID_SHA256=$(sha256sum /etc/machine-id | awk '{print $1}')
 ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" true \
     || fail "remote host is unavailable through noninteractive SSH"
 
 REMOTE_FACTS=$(
     ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" 'set -eu
-for command in docker python3 sha256sum sudo tar tcpdump iptables; do
+for command in docker ip podman python3 sha256sum sudo tar tcpdump iptables \
+    iptables-save; do
     command -v "$command" >/dev/null || exit 20
 done
 sudo -n true
 docker info >/dev/null
+case $(docker --version) in
+    "podman version "*) ;;
+    *) exit 21 ;;
+esac
+backend=$(podman info --format json | python3 -c '"'"'
+import json
+import sys
+
+info = json.load(sys.stdin)
+security = info.get("host", {}).get("security", {})
+if security.get("rootless") is not True:
+    raise SystemExit(1)
+if info.get("host", {}).get("networkBackend") != "netavark":
+    raise SystemExit(1)
+print("podman-rootless-netavark")
+'"'"')
+machine_id=$(cat /etc/machine-id)
+case "$machine_id" in
+    *[!0-9a-f]*|"") exit 22 ;;
+esac
 docker image inspect '"$(printf '%q' "$REMOTE_IMAGE")"' >/dev/null
-provider_python=$(docker run --rm --pull=never --user 0:0 \
+remote_image_id=$(docker image inspect \
+    '"$(printf '%q' "$REMOTE_IMAGE")"' --format "{{.Id}}")
+case "$remote_image_id" in
+    [0-9a-f][0-9a-f]*) remote_image_id="sha256:$remote_image_id" ;;
+esac
+provider_python=$(docker run --rm --pull=never --security-opt label=disable \
+    --user 0:0 \
     '"$(printf '%q' "$REMOTE_IMAGE")"' sh -c "command -v python3")
 printf "ssh_source=%s\n" "${SSH_CONNECTION%% *}"
 printf "home=%s\n" "$HOME"
 printf "provider_python=%s\n" "$provider_python"
+printf "remote_image_id=%s\n" "$remote_image_id"
+printf "container_backend=%s\n" "$backend"
+printf "machine_id=%s\n" "$machine_id"
 '
 ) || fail "remote prerequisites or cached image are unavailable"
 SSH_SOURCE=$(awk -F= '$1 == "ssh_source" {print $2}' <<<"$REMOTE_FACTS")
@@ -250,11 +303,31 @@ REMOTE_HOME=$(awk -F= '$1 == "home" {print $2}' <<<"$REMOTE_FACTS")
 REMOTE_PROVIDER_PYTHON=$(
     awk -F= '$1 == "provider_python" {print $2}' <<<"$REMOTE_FACTS"
 )
+REMOTE_IMAGE_ID=$(
+    awk -F= '$1 == "remote_image_id" {print $2}' <<<"$REMOTE_FACTS"
+)
+REMOTE_CONTAINER_BACKEND=$(
+    awk -F= '$1 == "container_backend" {print $2}' <<<"$REMOTE_FACTS"
+)
+REMOTE_MACHINE_ID=$(
+    awk -F= '$1 == "machine_id" {print $2}' <<<"$REMOTE_FACTS"
+)
 validate_ipv4 "$SSH_SOURCE" || fail "remote SSH source discovery was invalid"
 [[ $REMOTE_HOME == /* && $REMOTE_HOME =~ ^[A-Za-z0-9._/-]+$ ]] \
     || fail "remote HOME is not a safe absolute path"
 [[ $REMOTE_PROVIDER_PYTHON =~ ^/[A-Za-z0-9._/-]+$ ]] \
     || fail "remote image Python path is not a safe absolute path"
+[[ $REMOTE_IMAGE_ID =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || fail "remote image ID is not a canonical sha256 image ID"
+[[ $REMOTE_CONTAINER_BACKEND == podman-rootless-netavark ]] \
+    || fail "remote container backend does not match the INPUT firewall contract"
+[[ $REMOTE_MACHINE_ID =~ ^[0-9a-f]{32}$ ]] \
+    || fail "remote machine identity is invalid"
+REMOTE_MACHINE_ID_SHA256=$(
+    printf '%s\n' "$REMOTE_MACHINE_ID" | sha256sum | awk '{print $1}'
+)
+[[ $REMOTE_MACHINE_ID_SHA256 != "$LOCAL_MACHINE_ID_SHA256" ]] \
+    || fail "remote host resolves to the local machine"
 
 if [[ -z $REMOTE_ADDRESS ]]; then
     REMOTE_ADDRESS=$(
@@ -277,6 +350,11 @@ PY
     ) || fail "could not discover one remote IPv4 address"
 fi
 validate_ipv4 "$REMOTE_ADDRESS" || fail "remote-address must be IPv4"
+[[ $REMOTE_ADDRESS != 127.* ]] || fail "remote-address must not be loopback"
+if ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 \
+    | grep -Fxq -- "$REMOTE_ADDRESS"; then
+    fail "remote-address is assigned to the local machine"
+fi
 if [[ -z $REMOTE_SOURCE_ADDRESS ]]; then
     REMOTE_SOURCE_ADDRESS=$SSH_SOURCE
 fi
@@ -293,13 +371,29 @@ fi
 [[ $REMOTE_INTERFACE =~ ^[A-Za-z0-9._:-]+$ ]] \
     || fail "remote capture interface discovery was invalid"
 
+DENIED_SOURCE_ADDRESS=$(
+    ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" \
+        ip -o -4 addr show scope global \
+    | awk -v public="$REMOTE_ADDRESS" -v allowed="$REMOTE_SOURCE_ADDRESS" '
+        {
+            split($4, address, "/")
+            if (address[1] != public && address[1] != allowed) {
+                print address[1]
+                exit
+            }
+        }
+    '
+)
+validate_ipv4 "$DENIED_SOURCE_ADDRESS" \
+    || fail "remote host lacks a distinct source for the firewall-negative probe"
+
 umask 077
 TMP_BASE=${AW_TLS_CROSS_HOST_SMOKE_TEMP_BASE:-${HOME:-}}
 [[ $TMP_BASE == /* && -d $TMP_BASE && ! -L $TMP_BASE ]] \
     || fail "a private absolute local temporary base is required"
 TMP_DIR=$(mktemp -d "$TMP_BASE/.aw-tls-cross-host.XXXXXX")
 mkdir -m 0700 "$TMP_DIR/bundle" "$TMP_DIR/remote-state" \
-    "$TMP_DIR/workload-context" "$TMP_DIR/local-evidence"
+    "$TMP_DIR/local-evidence"
 BEARER_HISTORY="$TMP_DIR/.bearer-history"
 VALID_BEARER=$(openssl rand -hex 24)
 INVALID_BEARER=$(openssl rand -hex 24)
@@ -310,7 +404,8 @@ printf '%s\n%s\n%s\n' "$VALID_BEARER" "$INVALID_BEARER" "$PRIVATE_VALUE" \
 SUFFIX=$(openssl rand -hex 6)
 [[ $SUFFIX =~ ^[0-9a-f]{12}$ ]] || fail "could not create a resource suffix"
 NETWORK="aw-tls-cross-$SUFFIX"
-WORKLOAD_IMAGE="aw-tls-cross-workload-$SUFFIX"
+WORKLOAD_IMAGE=$WORKLOAD_BASE_IMAGE
+WORKLOAD_IMAGE_ID=$WORKLOAD_BASE_IMAGE_ID
 
 read -r TLS_HTTP_PORT TLS_HTTPS_PORT < <(
     ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" \
@@ -454,7 +549,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 http_server = http.server.ThreadingHTTPServer(("0.0.0.0", 80), Handler)
 https = http.server.ThreadingHTTPServer(("0.0.0.0", 443), Handler)
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-context.load_cert_chain("/bundle/origin-cert.pem", "/bundle/origin-key.pem")
+context.load_cert_chain("/fixture/origin-cert.pem", "/fixture/origin-key.pem")
 https.socket = context.wrap_socket(https.socket, server_side=True)
 threading.Thread(target=http_server.serve_forever, daemon=True).start()
 https.serve_forever()
@@ -807,14 +902,44 @@ load_state() {
 remove_firewall() {
     [[ -f $STATE/runtime.env ]] || return 0
     load_state
-    sudo -n iptables -w 5 -D INPUT \
+    local attempt
+    for attempt in {1..5}; do
+        sudo -n iptables -w 5 -C INPUT \
+            -s "$SOURCE_ADDRESS/32" -d "$PUBLIC_ADDRESS/32" -p tcp \
+            -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
+            -m comment --comment "$TAG.allow" -j ACCEPT 2>/dev/null \
+            || break
+        sudo -n iptables -w 5 -D INPUT \
+            -s "$SOURCE_ADDRESS/32" -d "$PUBLIC_ADDRESS/32" -p tcp \
+            -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
+            -m comment --comment "$TAG.allow" -j ACCEPT 2>/dev/null \
+            || sleep 0.1
+    done
+    for attempt in {1..5}; do
+        sudo -n iptables -w 5 -C INPUT \
+            -d "$PUBLIC_ADDRESS/32" -p tcp \
+            -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
+            -m comment --comment "$TAG.deny" -j DROP 2>/dev/null \
+            || break
+        sudo -n iptables -w 5 -D INPUT \
+            -d "$PUBLIC_ADDRESS/32" -p tcp \
+            -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
+            -m comment --comment "$TAG.deny" -j DROP 2>/dev/null \
+            || sleep 0.1
+    done
+    ! sudo -n iptables -w 5 -C INPUT \
         -s "$SOURCE_ADDRESS/32" -d "$PUBLIC_ADDRESS/32" -p tcp \
         -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
-        -m comment --comment "$TAG.allow" -j ACCEPT 2>/dev/null || true
-    sudo -n iptables -w 5 -D INPUT \
+        -m comment --comment "$TAG.allow" -j ACCEPT 2>/dev/null
+    ! sudo -n iptables -w 5 -C INPUT \
         -d "$PUBLIC_ADDRESS/32" -p tcp \
         -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
-        -m comment --comment "$TAG.deny" -j DROP 2>/dev/null || true
+        -m comment --comment "$TAG.deny" -j DROP 2>/dev/null
+    if sudo -n iptables-save | grep -Fq -- "$TAG."; then
+        printf 'tagged firewall rules remain after bounded removal: %s\n' \
+            "$TAG" >&2
+        return 1
+    fi
 }
 
 stop_capture() {
@@ -877,15 +1002,19 @@ EOF
         docker image inspect "$REMOTE_IMAGE" >/dev/null
         docker network create "$NETWORK" >/dev/null
         docker run -d --pull=never --user 0:0 --name "$ORIGIN_CONTAINER" \
+            --security-opt label=disable \
             --network "$NETWORK" --network-alias origin.test \
-            --volume "$BUNDLE:/bundle:ro,z" \
-            --volume "$STATE:/state:rw,z" \
-            "$REMOTE_IMAGE" python3 /bundle/origin.py >/dev/null
+            --volume "$BUNDLE/origin.py:/fixture/origin.py:ro,z" \
+            --volume "$BUNDLE/origin-cert.pem:/fixture/origin-cert.pem:ro,z" \
+            --volume "$BUNDLE/origin-key.pem:/fixture/origin-key.pem:ro,z" \
+            --volume "$STATE/origin.jsonl:/state/origin.jsonl:rw,z" \
+            "$REMOTE_IMAGE" python3 /fixture/origin.py >/dev/null
         docker run -d --pull=never --user 0:0 --name "$PARENT_CONTAINER" \
+            --security-opt label=disable \
             --network "$NETWORK" --network-alias parent \
-            --volume "$BUNDLE:/bundle:ro,z" \
-            --volume "$STATE:/state:rw,z" \
-            "$REMOTE_IMAGE" python3 /bundle/parent.py >/dev/null
+            --volume "$BUNDLE/parent.py:/fixture/parent.py:ro,z" \
+            --volume "$STATE/parent.jsonl:/state/parent.jsonl:rw,z" \
+            "$REMOTE_IMAGE" python3 /fixture/parent.py >/dev/null
         sudo -n iptables -w 5 -I INPUT 1 \
             -d "$PUBLIC_ADDRESS/32" -p tcp \
             -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
@@ -903,6 +1032,7 @@ EOF
             -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
             -m comment --comment "$TAG.deny" -j DROP
         docker run --rm --pull=never --user 0:0 \
+            --security-opt label=disable \
             --network "$NETWORK" \
             --volume "$BUNDLE:/bundle:ro,z" \
             --volume "$STATE:/state:rw,z" \
@@ -911,6 +1041,7 @@ EOF
             config validate --config /bundle/acl-proxy.toml \
             >"$STATE/config-validate.log" 2>&1
         docker run -d --pull=never --user 0:0 --name "$PROXY_CONTAINER" \
+            --security-opt label=disable \
             --network "$NETWORK" \
             --publish "$PUBLIC_ADDRESS:$HTTP_PORT:$HTTP_PORT/tcp" \
             --publish "$PUBLIC_ADDRESS:$HTTPS_PORT:$HTTPS_PORT/tcp" \
@@ -936,6 +1067,46 @@ PY
             sleep 0.05
         done
         exit 1
+        ;;
+    probe-denied-source)
+        (($# == 1)) || exit 2
+        load_state
+        denied_source=$1
+        before=$(
+            sudo -n iptables -w 5 -L INPUT -nvx \
+                | awk -v tag="$TAG.deny" \
+                    'index($0, tag) { print $1; exit }'
+        )
+        [[ $before =~ ^[0-9]+$ ]]
+        python3 - "$denied_source" "$PUBLIC_ADDRESS" "$HTTP_PORT" <<'PY'
+import socket
+import sys
+
+source, destination, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+client = socket.socket()
+client.settimeout(0.75)
+client.bind((source, 0))
+try:
+    client.connect((destination, port))
+except TimeoutError:
+    pass
+else:
+    raise SystemExit("disallowed source reached the published listener")
+finally:
+    client.close()
+PY
+        after=
+        for _ in {1..20}; do
+            after=$(
+                sudo -n iptables -w 5 -L INPUT -nvx \
+                    | awk -v tag="$TAG.deny" \
+                        'index($0, tag) { print $1; exit }'
+            )
+            [[ $after =~ ^[0-9]+$ && $after -gt $before ]] && break
+            sleep 0.05
+        done
+        [[ $after =~ ^[0-9]+$ && $after -gt $before ]]
+        printf '%s\n' denied
         ;;
     counts)
         python3 - "$STATE" <<'PY'
@@ -1089,19 +1260,9 @@ remote_control start "$REMOTE_ADDRESS" "$REMOTE_SOURCE_ADDRESS" \
     "$REMOTE_INTERFACE" "$TLS_HTTP_PORT" "$TLS_HTTPS_PORT" "$SUFFIX" \
     "$REMOTE_IMAGE" | grep -qx ready \
     || fail "remote Access Flow topology did not become ready"
+remote_control probe-denied-source "$DENIED_SOURCE_ADDRESS" | grep -qx denied \
+    || fail "remote firewall did not reject and count the disallowed source"
 
-cat >"$TMP_DIR/workload-context/Dockerfile" <<EOF
-FROM $BASE_IMAGE
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update -qq \
-    && apt-get install -y -qq --no-install-recommends \
-        ca-certificates curl iproute2 iptables util-linux \
-    && rm -rf /var/lib/apt/lists/*
-EOF
-docker build --pull=false --quiet --tag "$WORKLOAD_IMAGE" \
-    "$TMP_DIR/workload-context" >/dev/null \
-    || fail "could not build the local protected workload image"
-WORKLOAD_IMAGE_ID=$(docker image inspect "$WORKLOAD_IMAGE" --format '{{.Id}}')
 docker network create "$NETWORK" >/dev/null
 NETWORK_GATEWAY=$(docker network inspect "$NETWORK" \
     --format '{{(index .IPAM.Config 0).Gateway}}')
@@ -1506,10 +1667,23 @@ printf '%s\n' \
     'one-connection-per-flow=passed' \
     'fallback=none' \
     'remote-firewall=passed' \
+    'remote-firewall-negative-source=passed' \
+    'remote-firewall-cleanup=passed' \
     'observable-secret-scan=passed' \
     "remote-host=$REMOTE_HOST" \
     "remote-address=$REMOTE_ADDRESS" \
     "remote-interface=$REMOTE_INTERFACE" \
+    "remote-allowed-source-address=$REMOTE_SOURCE_ADDRESS" \
+    "remote-denied-source-address=$DENIED_SOURCE_ADDRESS" \
+    "remote-container-backend=$REMOTE_CONTAINER_BACKEND" \
+    'remote-container-security=selinux-label-disabled' \
+    "local-machine-id-sha256=$LOCAL_MACHINE_ID_SHA256" \
+    "remote-machine-id-sha256=$REMOTE_MACHINE_ID_SHA256" \
+    "workload-base-image=$WORKLOAD_BASE_IMAGE" \
+    "workload-base-image-id=$WORKLOAD_BASE_IMAGE_ID" \
+    'workload-image-material=cached-direct' \
+    "remote-image=$REMOTE_IMAGE" \
+    "remote-image-id=$REMOTE_IMAGE_ID" \
     "acl-repository-sha=$EXPECTED_ACL_SHA" \
     "access-runtime-repository-sha=$EXPECTED_ACCESS_RUNTIME_SHA" \
     "aw-repository-sha=$EXPECTED_AW_SHA" \
