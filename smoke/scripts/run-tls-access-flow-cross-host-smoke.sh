@@ -22,6 +22,8 @@ DENIED_SOURCE_ADDRESS=
 WORKLOAD_BASE_IMAGE=
 WORKLOAD_BASE_IMAGE_ID=
 WORKLOAD_IMAGE_PACKAGE_MANIFEST_SHA256=
+WORKLOAD_AGENT_IMAGE=
+WORKLOAD_AGENT_IMAGE_ID=
 REMOTE_IMAGE=
 REMOTE_IMAGE_ID=
 
@@ -30,7 +32,9 @@ REMOTE_DIR=
 NETWORK=
 WORKLOAD_IMAGE=
 WORKLOAD_CONTAINER=
+AGENT_CONTAINER=
 IDENTITY_WRITER_PID=
+CAPTURE_CONTROLLER_PID=
 REMOTE_STARTED=0
 REMOTE_CLEANUP_FAILED=0
 SUCCESS=0
@@ -55,6 +59,7 @@ Usage: run-tls-access-flow-cross-host-smoke.sh \
   --expected-aw-sha <full-sha> \
   --remote-host <ssh-host> \
   --workload-image <image> \
+  --agent-image <image> \
   --remote-image <image> \
   [--remote-address <IPv4>] \
   [--remote-source-address <IPv4>] \
@@ -108,12 +113,62 @@ remote_control() {
         "$REMOTE_DIR/bundle/remote-control.sh" "$@"
 }
 
+ssh_bounded() {
+    local limit=$1
+    shift
+    timeout --foreground --signal=TERM --kill-after=2s "$limit" \
+        ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" "$@"
+}
+
+remote_control_bounded() {
+    local limit=$1
+    shift
+    ssh_bounded "$limit" "$REMOTE_DIR/bundle/remote-control.sh" "$@"
+}
+
+wait_capture_controller() {
+    local signal state status
+    [[ -n $CAPTURE_CONTROLLER_PID ]] || return 0
+    for signal in none TERM KILL; do
+        if [[ $signal != none ]]; then
+            kill "-$signal" "$CAPTURE_CONTROLLER_PID" 2>/dev/null || true
+        fi
+        for _ in {1..100}; do
+            if [[ ! -r /proc/$CAPTURE_CONTROLLER_PID/stat ]]; then
+                break 2
+            fi
+            state=$(awk '{print $3}' "/proc/$CAPTURE_CONTROLLER_PID/stat") \
+                || return 1
+            [[ $state == Z ]] && break 2
+            sleep 0.02
+        done
+    done
+    if [[ -r /proc/$CAPTURE_CONTROLLER_PID/stat ]] \
+        && [[ $(awk '{print $3}' "/proc/$CAPTURE_CONTROLLER_PID/stat") != Z ]]; then
+        printf 'attached packet-capture controller survived bounded KILL teardown\n' \
+            >&2
+        return 1
+    fi
+    if wait "$CAPTURE_CONTROLLER_PID"; then
+        status=0
+    else
+        status=$?
+    fi
+    CAPTURE_CONTROLLER_PID=
+    if ((status != 0)); then
+        printf 'attached packet-capture controller exited unsuccessfully: %s\n' \
+            "$status" >&2
+        return 1
+    fi
+}
+
 stop_remote() {
     local output tag
     ((REMOTE_STARTED == 1)) || return 0
     tag=${SUFFIX:+aw-rt05-$SUFFIX}
-    if output=$(remote_control stop 2>&1); then
+    if output=$(remote_control_bounded 60s stop 2>&1); then
         REMOTE_STARTED=0
+        wait_capture_controller || return 1
         return 0
     fi
     printf '%s\n' "$output" | sanitize_diagnostics >&2
@@ -133,17 +188,27 @@ cleanup() {
         status=1
     fi
     if ((status != 0)); then
+        if [[ -n $AGENT_CONTAINER ]]; then
+            for log in /tmp/agent.stdout /tmp/agent.stderr; do
+                docker cp "$AGENT_CONTAINER:$log" - 2>/dev/null \
+                    | tar -xO 2>/dev/null \
+                    | sanitize_diagnostics >&2 || true
+            done
+            docker logs --tail 100 "$AGENT_CONTAINER" 2>&1 \
+                | sanitize_diagnostics >&2 || true
+        fi
         if [[ -n $WORKLOAD_CONTAINER ]]; then
-            for log in /tmp/agent.stdout /tmp/agent.stderr \
-                /tmp/firewall.stdout /tmp/firewall.stderr; do
-                docker exec "$WORKLOAD_CONTAINER" cat "$log" 2>&1 \
+            for log in /tmp/firewall.stdout /tmp/firewall.stderr; do
+                docker cp "$WORKLOAD_CONTAINER:$log" - 2>/dev/null \
+                    | tar -xO 2>/dev/null \
                     | sanitize_diagnostics >&2 || true
             done
             docker logs --tail 100 "$WORKLOAD_CONTAINER" 2>&1 \
                 | sanitize_diagnostics >&2 || true
         fi
         if [[ -n $REMOTE_DIR ]]; then
-            remote_control diagnostics 2>&1 | sanitize_diagnostics >&2 || true
+            remote_control_bounded 15s diagnostics 2>&1 \
+                | sanitize_diagnostics >&2 || true
         fi
     fi
     if [[ -n $IDENTITY_WRITER_PID ]] \
@@ -151,16 +216,39 @@ cleanup() {
         kill -TERM "$IDENTITY_WRITER_PID" 2>/dev/null || true
         wait "$IDENTITY_WRITER_PID" 2>/dev/null || true
     fi
-    [[ -z $WORKLOAD_CONTAINER ]] \
-        || docker rm -f "$WORKLOAD_CONTAINER" >/dev/null 2>&1 || true
-    [[ -z $NETWORK ]] || docker network rm "$NETWORK" >/dev/null 2>&1 || true
+    if [[ -n $AGENT_CONTAINER ]]; then
+        docker rm -f "$AGENT_CONTAINER" >/dev/null 2>&1 || status=1
+        if docker inspect "$AGENT_CONTAINER" >/dev/null 2>&1; then
+            printf 'agent carrier container remains after cleanup: %s\n' \
+                "$AGENT_CONTAINER" >&2
+            status=1
+        fi
+    fi
+    if [[ -n $WORKLOAD_CONTAINER ]]; then
+        docker rm -f "$WORKLOAD_CONTAINER" >/dev/null 2>&1 || status=1
+        if docker inspect "$WORKLOAD_CONTAINER" >/dev/null 2>&1; then
+            printf 'workload container remains after cleanup: %s\n' \
+                "$WORKLOAD_CONTAINER" >&2
+            status=1
+        fi
+    fi
+    if [[ -n $NETWORK ]]; then
+        docker network rm "$NETWORK" >/dev/null 2>&1 || status=1
+        if docker network inspect "$NETWORK" >/dev/null 2>&1; then
+            printf 'local workload network remains after cleanup: %s\n' \
+                "$NETWORK" >&2
+            status=1
+        fi
+    fi
     if ((REMOTE_STARTED == 1 && REMOTE_CLEANUP_FAILED == 0)) \
         && [[ -n $REMOTE_DIR ]]; then
         stop_remote || status=1
     fi
+    if [[ -n $CAPTURE_CONTROLLER_PID ]]; then
+        wait_capture_controller || status=1
+    fi
     if [[ -n $REMOTE_DIR && $REMOTE_CLEANUP_FAILED == 0 ]]; then
-        if ! ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" \
-            rm -rf -- "$REMOTE_DIR" >/dev/null 2>&1; then
+        if ! ssh_bounded 15s rm -rf -- "$REMOTE_DIR" >/dev/null 2>&1; then
             printf 'could not remove remote control directory; host=%s control_dir=%s\n' \
                 "$REMOTE_HOST" "$REMOTE_DIR" >&2
             status=1
@@ -186,6 +274,7 @@ while (($#)); do
         --expected-aw-sha) EXPECTED_AW_SHA=$2 ;;
         --remote-host) REMOTE_HOST=$2 ;;
         --workload-image) WORKLOAD_BASE_IMAGE=$2 ;;
+        --agent-image) WORKLOAD_AGENT_IMAGE=$2 ;;
         --remote-image) REMOTE_IMAGE=$2 ;;
         --remote-address) REMOTE_ADDRESS=$2 ;;
         --remote-source-address) REMOTE_SOURCE_ADDRESS=$2 ;;
@@ -199,7 +288,7 @@ done
     && -n $ACCESS_RUNTIME_REPO && -n $AW_REPO && -n $EXPECTED_ACL_SHA \
     && -n $EXPECTED_ACCESS_RUNTIME_SHA && -n $EXPECTED_AW_SHA \
     && -n $REMOTE_HOST && -n $WORKLOAD_BASE_IMAGE \
-    && -n $REMOTE_IMAGE ]] || usage
+    && -n $WORKLOAD_AGENT_IMAGE && -n $REMOTE_IMAGE ]] || usage
 [[ $REMOTE_HOST =~ ^[A-Za-z0-9._@-]+$ ]] \
     || fail "remote-host contains unsupported SSH/scp characters"
 [[ ${REMOTE_HOST,,} != localhost && ${REMOTE_HOST,,} != localhost.* ]] \
@@ -208,6 +297,8 @@ done
     || fail "remote-interface contains unsupported characters"
 [[ $WORKLOAD_BASE_IMAGE =~ ^[A-Za-z0-9][A-Za-z0-9._:/@-]*$ ]] \
     || fail "workload container image reference contains unsupported characters"
+[[ $WORKLOAD_AGENT_IMAGE =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]] \
+    || fail "workload agent image must use an immutable sha256 digest"
 [[ $REMOTE_IMAGE =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]] \
     || fail "remote container image must use an immutable sha256 digest"
 
@@ -278,6 +369,19 @@ WORKLOAD_IMAGE_PACKAGE_MANIFEST_SHA256=$(
 ) || fail "could not inventory the explicit workload image packages"
 [[ $WORKLOAD_IMAGE_PACKAGE_MANIFEST_SHA256 =~ ^[0-9a-f]{64}$ ]] \
     || fail "workload image package manifest digest is not canonical sha256"
+docker image inspect "$WORKLOAD_AGENT_IMAGE" >/dev/null 2>&1 \
+    || fail "required workload agent image is not cached: $WORKLOAD_AGENT_IMAGE"
+WORKLOAD_AGENT_IMAGE_ID=$(
+    docker image inspect "$WORKLOAD_AGENT_IMAGE" --format '{{.Id}}'
+)
+[[ $WORKLOAD_AGENT_IMAGE_ID =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || fail "workload agent image ID is not a canonical sha256 image ID"
+docker run --rm --pull=never --user 0:0 "$WORKLOAD_AGENT_IMAGE" \
+    bash -eu -c '
+command -v bash >/dev/null
+command -v install >/dev/null
+[[ $(getconf GNU_LIBC_VERSION) == glibc\ * ]]
+' || fail "pinned agent carrier image lacks its required glibc tools"
 [[ -r /etc/machine-id ]] || fail "local machine identity is unavailable"
 LOCAL_MACHINE_ID_SHA256=$(sha256sum /etc/machine-id | awk '{print $1}')
 ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" true \
@@ -285,8 +389,8 @@ ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" true \
 
 REMOTE_FACTS=$(
     ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" 'set -eu
-for command in docker ip podman python3 sha256sum sudo tar tcpdump iptables \
-    iptables-save; do
+for command in docker ip podman python3 sha256sum stat sudo tar tcpdump \
+    iptables iptables-save; do
     command -v "$command" >/dev/null || exit 20
 done
 sudo -n true
@@ -392,11 +496,39 @@ validate_ipv4 "$REMOTE_SOURCE_ADDRESS" \
     || fail "remote-source-address must be IPv4"
 
 if [[ -z $REMOTE_INTERFACE ]]; then
-    REMOTE_INTERFACE=$(
+    REMOTE_ROUTE_INTERFACE=$(
         ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" \
             ip route get "$REMOTE_SOURCE_ADDRESS" \
         | awk '{for (field = 1; field <= NF; field++) if ($field == "dev") {print $(field + 1); exit}}'
     )
+    [[ $REMOTE_ROUTE_INTERFACE =~ ^[A-Za-z0-9._:-]+$ ]] \
+        || fail "remote route interface discovery was invalid"
+    REMOTE_INTERFACE=$(
+        ssh "${SSH_OPTIONS[@]}" "$REMOTE_HOST" sh -s -- \
+            "$REMOTE_ROUTE_INTERFACE" <<'REMOTE_INTERFACE_DISCOVERY'
+set -eu
+route_interface=$1
+if [ ! -d "/sys/class/net/$route_interface/bridge" ]; then
+    printf '%s\n' "$route_interface"
+    exit 0
+fi
+
+physical_members=
+for member_path in "/sys/class/net/$route_interface/brif/"*; do
+    [ -e "$member_path" ] || continue
+    member=${member_path##*/}
+    if [ -e "/sys/class/net/$member/device" ]; then
+        physical_members="${physical_members}${physical_members:+
+}$member"
+    fi
+done
+
+[ -n "$physical_members" ]
+[ "$(printf '%s\n' "$physical_members" | wc -l)" -eq 1 ]
+printf '%s\n' "$physical_members"
+REMOTE_INTERFACE_DISCOVERY
+    ) || fail \
+        "remote route bridge must have one physical member or --remote-interface must be specified"
 fi
 [[ $REMOTE_INTERFACE =~ ^[A-Za-z0-9._:-]+$ ]] \
     || fail "remote capture interface discovery was invalid"
@@ -1032,6 +1164,45 @@ stop_capture() {
     return 1
 }
 
+capture_counts() {
+    sudo -n tcpdump -nn -r "$STATE/outer.pcap" \
+        'tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0' \
+        2>/dev/null \
+        | awk '
+            {
+                for (field = 1; field <= NF; field++) {
+                    if ($field == "IP" && field + 3 <= NF) {
+                        source=$(field + 1)
+                        destination=$(field + 3)
+                        sub(/:$/, "", destination)
+                        print source ">" destination
+                        break
+                    }
+                }
+            }
+        ' | sort -u >"$STATE/outer-tuples.txt"
+    http=$(awk -v source="$SOURCE_ADDRESS." \
+        -v target="$PUBLIC_ADDRESS.$HTTP_PORT" '
+            {
+                split($0, tuple, ">")
+                if (index(tuple[1], source) == 1 && tuple[2] == target) count++
+            }
+            END {print count+0}
+        ' \
+        "$STATE/outer-tuples.txt")
+    https=$(awk -v source="$SOURCE_ADDRESS." \
+        -v target="$PUBLIC_ADDRESS.$HTTPS_PORT" '
+            {
+                split($0, tuple, ">")
+                if (index(tuple[1], source) == 1 && tuple[2] == target) count++
+            }
+            END {print count+0}
+        ' \
+        "$STATE/outer-tuples.txt")
+    printf 'http=%s\nhttps=%s\ntotal=%s\n' "$http" "$https" \
+        "$((http + https))"
+}
+
 verify_remote_topology_absent() {
     local containers networks name failed=0
     containers=$(docker container ls -a --format '{{.Names}}') || {
@@ -1259,50 +1430,40 @@ PY
         load_state
         stop_capture
         rm -f "$STATE/outer.pcap" "$STATE/tcpdump.log"
-        sudo -n sh -c '
+        exec sudo -n sh -c '
             start_time=$(awk "{print \$22}" "/proc/$$/stat")
             printf "%s %s\n" "$$" "$start_time" >"$1"
-            exec tcpdump -Q in -i "$2" -nn -U \
-                "dst host $3 and tcp and (dst port $4 or dst port $5)" \
+            printf "capture-filter=source:%s http:%s https:%s\n" \
+                "$3" "$4" "$5" >&2
+            exec tcpdump --immediate-mode -i "$2" -nn -U \
+                "host $3" \
                 -w "$6"
-        ' sh "$STATE/tcpdump.pid" "$CAPTURE_INTERFACE" "$PUBLIC_ADDRESS" \
+        ' sh "$STATE/tcpdump.pid" "$CAPTURE_INTERFACE" "$SOURCE_ADDRESS" \
             "$HTTP_PORT" "$HTTPS_PORT" "$STATE/outer.pcap" \
-            >"$STATE/tcpdump.log" 2>&1 &
-        for _ in {1..100}; do
-            [[ -s $STATE/tcpdump.pid ]] && break
-            sleep 0.02
-        done
-        [[ -s $STATE/tcpdump.pid ]]
-        sleep 0.2
+            >"$STATE/tcpdump.log" 2>&1
+        ;;
+    capture-ready)
+        (($# == 0)) || exit 2
+        [[ -s $STATE/tcpdump.pid && -f $STATE/outer.pcap ]]
+        read -r capture_pid capture_start_time <"$STATE/tcpdump.pid"
+        [[ $capture_pid =~ ^[1-9][0-9]*$ \
+            && $capture_start_time =~ ^[1-9][0-9]*$ ]]
+        [[ -r /proc/$capture_pid/stat ]]
+        [[ $(awk '{print $22}' "/proc/$capture_pid/stat") \
+            == "$capture_start_time" ]]
+        (( $(stat -c %s "$STATE/outer.pcap") > 24 ))
+        printf '%s\n' ready
+        ;;
+    capture-counts)
+        (($# == 0)) || exit 2
+        load_state
+        capture_counts
         ;;
     capture-stop)
         (($# == 0)) || exit 2
         load_state
         stop_capture
-        sudo -n tcpdump -nn -r "$STATE/outer.pcap" \
-            'tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack = 0' \
-            2>/dev/null \
-            | awk '
-                {
-                    for (field = 1; field <= NF; field++) {
-                        if ($field == "IP" && field + 3 <= NF) {
-                            source=$(field + 1)
-                            destination=$(field + 3)
-                            sub(/:$/, "", destination)
-                            print source ">" destination
-                            break
-                        }
-                    }
-                }
-            ' | sort -u >"$STATE/outer-tuples.txt"
-        http=$(awk -v port=".$HTTP_PORT" \
-            'index($0, port) == length($0) - length(port) + 1 {count++} END {print count+0}' \
-            "$STATE/outer-tuples.txt")
-        https=$(awk -v port=".$HTTPS_PORT" \
-            'index($0, port) == length($0) - length(port) + 1 {count++} END {print count+0}' \
-            "$STATE/outer-tuples.txt")
-        printf 'http=%s\nhttps=%s\ntotal=%s\n' "$http" "$https" \
-            "$((http + https))"
+        capture_counts
         ;;
     export-state)
         load_state
@@ -1357,6 +1518,7 @@ PY
             [[ ! -f $log ]] || cat "$log"
         done
         [[ ! -f $STATE/tcpdump.log ]] || cat "$STATE/tcpdump.log"
+        [[ ! -f $STATE/outer-tuples.txt ]] || cat "$STATE/outer-tuples.txt"
         ;;
     stop)
         stop_all
@@ -1406,16 +1568,17 @@ LOCAL_ACL_SHA=$(sha256sum "$ACL_PROXY_BIN" | awk '{print $1}')
     || fail "remote ACL Proxy binary digest differs from local release artifact"
 
 REMOTE_STARTED=1
-remote_control start "$REMOTE_ADDRESS" "$REMOTE_SOURCE_ADDRESS" \
+remote_control_bounded 60s start "$REMOTE_ADDRESS" "$REMOTE_SOURCE_ADDRESS" \
     "$REMOTE_INTERFACE" "$TLS_HTTP_PORT" "$TLS_HTTPS_PORT" "$SUFFIX" \
     "$REMOTE_IMAGE" | grep -qx ready \
     || fail "remote Access Flow topology did not become ready"
-REMOTE_EXECUTED_IMAGE_ID=$(remote_control executed-image-id) \
+REMOTE_EXECUTED_IMAGE_ID=$(remote_control_bounded 10s executed-image-id) \
     || fail "could not inventory the executed remote container image"
 [[ $REMOTE_EXECUTED_IMAGE_ID == "$REMOTE_IMAGE_ID" ]] \
     || fail "executed remote container image differs from preflight image"
 REMOTE_IMAGE_ID=$REMOTE_EXECUTED_IMAGE_ID
-remote_control probe-denied-source "$DENIED_SOURCE_ADDRESS" | grep -qx denied \
+remote_control_bounded 10s probe-denied-source "$DENIED_SOURCE_ADDRESS" \
+    | grep -qx denied \
     || fail "remote firewall did not reject and count the disallowed source"
 
 docker network create "$NETWORK" >/dev/null
@@ -1508,14 +1671,10 @@ cat >"$TMP_DIR/workload.sh" <<'SH'
 set -Eeuo pipefail
 cleanup() {
     set +e
-    [[ -z ${AGENT_PID:-} ]] || kill -TERM "$AGENT_PID" 2>/dev/null || true
     [[ -z ${FIREWALL_PID:-} ]] || kill -TERM "$FIREWALL_PID" 2>/dev/null || true
     wait 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
-install -D -o 0 -g 0 -m 0644 \
-    /mnt/aw-gateway/access-flow-root.pem \
-    /run/aw-gateway/trust/access-flow-root.pem
 install -D -o 65534 -g 65534 -m 0400 \
     /mnt/aw-gateway/private-expected \
     /run/aw-gateway/private-value
@@ -1528,6 +1687,22 @@ for _ in {1..100}; do
     sleep 0.05
 done
 [[ -f /tmp/firewall.ready ]]
+wait "$FIREWALL_PID"
+SH
+chmod 0700 "$TMP_DIR/workload.sh"
+
+cat >"$TMP_DIR/agent-carrier.sh" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+cleanup() {
+    set +e
+    [[ -z ${AGENT_PID:-} ]] || kill -TERM "$AGENT_PID" 2>/dev/null || true
+    wait 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+install -D -o 0 -g 0 -m 0644 \
+    /mnt/aw-gateway/access-flow-root.pem \
+    /run/aw-gateway/trust/access-flow-root.pem
 IFS= read -r AW_IDENTITY_TOKEN </run/aw-gateway/identity-token.fifo
 export AW_IDENTITY_TOKEN
 /opt/aw-gateway/bin/aw-container-agent \
@@ -1536,40 +1711,49 @@ export AW_IDENTITY_TOKEN
 AGENT_PID=$!
 unset AW_IDENTITY_TOKEN
 printf '%s\n' "$AGENT_PID" >/tmp/agent.pid
-for _ in {1..100}; do
-    if timeout 0.2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3128' \
-        && timeout 0.2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/3129'; then
-        touch /tmp/stack.ready
-        break
-    fi
-    if ! kill -0 "$AGENT_PID"; then
-        cat /tmp/agent.stderr >&2
-        cat /tmp/firewall.stderr >&2
-        exit 1
-    fi
-    sleep 0.05
-done
-[[ -f /tmp/stack.ready ]]
 wait "$AGENT_PID"
 SH
-chmod 0700 "$TMP_DIR/workload.sh"
+chmod 0700 "$TMP_DIR/agent-carrier.sh"
 
 start_workload() {
     local bearer=$1 label=$2 fifo
     fifo="$TMP_DIR/$label.fifo"
     WORKLOAD_CONTAINER="aw-tls-cross-$label-$SUFFIX"
+    AGENT_CONTAINER="aw-tls-cross-agent-$label-$SUFFIX"
     mkfifo -m 0600 "$fifo"
     docker run -d --name "$WORKLOAD_CONTAINER" --privileged --network "$NETWORK" \
         --ulimit nofile=4096:4096 \
-        --mount "type=bind,src=$AGENT_BIN,dst=/opt/aw-gateway/bin/aw-container-agent,readonly" \
-        --mount "type=bind,src=$TMP_DIR/container-agent.toml,dst=/etc/aw-gateway/container-agent.toml,readonly" \
-        --mount "type=bind,src=$TMP_DIR/bundle/access-flow-root.pem,dst=/mnt/aw-gateway/access-flow-root.pem,readonly" \
         --mount "type=bind,src=$TMP_DIR/bundle/mitm-ca-cert.pem,dst=/etc/acl-proxy/mitm-ca-cert.pem,readonly" \
         --mount "type=bind,src=$TMP_DIR/bundle/private-expected,dst=/mnt/aw-gateway/private-expected,readonly" \
         --mount "type=bind,src=$TMP_DIR/workload-firewall.sh,dst=/opt/aw-gateway/bin/workload-firewall,readonly" \
         --mount "type=bind,src=$TMP_DIR/workload.sh,dst=/usr/local/bin/workload-smoke,readonly" \
-        --mount "type=bind,src=$fifo,dst=/run/aw-gateway/identity-token.fifo" \
         "$WORKLOAD_IMAGE" bash /usr/local/bin/workload-smoke >/dev/null
+    for _ in {1..100}; do
+        docker inspect "$WORKLOAD_CONTAINER" --format '{{.State.Running}}' \
+            | grep -qx true \
+            || fail "workload exited before firewall readiness"
+        docker exec "$WORKLOAD_CONTAINER" test -f /tmp/firewall.ready \
+            2>/dev/null && break
+        sleep 0.05
+    done
+    docker exec "$WORKLOAD_CONTAINER" test -f /tmp/firewall.ready \
+        || fail "workload firewall did not become ready"
+    docker run -d --pull=never --name "$AGENT_CONTAINER" \
+        --network "container:$WORKLOAD_CONTAINER" --user 0:0 \
+        --ulimit nofile=4096:4096 \
+        --mount "type=bind,src=$AGENT_BIN,dst=/opt/aw-gateway/bin/aw-container-agent,readonly" \
+        --mount "type=bind,src=$TMP_DIR/container-agent.toml,dst=/etc/aw-gateway/container-agent.toml,readonly" \
+        --mount "type=bind,src=$TMP_DIR/bundle/access-flow-root.pem,dst=/mnt/aw-gateway/access-flow-root.pem,readonly" \
+        --mount "type=bind,src=$TMP_DIR/agent-carrier.sh,dst=/usr/local/bin/agent-carrier,readonly" \
+        --mount "type=bind,src=$fifo,dst=/run/aw-gateway/identity-token.fifo" \
+        "$WORKLOAD_AGENT_IMAGE" bash /usr/local/bin/agent-carrier >/dev/null
+    local executed_agent_image_id
+    executed_agent_image_id=$(
+        docker inspect "$AGENT_CONTAINER" --format '{{.Image}}'
+    )
+    [[ $executed_agent_image_id == "$WORKLOAD_AGENT_IMAGE_ID" ]] \
+        || fail "executed agent carrier image differs from its preflight image"
+    WORKLOAD_AGENT_IMAGE_ID=$executed_agent_image_id
     (printf '%s\n' "$bearer" >"$fifo") &
     IDENTITY_WRITER_PID=$!
     for _ in {1..100}; do
@@ -1585,15 +1769,31 @@ start_workload() {
         docker inspect "$WORKLOAD_CONTAINER" --format '{{.State.Running}}' \
             | grep -qx true \
             || fail "workload exited before relay readiness"
-        docker exec "$WORKLOAD_CONTAINER" test -f /tmp/stack.ready \
-            2>/dev/null && return
+        docker inspect "$AGENT_CONTAINER" --format '{{.State.Running}}' \
+            | grep -qx true \
+            || fail "agent carrier exited before relay readiness"
+        if timeout 0.2 docker exec "$WORKLOAD_CONTAINER" \
+            bash -c 'exec 3<>/dev/tcp/127.0.0.1/3128' >/dev/null 2>&1 \
+            && timeout 0.2 docker exec "$WORKLOAD_CONTAINER" \
+                bash -c 'exec 3<>/dev/tcp/127.0.0.1/3129' >/dev/null 2>&1; then
+            return
+        fi
         sleep 0.05
     done
     fail "workload relay did not become ready"
 }
 
 stop_workload() {
+    local agent_container=$AGENT_CONTAINER workload_container=$WORKLOAD_CONTAINER
+    docker rm -f "$agent_container" >/dev/null
+    if docker inspect "$agent_container" >/dev/null 2>&1; then
+        fail "agent carrier container remained after teardown"
+    fi
+    AGENT_CONTAINER=
     docker rm -f "$WORKLOAD_CONTAINER" >/dev/null
+    if docker inspect "$workload_container" >/dev/null 2>&1; then
+        fail "workload container remained after teardown"
+    fi
     WORKLOAD_CONTAINER=
 }
 
@@ -1601,11 +1801,19 @@ capture_local_evidence() {
     local label=$1 destination
     destination="$TMP_DIR/local-evidence/$label"
     mkdir -m 0700 "$destination"
-    docker inspect "$WORKLOAD_CONTAINER" >"$destination/container-inspect.json"
-    docker logs "$WORKLOAD_CONTAINER" >"$destination/container.stdout" \
-        2>"$destination/container.stderr"
-    for path in agent.stdout agent.stderr firewall.stdout firewall.stderr; do
+    docker inspect "$WORKLOAD_CONTAINER" \
+        >"$destination/workload-container-inspect.json"
+    docker logs "$WORKLOAD_CONTAINER" >"$destination/workload-container.stdout" \
+        2>"$destination/workload-container.stderr"
+    docker inspect "$AGENT_CONTAINER" \
+        >"$destination/agent-carrier-inspect.json"
+    docker logs "$AGENT_CONTAINER" >"$destination/agent-carrier.stdout" \
+        2>"$destination/agent-carrier.stderr"
+    for path in firewall.stdout firewall.stderr; do
         docker cp "$WORKLOAD_CONTAINER:/tmp/$path" "$destination/$path"
+    done
+    for path in agent.stdout agent.stderr; do
+        docker cp "$AGENT_CONTAINER:/tmp/$path" "$destination/$path"
     done
 }
 
@@ -1622,37 +1830,52 @@ request_https() {
         --resolve 'origin.test:443:198.18.0.10' "$@"
 }
 
-INVALID_COUNTS_BEFORE=$(remote_control counts)
+INVALID_COUNTS_BEFORE=$(remote_control_bounded 10s counts)
 start_workload "$INVALID_BEARER" invalid
 if request_http http://origin.test/invalid-bearer-marker >/dev/null 2>&1; then
     fail "an invalid bearer reached the HTTP application pipeline"
 fi
-INVALID_COUNTS_AFTER=$(remote_control counts)
+INVALID_COUNTS_AFTER=$(remote_control_bounded 10s counts)
 [[ $INVALID_COUNTS_AFTER == "$INVALID_COUNTS_BEFORE" ]] \
     || fail "invalid bearer changed origin, parent, provider, or capture counters"
-remote_control assert-marker-absent invalid-bearer-marker \
+remote_control_bounded 10s assert-marker-absent invalid-bearer-marker \
     || fail "invalid bearer application bytes reached an observable sink"
 capture_local_evidence invalid
 stop_workload
 
 start_workload "$VALID_BEARER" valid
 capture_local_evidence valid-start
-python3 - "$TMP_DIR/local-evidence/valid-start/container-inspect.json" \
+python3 - "$TMP_DIR/local-evidence/valid-start/workload-container-inspect.json" \
+    "$TMP_DIR/local-evidence/valid-start/agent-carrier-inspect.json" \
     "$BEARER_HISTORY" <<'PY'
 import pathlib
 import sys
 
-data = pathlib.Path(sys.argv[1]).read_bytes()
-bearer = pathlib.Path(sys.argv[2]).read_bytes().splitlines()[0]
+data = b"".join(pathlib.Path(path).read_bytes() for path in sys.argv[1:3])
+bearer = pathlib.Path(sys.argv[3]).read_bytes().splitlines()[0]
 if bearer in data:
     raise SystemExit("Docker launch metadata retained the bearer")
 PY
 docker exec "$WORKLOAD_CONTAINER" sh -eu -c '
     test "${AW_IDENTITY_TOKEN+x}" != x
+' || fail "workload launcher retained the bearer"
+docker exec "$AGENT_CONTAINER" sh -eu -c '
+    test "${AW_IDENTITY_TOKEN+x}" != x
     kill -0 "$(cat /tmp/agent.pid)"
-' || fail "workload launcher retained the bearer or agent exited"
+' || fail "agent carrier launcher retained the bearer or agent exited"
 
-remote_control capture-start
+remote_control capture-start &
+CAPTURE_CONTROLLER_PID=$!
+CAPTURE_READY=0
+for _ in {1..20}; do
+    if ssh_bounded 5s true \
+        && remote_control_bounded 5s capture-ready | grep -qx ready; then
+        CAPTURE_READY=1
+        break
+    fi
+    sleep 0.05
+done
+((CAPTURE_READY == 1)) || fail "remote packet capture did not become ready"
 principal_body=$(request_http http://origin.test/principal) \
     || fail "principal policy HTTP flow failed"
 [[ $principal_body == \
@@ -1687,24 +1910,51 @@ KEEPALIVE_CONNECTIONS=$(awk '{sum += $1} END {print sum + 0}' \
     <<<"$keepalive_connects")
 [[ $KEEPALIVE_CONNECTIONS == 1 ]] \
     || fail "two keepalive requests used $KEEPALIVE_CONNECTIONS workload flows"
-OUTER_COUNTS=$(remote_control capture-stop)
-[[ $(awk -F= '$1 == "http" {print $2}' <<<"$OUTER_COUNTS") == 4 ]] \
-    || fail "four HTTP workload flows did not use four outer connections"
-[[ $(awk -F= '$1 == "https" {print $2}' <<<"$OUTER_COUNTS") == 1 ]] \
-    || fail "one HTTPS workload flow did not use one outer connection"
-[[ $(awk -F= '$1 == "total" {print $2}' <<<"$OUTER_COUNTS") == 5 ]] \
-    || fail "five workload flows did not use five outer connections"
+CAPTURE_DRAINED=0
+for _ in {1..100}; do
+    OUTER_COUNTS=$(remote_control_bounded 5s capture-counts 2>/dev/null) || true
+    HTTP_OUTER_CONNECTIONS=$(
+        awk -F= '$1 == "http" {print $2}' <<<"$OUTER_COUNTS"
+    )
+    HTTPS_OUTER_CONNECTIONS=$(
+        awk -F= '$1 == "https" {print $2}' <<<"$OUTER_COUNTS"
+    )
+    TOTAL_OUTER_CONNECTIONS=$(
+        awk -F= '$1 == "total" {print $2}' <<<"$OUTER_COUNTS"
+    )
+    if [[ $HTTP_OUTER_CONNECTIONS == 4 \
+        && $HTTPS_OUTER_CONNECTIONS == 1 \
+        && $TOTAL_OUTER_CONNECTIONS == 5 ]]; then
+        CAPTURE_DRAINED=1
+        break
+    fi
+    sleep 0.05
+done
+((CAPTURE_DRAINED == 1)) \
+    || fail "remote packet capture did not drain the five expected outer connections"
+OUTER_COUNTS=$(remote_control_bounded 15s capture-stop)
+wait_capture_controller \
+    || fail "attached packet-capture controller did not stop cleanly"
+HTTP_OUTER_CONNECTIONS=$(awk -F= '$1 == "http" {print $2}' <<<"$OUTER_COUNTS")
+HTTPS_OUTER_CONNECTIONS=$(awk -F= '$1 == "https" {print $2}' <<<"$OUTER_COUNTS")
+TOTAL_OUTER_CONNECTIONS=$(awk -F= '$1 == "total" {print $2}' <<<"$OUTER_COUNTS")
+[[ $HTTP_OUTER_CONNECTIONS == 4 ]] \
+    || fail "four HTTP workload flows did not use four outer connections; observed: $OUTER_COUNTS"
+[[ $HTTPS_OUTER_CONNECTIONS == 1 ]] \
+    || fail "one HTTPS workload flow did not use one outer connection; observed: $OUTER_COUNTS"
+[[ $TOTAL_OUTER_CONNECTIONS == 5 ]] \
+    || fail "five workload flows did not use five outer connections; observed: $OUTER_COUNTS"
 
 if docker exec --user 65534:65534 "$WORKLOAD_CONTAINER" curl \
     --fail --silent --connect-timeout 1 --max-time 2 --noproxy '*' \
     http://198.18.0.10:8080/escape >/dev/null 2>&1; then
     fail "non-protected workload egress bypassed the fail-closed firewall"
 fi
-docker exec "$WORKLOAD_CONTAINER" kill -0 "$(docker exec "$WORKLOAD_CONTAINER" \
+docker exec "$AGENT_CONTAINER" kill -0 "$(docker exec "$AGENT_CONTAINER" \
     cat /tmp/agent.pid)" || fail "relay exited after functional flows"
 capture_local_evidence valid-final
 
-remote_control export-state \
+remote_control_bounded 30s export-state \
     | tar -C "$TMP_DIR/remote-state" -xf - \
     || fail "could not retrieve sanitized remote evidence"
 
@@ -1802,6 +2052,12 @@ for path in root.rglob("*"):
 PY
 
 stop_workload
+docker network rm "$NETWORK" >/dev/null \
+    || fail "local workload network cleanup failed"
+if docker network inspect "$NETWORK" >/dev/null 2>&1; then
+    fail "local workload network remained after teardown"
+fi
+NETWORK=
 stop_remote || fail "remote topology cleanup did not complete"
 
 printf '%s\n' \
@@ -1823,10 +2079,12 @@ printf '%s\n' \
     'remote-firewall=passed' \
     'remote-firewall-negative-source=passed' \
     'remote-firewall-cleanup=passed' \
+    'local-topology-cleanup=passed' \
     'observable-secret-scan=passed' \
     "remote-host=$REMOTE_HOST" \
     "remote-address=$REMOTE_ADDRESS" \
     "remote-interface=$REMOTE_INTERFACE" \
+    "remote-capture-interface=$REMOTE_INTERFACE" \
     "remote-allowed-source-address=$REMOTE_SOURCE_ADDRESS" \
     "remote-denied-source-address=$DENIED_SOURCE_ADDRESS" \
     "remote-container-backend=$REMOTE_CONTAINER_BACKEND" \
@@ -1838,6 +2096,8 @@ printf '%s\n' \
     'workload-image-tools=bash,curl,ip,iptables,nsenter' \
     "workload-image-package-manifest-sha256=$WORKLOAD_IMAGE_PACKAGE_MANIFEST_SHA256" \
     'workload-image-material=cached-direct' \
+    "workload-agent-image=$WORKLOAD_AGENT_IMAGE" \
+    "workload-agent-image-id=$WORKLOAD_AGENT_IMAGE_ID" \
     "remote-image=$REMOTE_IMAGE" \
     "remote-image-id=$REMOTE_IMAGE_ID" \
     "acl-repository-sha=$EXPECTED_ACL_SHA" \

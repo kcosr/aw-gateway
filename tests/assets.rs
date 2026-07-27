@@ -24,6 +24,131 @@ fn example_asset(runtime: &str, name: &str) -> String {
         .to_string()
 }
 
+fn validate_cross_host_agent_carrier(smoke: &str) -> Result<(), String> {
+    for required in [
+        "--agent-image <image>",
+        "--agent-image) WORKLOAD_AGENT_IMAGE=$2",
+        "workload agent image must use an immutable sha256 digest",
+        "[[ $WORKLOAD_AGENT_IMAGE_ID =~ ^sha256:[0-9a-f]{64}$ ]]",
+        "docker run -d --pull=never --name \"$AGENT_CONTAINER\"",
+        "--network \"container:$WORKLOAD_CONTAINER\"",
+        "src=$AGENT_BIN,dst=/opt/aw-gateway/bin/aw-container-agent,readonly",
+        "src=$fifo,dst=/run/aw-gateway/identity-token.fifo",
+        "\"$WORKLOAD_AGENT_IMAGE\" bash /usr/local/bin/agent-carrier",
+        "[[ $executed_agent_image_id == \"$WORKLOAD_AGENT_IMAGE_ID\" ]]",
+        "agent-carrier-inspect.json",
+        "docker rm -f \"$agent_container\"",
+        "agent carrier container remained after teardown",
+        "workload container remained after teardown",
+        "docker network rm \"$NETWORK\"",
+        "local workload network remained after teardown",
+        "workload-agent-image=$WORKLOAD_AGENT_IMAGE",
+        "workload-agent-image-id=$WORKLOAD_AGENT_IMAGE_ID",
+        "local-topology-cleanup=passed",
+        "docker cp \"$AGENT_CONTAINER:$log\" -",
+        "capture-ready)",
+        "remote_control capture-start &",
+        "CAPTURE_CONTROLLER_PID=$!",
+        "wait_capture_controller",
+        "timeout --foreground --signal=TERM --kill-after=2s \"$limit\"",
+        "ssh_bounded 5s true",
+        "ssh_bounded 15s rm -rf -- \"$REMOTE_DIR\"",
+        "remote_control_bounded 5s capture-counts",
+        "remote_control_bounded 15s capture-stop",
+        "remote_control_bounded 60s stop",
+        "for signal in none TERM KILL; do",
+        "if wait \"$CAPTURE_CONTROLLER_PID\"; then",
+        "if ((status != 0)); then",
+        "attached packet-capture controller did not stop cleanly",
+        "attached packet-capture controller survived bounded KILL teardown",
+        "attached packet-capture controller exited unsuccessfully",
+        "host $3",
+        "\"$SOURCE_ADDRESS\"",
+        "\"/sys/class/net/$route_interface/bridge\"",
+        "\"/sys/class/net/$route_interface/brif/\"*",
+        "\"/sys/class/net/$member/device\"",
+        "remote route bridge must have one physical member or --remote-interface must be specified",
+        "source=\"$SOURCE_ADDRESS.\"",
+        "target=\"$PUBLIC_ADDRESS.$HTTP_PORT\"",
+        "target=\"$PUBLIC_ADDRESS.$HTTPS_PORT\"",
+        "remote packet capture did not become ready",
+        "exec tcpdump --immediate-mode -i \"$2\" -nn -U",
+        "capture-counts)",
+        "remote packet capture did not drain the five expected outer connections",
+        "remote-capture-interface=$REMOTE_INTERFACE",
+    ] {
+        if !smoke.contains(required) {
+            return Err(format!("missing carrier contract {required:?}"));
+        }
+    }
+    let capture_wait = smoke
+        .split_once("wait_capture_controller() {")
+        .and_then(|(_, suffix)| suffix.split_once("\n}\n\nstop_remote() {"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| "missing bounded capture-controller wait".to_owned())?;
+    for required in [
+        "for signal in none TERM KILL; do",
+        "if wait \"$CAPTURE_CONTROLLER_PID\"; then",
+        "if ((status != 0)); then",
+        "attached packet-capture controller survived bounded KILL teardown",
+        "attached packet-capture controller exited unsuccessfully",
+    ] {
+        if !capture_wait.contains(required) {
+            return Err(format!(
+                "missing capture-controller lifecycle contract {required:?}"
+            ));
+        }
+    }
+    let start = smoke
+        .split_once("start_workload() {")
+        .and_then(|(_, suffix)| suffix.split_once("\n}\n\nstop_workload() {"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| "missing start_workload body".to_owned())?;
+    let carrier_launch = start
+        .split_once("docker run -d --pull=never --name \"$AGENT_CONTAINER\"")
+        .and_then(|(_, suffix)| suffix.split_once("\n    local executed_agent_image_id"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| "missing bounded agent carrier launch".to_owned())?;
+    if carrier_launch.contains("AW_IDENTITY_TOKEN=")
+        || carrier_launch.contains("--env")
+        || carrier_launch.contains(" -e ")
+    {
+        return Err("agent bearer was placed in container launch metadata".to_owned());
+    }
+    if start.find("test -f /tmp/firewall.ready")
+        >= start.find("docker run -d --pull=never --name \"$AGENT_CONTAINER\"")
+    {
+        return Err("agent carrier starts before the workload firewall is ready".to_owned());
+    }
+    let stop = smoke
+        .split_once("stop_workload() {")
+        .and_then(|(_, suffix)| suffix.split_once("\n}\n\ncapture_local_evidence() {"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| "missing stop_workload body".to_owned())?;
+    if stop.find("docker rm -f \"$agent_container\"")
+        >= stop.find("docker rm -f \"$WORKLOAD_CONTAINER\"")
+    {
+        return Err("network namespace owner is removed before the agent carrier".to_owned());
+    }
+    let completion = smoke
+        .rsplit_once("\nstop_workload\n")
+        .map(|(_, suffix)| suffix)
+        .ok_or_else(|| "missing final local topology teardown".to_owned())?;
+    let network_remove = completion
+        .find("docker network rm \"$NETWORK\"")
+        .ok_or_else(|| "missing final network removal".to_owned())?;
+    let network_verify = completion
+        .find("docker network inspect \"$NETWORK\"")
+        .ok_or_else(|| "missing final network removal verification".to_owned())?;
+    let transcript = completion
+        .find("'local-topology-cleanup=passed'")
+        .ok_or_else(|| "missing local topology cleanup transcript".to_owned())?;
+    if !(network_remove < network_verify && network_verify < transcript) {
+        return Err("cleanup transcript precedes verified network removal".to_owned());
+    }
+    Ok(())
+}
+
 fn start_container_sshd_scripts() -> Vec<(&'static str, String)> {
     let mut scripts = vec![("assets", asset("start-container-sshd"))];
     scripts.extend(
@@ -59,6 +184,7 @@ fn asset_scripts_are_shell_syntax_valid() {
 
     for script in [
         "run-host-socket-exposure-smoke.sh",
+        "run-tls-access-flow-cross-host-smoke.sh",
         "run-tls-access-flow-stack-smoke.sh",
         "run-transparent-firewall-smoke.sh",
         "run-transparent-uds-stack-smoke.sh",
@@ -467,6 +593,35 @@ fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() 
             .join("smoke/scripts/run-tls-access-flow-cross-host-smoke.sh"),
     )
     .unwrap();
+    validate_cross_host_agent_carrier(&smoke).unwrap();
+    for marker in [
+        "--agent-image) WORKLOAD_AGENT_IMAGE=$2",
+        "--network \"container:$WORKLOAD_CONTAINER\"",
+        "[[ $executed_agent_image_id == \"$WORKLOAD_AGENT_IMAGE_ID\" ]]",
+        "docker rm -f \"$agent_container\"",
+        "fail \"local workload network remained after teardown\"",
+        "workload-agent-image-id=$WORKLOAD_AGENT_IMAGE_ID",
+        "local-topology-cleanup=passed",
+        "capture-ready)",
+        "remote packet capture did not become ready",
+        "timeout --foreground --signal=TERM --kill-after=2s \"$limit\"",
+        "ssh_bounded 5s true",
+        "ssh_bounded 15s rm -rf -- \"$REMOTE_DIR\"",
+        "remote_control_bounded 5s capture-counts",
+        "remote_control_bounded 15s capture-stop",
+        "remote_control_bounded 60s stop",
+        "for signal in none TERM KILL; do",
+        "if wait \"$CAPTURE_CONTROLLER_PID\"; then",
+        "if ((status != 0)); then",
+        "exec tcpdump --immediate-mode -i \"$2\" -nn -U",
+        "remote-capture-interface=$REMOTE_INTERFACE",
+    ] {
+        let mutated = smoke.replacen(marker, "removed-by-mutation", 1);
+        assert!(
+            validate_cross_host_agent_carrier(&mutated).is_err(),
+            "removing {marker:?} did not invalidate the carrier contract"
+        );
+    }
     assert!(!smoke.contains("for (index ="));
     assert!(!smoke.contains("$(index +"));
     assert!(!smoke.contains("trap stop_all ERR"));
@@ -485,6 +640,9 @@ fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() 
     assert!(smoke.contains("\"workload-base-image-id=$WORKLOAD_BASE_IMAGE_ID\""));
     assert!(smoke.contains("\"remote-image=$REMOTE_IMAGE\""));
     assert!(smoke.contains("\"remote-image-id=$REMOTE_IMAGE_ID\""));
+    assert!(!smoke.contains("agent-carrier-image="));
+    assert!(!smoke.contains("agent-carrier-image-id="));
+    assert!(!smoke.contains("agent-carrier-executed-image-id="));
     assert!(smoke.contains("podman-rootless-netavark"));
     assert!(smoke.contains("remote-container-security=selinux-label-disabled"));
     assert_eq!(smoke.matches("--security-opt label=disable").count(), 5);
@@ -506,12 +664,14 @@ fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() 
     assert!(
         smoke.contains("container_image_id=$(docker inspect \"$container\" --format '{{.Image}}')")
     );
-    assert!(smoke.contains("REMOTE_EXECUTED_IMAGE_ID=$(remote_control executed-image-id)"));
+    assert!(
+        smoke.contains("REMOTE_EXECUTED_IMAGE_ID=$(remote_control_bounded 10s executed-image-id)")
+    );
     assert!(smoke.contains("[[ $REMOTE_EXECUTED_IMAGE_ID == \"$REMOTE_IMAGE_ID\" ]]"));
     assert!(smoke.contains("[[ $WORKLOAD_IMAGE_PACKAGE_MANIFEST_SHA256 =~ ^[0-9a-f]{64}$ ]]"));
     assert!(smoke.contains("cat \"$STATE/config-validate.log\""));
     assert!(smoke.contains("if docker inspect \"$PROXY_CONTAINER\""));
-    assert_eq!(smoke.matches("--user 0:0").count(), 7);
+    assert_eq!(smoke.matches("--user 0:0").count(), 9);
     assert!(!smoke.contains("$BUNDLE:/bundle:"));
     assert!(!smoke.contains("$STATE:/state:"));
     assert!(smoke.contains("$BUNDLE/origin.py:/fixture/origin.py:ro,z"));
