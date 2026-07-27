@@ -302,9 +302,6 @@ done
 if [[ -n $MEASUREMENT_CONTROL_DIR ]]; then
     require_command /usr/bin/time
     require_command pgrep
-    require_command sudo
-    sudo -n true >/dev/null 2>&1 \
-        || fail "resource measurement requires noninteractive root access to process metrics"
 fi
 
 canonical_repo() {
@@ -1687,7 +1684,7 @@ run_resource_measurement() {
     local load=$MEASUREMENT_LOAD
     local http_count=$((load / 2))
     local https_count=$((load - http_count))
-    local agent_namespace_pid agent_container_init_pid agent_host_pid
+    local agent_namespace_pid agent_container_init_pid
     publish_measurement_secret_scan_input \
         || fail "could not publish ephemeral measurement secret scan input"
     agent_namespace_pid=$(docker exec "$WORKLOAD_CONTAINER" cat /tmp/relay.pid)
@@ -1696,82 +1693,21 @@ run_resource_measurement() {
     agent_container_init_pid=$(docker inspect --format '{{.State.Pid}}' "$WORKLOAD_CONTAINER")
     [[ $agent_container_init_pid =~ ^[1-9][0-9]*$ ]] \
         || fail "could not resolve the workload container host PID"
-    agent_host_pid=$(sudo -n python3 - "$agent_namespace_pid" "$agent_container_init_pid" \
-        "$AGENT_BIN" <<'PY'
-import os
-from pathlib import Path
-import sys
-
-namespace_pid = int(sys.argv[1])
-container_init = int(sys.argv[2])
-expected_exe = Path(sys.argv[3])
-
-def status_fields(pid):
-    fields = {}
-    for line in (Path("/proc") / str(pid) / "status").read_text(encoding="ascii").splitlines():
-        key, separator, value = line.partition(":")
-        if separator:
-            fields[key] = value.strip()
-    return fields
-
-def belongs_to_container(pid):
-    seen = set()
-    while pid > 1 and pid not in seen:
-        if pid == container_init:
-            return True
-        seen.add(pid)
-        pid = int(status_fields(pid)["PPid"])
-    return False
-
-matches = []
-for entry in Path("/proc").iterdir():
-    if not entry.name.isdigit():
-        continue
-    try:
-        pid = int(entry.name)
-        fields = status_fields(pid)
-        nspid = [int(value) for value in fields.get("NSpid", "").split()]
-        if nspid and nspid[-1] == namespace_pid and belongs_to_container(pid):
-            if os.path.samefile(entry / "exe", expected_exe):
-                matches.append(pid)
-    except (FileNotFoundError, PermissionError, ProcessLookupError, KeyError, ValueError):
-        continue
-if len(matches) != 1:
-    raise SystemExit(f"expected one namespace/executable-bound agent PID, found {len(matches)}")
-print(matches[0])
-PY
-    ) || fail "could not map the measured agent namespace PID to its exact host process"
-    [[ $agent_host_pid =~ ^[1-9][0-9]*$ ]] \
-        || fail "could not resolve the measured agent host PID"
-
-    sudo -n python3 - "$ACL_PID" "$ACL_PROXY_BIN" "$agent_host_pid" "$AGENT_BIN" \
-        >"$MEASUREMENT_CONTROL_DIR/pids.tsv" <<'PY'
-import hashlib
-import os
-from pathlib import Path
-import sys
-
-def starttime(pid):
-    stat = (Path("/proc") / str(pid) / "stat").read_text(encoding="ascii")
-    end_name = stat.rfind(")")
-    fields = stat[end_name + 2:].split() if end_name >= 0 else []
-    if len(fields) < 20:
-        raise SystemExit("process stat is truncated")
-    return int(fields[19])
-
-print("process\tpid\tstarttime\texe_sha256")
-for name, pid_text, expected_text in (
-    ("proxy", sys.argv[1], sys.argv[2]),
-    ("gateway", sys.argv[3], sys.argv[4]),
-):
-    pid = int(pid_text)
-    exe = Path("/proc") / str(pid) / "exe"
-    if not os.path.samefile(exe, expected_text):
-        raise SystemExit(f"{name} executable does not match the built binary")
-    with exe.open("rb") as source:
-        digest = hashlib.file_digest(source, "sha256").hexdigest()
-    print(f"{name}\t{pid}\t{starttime(pid)}\t{digest}")
-PY
+    (
+        umask 0077
+        printf 'field\tvalue\n'
+        printf 'namespace_pid\t%s\n' "$agent_namespace_pid"
+        printf 'container_init_pid\t%s\n' "$agent_container_init_pid"
+        printf 'agent_bin\t%s\n' "$AGENT_BIN"
+        printf 'proxy_pid\t%s\n' "$ACL_PID"
+        printf 'proxy_bin\t%s\n' "$ACL_PROXY_BIN"
+    ) >"$MEASUREMENT_CONTROL_DIR/process-request.tsv"
+    (umask 0077; : >"$MEASUREMENT_CONTROL_DIR/process-request-ready")
+    wait_for_measurement_file "$MEASUREMENT_CONTROL_DIR/pids-bound" \
+        "exact measured process binding"
+    rm -- "$MEASUREMENT_CONTROL_DIR/process-request.tsv" \
+        "$MEASUREMENT_CONTROL_DIR/process-request-ready" \
+        "$MEASUREMENT_CONTROL_DIR/pids-bound"
     printf 'epoch\tphase\tactive_flows\thttp_flows\thttps_flows\tlogical_permits\tlogical_tasks\tknown_buffer_bytes\tminimum_active_projection_bytes\n' \
         >"$MEASUREMENT_CONTROL_DIR/logical.tsv"
     write_measurement_projection

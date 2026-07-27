@@ -593,8 +593,9 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
         "websocket-upgrade-frame=passed",
         "half-close=passed",
         "low-concurrency-cancellation=passed",
-        "agent_host_pid=$(sudo -n python3",
-        "sudo -n python3 - \"$ACL_PID\"",
+        ") >\"$MEASUREMENT_CONTROL_DIR/process-request.tsv\"",
+        "(umask 0077; : >\"$MEASUREMENT_CONTROL_DIR/process-request-ready\")",
+        "wait_for_measurement_file \"$MEASUREMENT_CONTROL_DIR/pids-bound\"",
         "test ! -e /run/acl-proxy/transparent-http.sock",
         "tls-access-flow-stack-smoke=passed",
     ] {
@@ -616,6 +617,30 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
         if script.contains(forbidden) {
             return Err(forbidden);
         }
+    }
+    Ok(())
+}
+
+fn validate_resource_process_binder(script: &str) -> Result<(), &'static str> {
+    for required in [
+        "def find_agent_host_pid(",
+        "def belongs_to_container(",
+        "os.path.samefile(proc_exe, expected_exe)",
+        "start_before != start_after",
+        "os.O_DIRECTORY | os.O_NOFOLLOW",
+        "os.O_EXCL | os.O_NOFOLLOW",
+        "dir_fd=directory_fd",
+        "os.fchown(descriptor, output_uid, output_gid)",
+        "os.fchmod(descriptor, 0o600)",
+        "args.output_uid != int(sudo_uid)",
+        "args.output_gid != int(sudo_gid)",
+    ] {
+        if !script.contains(required) {
+            return Err(required);
+        }
+    }
+    if script.matches("dir_fd=directory_fd").count() != 3 {
+        return Err("dir_fd=directory_fd");
     }
     Ok(())
 }
@@ -648,14 +673,44 @@ fn tls_access_flow_stack_smoke_is_integrated_non_vacuous_and_mutation_guarded() 
         "websocket-upgrade-frame=passed",
         "half-close=passed",
         "low-concurrency-cancellation=passed",
-        "agent_host_pid=$(sudo -n python3",
-        "sudo -n python3 - \"$ACL_PID\"",
+        ") >\"$MEASUREMENT_CONTROL_DIR/process-request.tsv\"",
+        "(umask 0077; : >\"$MEASUREMENT_CONTROL_DIR/process-request-ready\")",
+        "wait_for_measurement_file \"$MEASUREMENT_CONTROL_DIR/pids-bound\"",
         "tls-access-flow-stack-smoke=passed",
     ] {
         let mutated = smoke.replacen(marker, "removed-by-mutation", 1);
         assert!(
             validate_tls_access_flow_smoke(&mutated).is_err(),
             "removing {marker:?} did not invalidate the smoke contract"
+        );
+    }
+}
+
+#[test]
+fn tls_access_flow_resource_process_binder_is_identity_and_mutation_guarded() {
+    let binder = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("smoke/scripts/bind-access-flow-resource-processes.py"),
+    )
+    .unwrap();
+    validate_resource_process_binder(&binder).unwrap();
+    for marker in [
+        "def find_agent_host_pid(",
+        "def belongs_to_container(",
+        "os.path.samefile(proc_exe, expected_exe)",
+        "start_before != start_after",
+        "os.O_DIRECTORY | os.O_NOFOLLOW",
+        "os.O_EXCL | os.O_NOFOLLOW",
+        "dir_fd=directory_fd",
+        "os.fchown(descriptor, output_uid, output_gid)",
+        "os.fchmod(descriptor, 0o600)",
+        "args.output_uid != int(sudo_uid)",
+        "args.output_gid != int(sudo_gid)",
+    ] {
+        let mutated = binder.replacen(marker, "removed-by-mutation", 1);
+        assert!(
+            validate_resource_process_binder(&mutated).is_err(),
+            "removing {marker:?} did not invalidate the process-binder contract"
         );
     }
 }
