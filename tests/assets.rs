@@ -610,7 +610,9 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
         "str(measurement_hold_response_bytes)",
         "class Server(socketserver.ThreadingTCPServer):",
         "max_request_wire_bytes = 1048576",
+        "max_request_decoded_bytes = 1048576",
         "max_response_wire_bytes = 16777216",
+        "max_response_decoded_bytes = 16777216",
         "--gateway-projection-probe <absolute-regular-file>",
         "gateway_projected_bytes\t$GATEWAY_PROJECTED_BYTES",
         "gateway_projected_descriptors\t$GATEWAY_PROJECTED_DESCRIPTORS",
@@ -632,6 +634,7 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
         "token-rotation-resolver-reload=passed",
         "proxy-loss-fail-closed=passed",
         "pinned-inode-rebind=passed",
+        "max_inflight_wire_body_bytes_per_quota_key",
     ] {
         if script.contains(forbidden) {
             return Err(forbidden);
@@ -740,7 +743,9 @@ fn tls_access_flow_stack_smoke_is_integrated_non_vacuous_and_mutation_guarded() 
         "str(measurement_hold_response_bytes)",
         "class Server(socketserver.ThreadingTCPServer):",
         "max_request_wire_bytes = 1048576",
+        "max_request_decoded_bytes = 1048576",
         "max_response_wire_bytes = 16777216",
+        "max_response_decoded_bytes = 16777216",
         "--gateway-projection-probe <absolute-regular-file>",
         "gateway_projected_bytes\t$GATEWAY_PROJECTED_BYTES",
         "gateway_projected_descriptors\t$GATEWAY_PROJECTED_DESCRIPTORS",
