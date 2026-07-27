@@ -17,7 +17,8 @@ mod validation;
 
 pub(crate) use agent::{
     ACCESS_FLOW_RELAY_NODE, AccessFlowRelayValidationMode, CompiledAccessFlowRelayConfig,
-    CompiledAccessFlowRelayEndpoint,
+    CompiledAccessFlowRelayEndpoint, MAX_ACCESS_FLOW_TRUST_PATH_BYTES,
+    MAX_ACCESS_FLOW_TRUST_PATH_COMPONENTS,
 };
 pub use agent::{
     AccessFlowRelayConfig, AccessFlowRelayPresentation, AccessFlowRelayRoute,

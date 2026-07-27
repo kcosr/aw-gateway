@@ -11,7 +11,7 @@ control_socket = false
 [container_agent.access_flow_relay]
 setup_timeout = "5s"
 drain_timeout = "10s"
-max_connections = 128
+max_connections = 96
 copy_buffer_bytes_per_direction = 16384
 
 [container_agent.access_flow_relay.presentation]
@@ -30,7 +30,7 @@ server_name = "proxy.example.com"
 
 [container_agent.access_flow_relay.routes.transport.trust]
 kind = "pem_bundle"
-path = "/etc/aw-gateway/acl-proxy-roots.pem"
+path = "/etc/aw-gateway/acl-proxy-trust/roots.pem"
 
 [[container_agent.access_flow_relay.routes]]
 name = "https"
@@ -44,4 +44,4 @@ server_name = "proxy.example.com"
 
 [container_agent.access_flow_relay.routes.transport.trust]
 kind = "pem_bundle"
-path = "/etc/aw-gateway/acl-proxy-roots.pem"
+path = "/etc/aw-gateway/acl-proxy-trust/roots.pem"

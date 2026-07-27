@@ -74,6 +74,11 @@
 
 ### Fixed
 
+- TLS Access Flow relay preflight now charges one exact plan-wide trust-loader
+  peak before reading trust material while retaining the per-flow reserve needed
+  for long-lived connections across arbitrary successful reloads. The shipped
+  two-route profile uses a verified 96-connection ceiling that fits both
+  bridge-disabled and bridge-enabled 256 MiB agent budgets.
 - Host socket exposure readiness retries now stop at their shared endpoint
   deadline instead of sleeping a full retry interval beyond it, while terminal
   probe timeouts retain the last completed readiness failure.

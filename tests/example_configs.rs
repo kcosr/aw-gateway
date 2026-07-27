@@ -1,4 +1,8 @@
 use assert_cmd::Command;
+use aw_gateway::config::{
+    AccessFlowRelayTransport, AccessFlowRelayTrust, ContainerAgentFile, ContainerMountMode,
+    GatewayConfig,
+};
 use std::path::Path;
 
 #[test]
@@ -22,6 +26,7 @@ fn example_gateway_configs_validate() {
         "examples/podman/gateway-runtime-exec.toml",
         "examples/podman/gateway-remote.toml",
         "examples/docker/gateway-local.toml",
+        "examples/docker/gateway-access-flow-tls.toml",
         "examples/docker/gateway-runtime-exec.toml",
         "examples/docker/gateway-remote.toml",
         "examples/colima/gateway-local.toml",
@@ -68,4 +73,91 @@ fn remote_tls_agent_example_schema_validates_without_source_access() {
         .args(["config", "validate"])
         .assert()
         .success();
+}
+
+#[test]
+fn remote_tls_gateway_and_agent_examples_share_one_relay_contract() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let agent: ContainerAgentFile = toml::from_str(
+        &std::fs::read_to_string(
+            manifest_dir.join("examples/docker/container-agent-access-flow-tls.toml"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let gateway: GatewayConfig = toml::from_str(
+        &std::fs::read_to_string(manifest_dir.join("examples/docker/gateway-access-flow-tls.toml"))
+            .unwrap(),
+    )
+    .unwrap();
+
+    let agent_relay = agent.container_agent.access_flow_relay.as_ref().unwrap();
+    let gateway_agent = gateway.target_defaults.container_agent.as_ref().unwrap();
+    let gateway_relay = gateway_agent.access_flow_relay.as_ref().unwrap();
+    assert_eq!(agent_relay.setup_timeout, gateway_relay.setup_timeout);
+    assert_eq!(agent_relay.drain_timeout, gateway_relay.drain_timeout);
+    assert_eq!(agent_relay.max_connections, 96);
+    assert_eq!(agent_relay.max_connections, gateway_relay.max_connections);
+    assert_eq!(
+        agent_relay.copy_buffer_bytes_per_direction,
+        gateway_relay.copy_buffer_bytes_per_direction
+    );
+    assert_eq!(agent_relay.presentation, gateway_relay.presentation);
+    assert_eq!(agent_relay.routes.len(), 2);
+    assert_eq!(agent_relay.routes.len(), gateway_relay.routes.len());
+    for (agent_route, gateway_route) in agent_relay.routes.iter().zip(&gateway_relay.routes) {
+        assert_eq!(agent_route.name, gateway_route.name);
+        assert_eq!(agent_route.listen, gateway_route.listen);
+        assert_eq!(
+            agent_route.allowed_destination_ports,
+            gateway_route.allowed_destination_ports
+        );
+        let (
+            AccessFlowRelayTransport::TlsTcp {
+                address: agent_address,
+                server_name: agent_server_name,
+                trust:
+                    AccessFlowRelayTrust::PemBundle {
+                        path: agent_trust_path,
+                    },
+            },
+            AccessFlowRelayTransport::TlsTcp {
+                address: gateway_address,
+                server_name: gateway_server_name,
+                trust:
+                    AccessFlowRelayTrust::PemBundle {
+                        path: gateway_trust_path,
+                    },
+            },
+        ) = (&agent_route.transport, &gateway_route.transport)
+        else {
+            panic!("remote TLS examples must contain only tls_tcp routes");
+        };
+        assert_eq!(agent_address, gateway_address);
+        assert_eq!(agent_server_name, gateway_server_name);
+        assert_eq!(agent_trust_path, gateway_trust_path);
+        assert_eq!(
+            agent_trust_path,
+            "/etc/aw-gateway/acl-proxy-trust/roots.pem"
+        );
+    }
+
+    let trust_mount = gateway
+        .target_defaults
+        .container_mounts
+        .iter()
+        .find(|mount| mount.target == "/etc/aw-gateway/acl-proxy-trust")
+        .expect("dedicated TLS example must provision its trust directory");
+    assert_eq!(trust_mount.source, "/opt/aw-gateway/trust/acl-proxy");
+    assert_eq!(trust_mount.mode, ContainerMountMode::Ro);
+    assert!(
+        gateway_agent.services.iter().any(|service| {
+            service.name == "container-sshd"
+                && service
+                    .depends_on
+                    .iter()
+                    .any(|name| name == "@access-flow-relay")
+        }),
+        "workload readiness must depend on the TLS relay"
+    );
 }

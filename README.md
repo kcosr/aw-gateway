@@ -658,7 +658,40 @@ kind = "unix"
 path = "/run/acl-proxy/transparent-http.sock"
 ```
 
-A route may instead use server-authenticated TLS/TCP:
+A route may instead use server-authenticated TLS/TCP. Provision its explicit
+trust bundle through a read-only mount. Mount the containing directory rather
+than the individual file so an atomic host-side replacement remains visible
+to a later `SIGHUP`:
+
+```toml
+[[target_defaults.container_mounts]]
+source = "/opt/aw-gateway/trust/acl-proxy"
+target = "/etc/aw-gateway/acl-proxy-trust"
+mode = "ro"
+```
+
+The dedicated
+[`examples/docker/gateway-access-flow-tls.toml`](examples/docker/gateway-access-flow-tls.toml)
+profile shows the mount and relay configuration together. Before starting its
+root-run container agent, provision the host source as root-owned, single-link
+material:
+
+```bash
+sudo install -d -o root -g root -m 0755 /opt/aw-gateway/trust/acl-proxy
+sudo install -o root -g root -m 0644 ./acl-proxy-roots.pem \
+  /opt/aw-gateway/trust/acl-proxy/roots.pem
+```
+
+The secure loader evaluates metadata in the container's filesystem view.
+`/`, every directory component, and the PEM leaf must be owned by root or the
+agent's effective UID and must not be group- or world-writable. No component
+may be a symlink. The leaf must be a nonempty regular file with exactly one
+hard link and is limited to 1 MiB. For the shipped root-run profile, use
+root ownership as shown above. A read-only mount prevents container writes but
+does not make unsafe source ownership, modes, links, or host-side mutation
+trusted.
+
+The corresponding TLS route is:
 
 ```toml
 [[target_defaults.container_agent.access_flow_relay.routes]]
@@ -673,7 +706,7 @@ server_name = "proxy.example.com"
 
 [target_defaults.container_agent.access_flow_relay.routes.transport.trust]
 kind = "pem_bundle"
-path = "/etc/aw-gateway/acl-proxy-roots.pem"
+path = "/etc/aw-gateway/acl-proxy-trust/roots.pem"
 ```
 
 TLS routes require `bearer_environment`; disabled and anonymous presentation

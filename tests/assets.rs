@@ -403,7 +403,8 @@ fn embedded_relay_uses_shared_runtime_engine_without_a_copied_data_plane() {
     }
     for required in [
         "AccessFlowRelay::new(",
-        "RelayTransportRuntime::activate(",
+        "RelayTransportRuntime::prepare(",
+        ".activate_prepared()",
         "UnixAccessFlowConnector::new()",
         "TlsAccessFlowConnector::with_system_resolver(",
         "RunningAccessFlowRelay",

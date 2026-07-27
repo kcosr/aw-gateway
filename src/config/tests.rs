@@ -6089,6 +6089,62 @@ fn tls_transport_rejects_invalid_addresses_names_and_trust_paths() {
 }
 
 #[test]
+fn tls_trust_path_enforces_authored_byte_and_component_bounds() {
+    let exact_bytes = format!(
+        "/{}",
+        "a".repeat(super::agent::MAX_ACCESS_FLOW_TRUST_PATH_BYTES - 1)
+    );
+    assert_eq!(
+        exact_bytes.len(),
+        super::agent::MAX_ACCESS_FLOW_TRUST_PATH_BYTES
+    );
+    let exact_bytes_raw =
+        bearer_tls_access_flow_relay().replace("/etc/aw-gateway/acl-proxy-roots.pem", &exact_bytes);
+    let exact_bytes_config: ContainerAgentFile = toml::from_str(&exact_bytes_raw).unwrap();
+    exact_bytes_config.validate().unwrap();
+
+    let over_bytes = format!("{exact_bytes}a");
+    let over_bytes_raw =
+        bearer_tls_access_flow_relay().replace("/etc/aw-gateway/acl-proxy-roots.pem", &over_bytes);
+    let over_bytes_config: ContainerAgentFile = toml::from_str(&over_bytes_raw).unwrap();
+    let over_bytes_error = over_bytes_config.validate().unwrap_err().to_string();
+    assert!(
+        over_bytes_error.contains("at most 4096 UTF-8 bytes"),
+        "{over_bytes_error}"
+    );
+    assert!(
+        !over_bytes_error.contains(&over_bytes),
+        "{over_bytes_error}"
+    );
+
+    let exact_components = format!(
+        "/{}",
+        std::iter::repeat_n("a", super::agent::MAX_ACCESS_FLOW_TRUST_PATH_COMPONENTS)
+            .collect::<Vec<_>>()
+            .join("/")
+    );
+    let exact_components_raw = bearer_tls_access_flow_relay()
+        .replace("/etc/aw-gateway/acl-proxy-roots.pem", &exact_components);
+    let exact_components_config: ContainerAgentFile =
+        toml::from_str(&exact_components_raw).unwrap();
+    exact_components_config.validate().unwrap();
+
+    let over_components = format!("{exact_components}/a");
+    let over_components_raw = bearer_tls_access_flow_relay()
+        .replace("/etc/aw-gateway/acl-proxy-roots.pem", &over_components);
+    let over_components_config: ContainerAgentFile = toml::from_str(&over_components_raw).unwrap();
+    let over_components_error = over_components_config.validate().unwrap_err().to_string();
+    assert!(
+        over_components_error.contains("at most 256 components"),
+        "{over_components_error}"
+    );
+    assert!(
+        !over_components_error.contains(&over_components),
+        "{over_components_error}"
+    );
+}
+
+#[test]
 fn relay_transport_schema_rejects_unknown_cross_variant_and_trust_shapes() {
     let tls = bearer_tls_access_flow_relay();
     for invalid in [

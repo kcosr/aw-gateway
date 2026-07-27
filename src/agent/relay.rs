@@ -394,18 +394,17 @@ async fn run_relay(
         )
         .context("compile access flow relay configuration")?;
     probe_unix_endpoints(&compiled)?;
-    let reload_descriptor_reserve =
-        RelayTransportRuntime::reload_descriptor_reserve(&compiled.plan)
-            .context("project access flow relay transport reload resources")?;
+    let transport_reserve = RelayTransportRuntime::resource_reserve(&compiled.plan)
+        .context("project access flow relay transport reload resources")?;
     let budget = relay_resource_budget(
         state.bridge_enabled,
         services.len(),
-        reload_descriptor_reserve,
+        transport_reserve.descriptors,
+        transport_reserve.memory_bytes,
     )?;
     let transport =
-        RelayTransportRuntime::activate(&compiled.plan, Arc::clone(&control.security_healthy))
-            .await
-            .context("activate access flow relay transport")?;
+        RelayTransportRuntime::prepare(&compiled.plan, Arc::clone(&control.security_healthy))
+            .context("prepare access flow relay transport")?;
     let relay = AccessFlowRelay::new(
         compiled.plan,
         transport.connector(),
@@ -415,11 +414,25 @@ async fn run_relay(
         budget,
     )
     .context("access flow relay resource preflight")?;
+    let projected_descriptors = relay
+        .resource_projection()
+        .total_descriptors
+        .checked_add(transport_reserve.descriptors)
+        .context("access flow relay descriptor projection overflow")?;
+    let projected_memory_bytes = relay
+        .resource_projection()
+        .total_memory_bytes
+        .checked_add(transport_reserve.memory_bytes)
+        .context("access flow relay memory projection overflow")?;
     tracing::info!(
-        descriptors = relay.resource_projection().total_descriptors,
-        memory_bytes = relay.resource_projection().total_memory_bytes,
+        descriptors = projected_descriptors,
+        memory_bytes = projected_memory_bytes,
         "access flow relay resource preflight passed"
     );
+    transport
+        .activate_prepared()
+        .await
+        .context("activate access flow relay transport")?;
     let prepared = match relay
         .prepare(Arc::new(control.startup_cancellation.clone()))
         .await
@@ -880,6 +893,23 @@ fn relay_resource_budget(
     bridge_enabled: bool,
     service_count: usize,
     transport_reload_descriptors: u64,
+    transport_reload_memory_bytes: u64,
+) -> anyhow::Result<AccessFlowRelayResourceBudget> {
+    relay_resource_budget_with_nofile(
+        bridge_enabled,
+        service_count,
+        transport_reload_descriptors,
+        transport_reload_memory_bytes,
+        soft_nofile_limit()?,
+    )
+}
+
+fn relay_resource_budget_with_nofile(
+    bridge_enabled: bool,
+    service_count: usize,
+    transport_reload_descriptors: u64,
+    transport_reload_memory_bytes: u64,
+    soft_nofile: u64,
 ) -> anyhow::Result<AccessFlowRelayResourceBudget> {
     let services = u64::try_from(service_count).context("service count exceeds u64")?;
     let descriptor_reserve = if bridge_enabled {
@@ -896,7 +926,7 @@ fn relay_resource_budget(
     let descriptor_reserve = descriptor_reserve
         .checked_add(transport_reload_descriptors)
         .ok_or_else(|| anyhow::anyhow!("transport reload descriptor reserve overflow"))?;
-    let descriptors = soft_nofile_limit()?
+    let descriptors = soft_nofile
         .checked_sub(descriptor_reserve)
         .ok_or_else(|| anyhow::anyhow!("RLIMIT_NOFILE is below the agent non-relay reserve"))?;
 
@@ -911,6 +941,7 @@ fn relay_resource_budget(
                 .checked_mul(services)
                 .ok_or_else(|| anyhow::anyhow!("non-relay memory reserve overflow"))?,
         )
+        .and_then(|value| value.checked_add(transport_reload_memory_bytes))
         .ok_or_else(|| anyhow::anyhow!("non-relay memory reserve overflow"))?;
     let memory_bytes = TOTAL_AGENT_MEMORY_PREFLIGHT_BYTES
         .checked_sub(memory_reserve)
@@ -953,7 +984,7 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use access_flow_conformance::load_tls_pki_fixture;
-    use access_flow_relay::AccessFlowRelayFailureKind;
+    use access_flow_relay::{AccessFlowConnector, AccessFlowRelayFailureKind};
     #[cfg(target_os = "linux")]
     use access_flow_tls::{
         TlsAccessFlowHandshakeTimeout, TlsAccessFlowServerAdapter, TlsAccessFlowServerChannel,
@@ -962,7 +993,7 @@ mod tests {
     use std::collections::BTreeMap;
     #[cfg(target_os = "linux")]
     use std::convert::Infallible;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -970,7 +1001,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     const TEST_ACCESS_FLOW_BEARER: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEF";
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     const TEST_ACCESS_FLOW_ROOT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
 MIIBeDCCASqgAwIBAgIUXLfYBhGLaC2YWMIvB0aPnyCXmZMwBQYDK2VwMCgxJjAk
 BgNVBAMMHUFXIEFjY2VzcyBGbG93IFJUMDEgVGVzdCBSb290MB4XDTI2MDcyNjE5
@@ -1069,8 +1100,8 @@ O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
 
     #[test]
     fn resource_budget_subtracts_frozen_non_relay_memory() {
-        let no_bridge = relay_resource_budget(false, 4, 0).unwrap();
-        let bridge = relay_resource_budget(true, 4, 0).unwrap();
+        let no_bridge = relay_resource_budget(false, 4, 0, 0).unwrap();
+        let bridge = relay_resource_budget(true, 4, 0, 0).unwrap();
         assert_eq!(
             no_bridge.memory_bytes,
             TOTAL_AGENT_MEMORY_PREFLIGHT_BYTES
@@ -1087,10 +1118,91 @@ O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
 
     #[test]
     fn resource_budget_reserves_transport_reload_descriptors() {
-        let baseline = relay_resource_budget(false, 0, 0).unwrap();
-        let with_tls_reload = relay_resource_budget(false, 0, 2).unwrap();
+        let baseline = relay_resource_budget(false, 0, 0, 0).unwrap();
+        let with_tls_reload = relay_resource_budget(false, 0, 2, 1024).unwrap();
         assert_eq!(with_tls_reload.descriptors, baseline.descriptors - 2);
-        assert!(relay_resource_budget(false, 0, u64::MAX).is_err());
+        assert_eq!(with_tls_reload.memory_bytes, baseline.memory_bytes - 1024);
+        assert!(relay_resource_budget(false, 0, u64::MAX, 0).is_err());
+        assert!(relay_resource_budget(false, 0, 0, u64::MAX).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shipped_tls_agent_plan_fits_supported_product_topologies() {
+        let mut authored: crate::config::ContainerAgentFile = toml::from_str(include_str!(
+            "../../examples/docker/container-agent-access-flow-tls.toml"
+        ))
+        .unwrap();
+        authored.validate().unwrap();
+        let relay_config = authored
+            .container_agent
+            .access_flow_relay
+            .as_mut()
+            .expect("shipped TLS relay");
+        assert_eq!(relay_config.routes.len(), 2);
+        assert_eq!(relay_config.max_connections, 96);
+        assert_eq!(relay_config.copy_buffer_bytes_per_direction, 16 * 1024);
+
+        let dir = tempfile::Builder::new()
+            .prefix(".relay-product-preflight-")
+            .tempdir_in(std::env::var_os("HOME").unwrap())
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let trust_path = dir.path().join("roots.pem");
+        std::fs::write(&trust_path, TEST_ACCESS_FLOW_ROOT_PEM).unwrap();
+        std::fs::set_permissions(&trust_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        for route in &mut relay_config.routes {
+            let AccessFlowRelayTransport::TlsTcp { trust, .. } = &mut route.transport else {
+                panic!("shipped TLS relay contains a non-TLS route");
+            };
+            let AccessFlowRelayTrust::PemBundle { path } = trust;
+            *path = trust_path.display().to_string();
+        }
+        let relay_config = relay_config.clone();
+        let bearer = vec![b'B'; access_identity::MAX_BEARER_LEN];
+
+        for (bridge_enabled, service_count) in [(false, 0), (true, 0), (true, 2)] {
+            let compiled = relay_config
+                .compile_with_presentation(
+                    crate::config::AccessFlowRelayValidationMode::Agent,
+                    IdentityPresentation::Bearer(
+                        access_identity::SensitiveBearer::new(&bearer).unwrap(),
+                    ),
+                )
+                .unwrap();
+            let transport_reserve =
+                RelayTransportRuntime::resource_reserve(&compiled.plan).unwrap();
+            let budget = relay_resource_budget_with_nofile(
+                bridge_enabled,
+                service_count,
+                transport_reserve.descriptors,
+                transport_reserve.memory_bytes,
+                4096,
+            )
+            .unwrap();
+            let transport =
+                RelayTransportRuntime::prepare(&compiled.plan, Arc::new(AtomicBool::new(false)))
+                    .unwrap();
+            let relay = AccessFlowRelay::new(
+                compiled.plan,
+                transport.connector(),
+                Arc::new(RelayObserver {
+                    active_flows: Arc::new(AtomicUsize::new(0)),
+                }),
+                budget,
+            )
+            .unwrap();
+            transport.activate_prepared().await.unwrap();
+            let projection = relay.resource_projection();
+            assert!(projection.total_descriptors <= budget.descriptors);
+            assert!(projection.total_memory_bytes <= budget.memory_bytes);
+            if bridge_enabled && service_count == 2 {
+                assert!(
+                    budget.memory_bytes - projection.total_memory_bytes >= 8 * 1024 * 1024,
+                    "shipped bridge topology has less than 8 MiB relay preflight margin"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1115,7 +1227,7 @@ O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
             Arc::new(RelayObserver {
                 active_flows: Arc::new(AtomicUsize::new(0)),
             }),
-            relay_resource_budget(false, 0, 0).unwrap(),
+            relay_resource_budget(false, 0, 0, 0).unwrap(),
         )
         .unwrap();
 
@@ -1269,6 +1381,116 @@ O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
             AccessFlowRelayStateName::Stopped
         );
         assert_eq!(control.active_flows(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn established_tls_streams_survive_multiple_successful_trust_reloads() {
+        let dir = tempfile::Builder::new()
+            .prefix(".relay-generation-overlap-test-")
+            .tempdir_in(std::env::var_os("HOME").unwrap())
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let trust_path = dir.path().join("access-flow-root.pem");
+        std::fs::write(&trust_path, TEST_ACCESS_FLOW_ROOT_PEM).unwrap();
+        std::fs::set_permissions(&trust_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let tls_tcp = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let tls_address = tls_tcp.local_addr().unwrap();
+        let mut tls_listener = TlsAccessFlowTcpListener::from_std(tls_tcp).unwrap();
+        let fixture = load_tls_pki_fixture().unwrap();
+        let server_name = fixture.server_name().host().dns_name().unwrap().to_string();
+        let (_, _, server_identity) = fixture.into_parts();
+        let tls_server = TlsAccessFlowServerAdapter::new(
+            server_identity,
+            TlsAccessFlowHandshakeTimeout::new(Duration::from_secs(2)).unwrap(),
+            TlsAccessFlowServerLimits::new(8, 8, 16, 32, 1).unwrap(),
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            let cancellation = RelayCancellation::default();
+            let mut retained = Vec::new();
+            for _ in 0..3 {
+                retained.push(
+                    tls_server
+                        .accept(&mut tls_listener, &cancellation)
+                        .await
+                        .unwrap()
+                        .establish(&cancellation)
+                        .await
+                        .unwrap(),
+                );
+            }
+            retained
+        });
+
+        let config = AccessFlowRelayConfig {
+            setup_timeout: "2s".into(),
+            drain_timeout: "1s".into(),
+            max_connections: 4,
+            copy_buffer_bytes_per_direction: 4096,
+            start_after_services: Vec::new(),
+            presentation: AccessFlowRelayPresentation::BearerEnvironment {
+                variable: "AW_ACCESS_FLOW_TEST_TOKEN".into(),
+            },
+            routes: vec![AccessFlowRelayRoute {
+                name: "https".into(),
+                listen: "127.0.0.1:3129".into(),
+                allowed_destination_ports: vec![443],
+                transport: AccessFlowRelayTransport::TlsTcp {
+                    address: tls_address.to_string(),
+                    server_name,
+                    trust: AccessFlowRelayTrust::PemBundle {
+                        path: trust_path.display().to_string(),
+                    },
+                },
+            }],
+        };
+        let compiled = config
+            .compile_with_presentation(
+                crate::config::AccessFlowRelayValidationMode::Agent,
+                IdentityPresentation::Bearer(
+                    access_identity::SensitiveBearer::new(TEST_ACCESS_FLOW_BEARER).unwrap(),
+                ),
+            )
+            .unwrap();
+        let runtime =
+            RelayTransportRuntime::activate(&compiled.plan, Arc::new(AtomicBool::new(false)))
+                .await
+                .unwrap();
+        let connector = runtime.connector();
+        let cancellation = RelayCancellation::default();
+        let mut streams = Vec::new();
+        for generation in 0..3 {
+            let context = access_flow_relay::AccessFlowConnectContext::new(
+                Instant::now() + Duration::from_secs(2),
+                &cancellation,
+            );
+            streams.push(
+                connector
+                    .connect(compiled.plan.routes()[0].endpoint(), context)
+                    .await
+                    .unwrap(),
+            );
+            if generation < 2 {
+                runtime
+                    .begin_reload()
+                    .unwrap()
+                    .expect("TLS reload worker")
+                    .complete()
+                    .await
+                    .unwrap();
+            }
+        }
+        let retained_server_channels = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained_server_channels.len(), 3);
+        for stream in &mut streams {
+            stream.write_all(b"x").await.unwrap();
+            stream.flush().await.unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1870,7 +2092,7 @@ O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
             Arc::new(RelayObserver {
                 active_flows: Arc::new(AtomicUsize::new(0)),
             }),
-            relay_resource_budget(false, 0, 0).unwrap(),
+            relay_resource_budget(false, 0, 0, 0).unwrap(),
         )
         .unwrap();
 

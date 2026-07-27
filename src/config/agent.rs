@@ -16,6 +16,8 @@ use access_flow_unix::{NormalizedUnixSocketPath, UnixAccessFlowEndpoint, UnixExe
 use access_identity::{IdentityPresentation, SensitiveBearer};
 
 pub const ACCESS_FLOW_RELAY_NODE: &str = "@access-flow-relay";
+pub(crate) const MAX_ACCESS_FLOW_TRUST_PATH_BYTES: usize = 4096;
+pub(crate) const MAX_ACCESS_FLOW_TRUST_PATH_COMPONENTS: usize = 256;
 const REMOVED_LOCAL_FLOW_RELAY_NODE: &str = "@local-flow-relay";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -934,15 +936,35 @@ fn validate_tls_transport_templates(
 }
 
 fn normalized_absolute_trust_path(path: &str) -> anyhow::Result<PathBuf> {
+    if path.len() > MAX_ACCESS_FLOW_TRUST_PATH_BYTES {
+        anyhow::bail!(
+            "container_agent.access_flow_relay.routes.transport.trust.path must contain at most {MAX_ACCESS_FLOW_TRUST_PATH_BYTES} UTF-8 bytes"
+        );
+    }
     let mut segments = path.split('/');
     let rooted = segments.next() == Some("");
-    let segments = segments.collect::<Vec<_>>();
-    if !rooted
-        || segments.is_empty()
-        || segments
-            .iter()
-            .any(|segment| segment.is_empty() || matches!(*segment, "." | ".."))
-    {
+    if !rooted {
+        anyhow::bail!(
+            "container_agent.access_flow_relay.routes.transport.trust.path must be a normalized absolute non-root path"
+        );
+    }
+    let mut component_count = 0_usize;
+    for segment in segments {
+        if segment.is_empty() || matches!(segment, "." | "..") {
+            anyhow::bail!(
+                "container_agent.access_flow_relay.routes.transport.trust.path must be a normalized absolute non-root path"
+            );
+        }
+        component_count = component_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("trust path component count overflow"))?;
+        if component_count > MAX_ACCESS_FLOW_TRUST_PATH_COMPONENTS {
+            anyhow::bail!(
+                "container_agent.access_flow_relay.routes.transport.trust.path must contain at most {MAX_ACCESS_FLOW_TRUST_PATH_COMPONENTS} components"
+            );
+        }
+    }
+    if component_count == 0 {
         anyhow::bail!(
             "container_agent.access_flow_relay.routes.transport.trust.path must be a normalized absolute non-root path"
         );
