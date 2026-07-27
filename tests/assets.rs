@@ -593,6 +593,8 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
         "websocket-upgrade-frame=passed",
         "half-close=passed",
         "low-concurrency-cancellation=passed",
+        "agent_host_pid=$(sudo -n python3",
+        "sudo -n python3 - \"$ACL_PID\"",
         "test ! -e /run/acl-proxy/transparent-http.sock",
         "tls-access-flow-stack-smoke=passed",
     ] {
@@ -646,6 +648,8 @@ fn tls_access_flow_stack_smoke_is_integrated_non_vacuous_and_mutation_guarded() 
         "websocket-upgrade-frame=passed",
         "half-close=passed",
         "low-concurrency-cancellation=passed",
+        "agent_host_pid=$(sudo -n python3",
+        "sudo -n python3 - \"$ACL_PID\"",
         "tls-access-flow-stack-smoke=passed",
     ] {
         let mutated = smoke.replacen(marker, "removed-by-mutation", 1);

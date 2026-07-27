@@ -302,6 +302,9 @@ done
 if [[ -n $MEASUREMENT_CONTROL_DIR ]]; then
     require_command /usr/bin/time
     require_command pgrep
+    require_command sudo
+    sudo -n true >/dev/null 2>&1 \
+        || fail "resource measurement requires noninteractive root access to process metrics"
 fi
 
 canonical_repo() {
@@ -1693,7 +1696,7 @@ run_resource_measurement() {
     agent_container_init_pid=$(docker inspect --format '{{.State.Pid}}' "$WORKLOAD_CONTAINER")
     [[ $agent_container_init_pid =~ ^[1-9][0-9]*$ ]] \
         || fail "could not resolve the workload container host PID"
-    agent_host_pid=$(python3 - "$agent_namespace_pid" "$agent_container_init_pid" \
+    agent_host_pid=$(sudo -n python3 - "$agent_namespace_pid" "$agent_container_init_pid" \
         "$AGENT_BIN" <<'PY'
 import os
 from pathlib import Path
@@ -1741,7 +1744,7 @@ PY
     [[ $agent_host_pid =~ ^[1-9][0-9]*$ ]] \
         || fail "could not resolve the measured agent host PID"
 
-    python3 - "$ACL_PID" "$ACL_PROXY_BIN" "$agent_host_pid" "$AGENT_BIN" \
+    sudo -n python3 - "$ACL_PID" "$ACL_PROXY_BIN" "$agent_host_pid" "$AGENT_BIN" \
         >"$MEASUREMENT_CONTROL_DIR/pids.tsv" <<'PY'
 import hashlib
 import os
