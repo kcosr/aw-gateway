@@ -1886,7 +1886,11 @@ SH
         || fail "measurement clients did not drain"
     MEASUREMENT_CLIENTS_STARTED=0
     wait_for_measurement_active_flows 0
-    write_measurement_phase 3 drained 0 0 0
+    write_measurement_phase 3 draining 0 0 0
+    touch "$MEASUREMENT_CONTROL_DIR/draining-ready"
+    wait_for_measurement_file "$MEASUREMENT_CONTROL_DIR/drain-stable" \
+        "bounded Proxy and Gateway resource stabilization"
+    write_measurement_phase 4 drained 0 0 0
     touch "$MEASUREMENT_CONTROL_DIR/drained-ready"
     wait_for_measurement_file "$MEASUREMENT_CONTROL_DIR/finish" "measurement finish"
 
