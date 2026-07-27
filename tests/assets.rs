@@ -467,6 +467,9 @@ fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() 
     assert_eq!(smoke.matches("--user 0:0").count(), 4);
     assert_eq!(smoke.matches("$BUNDLE:/bundle:ro,z").count(), 4);
     assert_eq!(smoke.matches("$STATE:/state:rw,z").count(), 4);
+    assert!(!smoke.contains("http = http.server.ThreadingHTTPServer"));
+    assert!(!smoke.contains("retire_timeout = \"2s\""));
+    assert!(smoke.contains("retire_timeout = \"30s\""));
 }
 
 #[test]

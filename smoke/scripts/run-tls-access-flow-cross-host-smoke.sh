@@ -438,12 +438,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-http = http.server.ThreadingHTTPServer(("0.0.0.0", 80), Handler)
+http_server = http.server.ThreadingHTTPServer(("0.0.0.0", 80), Handler)
 https = http.server.ThreadingHTTPServer(("0.0.0.0", 443), Handler)
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 context.load_cert_chain("/bundle/origin-cert.pem", "/bundle/origin-key.pem")
 https.socket = context.wrap_socket(https.socket, server_side=True)
-threading.Thread(target=http.serve_forever, daemon=True).start()
+threading.Thread(target=http_server.serve_forever, daemon=True).start()
 https.serve_forever()
 PY
 
@@ -680,7 +680,7 @@ include_identity = true
 max_stdout_line_bytes = 65536
 max_pending_requests = 8
 restart_backoff = "100ms"
-retire_timeout = "2s"
+retire_timeout = "30s"
 
 [credentials.inbound.rt05_private]
 header = "x-rt05-private"
