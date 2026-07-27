@@ -473,6 +473,17 @@ fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() 
     assert!(smoke.contains("max_inflight_body_bytes = 134217728"));
     assert!(smoke.contains("command = \"$REMOTE_PROVIDER_PYTHON\""));
     assert!(!smoke.contains("label=$2 fifo=\"$TMP_DIR/$label.fifo\""));
+    assert!(!smoke.contains("label=$1 destination=\"$TMP_DIR/local-evidence/$label\""));
+    assert!(smoke.contains("max_connections = 64"));
+    assert_eq!(
+        smoke
+            .matches("path = \"/run/aw-gateway/trust/access-flow-root.pem\"")
+            .count(),
+        2
+    );
+    assert!(smoke.contains("install -D -o 0 -g 0 -m 0644"));
+    assert!(smoke.contains("install -D -o 65534 -g 65534 -m 0400"));
+    assert!(smoke.contains("\"connection\", \"content-length\", \"transfer-encoding\""));
 }
 
 #[test]

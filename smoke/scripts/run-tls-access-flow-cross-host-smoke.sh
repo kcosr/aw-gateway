@@ -110,6 +110,11 @@ cleanup() {
     fi
     if ((status != 0)); then
         if [[ -n $WORKLOAD_CONTAINER ]]; then
+            for log in /tmp/agent.stdout /tmp/agent.stderr \
+                /tmp/firewall.stdout /tmp/firewall.stderr; do
+                docker exec "$WORKLOAD_CONTAINER" cat "$log" 2>&1 \
+                    | sanitize_diagnostics >&2 || true
+            done
             docker logs --tail 100 "$WORKLOAD_CONTAINER" 2>&1 \
                 | sanitize_diagnostics >&2 || true
         fi
@@ -522,7 +527,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             body = response.read()
             self.send_response(response.status)
             for name, value in response.getheaders():
-                if name.lower() not in {"connection", "transfer-encoding"}:
+                if name.lower() not in {
+                    "connection", "content-length", "transfer-encoding",
+                }:
                     self.send_header(name, value)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -1021,6 +1028,13 @@ PY
         fi
         [[ ! -f $STATE/config-validate.log ]] \
             || cat "$STATE/config-validate.log"
+        for log in "$STATE"/proxy-logs/*; do
+            [[ ! -f $log ]] || tail -n 100 "$log"
+        done
+        for log in "$STATE"/origin.jsonl "$STATE"/parent.jsonl \
+            "$STATE"/provider.jsonl; do
+            [[ ! -f $log ]] || cat "$log"
+        done
         [[ ! -f $STATE/tcpdump.log ]] || cat "$STATE/tcpdump.log"
         ;;
     stop)
@@ -1104,7 +1118,7 @@ control_socket = false
 [container_agent.access_flow_relay]
 setup_timeout = "3s"
 drain_timeout = "5s"
-max_connections = 128
+max_connections = 64
 copy_buffer_bytes_per_direction = 16384
 
 [container_agent.access_flow_relay.presentation]
@@ -1123,7 +1137,7 @@ server_name = "proxy.access-flow.test"
 
 [container_agent.access_flow_relay.routes.transport.trust]
 kind = "pem_bundle"
-path = "/etc/aw-gateway/access-flow-root.pem"
+path = "/run/aw-gateway/trust/access-flow-root.pem"
 
 [[container_agent.access_flow_relay.routes]]
 name = "https"
@@ -1137,7 +1151,7 @@ server_name = "proxy.access-flow.test"
 
 [container_agent.access_flow_relay.routes.transport.trust]
 kind = "pem_bundle"
-path = "/etc/aw-gateway/access-flow-root.pem"
+path = "/run/aw-gateway/trust/access-flow-root.pem"
 EOF
 chmod 0600 "$TMP_DIR/container-agent.toml"
 
@@ -1183,6 +1197,12 @@ cleanup() {
     wait 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
+install -D -o 0 -g 0 -m 0644 \
+    /mnt/aw-gateway/access-flow-root.pem \
+    /run/aw-gateway/trust/access-flow-root.pem
+install -D -o 65534 -g 65534 -m 0400 \
+    /mnt/aw-gateway/private-expected \
+    /run/aw-gateway/private-value
 /opt/aw-gateway/bin/workload-firewall \
     >/tmp/firewall.stdout 2>/tmp/firewall.stderr &
 FIREWALL_PID=$!
@@ -1206,7 +1226,11 @@ for _ in {1..100}; do
         touch /tmp/stack.ready
         break
     fi
-    kill -0 "$AGENT_PID"
+    if ! kill -0 "$AGENT_PID"; then
+        cat /tmp/agent.stderr >&2
+        cat /tmp/firewall.stderr >&2
+        exit 1
+    fi
     sleep 0.05
 done
 [[ -f /tmp/stack.ready ]]
@@ -1223,9 +1247,9 @@ start_workload() {
         --ulimit nofile=4096:4096 \
         --mount "type=bind,src=$AGENT_BIN,dst=/opt/aw-gateway/bin/aw-container-agent,readonly" \
         --mount "type=bind,src=$TMP_DIR/container-agent.toml,dst=/etc/aw-gateway/container-agent.toml,readonly" \
-        --mount "type=bind,src=$TMP_DIR/bundle/access-flow-root.pem,dst=/etc/aw-gateway/access-flow-root.pem,readonly" \
+        --mount "type=bind,src=$TMP_DIR/bundle/access-flow-root.pem,dst=/mnt/aw-gateway/access-flow-root.pem,readonly" \
         --mount "type=bind,src=$TMP_DIR/bundle/mitm-ca-cert.pem,dst=/etc/acl-proxy/mitm-ca-cert.pem,readonly" \
-        --mount "type=bind,src=$TMP_DIR/bundle/private-expected,dst=/run/aw-gateway/private-value,readonly" \
+        --mount "type=bind,src=$TMP_DIR/bundle/private-expected,dst=/mnt/aw-gateway/private-expected,readonly" \
         --mount "type=bind,src=$TMP_DIR/workload-firewall.sh,dst=/opt/aw-gateway/bin/workload-firewall,readonly" \
         --mount "type=bind,src=$TMP_DIR/workload.sh,dst=/usr/local/bin/workload-smoke,readonly" \
         --mount "type=bind,src=$fifo,dst=/run/aw-gateway/identity-token.fifo" \
@@ -1258,7 +1282,8 @@ stop_workload() {
 }
 
 capture_local_evidence() {
-    local label=$1 destination="$TMP_DIR/local-evidence/$label"
+    local label=$1 destination
+    destination="$TMP_DIR/local-evidence/$label"
     mkdir -m 0700 "$destination"
     docker inspect "$WORKLOAD_CONTAINER" >"$destination/container-inspect.json"
     docker logs "$WORKLOAD_CONTAINER" >"$destination/container.stdout" \
@@ -1312,11 +1337,13 @@ docker exec "$WORKLOAD_CONTAINER" sh -eu -c '
 ' || fail "workload launcher retained the bearer or agent exited"
 
 remote_control capture-start
-principal_body=$(request_http http://origin.test/principal)
+principal_body=$(request_http http://origin.test/principal) \
+    || fail "principal policy HTTP flow failed"
 [[ $principal_body == \
     'origin:/principal:identity=absent:private=absent' ]] \
     || fail "principal policy HTTP flow returned an unexpected response"
-group_body=$(request_http http://origin.test/group)
+group_body=$(request_http http://origin.test/group) \
+    || fail "group policy HTTP flow failed"
 [[ $group_body == 'origin:/group:identity=absent:private=absent' ]] \
     || fail "group policy HTTP flow returned an unexpected response"
 delegate_body=$(
@@ -1326,10 +1353,11 @@ delegate_body=$(
             --noproxy "*" --resolve "origin.test:80:198.18.0.10" \
             -H "x-rt05-private: $private" http://origin.test/delegate
     '
-)
+) || fail "delegate/private-field HTTP flow failed"
 [[ $delegate_body == 'origin:/delegate:identity=absent:private=absent' ]] \
     || fail "delegate/private-field HTTP flow returned an unexpected response"
-https_body=$(request_https https://origin.test/secure)
+https_body=$(request_https https://origin.test/secure) \
+    || fail "nested HTTPS flow failed"
 [[ $https_body == 'origin:/secure:identity=absent:private=absent' ]] \
     || fail "nested HTTPS flow returned an unexpected response"
 keepalive_connects=$(docker exec --user 65534:65534 "$WORKLOAD_CONTAINER" curl \
@@ -1337,7 +1365,8 @@ keepalive_connects=$(docker exec --user 65534:65534 "$WORKLOAD_CONTAINER" curl \
     --write-out '%{num_connects}\n' --noproxy '*' \
     --resolve 'origin.test:80:198.18.0.10' \
     --output /dev/null http://origin.test/keepalive-one \
-    --output /dev/null http://origin.test/keepalive-two)
+    --output /dev/null http://origin.test/keepalive-two) \
+    || fail "keepalive HTTP flow failed"
 KEEPALIVE_CONNECTIONS=$(awk '{sum += $1} END {print sum + 0}' \
     <<<"$keepalive_connects")
 [[ $KEEPALIVE_CONNECTIONS == 1 ]] \
