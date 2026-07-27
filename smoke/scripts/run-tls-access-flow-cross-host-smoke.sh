@@ -861,15 +861,15 @@ TAG=$TAG
 EOF
         docker image inspect "$REMOTE_IMAGE" >/dev/null
         docker network create "$NETWORK" >/dev/null
-        docker run -d --pull=never --name "$ORIGIN_CONTAINER" \
+        docker run -d --pull=never --user 0:0 --name "$ORIGIN_CONTAINER" \
             --network "$NETWORK" --network-alias origin.test \
-            --mount "type=bind,src=$BUNDLE,dst=/bundle,readonly" \
-            --mount "type=bind,src=$STATE,dst=/state" \
+            --volume "$BUNDLE:/bundle:ro,z" \
+            --volume "$STATE:/state:rw,z" \
             "$REMOTE_IMAGE" python3 /bundle/origin.py >/dev/null
-        docker run -d --pull=never --name "$PARENT_CONTAINER" \
+        docker run -d --pull=never --user 0:0 --name "$PARENT_CONTAINER" \
             --network "$NETWORK" --network-alias parent \
-            --mount "type=bind,src=$BUNDLE,dst=/bundle,readonly" \
-            --mount "type=bind,src=$STATE,dst=/state" \
+            --volume "$BUNDLE:/bundle:ro,z" \
+            --volume "$STATE:/state:rw,z" \
             "$REMOTE_IMAGE" python3 /bundle/parent.py >/dev/null
         sudo -n iptables -w 5 -I INPUT 1 \
             -d "$PUBLIC_ADDRESS/32" -p tcp \
@@ -887,20 +887,20 @@ EOF
             -d "$PUBLIC_ADDRESS/32" -p tcp \
             -m multiport --dports "$HTTP_PORT,$HTTPS_PORT" \
             -m comment --comment "$TAG.deny" -j DROP
-        docker run --rm --pull=never \
+        docker run --rm --pull=never --user 0:0 \
             --network "$NETWORK" \
-            --mount "type=bind,src=$BUNDLE,dst=/bundle,readonly" \
-            --mount "type=bind,src=$STATE,dst=/state" \
+            --volume "$BUNDLE:/bundle:ro,z" \
+            --volume "$STATE:/state:rw,z" \
             --env HOME=/state/home \
             "$REMOTE_IMAGE" /bundle/acl-proxy \
             config validate --config /bundle/acl-proxy.toml \
             >"$STATE/config-validate.log" 2>&1
-        docker run -d --pull=never --name "$PROXY_CONTAINER" \
+        docker run -d --pull=never --user 0:0 --name "$PROXY_CONTAINER" \
             --network "$NETWORK" \
             --publish "$PUBLIC_ADDRESS:$HTTP_PORT:$HTTP_PORT/tcp" \
             --publish "$PUBLIC_ADDRESS:$HTTPS_PORT:$HTTPS_PORT/tcp" \
-            --mount "type=bind,src=$BUNDLE,dst=/bundle,readonly" \
-            --mount "type=bind,src=$STATE,dst=/state" \
+            --volume "$BUNDLE:/bundle:ro,z" \
+            --volume "$STATE:/state:rw,z" \
             --env HOME=/state/home \
             "$REMOTE_IMAGE" /bundle/acl-proxy \
             run --config /bundle/acl-proxy.toml >/dev/null

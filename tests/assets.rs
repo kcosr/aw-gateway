@@ -464,6 +464,9 @@ fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() 
     assert!(!smoke.contains("trap stop_all ERR"));
     assert!(smoke.contains("cat \"$STATE/config-validate.log\""));
     assert!(smoke.contains("if docker inspect \"$PROXY_CONTAINER\""));
+    assert_eq!(smoke.matches("--user 0:0").count(), 4);
+    assert_eq!(smoke.matches("$BUNDLE:/bundle:ro,z").count(), 4);
+    assert_eq!(smoke.matches("$STATE:/state:rw,z").count(), 4);
 }
 
 #[test]
