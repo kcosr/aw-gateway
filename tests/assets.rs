@@ -470,6 +470,7 @@ fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() 
     assert!(!smoke.contains("http = http.server.ThreadingHTTPServer"));
     assert!(!smoke.contains("retire_timeout = \"2s\""));
     assert!(smoke.contains("retire_timeout = \"30s\""));
+    assert!(smoke.contains("max_inflight_body_bytes = 134217728"));
 }
 
 #[test]
