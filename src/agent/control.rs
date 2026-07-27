@@ -38,76 +38,77 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 pub(super) async fn run_control_socket(state: Arc<AgentState>, path: &Path) -> anyhow::Result<()> {
     let listener = bind_private_unix_socket(path, state.socket_owner).await?;
-    let mut shutdown = Box::pin(shutdown_signal());
     let connection_slots = Arc::new(Semaphore::new(MAX_CONTROL_CONNECTIONS));
     let session_slots = Arc::new(Semaphore::new(MAX_CONTROL_SESSION_HOLDS));
     loop {
-        tokio::select! {
-            result = &mut shutdown => {
-                result?;
-                let delay = shutdown_watchdog_delay(&state, Duration::from_secs(30)).await;
-                schedule_forced_exit_after(
-                    state.clone(),
-                    delay,
-                    "control-signal",
-                    ForcedExitStatus::Success,
-                );
-                shutdown_agent(state).await;
-                return Ok(());
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                tracing::warn!(error = %err, "control socket accept failed");
+                sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
             }
-            result = listener.accept() => {
-                let (stream, _) = match result {
-                    Ok(accepted) => accepted,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "control socket accept failed");
-                        sleep(ACCEPT_ERROR_BACKOFF).await;
-                        continue;
-                    }
-                };
-                let Ok(connection_permit) = connection_slots.clone().try_acquire_owned() else {
-                    tracing::warn!(
-                        limit = MAX_CONTROL_CONNECTIONS,
-                        "control connection limit reached; rejecting connection"
-                    );
-                    continue;
-                };
-                let state = state.clone();
-                let session_slots = session_slots.clone();
-                tokio::spawn(async move {
-                    let _connection_permit = connection_permit;
-                    if let Err(err) = handle_control_connection(state, stream, session_slots).await {
-                        tracing::warn!(error = %err, "control connection failed");
-                    }
-                });
+        };
+        let Ok(connection_permit) = connection_slots.clone().try_acquire_owned() else {
+            tracing::warn!(
+                limit = MAX_CONTROL_CONNECTIONS,
+                "control connection limit reached; rejecting connection"
+            );
+            continue;
+        };
+        let state = state.clone();
+        let session_slots = session_slots.clone();
+        tokio::spawn(async move {
+            let _connection_permit = connection_permit;
+            if let Err(err) = handle_control_connection(state, stream, session_slots).await {
+                tracing::warn!(error = %err, "control connection failed");
             }
-        }
+        });
     }
 }
 
-pub(super) async fn wait_for_shutdown_signal(state: Arc<AgentState>) -> anyhow::Result<()> {
-    shutdown_signal().await?;
-    let delay = shutdown_watchdog_delay(&state, Duration::from_secs(30)).await;
-    schedule_forced_exit_after(state.clone(), delay, "signal", ForcedExitStatus::Success);
-    shutdown_agent(state).await;
-    Ok(())
-}
-
-async fn shutdown_signal() -> anyhow::Result<()> {
+pub(super) async fn run_signal_broker(state: Arc<AgentState>) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .context("install SIGTERM handler")?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                result.context("wait for Ctrl-C")?;
+        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .context("install SIGHUP handler")?;
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::pin!(ctrl_c);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut ctrl_c => {
+                    result.context("wait for Ctrl-C")?;
+                    break;
+                }
+                received = sigterm.recv() => {
+                    if received.is_none() {
+                        anyhow::bail!("SIGTERM signal stream closed");
+                    }
+                    break;
+                }
+                received = sighup.recv() => {
+                    if received.is_none() {
+                        anyhow::bail!("SIGHUP signal stream closed");
+                    }
+                    if let Some(relay) = &state.access_flow_relay {
+                        let _ = relay.initiate_security_reload();
+                    } else {
+                        tracing::debug!("SIGHUP ignored because no access flow relay is configured");
+                    }
+                }
             }
-            _ = sigterm.recv() => {}
         }
     }
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await.context("wait for Ctrl-C")?;
     }
+    let delay = shutdown_watchdog_delay(&state, Duration::from_secs(30)).await;
+    schedule_forced_exit_after(state.clone(), delay, "signal", ForcedExitStatus::Success);
+    shutdown_agent(state).await;
     Ok(())
 }
 

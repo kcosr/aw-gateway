@@ -5,11 +5,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddrV4;
 use std::num::{NonZeroU16, NonZeroUsize};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use access_flow_relay::{
     AccessFlowRelayPlan, AccessFlowRelayPlanError, AccessFlowRoute, AccessFlowRouteName,
 };
+use access_flow_tls::{TlsAccessFlowAddress, TlsAccessFlowServerName};
 use access_flow_unix::{NormalizedUnixSocketPath, UnixAccessFlowEndpoint, UnixExecutionTarget};
 use access_identity::{IdentityPresentation, SensitiveBearer};
 
@@ -576,6 +578,25 @@ impl AccessFlowRelayConfig {
         mode: AccessFlowRelayValidationMode,
         presentation: IdentityPresentation,
     ) -> anyhow::Result<CompiledAccessFlowRelayConfig> {
+        let has_tls_route = self
+            .routes
+            .iter()
+            .any(|route| matches!(&route.transport, AccessFlowRelayTransport::TlsTcp { .. }));
+        if has_tls_route
+            && !matches!(
+                &self.presentation,
+                AccessFlowRelayPresentation::BearerEnvironment { .. }
+            )
+        {
+            anyhow::bail!(
+                "container_agent.access_flow_relay TLS routes require bearer_environment presentation"
+            );
+        }
+        if has_tls_route && !matches!(&presentation, IdentityPresentation::Bearer(_)) {
+            anyhow::bail!(
+                "container_agent.access_flow_relay TLS routes require an activated bearer presentation"
+            );
+        }
         let setup_timeout = parse_duration(&self.setup_timeout)
             .context("container_agent.access_flow_relay.setup_timeout")?;
         let drain_timeout = parse_duration(&self.drain_timeout)
@@ -611,8 +632,17 @@ impl AccessFlowRelayConfig {
         }
 
         let mut routes = Vec::with_capacity(self.routes.len());
+        let mut tls_index = 0_usize;
         for route in &self.routes {
-            routes.push(route.compile(mode)?);
+            let route_tls_index =
+                matches!(&route.transport, AccessFlowRelayTransport::TlsTcp { .. })
+                    .then_some(tls_index);
+            routes.push(route.compile(mode, route_tls_index)?);
+            if route_tls_index.is_some() {
+                tls_index = tls_index
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("access flow TLS route count overflow"))?;
+            }
         }
         let plan = AccessFlowRelayPlan::new(
             routes,
@@ -635,21 +665,32 @@ impl AccessFlowRelayConfig {
                 AccessFlowRelayTransport::Unix { path } => {
                     *path = template::render(path, vars)?;
                 }
+                AccessFlowRelayTransport::TlsTcp { .. } => {}
             }
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum AccessFlowRelayValidationMode {
     Gateway,
     Agent,
 }
 
 pub(crate) struct CompiledAccessFlowRelayConfig {
-    pub(crate) plan: AccessFlowRelayPlan<UnixAccessFlowEndpoint>,
+    pub(crate) plan: AccessFlowRelayPlan<CompiledAccessFlowRelayEndpoint>,
     pub(crate) drain_timeout: Duration,
+}
+
+pub(crate) enum CompiledAccessFlowRelayEndpoint {
+    Unix(UnixAccessFlowEndpoint),
+    TlsTcp {
+        tls_index: usize,
+        address: TlsAccessFlowAddress,
+        server_name: TlsAccessFlowServerName,
+        trust_path: PathBuf,
+    },
 }
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -740,34 +781,35 @@ impl AccessFlowRelayRoute {
     fn compile(
         &self,
         mode: AccessFlowRelayValidationMode,
-    ) -> anyhow::Result<AccessFlowRoute<UnixAccessFlowEndpoint>> {
-        let (listen, path) = match mode {
+        tls_index: Option<usize>,
+    ) -> anyhow::Result<AccessFlowRoute<CompiledAccessFlowRelayEndpoint>> {
+        let listen = match mode {
             AccessFlowRelayValidationMode::Gateway => {
                 validate_template(
                     "container_agent.access_flow_relay.routes.listen",
                     &self.listen,
                     GATEWAY_TEMPLATE_VARS,
                 )?;
-                let path = match &self.transport {
+                match &self.transport {
                     AccessFlowRelayTransport::Unix { path } => {
                         validate_template(
                             "container_agent.access_flow_relay.routes.transport.path",
                             path,
                             GATEWAY_TEMPLATE_VARS,
                         )?;
-                        path
                     }
-                };
+                    AccessFlowRelayTransport::TlsTcp {
+                        address,
+                        server_name,
+                        trust,
+                    } => validate_tls_transport_templates(address, server_name, trust)?,
+                }
                 if self.listen.contains('{') {
                     anyhow::bail!(
                         "container_agent.access_flow_relay.routes.listen must be a literal IPv4 loopback address"
                     );
                 }
-                let listen = self.listen.parse::<SocketAddrV4>()?;
-                if path.contains('{') {
-                    return self.compile_placeholder(listen);
-                }
-                (listen, path)
+                self.listen.parse::<SocketAddrV4>()?
             }
             AccessFlowRelayValidationMode::Agent => {
                 validate_template(
@@ -775,43 +817,66 @@ impl AccessFlowRelayRoute {
                     &self.listen,
                     &[],
                 )?;
-                let path = match &self.transport {
+                match &self.transport {
                     AccessFlowRelayTransport::Unix { path } => {
                         validate_template(
                             "container_agent.access_flow_relay.routes.transport.path",
                             path,
                             &[],
                         )?;
-                        path
                     }
-                };
-                (self.listen.parse::<SocketAddrV4>()?, path)
+                    AccessFlowRelayTransport::TlsTcp {
+                        address,
+                        server_name,
+                        trust,
+                    } => validate_tls_transport_templates(address, server_name, trust)?,
+                }
+                self.listen.parse::<SocketAddrV4>()?
             }
         };
-        self.compile_values(listen, path)
-    }
 
-    fn compile_placeholder(
-        &self,
-        listen: SocketAddrV4,
-    ) -> anyhow::Result<AccessFlowRoute<UnixAccessFlowEndpoint>> {
-        let name = AccessFlowRouteName::new(self.name.clone()).map_err(map_relay_plan_error)?;
-        let placeholder_path = format!("/run/aw-gateway/{}.sock", name.as_str());
-        self.compile_values(listen, &placeholder_path)
+        let endpoint = match &self.transport {
+            AccessFlowRelayTransport::Unix { path } => {
+                let path = if mode == AccessFlowRelayValidationMode::Gateway && path.contains('{') {
+                    format!(
+                        "/run/aw-gateway/{}.sock",
+                        AccessFlowRouteName::new(self.name.clone())
+                            .map_err(map_relay_plan_error)?
+                            .as_str()
+                    )
+                } else {
+                    path.clone()
+                };
+                CompiledAccessFlowRelayEndpoint::Unix(compile_unix_endpoint(&path)?)
+            }
+            AccessFlowRelayTransport::TlsTcp {
+                address,
+                server_name,
+                trust,
+            } => {
+                let tls_index =
+                    tls_index.expect("the relay compiler assigns an index to every TLS transport");
+                let AccessFlowRelayTrust::PemBundle { path } = trust;
+                CompiledAccessFlowRelayEndpoint::TlsTcp {
+                    tls_index,
+                    address: TlsAccessFlowAddress::parse(address).context(
+                        "container_agent.access_flow_relay.routes.transport.address is invalid",
+                    )?,
+                    server_name: TlsAccessFlowServerName::parse(server_name).context(
+                        "container_agent.access_flow_relay.routes.transport.server_name is invalid",
+                    )?,
+                    trust_path: normalized_absolute_trust_path(path)?,
+                }
+            }
+        };
+        self.compile_values(listen, endpoint)
     }
 
     fn compile_values(
         &self,
         listen: SocketAddrV4,
-        path: &str,
-    ) -> anyhow::Result<AccessFlowRoute<UnixAccessFlowEndpoint>> {
-        let endpoint = UnixAccessFlowEndpoint::new(
-            NormalizedUnixSocketPath::new(path)
-                .context("container_agent.access_flow_relay.routes.transport.path is invalid")?,
-        );
-        endpoint.validate_for(UnixExecutionTarget::Linux).context(
-            "container_agent.access_flow_relay.routes.transport.path exceeds Linux pathname capacity",
-        )?;
+        endpoint: CompiledAccessFlowRelayEndpoint,
+    ) -> anyhow::Result<AccessFlowRoute<CompiledAccessFlowRelayEndpoint>> {
         let ports = self
             .allowed_destination_ports
             .iter()
@@ -834,10 +899,74 @@ impl AccessFlowRelayRoute {
     }
 }
 
+fn compile_unix_endpoint(path: &str) -> anyhow::Result<UnixAccessFlowEndpoint> {
+    let endpoint = UnixAccessFlowEndpoint::new(
+        NormalizedUnixSocketPath::new(path)
+            .context("container_agent.access_flow_relay.routes.transport.path is invalid")?,
+    );
+    endpoint.validate_for(UnixExecutionTarget::Linux).context(
+        "container_agent.access_flow_relay.routes.transport.path exceeds Linux pathname capacity",
+    )?;
+    Ok(endpoint)
+}
+
+fn validate_tls_transport_templates(
+    address: &str,
+    server_name: &str,
+    trust: &AccessFlowRelayTrust,
+) -> anyhow::Result<()> {
+    validate_template(
+        "container_agent.access_flow_relay.routes.transport.address",
+        address,
+        &[],
+    )?;
+    validate_template(
+        "container_agent.access_flow_relay.routes.transport.server_name",
+        server_name,
+        &[],
+    )?;
+    let AccessFlowRelayTrust::PemBundle { path } = trust;
+    validate_template(
+        "container_agent.access_flow_relay.routes.transport.trust.path",
+        path,
+        &[],
+    )
+}
+
+fn normalized_absolute_trust_path(path: &str) -> anyhow::Result<PathBuf> {
+    let mut segments = path.split('/');
+    let rooted = segments.next() == Some("");
+    let segments = segments.collect::<Vec<_>>();
+    if !rooted
+        || segments.is_empty()
+        || segments
+            .iter()
+            .any(|segment| segment.is_empty() || matches!(*segment, "." | ".."))
+    {
+        anyhow::bail!(
+            "container_agent.access_flow_relay.routes.transport.trust.path must be a normalized absolute non-root path"
+        );
+    }
+    Ok(PathBuf::from(path))
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AccessFlowRelayTransport {
-    Unix { path: String },
+    Unix {
+        path: String,
+    },
+    TlsTcp {
+        address: String,
+        server_name: String,
+        trust: AccessFlowRelayTrust,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AccessFlowRelayTrust {
+    PemBundle { path: String },
 }
 
 fn map_relay_plan_error(error: AccessFlowRelayPlanError) -> anyhow::Error {

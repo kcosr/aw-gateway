@@ -1,0 +1,47 @@
+schema_version = "1"
+
+[logging]
+level = "info"
+console = true
+
+[container_agent]
+enabled = true
+control_socket = false
+
+[container_agent.access_flow_relay]
+setup_timeout = "5s"
+drain_timeout = "10s"
+max_connections = 128
+copy_buffer_bytes_per_direction = 16384
+
+[container_agent.access_flow_relay.presentation]
+kind = "bearer_environment"
+variable = "AW_IDENTITY_TOKEN"
+
+[[container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[container_agent.access_flow_relay.routes.transport]
+kind = "tls_tcp"
+address = "proxy.example.com:7443"
+server_name = "proxy.example.com"
+
+[container_agent.access_flow_relay.routes.transport.trust]
+kind = "pem_bundle"
+path = "/etc/aw-gateway/acl-proxy-roots.pem"
+
+[[container_agent.access_flow_relay.routes]]
+name = "https"
+listen = "127.0.0.1:3129"
+allowed_destination_ports = [443]
+
+[container_agent.access_flow_relay.routes.transport]
+kind = "tls_tcp"
+address = "proxy.example.com:7444"
+server_name = "proxy.example.com"
+
+[container_agent.access_flow_relay.routes.transport.trust]
+kind = "pem_bundle"
+path = "/etc/aw-gateway/acl-proxy-roots.pem"

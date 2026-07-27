@@ -5,10 +5,8 @@ use access_flow_relay::{
     AccessFlowRelay, AccessFlowRelayEvent, AccessFlowRelayEventKind, AccessFlowRelayFailure,
     AccessFlowRelayObserver, AccessFlowRelayResourceBudget, RunningAccessFlowRelay,
 };
-use access_flow_unix::UnixAccessFlowConnector;
 use access_identity::IdentityPresentation;
 use anyhow::Context;
-use std::fs::FileType;
 use std::os::unix::fs::FileTypeExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -20,8 +18,11 @@ use tokio_util::sync::CancellationToken;
 use crate::agent_control::{
     AccessFlowRelayRouteStatus, AccessFlowRelayStateName, AccessFlowRelayStatus,
 };
-use crate::config::{AccessFlowRelayConfig, CompiledAccessFlowRelayConfig};
+use crate::config::{
+    AccessFlowRelayConfig, CompiledAccessFlowRelayConfig, CompiledAccessFlowRelayEndpoint,
+};
 
+use super::relay_transport::{PendingRelayTransportReload, RelayTransportRuntime};
 use super::service::ManagedService;
 use super::state::AgentState;
 
@@ -45,6 +46,7 @@ pub(super) enum RelayFatalKind {
 }
 
 enum RelayCommand {
+    ReloadSecurity,
     CloseAdmission(oneshot::Sender<()>),
     Shutdown {
         deadline: Instant,
@@ -63,12 +65,16 @@ pub(super) struct RelayControl {
     route_names: Box<[String]>,
     active_flows: Arc<AtomicUsize>,
     accepting: AtomicBool,
+    security_healthy: Arc<AtomicBool>,
+    reload_in_progress: AtomicBool,
     phase: AtomicU8,
     command_tx: mpsc::Sender<RelayCommand>,
     startup_cancellation: RelayCancellation,
     drain_timeout: Duration,
     #[cfg(test)]
     activation_pause: Mutex<Option<ActivationPause>>,
+    #[cfg(test)]
+    reload_pause: Mutex<Option<ReloadWorkerPause>>,
 }
 
 impl RelayControl {
@@ -87,12 +93,16 @@ impl RelayControl {
                     .collect(),
                 active_flows: Arc::new(AtomicUsize::new(0)),
                 accepting: AtomicBool::new(false),
+                security_healthy: Arc::new(AtomicBool::new(false)),
+                reload_in_progress: AtomicBool::new(false),
                 phase: AtomicU8::new(RELAY_PHASE_PREPARING),
                 command_tx,
                 startup_cancellation,
                 drain_timeout,
                 #[cfg(test)]
                 activation_pause: Mutex::new(None),
+                #[cfg(test)]
+                reload_pause: Mutex::new(None),
             }),
             RelayCommandReceiver(command_rx),
         )
@@ -100,7 +110,9 @@ impl RelayControl {
 
     pub(super) async fn status(&self) -> AccessFlowRelayStatus {
         let state = *self.state.lock().await;
-        let accepting = self.accepting.load(Ordering::Acquire);
+        let accepting = self.phase.load(Ordering::Acquire) == RELAY_PHASE_ACTIVE
+            && self.accepting.load(Ordering::Acquire)
+            && self.security_healthy.load(Ordering::Acquire);
         AccessFlowRelayStatus {
             state,
             ready: state == AccessFlowRelayStateName::Accepting && accepting,
@@ -123,6 +135,7 @@ impl RelayControl {
     pub(super) fn is_ready(&self) -> bool {
         self.phase.load(Ordering::Acquire) == RELAY_PHASE_ACTIVE
             && self.accepting.load(Ordering::Acquire)
+            && self.security_healthy.load(Ordering::Acquire)
     }
 
     pub(super) fn drain_timeout(&self) -> Duration {
@@ -132,6 +145,7 @@ impl RelayControl {
     pub(super) async fn close_admission(&self) {
         let phase = self.phase.swap(RELAY_PHASE_CLOSING, Ordering::AcqRel);
         self.accepting.store(false, Ordering::Release);
+        self.security_healthy.store(false, Ordering::Release);
         let mut state = self.state.lock().await;
         if *state != AccessFlowRelayStateName::Failed {
             *state = AccessFlowRelayStateName::Draining;
@@ -149,6 +163,40 @@ impl RelayControl {
         {
             let _ = wait.await;
         }
+    }
+
+    pub(super) fn initiate_security_reload(self: &Arc<Self>) -> Result<(), ()> {
+        if self.phase.load(Ordering::Acquire) != RELAY_PHASE_ACTIVE {
+            tracing::debug!(
+                category = "security_material",
+                "access flow relay trust reload was rejected"
+            );
+            return Err(());
+        }
+        if self
+            .reload_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            tracing::debug!(
+                category = "security_material",
+                "access flow relay concurrent trust reload was rejected"
+            );
+            return Err(());
+        }
+        if self
+            .command_tx
+            .try_send(RelayCommand::ReloadSecurity)
+            .is_err()
+        {
+            self.reload_in_progress.store(false, Ordering::Release);
+            tracing::debug!(
+                category = "security_material",
+                "access flow relay trust reload was not started"
+            );
+            return Err(());
+        }
+        Ok(())
     }
 
     pub(super) async fn shutdown(&self, deadline: Instant) {
@@ -203,6 +251,20 @@ impl RelayControl {
         let _ = pause.reached.send(());
         let _ = pause.resume.await;
     }
+
+    #[cfg(test)]
+    async fn pause_blocking_reload(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, wait_for_reached) = std::sync::mpsc::channel();
+        let (resume, wait_for_resume) = std::sync::mpsc::channel();
+        let previous = self.reload_pause.lock().await.replace(ReloadWorkerPause {
+            reached,
+            resume: wait_for_resume,
+        });
+        assert!(previous.is_none(), "reload pause already installed");
+        (wait_for_reached, resume)
+    }
 }
 
 pub(super) struct RelayCommandReceiver(mpsc::Receiver<RelayCommand>);
@@ -212,6 +274,13 @@ pub(super) struct RelayCommandReceiver(mpsc::Receiver<RelayCommand>);
 struct ActivationPause {
     reached: oneshot::Sender<()>,
     resume: oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ReloadWorkerPause {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -269,6 +338,7 @@ impl AccessFlowRelayObserver for RelayObserver {
         tracing::debug!(
             event = ?event.kind,
             route = event.route.as_ref().map(|route| route.as_str()),
+            close_category = ?event.close_category,
             active_flows = event.active_flows,
             "access flow relay event"
         );
@@ -324,10 +394,21 @@ async fn run_relay(
         )
         .context("compile access flow relay configuration")?;
     probe_unix_endpoints(&compiled)?;
-    let budget = relay_resource_budget(state.bridge_enabled, services.len())?;
+    let reload_descriptor_reserve =
+        RelayTransportRuntime::reload_descriptor_reserve(&compiled.plan)
+            .context("project access flow relay transport reload resources")?;
+    let budget = relay_resource_budget(
+        state.bridge_enabled,
+        services.len(),
+        reload_descriptor_reserve,
+    )?;
+    let transport =
+        RelayTransportRuntime::activate(&compiled.plan, Arc::clone(&control.security_healthy))
+            .await
+            .context("activate access flow relay transport")?;
     let relay = AccessFlowRelay::new(
         compiled.plan,
-        UnixAccessFlowConnector::new(),
+        transport.connector(),
         Arc::new(RelayObserver {
             active_flows: Arc::clone(&control.active_flows),
         }),
@@ -375,7 +456,15 @@ async fn run_relay(
     } else {
         control.accepting.store(false, Ordering::Release);
     }
-    run_active_relay(running, compiled.drain_timeout, state, control, commands).await
+    run_active_relay(
+        running,
+        transport,
+        compiled.drain_timeout,
+        state,
+        control,
+        commands,
+    )
+    .await
 }
 
 async fn wait_for_start_dependencies(
@@ -420,6 +509,10 @@ async fn handle_start_command(
     control: &RelayControl,
 ) -> Option<StartupDisposition> {
     match command {
+        Some(RelayCommand::ReloadSecurity) => {
+            finish_security_reload(control, ReloadFinish::Rejected, Err(()));
+            None
+        }
         Some(RelayCommand::CloseAdmission(completed)) => {
             control.startup_cancellation.cancel();
             control.accepting.store(false, Ordering::Release);
@@ -454,6 +547,9 @@ async fn finish_cancelled_start(
     control.accepting.store(false, Ordering::Release);
     while let Some(command) = commands.recv().await {
         match command {
+            RelayCommand::ReloadSecurity => {
+                finish_security_reload(control, ReloadFinish::Rejected, Err(()));
+            }
             RelayCommand::CloseAdmission(completed) => {
                 let _ = completed.send(());
             }
@@ -474,14 +570,22 @@ async fn finish_cancelled_start(
 
 async fn run_active_relay(
     mut running: RunningAccessFlowRelay,
+    transport: RelayTransportRuntime,
     configured_drain_timeout: Duration,
     state: &AgentState,
     control: &RelayControl,
     commands: &mut mpsc::Receiver<RelayCommand>,
 ) -> anyhow::Result<()> {
+    let mut pending_reload = None;
     loop {
         tokio::select! {
             failure = running.wait_for_failure() => {
+                transport.close();
+                finish_pending_reload(
+                    control,
+                    &mut pending_reload,
+                    ReloadFinish::Shutdown,
+                ).await;
                 return begin_failed_relay_shutdown(
                     running,
                     configured_drain_timeout,
@@ -494,13 +598,66 @@ async fn run_active_relay(
             }
             command = commands.recv() => {
                 match command {
+                    Some(RelayCommand::ReloadSecurity) => {
+                        if pending_reload.is_some() {
+                            tracing::debug!(
+                                category = "security_material",
+                                "access flow relay concurrent trust reload was rejected"
+                            );
+                        } else {
+                            #[cfg(test)]
+                            let reload_pause = control.reload_pause.lock().await.take();
+                            #[cfg(test)]
+                            let reload = if let Some(reload_pause) = reload_pause {
+                                transport.begin_reload_with_hook(move || {
+                                    let _ = reload_pause.reached.send(());
+                                    let _ = reload_pause.resume.recv();
+                                })
+                            } else {
+                                transport.begin_reload()
+                            };
+                            #[cfg(not(test))]
+                            let reload = transport.begin_reload();
+                            match reload {
+                                Ok(Some(reload)) => {
+                                    pending_reload = Some(reload);
+                                    tracing::debug!(
+                                        category = "security_material",
+                                        "access flow relay trust reload started"
+                                    );
+                                }
+                                Ok(None) => finish_security_reload(
+                                    control,
+                                    ReloadFinish::Completed,
+                                    Ok(()),
+                                ),
+                                Err(_) => finish_security_reload(
+                                    control,
+                                    ReloadFinish::Completed,
+                                    Err(()),
+                                ),
+                            }
+                        }
+                    }
                     Some(RelayCommand::CloseAdmission(completed)) => {
+                        transport.close();
+                        finish_pending_reload(
+                            control,
+                            &mut pending_reload,
+                            ReloadFinish::Shutdown,
+                        ).await;
                         control.accepting.store(false, Ordering::Release);
                         control.set_state(AccessFlowRelayStateName::Draining).await;
                         running.close_admission().await;
                         let _ = completed.send(());
                     }
                     Some(RelayCommand::Shutdown { deadline, completed }) => {
+                        transport.close();
+                        finish_pending_reload(
+                            control,
+                            &mut pending_reload,
+                            ReloadFinish::Shutdown,
+                        ).await;
                         let configured_deadline = Instant::now()
                             .checked_add(configured_drain_timeout)
                             .unwrap_or(deadline);
@@ -514,12 +671,24 @@ async fn run_active_relay(
                         ).await;
                     }
                     None => {
+                        transport.close();
+                        finish_pending_reload(
+                            control,
+                            &mut pending_reload,
+                            ReloadFinish::Shutdown,
+                        ).await;
                         control.accepting.store(false, Ordering::Release);
                         let _ = running.shutdown(Instant::now()).await;
                         return Err(anyhow::anyhow!("access flow relay control channel closed"));
                     }
                     #[cfg(test)]
                     Some(RelayCommand::InjectFailure { failure, observed }) => {
+                        transport.close();
+                        finish_pending_reload(
+                            control,
+                            &mut pending_reload,
+                            ReloadFinish::Shutdown,
+                        ).await;
                         return begin_failed_relay_shutdown(
                             running,
                             configured_drain_timeout,
@@ -533,7 +702,68 @@ async fn run_active_relay(
                     }
                 }
             }
+            result = wait_for_reload(&mut pending_reload), if pending_reload.is_some() => {
+                let pending = pending_reload
+                    .take()
+                    .expect("completed reload remains owned by the relay loop");
+                drop(pending);
+                finish_security_reload(
+                    control,
+                    ReloadFinish::Completed,
+                    result.map_err(|_| ()),
+                );
+            }
         }
+    }
+}
+
+async fn wait_for_reload(
+    pending: &mut Option<PendingRelayTransportReload>,
+) -> Result<(), super::relay_transport::RelayTransportError> {
+    pending
+        .as_mut()
+        .expect("reload wait is guarded by task presence")
+        .wait()
+        .await
+}
+
+async fn finish_pending_reload(
+    control: &RelayControl,
+    pending: &mut Option<PendingRelayTransportReload>,
+    finish: ReloadFinish,
+) {
+    if let Some(pending) = pending.take() {
+        let result = pending.complete().await.map_err(|_| ());
+        finish_security_reload(control, finish, result);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReloadFinish {
+    Completed,
+    Rejected,
+    Shutdown,
+}
+
+fn finish_security_reload(control: &RelayControl, finish: ReloadFinish, result: Result<(), ()>) {
+    control.reload_in_progress.store(false, Ordering::Release);
+    match (finish, result) {
+        (ReloadFinish::Completed, Ok(())) => tracing::debug!(
+            category = "security_material",
+            "access flow relay trust reload completed"
+        ),
+        (ReloadFinish::Completed, Err(())) => tracing::warn!(
+            category = "security_material",
+            "access flow relay trust reload failed"
+        ),
+        (ReloadFinish::Rejected, _) => tracing::debug!(
+            category = "security_material",
+            "access flow relay trust reload was rejected"
+        ),
+        (ReloadFinish::Shutdown, _) => tracing::debug!(
+            category = "security_material",
+            "access flow relay trust reload joined during shutdown"
+        ),
     }
 }
 
@@ -544,6 +774,7 @@ async fn finish_shutdown_command(
     completed: oneshot::Sender<()>,
 ) -> anyhow::Result<()> {
     control.accepting.store(false, Ordering::Release);
+    control.security_healthy.store(false, Ordering::Release);
     if result.is_err() {
         control.set_state(AccessFlowRelayStateName::Failed).await;
         state.publish_relay_fatal(RelayFatalKind::RuntimeFailure);
@@ -564,6 +795,7 @@ async fn begin_failed_relay_shutdown(
     observed: Option<oneshot::Sender<()>>,
 ) -> anyhow::Result<()> {
     control.accepting.store(false, Ordering::Release);
+    control.security_healthy.store(false, Ordering::Release);
     control.phase.store(RELAY_PHASE_CLOSING, Ordering::Release);
     control.set_state(AccessFlowRelayStateName::Failed).await;
     running.close_admission().await;
@@ -571,17 +803,28 @@ async fn begin_failed_relay_shutdown(
     if let Some(observed) = observed {
         let _ = observed.send(());
     }
-    await_failed_relay_shutdown(running, configured_drain_timeout, commands, failure).await
+    await_failed_relay_shutdown(
+        running,
+        configured_drain_timeout,
+        control,
+        commands,
+        failure,
+    )
+    .await
 }
 
 async fn await_failed_relay_shutdown(
     running: RunningAccessFlowRelay,
     configured_drain_timeout: Duration,
+    control: &RelayControl,
     commands: &mut mpsc::Receiver<RelayCommand>,
     failure: access_flow_relay::AccessFlowRelayFailure,
 ) -> anyhow::Result<()> {
     while let Some(command) = commands.recv().await {
         match command {
+            RelayCommand::ReloadSecurity => {
+                finish_security_reload(control, ReloadFinish::Rejected, Err(()));
+            }
             RelayCommand::CloseAdmission(completed) => {
                 running.close_admission().await;
                 let _ = completed.send(());
@@ -612,14 +855,17 @@ async fn await_failed_relay_shutdown(
 
 fn probe_unix_endpoints(compiled: &CompiledAccessFlowRelayConfig) -> anyhow::Result<()> {
     for route in compiled.plan.routes() {
-        let path = route.endpoint().path().as_str();
+        let CompiledAccessFlowRelayEndpoint::Unix(endpoint) = route.endpoint() else {
+            continue;
+        };
+        let path = endpoint.path().as_str();
         let metadata = std::fs::symlink_metadata(path).with_context(|| {
             format!(
                 "access flow route {:?} endpoint is unavailable",
                 route.name().as_str()
             )
         })?;
-        let file_type: FileType = metadata.file_type();
+        let file_type = metadata.file_type();
         if file_type.is_symlink() || !file_type.is_socket() {
             anyhow::bail!(
                 "access flow route {:?} endpoint is not a Unix socket",
@@ -633,6 +879,7 @@ fn probe_unix_endpoints(compiled: &CompiledAccessFlowRelayConfig) -> anyhow::Res
 fn relay_resource_budget(
     bridge_enabled: bool,
     service_count: usize,
+    transport_reload_descriptors: u64,
 ) -> anyhow::Result<AccessFlowRelayResourceBudget> {
     let services = u64::try_from(service_count).context("service count exceeds u64")?;
     let descriptor_reserve = if bridge_enabled {
@@ -646,6 +893,9 @@ fn relay_resource_budget(
             .ok_or_else(|| anyhow::anyhow!("non-relay descriptor reserve overflow"))?,
     )
     .ok_or_else(|| anyhow::anyhow!("non-relay descriptor reserve overflow"))?;
+    let descriptor_reserve = descriptor_reserve
+        .checked_add(transport_reload_descriptors)
+        .ok_or_else(|| anyhow::anyhow!("transport reload descriptor reserve overflow"))?;
     let descriptors = soft_nofile_limit()?
         .checked_sub(descriptor_reserve)
         .ok_or_else(|| anyhow::anyhow!("RLIMIT_NOFILE is below the agent non-relay reserve"))?;
@@ -693,13 +943,69 @@ fn soft_nofile_limit() -> anyhow::Result<u64> {
 mod tests {
     use super::*;
     use crate::config::{
-        AccessFlowRelayPresentation, AccessFlowRelayRoute, AccessFlowRelayTransport, LoggingConfig,
-        RestartPolicy, ServiceConfig,
+        AccessFlowRelayPresentation, AccessFlowRelayRoute, AccessFlowRelayTransport,
+        AccessFlowRelayTrust, LoggingConfig, RestartPolicy, ServiceConfig,
     };
+    #[cfg(target_os = "linux")]
+    use access_flow::{
+        AccessFlowAcceptor, AccessFlowAdmission, AccessFlowAdmissionInput,
+        AccessFlowPresentationMode,
+    };
+    #[cfg(target_os = "linux")]
+    use access_flow_conformance::load_tls_pki_fixture;
     use access_flow_relay::AccessFlowRelayFailureKind;
+    #[cfg(target_os = "linux")]
+    use access_flow_tls::{
+        TlsAccessFlowHandshakeTimeout, TlsAccessFlowServerAdapter, TlsAccessFlowServerChannel,
+        TlsAccessFlowServerLimits, TlsAccessFlowTcpListener,
+    };
     use std::collections::BTreeMap;
+    #[cfg(target_os = "linux")]
+    use std::convert::Infallible;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[cfg(target_os = "linux")]
+    const TEST_ACCESS_FLOW_BEARER: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEF";
+
+    #[cfg(target_os = "linux")]
+    const TEST_ACCESS_FLOW_ROOT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBeDCCASqgAwIBAgIUXLfYBhGLaC2YWMIvB0aPnyCXmZMwBQYDK2VwMCgxJjAk
+BgNVBAMMHUFXIEFjY2VzcyBGbG93IFJUMDEgVGVzdCBSb290MB4XDTI2MDcyNjE5
+NDMwN1oXDTM2MDcyMzE5NDMwN1owKDEmMCQGA1UEAwwdQVcgQWNjZXNzIEZsb3cg
+UlQwMSBUZXN0IFJvb3QwKjAFBgMrZXADIQBpAdFVn/HrfItwIx/XktXtNOZRrLFE
+bRD4FW2ahSmyWaNmMGQwHwYDVR0jBBgwFoAUEXrimwcSAhT4Ae6XbVXVkbSfUUgw
+EgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFBF6
+4psHEgIU+AHul21V1ZG0n1FIMAUGAytlcANBAFpX6ZvogOz9Sd4QpaxfhacxJKGu
+O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
+-----END CERTIFICATE-----
+"#;
+
+    #[cfg(target_os = "linux")]
+    struct ExpectProductTlsPreface {
+        destination: access_flow::AccessFlowDestination,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl AccessFlowAdmission<TlsAccessFlowServerChannel> for ExpectProductTlsPreface {
+        type Facts = ();
+        type Error = Infallible;
+
+        fn admit<'a>(
+            &'a self,
+            input: AccessFlowAdmissionInput<'a, TlsAccessFlowServerChannel>,
+        ) -> BoxAccessFuture<'a, Result<Self::Facts, Self::Error>> {
+            assert_eq!(input.destination, self.destination);
+            let IdentityPresentation::Bearer(bearer) = input.presentation else {
+                panic!("product TLS route did not send the required bearer");
+            };
+            bearer.expose(|actual| assert_eq!(actual, TEST_ACCESS_FLOW_BEARER));
+            assert!(input.channel_facts.mark_admitted());
+            Box::pin(async { Ok(()) })
+        }
+    }
 
     fn test_config(listen: String, path: String) -> AccessFlowRelayConfig {
         let allowed_port = listen
@@ -763,8 +1069,8 @@ mod tests {
 
     #[test]
     fn resource_budget_subtracts_frozen_non_relay_memory() {
-        let no_bridge = relay_resource_budget(false, 4).unwrap();
-        let bridge = relay_resource_budget(true, 4).unwrap();
+        let no_bridge = relay_resource_budget(false, 4, 0).unwrap();
+        let bridge = relay_resource_budget(true, 4, 0).unwrap();
         assert_eq!(
             no_bridge.memory_bytes,
             TOTAL_AGENT_MEMORY_PREFLIGHT_BYTES
@@ -780,7 +1086,15 @@ mod tests {
     }
 
     #[test]
-    fn relay_resource_projection_accounts_for_retained_bearer() {
+    fn resource_budget_reserves_transport_reload_descriptors() {
+        let baseline = relay_resource_budget(false, 0, 0).unwrap();
+        let with_tls_reload = relay_resource_budget(false, 0, 2).unwrap();
+        assert_eq!(with_tls_reload.descriptors, baseline.descriptors - 2);
+        assert!(relay_resource_budget(false, 0, u64::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_resource_projection_accounts_for_retained_bearer() {
         let config = test_config("127.0.0.1:3128".into(), "/tmp/access-flow.sock".into());
         let compiled = config
             .compile_with_presentation(
@@ -791,13 +1105,17 @@ mod tests {
                 ),
             )
             .unwrap();
+        let transport =
+            RelayTransportRuntime::activate(&compiled.plan, Arc::new(AtomicBool::new(false)))
+                .await
+                .unwrap();
         let relay = AccessFlowRelay::new(
             compiled.plan,
-            UnixAccessFlowConnector::new(),
+            transport.connector(),
             Arc::new(RelayObserver {
                 active_flows: Arc::new(AtomicUsize::new(0)),
             }),
-            relay_resource_budget(false, 0).unwrap(),
+            relay_resource_budget(false, 0, 0).unwrap(),
         )
         .unwrap();
 
@@ -806,6 +1124,286 @@ mod tests {
             relay.resource_projection().total_memory_bytes
                 >= relay.resource_projection().presentation_bytes
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn product_tls_route_sends_awaf_preface_and_bidirectional_application_bytes() {
+        let dir = tempfile::Builder::new()
+            .prefix(".relay-product-tls-test-")
+            .tempdir_in(std::env::var_os("HOME").unwrap())
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let trust_path = dir.path().join("access-flow-root.pem");
+        std::fs::write(&trust_path, TEST_ACCESS_FLOW_ROOT_PEM).unwrap();
+        std::fs::set_permissions(&trust_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let tls_tcp = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let tls_address = tls_tcp.local_addr().unwrap();
+        let mut tls_listener = TlsAccessFlowTcpListener::from_std(tls_tcp).unwrap();
+        let fixture = load_tls_pki_fixture().unwrap();
+        let server_name = fixture.server_name().host().dns_name().unwrap().to_string();
+        let (_, _, server_identity) = fixture.into_parts();
+        let tls_server = TlsAccessFlowServerAdapter::new(
+            server_identity,
+            TlsAccessFlowHandshakeTimeout::new(Duration::from_secs(2)).unwrap(),
+            TlsAccessFlowServerLimits::new(8, 8, 16, 32, 1).unwrap(),
+        )
+        .unwrap();
+
+        let local = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listen = local.local_addr().unwrap();
+        drop(local);
+        let destination =
+            access_flow::AccessFlowDestination::new(std::net::Ipv4Addr::LOCALHOST, listen.port())
+                .unwrap();
+        let config = AccessFlowRelayConfig {
+            setup_timeout: "2s".into(),
+            drain_timeout: "1s".into(),
+            max_connections: 4,
+            copy_buffer_bytes_per_direction: 4096,
+            start_after_services: Vec::new(),
+            presentation: AccessFlowRelayPresentation::BearerEnvironment {
+                variable: "AW_ACCESS_FLOW_TEST_TOKEN".into(),
+            },
+            routes: vec![AccessFlowRelayRoute {
+                name: "https".into(),
+                listen: listen.to_string(),
+                allowed_destination_ports: vec![listen.port()],
+                transport: AccessFlowRelayTransport::TlsTcp {
+                    address: tls_address.to_string(),
+                    server_name,
+                    trust: AccessFlowRelayTrust::PemBundle {
+                        path: trust_path.display().to_string(),
+                    },
+                },
+            }],
+        };
+        let presentation = IdentityPresentation::Bearer(
+            access_identity::SensitiveBearer::new(TEST_ACCESS_FLOW_BEARER).unwrap(),
+        );
+        let (control, commands) = RelayControl::configured(&config);
+        let state = Arc::new(AgentState::new(
+            dir.path().join("state"),
+            None,
+            false,
+            None,
+            None,
+            Some(control.clone()),
+        ));
+
+        let server = tokio::spawn(async move {
+            let cancellation = RelayCancellation::default();
+            let channel = tls_server
+                .accept(&mut tls_listener, &cancellation)
+                .await
+                .unwrap()
+                .establish(&cancellation)
+                .await
+                .unwrap();
+            let acceptor =
+                AccessFlowAcceptor::new(AccessFlowPresentationMode::Required, [destination.port()])
+                    .unwrap();
+            let accepted = acceptor
+                .accept(
+                    channel,
+                    Instant::now() + Duration::from_secs(2),
+                    &cancellation,
+                    &ExpectProductTlsPreface { destination },
+                )
+                .await
+                .unwrap();
+            let mut stream = accepted.into_parts().io;
+            let mut request = [0_u8; 16];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"client-to-server");
+            stream.write_all(b"server-to-client").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let mut supervisor = tokio::spawn(run_relay_supervisor(
+            config,
+            presentation,
+            Vec::new(),
+            state,
+            control.clone(),
+            commands,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = &mut supervisor => {
+                    panic!("relay supervisor failed before readiness: {result:?}");
+                }
+                () = async {
+                    while !control.is_ready() {
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut client = tokio::net::TcpStream::connect(listen).await.unwrap();
+        client.write_all(b"client-to-server").await.unwrap();
+        let mut response = [0_u8; 16];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"server-to-client");
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+
+        control.close_admission().await;
+        control
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), supervisor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            control.status().await.state,
+            AccessFlowRelayStateName::Stopped
+        );
+        assert_eq!(control.active_flows(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ordered_shutdown_joins_an_in_progress_blocking_tls_reload() {
+        let dir = tempfile::Builder::new()
+            .prefix(".relay-reload-shutdown-test-")
+            .tempdir_in(std::env::var_os("HOME").unwrap())
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let trust_path = dir.path().join("access-flow-root.pem");
+        std::fs::write(&trust_path, TEST_ACCESS_FLOW_ROOT_PEM).unwrap();
+        std::fs::set_permissions(&trust_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let remote = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let remote_address = remote.local_addr().unwrap();
+        let local = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listen = local.local_addr().unwrap();
+        drop(local);
+        let fixture = load_tls_pki_fixture().unwrap();
+        let config = AccessFlowRelayConfig {
+            setup_timeout: "2s".into(),
+            drain_timeout: "1s".into(),
+            max_connections: 4,
+            copy_buffer_bytes_per_direction: 4096,
+            start_after_services: Vec::new(),
+            presentation: AccessFlowRelayPresentation::BearerEnvironment {
+                variable: "AW_ACCESS_FLOW_TEST_TOKEN".into(),
+            },
+            routes: vec![AccessFlowRelayRoute {
+                name: "https".into(),
+                listen: listen.to_string(),
+                allowed_destination_ports: vec![listen.port()],
+                transport: AccessFlowRelayTransport::TlsTcp {
+                    address: remote_address.to_string(),
+                    server_name: fixture.server_name().host().dns_name().unwrap().to_string(),
+                    trust: AccessFlowRelayTrust::PemBundle {
+                        path: trust_path.display().to_string(),
+                    },
+                },
+            }],
+        };
+        let presentation = IdentityPresentation::Bearer(
+            access_identity::SensitiveBearer::new(TEST_ACCESS_FLOW_BEARER).unwrap(),
+        );
+        let (control, commands) = RelayControl::configured(&config);
+        let (reload_reached, resume_reload) = control.pause_blocking_reload().await;
+        let state = Arc::new(AgentState::new(
+            dir.path().join("state"),
+            None,
+            false,
+            None,
+            None,
+            Some(control.clone()),
+        ));
+        let mut supervisor = tokio::spawn(run_relay_supervisor(
+            config,
+            presentation,
+            Vec::new(),
+            state,
+            control.clone(),
+            commands,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = &mut supervisor => {
+                    panic!("relay supervisor failed before readiness: {result:?}");
+                }
+                () = async {
+                    while !control.is_ready() {
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .unwrap();
+        control.initiate_security_reload().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || reload_reached.recv()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert!(!control.is_ready());
+        assert!(
+            control.initiate_security_reload().is_err(),
+            "concurrent reload was not coalesced"
+        );
+
+        let closing_control = control.clone();
+        let close = tokio::spawn(async move {
+            closing_control.close_admission().await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while control.phase.load(Ordering::Acquire) != RELAY_PHASE_CLOSING {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !close.is_finished(),
+            "shutdown completed without joining the paused reload task"
+        );
+        resume_reload.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), close)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while control.reload_in_progress.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(control.initiate_security_reload().is_err());
+
+        control
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), supervisor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            control.status().await.state,
+            AccessFlowRelayStateName::Stopped
+        );
+        drop(remote);
     }
 
     #[test]
@@ -1262,13 +1860,17 @@ mod tests {
             .compile(crate::config::AccessFlowRelayValidationMode::Agent)
             .unwrap();
         probe_unix_endpoints(&compiled).unwrap();
+        let transport =
+            RelayTransportRuntime::activate(&compiled.plan, Arc::new(AtomicBool::new(false)))
+                .await
+                .unwrap();
         let relay = AccessFlowRelay::new(
             compiled.plan,
-            UnixAccessFlowConnector::new(),
+            transport.connector(),
             Arc::new(RelayObserver {
                 active_flows: Arc::new(AtomicUsize::new(0)),
             }),
-            relay_resource_budget(false, 0).unwrap(),
+            relay_resource_budget(false, 0, 0).unwrap(),
         )
         .unwrap();
 

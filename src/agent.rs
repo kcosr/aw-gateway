@@ -4,6 +4,7 @@ mod idle;
 mod lifecycle;
 mod process;
 mod relay;
+mod relay_transport;
 mod service;
 mod socket;
 mod state;
@@ -15,6 +16,7 @@ use crate::fileutil;
 use crate::paths;
 use crate::template::{self, Vars};
 use access_identity::{IdentityPresentation, SensitiveBearer};
+use anyhow::Context as _;
 #[cfg(test)]
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
@@ -25,7 +27,7 @@ use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
 use bridge::run_bridge;
-use control::{run_control_socket, wait_for_shutdown_signal};
+use control::{run_control_socket, run_signal_broker};
 use idle::run_idle_cleanup;
 use relay::{RelayControl, run_relay_supervisor};
 use service::{ManagedService, service_supervisor};
@@ -281,22 +283,26 @@ async fn run_agent(prepared: PreparedAgent) -> anyhow::Result<()> {
             let state = state.clone();
             Box::pin(async move { run_control_socket(state, &control_socket).await })
         } else {
-            Box::pin(wait_for_shutdown_signal(state.clone()))
+            Box::pin(std::future::pending())
         };
     tokio::pin!(control);
+    let signals = run_signal_broker(state.clone());
+    tokio::pin!(signals);
     if let Some(mut relay_task) = relay_task {
         enum AgentEvent {
             Control(anyhow::Result<()>),
+            Signal(anyhow::Result<()>),
             RelayFatal(relay::RelayFatalKind),
             RelayTerminated(Result<anyhow::Result<()>, tokio::task::JoinError>),
         }
         let event = tokio::select! {
             result = &mut control => AgentEvent::Control(result),
+            result = &mut signals => AgentEvent::Signal(result),
             fatal = wait_for_relay_fatal(&state) => AgentEvent::RelayFatal(fatal),
             result = &mut relay_task => AgentEvent::RelayTerminated(result),
         };
         match event {
-            AgentEvent::Control(result) => {
+            AgentEvent::Control(result) | AgentEvent::Signal(result) => {
                 if !state
                     .shutting_down
                     .load(std::sync::atomic::Ordering::Acquire)
@@ -331,13 +337,19 @@ async fn run_agent(prepared: PreparedAgent) -> anyhow::Result<()> {
                     .or_else(|| relay_termination_fatal_kind(&result, shutting_down))
                 {
                     finish_relay_fatal_shutdown(state, fatal).await
+                } else if shutting_down {
+                    lifecycle::shutdown_agent(state.clone()).await;
+                    result.context("join access flow relay supervisor")?
                 } else {
                     control.await
                 }
             }
         }
     } else {
-        control.await
+        tokio::select! {
+            result = &mut control => result,
+            result = &mut signals => result,
+        }
     }
 }
 
@@ -416,7 +428,8 @@ mod tests {
     use crate::agent_control::ControlRequest;
     #[cfg(target_os = "linux")]
     use crate::config::{
-        AccessFlowRelayPresentation, AccessFlowRelayValidationMode, GatewayConfig,
+        AccessFlowRelayPresentation, AccessFlowRelayValidationMode,
+        CompiledAccessFlowRelayEndpoint, GatewayConfig,
     };
     use crate::config::{
         ContainerAgentConfig, ContainerAgentFile, HealthCheck, IdleCleanupAction,
@@ -459,8 +472,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn normalize_product_endpoint(
-        endpoint: &UnixAccessFlowEndpoint,
+        endpoint: &CompiledAccessFlowRelayEndpoint,
     ) -> anyhow::Result<NormalizedAccessFlowTransport> {
+        let CompiledAccessFlowRelayEndpoint::Unix(endpoint) = endpoint else {
+            anyhow::bail!("shipped host-proxy route unexpectedly uses TLS/TCP");
+        };
         let normalized = match endpoint.path().as_str() {
             PRODUCT_HTTP_ENDPOINT => CONFORMANCE_HTTP_ENDPOINT,
             PRODUCT_HTTPS_ENDPOINT => CONFORMANCE_HTTPS_ENDPOINT,
@@ -491,7 +507,12 @@ mod tests {
             .plan
             .routes()
             .iter()
-            .map(|route| route.endpoint().path().as_str())
+            .map(|route| match route.endpoint() {
+                CompiledAccessFlowRelayEndpoint::Unix(endpoint) => endpoint.path().as_str(),
+                CompiledAccessFlowRelayEndpoint::TlsTcp { .. } => {
+                    panic!("shipped host-proxy route unexpectedly uses TLS/TCP")
+                }
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             product_paths,
@@ -509,7 +530,7 @@ mod tests {
         let unknown_path = "/run/acl-proxy/unrecognized-sensitive-name.sock";
         let unknown =
             UnixAccessFlowEndpoint::new(NormalizedUnixSocketPath::new(unknown_path).unwrap());
-        let error = normalize_product_endpoint(&unknown)
+        let error = normalize_product_endpoint(&CompiledAccessFlowRelayEndpoint::Unix(unknown))
             .unwrap_err()
             .to_string();
         assert_eq!(error, "unrecognized AW Gateway Access Flow endpoint");

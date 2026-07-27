@@ -1,4 +1,5 @@
 use super::*;
+use access_identity::{IdentityPresentation, SensitiveBearer};
 use std::time::Duration;
 
 #[test]
@@ -5797,6 +5798,54 @@ command = ["/bin/true"]
 depends_on = ["@access-flow-relay"]
 "#;
 
+fn tls_access_flow_relay(presentation: &str) -> String {
+    AGENT_ACCESS_FLOW_RELAY
+        .replace("kind = \"disabled\"", presentation)
+        .replace(
+            r#"kind = "unix"
+path = "/run/acl-proxy/transparent-http.sock""#,
+            r#"kind = "tls_tcp"
+address = "proxy.example.test:7443"
+server_name = "proxy.example.test"
+
+[container_agent.access_flow_relay.routes.transport.trust]
+kind = "pem_bundle"
+path = "/etc/aw-gateway/acl-proxy-roots.pem""#,
+        )
+}
+
+fn bearer_tls_access_flow_relay() -> String {
+    tls_access_flow_relay("kind = \"bearer_environment\"\nvariable = \"AW_ACCESS_FLOW_TEST_TOKEN\"")
+}
+
+fn mixed_access_flow_relay() -> String {
+    let unix = AGENT_ACCESS_FLOW_RELAY.replace(
+        "kind = \"disabled\"",
+        "kind = \"bearer_environment\"\nvariable = \"AW_ACCESS_FLOW_TEST_TOKEN\"",
+    );
+    let tls_route = r#"
+[[container_agent.access_flow_relay.routes]]
+name = "https"
+listen = "127.0.0.1:3129"
+allowed_destination_ports = [443]
+
+[container_agent.access_flow_relay.routes.transport]
+kind = "tls_tcp"
+address = "proxy.example.test:7444"
+server_name = "proxy.example.test"
+
+[container_agent.access_flow_relay.routes.transport.trust]
+kind = "pem_bundle"
+path = "/etc/aw-gateway/acl-proxy-roots.pem"
+
+"#;
+    unix.replacen(
+        "[[container_agent.services]]",
+        &format!("{tls_route}[[container_agent.services]]"),
+        1,
+    )
+}
+
 #[test]
 fn container_agent_accepts_strict_access_flow_relay_and_absence() {
     let configured: ContainerAgentFile = toml::from_str(AGENT_ACCESS_FLOW_RELAY).unwrap();
@@ -5808,6 +5857,264 @@ fn container_agent_accepts_strict_access_flow_relay_and_absence() {
     let absent: ContainerAgentFile = toml::from_str("schema_version = \"1\"").unwrap();
     absent.validate().unwrap();
     assert!(absent.container_agent.access_flow_relay.is_none());
+}
+
+#[test]
+fn container_agent_accepts_strict_tls_and_mixed_relay_transports() {
+    let tls: ContainerAgentFile = toml::from_str(&bearer_tls_access_flow_relay()).unwrap();
+    tls.validate().unwrap();
+    let tls = tls.container_agent.access_flow_relay.unwrap();
+    for mode in [
+        AccessFlowRelayValidationMode::Gateway,
+        AccessFlowRelayValidationMode::Agent,
+    ] {
+        let compiled = tls.compile(mode).unwrap();
+        assert_eq!(compiled.plan.routes().len(), 1);
+        let CompiledAccessFlowRelayEndpoint::TlsTcp {
+            tls_index,
+            address,
+            server_name,
+            trust_path,
+        } = compiled.plan.routes()[0].endpoint()
+        else {
+            panic!("TLS route compiled as the wrong transport");
+        };
+        assert_eq!(*tls_index, 0);
+        assert_eq!(address.port().get(), 7443);
+        assert_eq!(address.host().dns_name(), Some("proxy.example.test"));
+        assert_eq!(server_name.host().dns_name(), Some("proxy.example.test"));
+        assert_eq!(trust_path, Path::new("/etc/aw-gateway/acl-proxy-roots.pem"));
+    }
+
+    let mixed: ContainerAgentFile = toml::from_str(&mixed_access_flow_relay()).unwrap();
+    mixed.validate().unwrap();
+    let compiled = mixed
+        .container_agent
+        .access_flow_relay
+        .unwrap()
+        .compile(AccessFlowRelayValidationMode::Agent)
+        .unwrap();
+    assert_eq!(compiled.plan.routes().len(), 2);
+    assert!(matches!(
+        compiled.plan.routes()[0].endpoint(),
+        CompiledAccessFlowRelayEndpoint::Unix(_)
+    ));
+    assert!(matches!(
+        compiled.plan.routes()[1].endpoint(),
+        CompiledAccessFlowRelayEndpoint::TlsTcp { tls_index: 0, .. }
+    ));
+}
+
+#[test]
+fn tls_route_indices_are_sequential_and_exclude_unix_routes() {
+    let second_tls = r#"
+[[container_agent.access_flow_relay.routes]]
+name = "tls-second"
+listen = "127.0.0.1:3130"
+allowed_destination_ports = [8443]
+
+[container_agent.access_flow_relay.routes.transport]
+kind = "tls_tcp"
+address = "proxy-two.example.test:7443"
+server_name = "proxy-two.example.test"
+
+[container_agent.access_flow_relay.routes.transport.trust]
+kind = "pem_bundle"
+path = "/etc/aw-gateway/second-roots.pem"
+
+"#;
+    let raw = mixed_access_flow_relay().replacen(
+        "[[container_agent.services]]",
+        &format!("{second_tls}[[container_agent.services]]"),
+        1,
+    );
+    let config: ContainerAgentFile = toml::from_str(&raw).unwrap();
+    let compiled = config
+        .container_agent
+        .access_flow_relay
+        .unwrap()
+        .compile(AccessFlowRelayValidationMode::Agent)
+        .unwrap();
+    let indices = compiled
+        .plan
+        .routes()
+        .iter()
+        .filter_map(|route| match route.endpoint() {
+            CompiledAccessFlowRelayEndpoint::Unix(_) => None,
+            CompiledAccessFlowRelayEndpoint::TlsTcp { tls_index, .. } => Some(*tls_index),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(indices, [0, 1]);
+}
+
+#[test]
+fn tls_routes_require_authored_and_activated_bearers() {
+    for authored in [
+        tls_access_flow_relay("kind = \"disabled\""),
+        tls_access_flow_relay("kind = \"anonymous\""),
+    ] {
+        let config: ContainerAgentFile = toml::from_str(&authored).unwrap();
+        for mode in [
+            AccessFlowRelayValidationMode::Gateway,
+            AccessFlowRelayValidationMode::Agent,
+        ] {
+            let error = config
+                .container_agent
+                .access_flow_relay
+                .as_ref()
+                .unwrap()
+                .compile(mode)
+                .err()
+                .expect("non-bearer TLS relay must be rejected")
+                .to_string();
+            assert!(error.contains("bearer_environment"), "{error}");
+        }
+    }
+
+    let config: ContainerAgentFile = toml::from_str(&bearer_tls_access_flow_relay()).unwrap();
+    let relay = config.container_agent.access_flow_relay.unwrap();
+    for presentation in [
+        IdentityPresentation::Disabled,
+        IdentityPresentation::Anonymous,
+    ] {
+        let error = relay
+            .compile_with_presentation(AccessFlowRelayValidationMode::Agent, presentation)
+            .err()
+            .expect("activated non-bearer TLS relay must be rejected")
+            .to_string();
+        assert!(error.contains("activated bearer"), "{error}");
+    }
+    relay
+        .compile_with_presentation(
+            AccessFlowRelayValidationMode::Agent,
+            IdentityPresentation::Bearer(
+                SensitiveBearer::new(b"abcdefghijklmnopqrstuvwxyzABCDEF").unwrap(),
+            ),
+        )
+        .unwrap();
+
+    let unix: ContainerAgentFile = toml::from_str(AGENT_ACCESS_FLOW_RELAY).unwrap();
+    unix.container_agent
+        .access_flow_relay
+        .unwrap()
+        .compile_with_presentation(
+            AccessFlowRelayValidationMode::Agent,
+            IdentityPresentation::Disabled,
+        )
+        .expect("Unix-only relay must retain disabled presentation");
+}
+
+#[test]
+fn tls_transport_rejects_templates_in_both_validation_modes() {
+    for raw in [
+        bearer_tls_access_flow_relay().replace(
+            "proxy.example.test:7443",
+            "{container_state_dir_in_container}:7443",
+        ),
+        bearer_tls_access_flow_relay().replace(
+            "server_name = \"proxy.example.test\"",
+            "server_name = \"{target}\"",
+        ),
+        bearer_tls_access_flow_relay().replace(
+            "/etc/aw-gateway/acl-proxy-roots.pem",
+            "/etc/{target}/roots.pem",
+        ),
+    ] {
+        let config: ContainerAgentFile = toml::from_str(&raw).unwrap();
+        let relay = config.container_agent.access_flow_relay.unwrap();
+        for mode in [
+            AccessFlowRelayValidationMode::Gateway,
+            AccessFlowRelayValidationMode::Agent,
+        ] {
+            assert!(relay.compile(mode).is_err(), "{mode:?} accepted:\n{raw}");
+        }
+    }
+}
+
+#[test]
+fn tls_transport_rejects_invalid_addresses_names_and_trust_paths() {
+    for (label, raw) in [
+        (
+            "address",
+            bearer_tls_access_flow_relay()
+                .replace("proxy.example.test:7443", "proxy.example.test:0"),
+        ),
+        (
+            "address",
+            bearer_tls_access_flow_relay()
+                .replace("proxy.example.test:7443", "Proxy.example.test:7443"),
+        ),
+        (
+            "address",
+            bearer_tls_access_flow_relay().replace("proxy.example.test:7443", "0.0.0.0:7443"),
+        ),
+        (
+            "server_name",
+            bearer_tls_access_flow_relay().replace(
+                "server_name = \"proxy.example.test\"",
+                "server_name = \"*.example.test\"",
+            ),
+        ),
+        (
+            "server_name",
+            bearer_tls_access_flow_relay().replace(
+                "server_name = \"proxy.example.test\"",
+                "server_name = \"Proxy.example.test\"",
+            ),
+        ),
+    ] {
+        let config: ContainerAgentFile = toml::from_str(&raw).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains(label), "{label}: {error}");
+    }
+
+    for path in [
+        "relative/roots.pem",
+        "/",
+        "/etc/aw-gateway/",
+        "/etc//aw-gateway/roots.pem",
+        "/etc/./aw-gateway/roots.pem",
+        "/etc/../aw-gateway/roots.pem",
+    ] {
+        let raw =
+            bearer_tls_access_flow_relay().replace("/etc/aw-gateway/acl-proxy-roots.pem", path);
+        let config: ContainerAgentFile = toml::from_str(&raw).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("normalized absolute non-root"),
+            "{path}: {error}"
+        );
+        assert!(!error.contains(path), "{path}: {error}");
+    }
+}
+
+#[test]
+fn relay_transport_schema_rejects_unknown_cross_variant_and_trust_shapes() {
+    let tls = bearer_tls_access_flow_relay();
+    for invalid in [
+        tls.replace(
+            "address = \"proxy.example.test:7443\"",
+            "address = \"proxy.example.test:7443\"\nclient_identity = \"/secret/client.pem\"",
+        ),
+        tls.replace(
+            "address = \"proxy.example.test:7443\"",
+            "address = \"proxy.example.test:7443\"\npath = \"/run/fallback.sock\"",
+        ),
+        tls.replace("kind = \"pem_bundle\"", "kind = \"platform\""),
+        tls.replace(
+            "kind = \"pem_bundle\"",
+            "kind = \"pem_bundle\"\ninsecure = true",
+        ),
+        AGENT_ACCESS_FLOW_RELAY.replace(
+            "path = \"/run/acl-proxy/transparent-http.sock\"",
+            "path = \"/run/acl-proxy/transparent-http.sock\"\naddress = \"proxy.example.test:7443\"",
+        ),
+    ] {
+        assert!(
+            toml::from_str::<ContainerAgentFile>(&invalid).is_err(),
+            "unexpectedly accepted:\n{invalid}"
+        );
+    }
 }
 
 #[test]

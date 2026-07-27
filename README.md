@@ -633,7 +633,7 @@ checks can require status codes and top-level JSON field matches.
 The optional Access Flow relay runs inside `aw-container-agent`; it is not a
 supervised child process. Every route listens on IPv4 loopback, recovers the
 original redirected destination, publishes an AW Access Flow preface, and
-connects to one Unix socket. Presentation is a strict tagged choice of
+connects through one configured Access Flow transport. Presentation is a strict tagged choice of
 `disabled`, `anonymous`, or `bearer_environment`:
 
 ```toml
@@ -657,6 +657,43 @@ allowed_destination_ports = [80]
 kind = "unix"
 path = "/run/acl-proxy/transparent-http.sock"
 ```
+
+A route may instead use server-authenticated TLS/TCP:
+
+```toml
+[[target_defaults.container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[target_defaults.container_agent.access_flow_relay.routes.transport]
+kind = "tls_tcp"
+address = "proxy.example.com:7443"
+server_name = "proxy.example.com"
+
+[target_defaults.container_agent.access_flow_relay.routes.transport.trust]
+kind = "pem_bundle"
+path = "/etc/aw-gateway/acl-proxy-roots.pem"
+```
+
+TLS routes require `bearer_environment`; disabled and anonymous presentation
+remain available only to Unix-only relays. Unix and TLS routes may coexist in
+one bearer-authenticated relay. TLS uses version 1.3, verifies the independently
+configured name against the explicit PEM bundle, requires the exact Access
+Flow ALPN, and opens one outer connection for each workload connection. It
+does not use client certificates, ambient proxy settings, cleartext fallback,
+endpoint fallback, pooling, or multiplexing. Address, server name, and trust
+path are literal and are not rendered from target variables.
+
+The agent securely loads a stable regular PEM source with bounded size and
+certificate count before reporting relay readiness. No remote reachability
+probe is required. `SIGHUP` atomically reloads the complete trust generation
+without reloading route configuration or the bearer. Existing flows retain
+their established generation and drain. A failed reload keeps them alive but
+makes the relay unready and rejects new Unix and TLS flows until a later
+successful `SIGHUP`. `SIGTERM` and Ctrl-C retain their ordered shutdown
+behavior whether or not the agent control socket is enabled. Foreground
+`aw-gateway` signal behavior is unchanged.
 
 `bearer_environment` makes the gateway provision its existing host identity
 token under the configured agent variable. Bootstrap disables core/dump
@@ -946,9 +983,10 @@ Gateway configs commonly include:
 - `[target_defaults.container_agent]`: optional in-container supervision and SSH bridge
   support.
 - `[target_defaults.container_agent.access_flow_relay]`: optional embedded
-  transparent TCP-to-Access-Flow relay with strict Unix routes. The relay table
-  replaces as one object in target overlays; an omitted table inherits, while
-  a present incomplete table is invalid and never borrows omitted fields.
+  transparent TCP-to-Access-Flow relay with strict Unix or
+  server-authenticated TLS/TCP routes. The relay table replaces as one object
+  in target overlays; an omitted table inherits, while a present incomplete
+  table is invalid and never borrows omitted fields.
 - `[[target_defaults.container_agent.services]]`: in-container services supervised by
   `aw-container-agent`. Use `depends_on` and dependency health checks to order
   managed services. Required `container_bootstrap_steps` perform privileged

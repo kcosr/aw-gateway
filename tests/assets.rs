@@ -382,9 +382,20 @@ fn embedded_relay_uses_shared_runtime_engine_without_a_copied_data_plane() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let cargo = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
     let relay = std::fs::read_to_string(root.join("src/agent/relay.rs")).unwrap();
-    let production = relay.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+    let relay_production = relay.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+    let transport = std::fs::read_to_string(root.join("src/agent/relay_transport.rs")).unwrap();
+    let transport_production = transport
+        .split("\n#[cfg(all(test, unix))]\nmod tests")
+        .next()
+        .unwrap();
+    let production = format!("{relay_production}\n{transport_production}");
 
-    for dependency in ["access-flow-relay", "access-flow-unix", "access-identity"] {
+    for dependency in [
+        "access-flow-relay",
+        "access-flow-tls",
+        "access-flow-unix",
+        "access-identity",
+    ] {
         assert!(
             cargo.contains(dependency),
             "missing shared Runtime dependency {dependency:?}"
@@ -392,7 +403,9 @@ fn embedded_relay_uses_shared_runtime_engine_without_a_copied_data_plane() {
     }
     for required in [
         "AccessFlowRelay::new(",
+        "RelayTransportRuntime::activate(",
         "UnixAccessFlowConnector::new()",
+        "TlsAccessFlowConnector::with_system_resolver(",
         "RunningAccessFlowRelay",
     ] {
         assert!(

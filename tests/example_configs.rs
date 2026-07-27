@@ -56,3 +56,16 @@ fn example_gateway_configs_validate() {
             .success();
     }
 }
+
+#[test]
+fn remote_tls_agent_example_schema_validates_without_source_access() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/docker/container-agent-access-flow-tls.toml");
+    Command::cargo_bin("aw-container-agent")
+        .unwrap()
+        .arg("--config")
+        .arg(path)
+        .args(["config", "validate"])
+        .assert()
+        .success();
+}

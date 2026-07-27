@@ -6,9 +6,23 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
+
+#[cfg(target_os = "linux")]
+const TEST_ACCESS_FLOW_ROOT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBeDCCASqgAwIBAgIUXLfYBhGLaC2YWMIvB0aPnyCXmZMwBQYDK2VwMCgxJjAk
+BgNVBAMMHUFXIEFjY2VzcyBGbG93IFJUMDEgVGVzdCBSb290MB4XDTI2MDcyNjE5
+NDMwN1oXDTM2MDcyMzE5NDMwN1owKDEmMCQGA1UEAwwdQVcgQWNjZXNzIEZsb3cg
+UlQwMSBUZXN0IFJvb3QwKjAFBgMrZXADIQBpAdFVn/HrfItwIx/XktXtNOZRrLFE
+bRD4FW2ahSmyWaNmMGQwHwYDVR0jBBgwFoAUEXrimwcSAhT4Ae6XbVXVkbSfUUgw
+EgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFBF6
+4psHEgIU+AHul21V1ZG0n1FIMAUGAytlcANBAFpX6ZvogOz9Sd4QpaxfhacxJKGu
+O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
+-----END CERTIFICATE-----
+"#;
 
 struct KillOnDrop(Child);
 
@@ -975,6 +989,261 @@ restart = "never"
 }
 
 #[test]
+fn signal_broker_ignores_sighup_and_orders_sigterm_shutdown_with_control_socket() {
+    assert_signal_broker_lifecycle(true);
+}
+
+#[test]
+fn signal_broker_ignores_sighup_and_orders_sigterm_shutdown_without_control_socket() {
+    assert_signal_broker_lifecycle(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tls_relay_sighup_failure_recovery_and_sigterm_shutdown_are_bounded() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::Builder::new()
+        .prefix(".agent-control-tls-reload-test-")
+        .tempdir_in(std::env::var_os("HOME").unwrap())
+        .unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let control_socket = dir.path().join("agent.sock");
+    let state_dir = dir.path().join("state");
+    let trust_path = dir.path().join("access-flow-root.pem");
+    let base_ready = dir.path().join("base.ready");
+    let dependent_ready = dir.path().join("dependent.ready");
+    let stop_order = dir.path().join("stop-order");
+    let config = dir.path().join("container-agent.toml");
+    std::fs::write(&trust_path, TEST_ACCESS_FLOW_ROOT_PEM).unwrap();
+    std::fs::set_permissions(&trust_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let remote = TcpListener::bind("127.0.0.1:0").unwrap();
+    let remote_address = remote.local_addr().unwrap();
+    let local = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listen = local.local_addr().unwrap();
+    drop(local);
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+
+[logging]
+level = "debug"
+
+[container_agent]
+control_socket = "{control_socket}"
+
+[container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "1s"
+max_connections = 4
+copy_buffer_bytes_per_direction = 4096
+
+[container_agent.access_flow_relay.presentation]
+kind = "bearer_environment"
+variable = "AW_ACCESS_FLOW_TEST_TOKEN"
+
+[[container_agent.access_flow_relay.routes]]
+name = "https"
+listen = "{listen}"
+allowed_destination_ports = [{destination_port}]
+
+[container_agent.access_flow_relay.routes.transport]
+kind = "tls_tcp"
+address = "{remote_address}"
+server_name = "access-flow.test"
+
+[container_agent.access_flow_relay.routes.transport.trust]
+kind = "pem_bundle"
+path = "{trust_path}"
+
+[[container_agent.services]]
+name = "base"
+command = ["/bin/sh", "-c", 'trap "echo base >> {stop_order}; exit 0" TERM; touch {base_ready}; while :; do sleep 0.05; done']
+restart = "never"
+shutdown_timeout = "1s"
+
+[[container_agent.services]]
+name = "dependent"
+command = ["/bin/sh", "-c", 'trap "echo dependent >> {stop_order}; exit 0" TERM; touch {dependent_ready}; while :; do sleep 0.05; done']
+restart = "never"
+shutdown_timeout = "1s"
+depends_on = ["base"]
+"#,
+            control_socket = control_socket.display(),
+            destination_port = listen.port(),
+            trust_path = trust_path.display(),
+            stop_order = stop_order.display(),
+            base_ready = base_ready.display(),
+            dependent_ready = dependent_ready.display(),
+        ),
+    )
+    .unwrap();
+
+    let mut process = Command::cargo_bin("aw-container-agent")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .env("AW_CONTAINER_STATE_DIR", &state_dir)
+        .env(
+            "AW_ACCESS_FLOW_TEST_TOKEN",
+            "abcdefghijklmnopqrstuvwxyzABCDEF",
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = process.stderr.take().unwrap();
+    let (log_tx, log_rx) = mpsc::channel();
+    let log_reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            if log_tx.send(line.unwrap()).is_err() {
+                return;
+            }
+        }
+    });
+    let mut child = KillOnDrop(process);
+
+    wait_for_path(&control_socket);
+    wait_for_path(&base_ready);
+    wait_for_path(&dependent_ready);
+    wait_for_relay_ready(&control_socket, true);
+
+    std::fs::write(&trust_path, "not a PEM trust bundle").unwrap();
+    signal_process(&child, libc::SIGHUP);
+    wait_for_log(&log_rx, "access flow relay trust reload failed");
+    wait_for_relay_ready(&control_socket, false);
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(!stop_order.exists());
+
+    std::fs::write(&trust_path, TEST_ACCESS_FLOW_ROOT_PEM).unwrap();
+    signal_process(&child, libc::SIGHUP);
+    wait_for_log(&log_rx, "access flow relay trust reload completed");
+    wait_for_relay_ready(&control_socket, true);
+
+    std::fs::write(&trust_path, "not a PEM trust bundle").unwrap();
+    signal_process(&child, libc::SIGHUP);
+    wait_for_log(&log_rx, "access flow relay trust reload started");
+    signal_process(&child, libc::SIGTERM);
+    let status = wait_for_child_exit_with_logs(&mut child, &log_rx);
+    assert!(status.success(), "SIGTERM exit status was {status}");
+    log_reader.join().unwrap();
+
+    let observed = std::fs::read_to_string(&stop_order).unwrap();
+    assert_eq!(observed.lines().collect::<Vec<_>>(), ["dependent", "base"]);
+    drop(remote);
+}
+
+fn assert_signal_broker_lifecycle(control_socket_enabled: bool) {
+    let dir = tempdir().unwrap();
+    let control_socket = dir.path().join("agent.sock");
+    let state_dir = dir.path().join("state");
+    let base_ready = dir.path().join("base.ready");
+    let dependent_ready = dir.path().join("dependent.ready");
+    let stop_order = dir.path().join("stop-order");
+    let config = dir.path().join("container-agent.toml");
+    let control_socket_value = if control_socket_enabled {
+        format!("\"{}\"", control_socket.display())
+    } else {
+        "false".to_string()
+    };
+    std::fs::write(
+        &config,
+        format!(
+            r#"
+schema_version = "1"
+
+[logging]
+level = "debug"
+
+[container_agent]
+control_socket = {control_socket_value}
+
+[[container_agent.services]]
+name = "base"
+command = ["/bin/sh", "-c", 'trap "echo base >> {stop_order}; exit 0" TERM; touch {base_ready}; while :; do sleep 0.05; done']
+restart = "never"
+shutdown_timeout = "3s"
+
+[[container_agent.services]]
+name = "dependent"
+command = ["/bin/sh", "-c", 'trap "echo dependent >> {stop_order}; exit 0" TERM; touch {dependent_ready}; while :; do sleep 0.05; done']
+restart = "never"
+shutdown_timeout = "3s"
+depends_on = ["base"]
+"#,
+            stop_order = stop_order.display(),
+            base_ready = base_ready.display(),
+            dependent_ready = dependent_ready.display(),
+        ),
+    )
+    .unwrap();
+
+    let mut process = Command::cargo_bin("aw-container-agent")
+        .unwrap()
+        .arg("--config")
+        .arg(&config)
+        .env("AW_CONTAINER_STATE_DIR", &state_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = process.stderr.take().unwrap();
+    let (log_tx, log_rx) = mpsc::channel();
+    let log_reader = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            if log_tx.send(line.unwrap()).is_err() {
+                return;
+            }
+        }
+    });
+    let mut child = KillOnDrop(process);
+
+    wait_for_path(&base_ready);
+    wait_for_path(&dependent_ready);
+    if control_socket_enabled {
+        wait_for_path(&control_socket);
+        let response = control_request(&control_socket, br#"{"id":"ready","method":"status"}"#);
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["ready"], true);
+    } else {
+        assert!(!control_socket.exists());
+    }
+
+    signal_process(&child, libc::SIGHUP);
+    wait_for_log(
+        &log_rx,
+        "SIGHUP ignored because no access flow relay is configured",
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "SIGHUP terminated the container agent"
+    );
+    assert!(
+        !stop_order.exists(),
+        "SIGHUP unexpectedly initiated service shutdown"
+    );
+    if control_socket_enabled {
+        let response = control_request(
+            &control_socket,
+            br#"{"id":"after-sighup","method":"status"}"#,
+        );
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["ready"], true);
+    }
+
+    signal_process(&child, libc::SIGTERM);
+    let status = wait_for_child_exit(&mut child);
+    assert!(status.success(), "SIGTERM exit status was {status}");
+    log_reader.join().unwrap();
+
+    let observed = std::fs::read_to_string(&stop_order).unwrap();
+    assert_eq!(observed.lines().collect::<Vec<_>>(), ["dependent", "base"]);
+}
+
+#[test]
 fn container_agent_shutdown_exits_after_authorized_request() {
     let dir = tempdir().unwrap();
     let control_socket = dir.path().join("agent.sock");
@@ -1124,4 +1393,61 @@ fn wait_for_child_exit(child: &mut std::process::Child) -> std::process::ExitSta
     }
     child.kill().unwrap();
     panic!("timed out waiting for child exit");
+}
+
+fn signal_process(child: &Child, signal: i32) {
+    let result = unsafe { libc::kill(child.id() as libc::pid_t, signal) };
+    assert_eq!(result, 0, "failed to signal process {}", child.id());
+}
+
+fn wait_for_log(receiver: &Receiver<String>, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut observed = Vec::new();
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(line) => {
+                let found = line.contains(needle);
+                observed.push(line);
+                if found {
+                    return;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    panic!("timed out waiting for log {needle:?}; observed {observed:?}");
+}
+
+fn wait_for_relay_ready(control_socket: &std::path::Path, expected: bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let response = control_request(
+            control_socket,
+            br#"{"id":"relay-readiness","method":"status"}"#,
+        );
+        if response["result"]["access_flow_relay"]["ready"] == expected {
+            return;
+        }
+        sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for access flow relay ready={expected}");
+}
+
+fn wait_for_child_exit_with_logs(
+    child: &mut Child,
+    logs: &Receiver<String>,
+) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        sleep(Duration::from_millis(25));
+    }
+    let observed = logs.try_iter().collect::<Vec<_>>();
+    child.kill().unwrap();
+    let _ = child.wait();
+    panic!("timed out waiting for child exit; observed logs: {observed:?}");
 }
