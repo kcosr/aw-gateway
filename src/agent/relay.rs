@@ -1126,7 +1126,7 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use access_flow::{
-        AccessFlowAcceptor, AccessFlowAdmission, AccessFlowAdmissionInput,
+        AccessFlowAcceptor, AccessFlowAdmission, AccessFlowAdmissionInput, AccessFlowPreface,
         AccessFlowPresentationMode,
     };
     #[cfg(target_os = "linux")]
@@ -1134,8 +1134,10 @@ mod tests {
     use access_flow_relay::{AccessFlowConnector, AccessFlowRelayFailureKind};
     #[cfg(target_os = "linux")]
     use access_flow_tls::{
-        TlsAccessFlowHandshakeTimeout, TlsAccessFlowServerAdapter, TlsAccessFlowServerChannel,
-        TlsAccessFlowServerLimits, TlsAccessFlowTcpListener,
+        EstablishedTlsAccessFlowChannel, TlsAccessFlowCertificateChain, TlsAccessFlowGeneration,
+        TlsAccessFlowHandshakeTimeout, TlsAccessFlowPrivateKey, TlsAccessFlowServerAdapter,
+        TlsAccessFlowServerChannel, TlsAccessFlowServerIdentity, TlsAccessFlowServerLimits,
+        TlsAccessFlowTcpListener,
     };
     use std::collections::BTreeMap;
     #[cfg(target_os = "linux")]
@@ -1159,6 +1161,72 @@ EgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFBF6
 4psHEgIU+AHul21V1ZG0n1FIMAUGAytlcANBAFpX6ZvogOz9Sd4QpaxfhacxJKGu
 O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
 -----END CERTIFICATE-----
+"#;
+
+    #[cfg(target_os = "linux")]
+    const RT06_OLD_ROOT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBZTCCARegAwIBAgIUHnYz2yzFmxU84z4ABlhv4/F5LnUwBQYDK2VwMCAxHjAc
+BgNVBAMMFUFXIFJUMDYgb2xkIFRlc3QgUm9vdDAeFw0yNjA3MjcxOTMzMzlaFw0z
+NjA3MjQxOTMzMzlaMCAxHjAcBgNVBAMMFUFXIFJUMDYgb2xkIFRlc3QgUm9vdDAq
+MAUGAytlcAMhAPUsEAtTONdXaX3PsLg5m0op+gAwISmupvtb/GVBAgElo2MwYTAd
+BgNVHQ4EFgQUsWvtfXQjVjyfbGvzXd0JCgSnuekwHwYDVR0jBBgwFoAUsWvtfXQj
+VjyfbGvzXd0JCgSnuekwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYw
+BQYDK2VwA0EA2WCGFxW+nw1huar98jP1LU/rlUiMXc0Y+sdVNky1XogaVauI27bw
+aMoOFB2KM9Y8mqmBE5+pvbaZqs1K+3q0CQ==
+-----END CERTIFICATE-----
+"#;
+
+    #[cfg(target_os = "linux")]
+    const RT06_OLD_LEAF_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBkTCCAUOgAwIBAgIUS43yMrf0ZlNMIl39s8iWQ4t7NoowBQYDK2VwMCAxHjAc
+BgNVBAMMFUFXIFJUMDYgb2xkIFRlc3QgUm9vdDAeFw0yNjA3MjcxOTMzMzlaFw0z
+NjA3MjQxOTMzMzlaMBsxGTAXBgNVBAMMEGFjY2Vzcy1mbG93LnRlc3QwKjAFBgMr
+ZXADIQDrRiLdZ9qPU78tWMi3+gijyuM48SdzKkY2Wr8uVRw6KaOBkzCBkDAMBgNV
+HRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDATAb
+BgNVHREEFDASghBhY2Nlc3MtZmxvdy50ZXN0MB0GA1UdDgQWBBSYAao1VncdIvxC
+DhAc7z2EiWNDuTAfBgNVHSMEGDAWgBSxa+19dCNWPJ9sa/Nd3QkKBKe56TAFBgMr
+ZXADQQD2FEj18diKXaEVYUfinchEwZa8t3sjuIp6ui+mmftXkT0443S9eb1Ct9CT
+NoTp/2CPPfeduH0D2vBiXXJ/i38D
+-----END CERTIFICATE-----
+"#;
+
+    #[cfg(target_os = "linux")]
+    const RT06_OLD_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIOhH2hCkQS3bz8y1WrZ+LGUyiKQyohqR9ClcHFJcfjti
+-----END PRIVATE KEY-----
+"#;
+
+    #[cfg(target_os = "linux")]
+    const RT06_NEW_ROOT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBZTCCARegAwIBAgIUTrszQRtyCdvLzg5vMnXv6xCQpOkwBQYDK2VwMCAxHjAc
+BgNVBAMMFUFXIFJUMDYgbmV3IFRlc3QgUm9vdDAeFw0yNjA3MjcxOTMzMzlaFw0z
+NjA3MjQxOTMzMzlaMCAxHjAcBgNVBAMMFUFXIFJUMDYgbmV3IFRlc3QgUm9vdDAq
+MAUGAytlcAMhAK3re6bsPSfxWXKa1in9ar92OMQAVEyD7hpwdzpzZexOo2MwYTAd
+BgNVHQ4EFgQUOMJ7vKAJgWNf954L9eDdQe1EuBUwHwYDVR0jBBgwFoAUOMJ7vKAJ
+gWNf954L9eDdQe1EuBUwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYw
+BQYDK2VwA0EAfjK+q0Y1GdjI5gha7N1LAOn9H9WS1HNpKixzOdP1DyLdR6xcCcz5
+gKqPfMOfkoKTGyuJBQnR1TnGE/59yzx7BA==
+-----END CERTIFICATE-----
+"#;
+
+    #[cfg(target_os = "linux")]
+    const RT06_NEW_LEAF_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBkTCCAUOgAwIBAgIUCaf3ckcsqB+oIkcSoL3v/SoDHmYwBQYDK2VwMCAxHjAc
+BgNVBAMMFUFXIFJUMDYgbmV3IFRlc3QgUm9vdDAeFw0yNjA3MjcxOTMzMzlaFw0z
+NjA3MjQxOTMzMzlaMBsxGTAXBgNVBAMMEGFjY2Vzcy1mbG93LnRlc3QwKjAFBgMr
+ZXADIQB9fZytzxpxniLELx0FBzP6cPdVbZWuUfluRcJOw8OH0aOBkzCBkDAMBgNV
+HRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDATAb
+BgNVHREEFDASghBhY2Nlc3MtZmxvdy50ZXN0MB0GA1UdDgQWBBTmGWSfT6geN23E
+oMjeUZWoj0ATjzAfBgNVHSMEGDAWgBQ4wnu8oAmBY1/3ngv14N1B7US4FTAFBgMr
+ZXADQQDo1KDk1uS6l9jqYad26iNByl5JSlergecmSPOtYp/sUEu3dMWF846gY4om
+iJPat6lRzLetfgUpaIOP5Tw8kmoF
+-----END CERTIFICATE-----
+"#;
+
+    #[cfg(target_os = "linux")]
+    const RT06_NEW_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
+-----END PRIVATE KEY-----
 "#;
 
     #[cfg(target_os = "linux")]
@@ -1204,6 +1272,30 @@ O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
                 transport: AccessFlowRelayTransport::Unix { path },
             }],
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rt06_server_adapter(
+        certificate_pem: &str,
+        private_key_pem: &str,
+        generation: u64,
+    ) -> TlsAccessFlowServerAdapter {
+        let (certificate_label, certificate) =
+            pem_rfc7468::decode_vec(certificate_pem.as_bytes()).unwrap();
+        assert_eq!(certificate_label, "CERTIFICATE");
+        let (key_label, private_key) = pem_rfc7468::decode_vec(private_key_pem.as_bytes()).unwrap();
+        assert_eq!(key_label, "PRIVATE KEY");
+        let identity = TlsAccessFlowServerIdentity::new(
+            TlsAccessFlowGeneration::new(generation).unwrap(),
+            TlsAccessFlowCertificateChain::new(vec![certificate]).unwrap(),
+            TlsAccessFlowPrivateKey::new(private_key).unwrap(),
+        );
+        TlsAccessFlowServerAdapter::new(
+            identity,
+            TlsAccessFlowHandshakeTimeout::new(Duration::from_secs(2)).unwrap(),
+            TlsAccessFlowServerLimits::new(8, 8, 16, 32, 1).unwrap(),
+        )
+        .unwrap()
     }
 
     fn observed_event(
@@ -1638,6 +1730,523 @@ O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
             stream.write_all(b"x").await.unwrap();
             stream.flush().await.unwrap();
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tls_trust_overlap_and_cutover_select_current_roots_and_preserve_old_stream() {
+        #[derive(Clone, Copy)]
+        enum ServerGeneration {
+            Old,
+            New,
+        }
+
+        let dir = tempfile::Builder::new()
+            .prefix(".relay-real-trust-overlap-test-")
+            .tempdir_in(std::env::var_os("HOME").unwrap())
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let trust_path = dir.path().join("access-flow-roots.pem");
+        std::fs::write(&trust_path, RT06_OLD_ROOT_PEM).unwrap();
+        std::fs::set_permissions(&trust_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let tls_tcp = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let tls_address = tls_tcp.local_addr().unwrap();
+        let mut tls_listener = TlsAccessFlowTcpListener::from_std(tls_tcp).unwrap();
+        let old_server = rt06_server_adapter(RT06_OLD_LEAF_PEM, RT06_OLD_KEY_PEM, 1);
+        let new_server = rt06_server_adapter(RT06_NEW_LEAF_PEM, RT06_NEW_KEY_PEM, 2);
+        let (server_tx, mut server_rx) = mpsc::channel::<(
+            ServerGeneration,
+            oneshot::Sender<Option<EstablishedTlsAccessFlowChannel>>,
+        )>(1);
+        let server = tokio::spawn(async move {
+            while let Some((generation, completed)) = server_rx.recv().await {
+                let cancellation = RelayCancellation::default();
+                let accepted = match generation {
+                    ServerGeneration::Old => {
+                        old_server.accept(&mut tls_listener, &cancellation).await
+                    }
+                    ServerGeneration::New => {
+                        new_server.accept(&mut tls_listener, &cancellation).await
+                    }
+                };
+                let channel = match accepted {
+                    Ok(accepted) => accepted.establish(&cancellation).await.ok(),
+                    Err(_) => None,
+                };
+                let _ = completed.send(channel);
+            }
+        });
+
+        let config = AccessFlowRelayConfig {
+            setup_timeout: "2s".into(),
+            drain_timeout: "1s".into(),
+            max_connections: 8,
+            copy_buffer_bytes_per_direction: 4096,
+            start_after_services: Vec::new(),
+            presentation: AccessFlowRelayPresentation::BearerEnvironment {
+                variable: "AW_ACCESS_FLOW_TEST_TOKEN".into(),
+            },
+            routes: vec![AccessFlowRelayRoute {
+                name: "https".into(),
+                listen: "127.0.0.1:3129".into(),
+                allowed_destination_ports: vec![443],
+                transport: AccessFlowRelayTransport::TlsTcp {
+                    address: tls_address.to_string(),
+                    server_name: "access-flow.test".into(),
+                    trust: AccessFlowRelayTrust::PemBundle {
+                        path: trust_path.display().to_string(),
+                    },
+                },
+            }],
+        };
+        let compiled = config
+            .compile_with_presentation(
+                crate::config::AccessFlowRelayValidationMode::Agent,
+                IdentityPresentation::Bearer(
+                    access_identity::SensitiveBearer::new(TEST_ACCESS_FLOW_BEARER).unwrap(),
+                ),
+            )
+            .unwrap();
+        let runtime =
+            RelayTransportRuntime::activate(&compiled.plan, Arc::new(AtomicBool::new(false)))
+                .await
+                .unwrap();
+        let connector = runtime.connector();
+        let endpoint = compiled.plan.routes()[0].endpoint();
+
+        macro_rules! connect_with {
+            ($generation:expr) => {{
+                let (completed, wait) = oneshot::channel();
+                server_tx.send(($generation, completed)).await.unwrap();
+                let cancellation = RelayCancellation::default();
+                let context = access_flow_relay::AccessFlowConnectContext::new(
+                    Instant::now() + Duration::from_secs(2),
+                    &cancellation,
+                );
+                let client = connector.connect(endpoint, context).await;
+                let server = tokio::time::timeout(Duration::from_secs(2), wait)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                (client, server)
+            }};
+        }
+
+        let (old_client, old_channel) = connect_with!(ServerGeneration::Old);
+        let mut old_client = old_client.expect("old-only generation accepts old server");
+        let old_channel = old_channel.expect("old server completed old-only handshake");
+
+        std::fs::write(
+            &trust_path,
+            format!("{RT06_OLD_ROOT_PEM}{RT06_NEW_ROOT_PEM}"),
+        )
+        .unwrap();
+        runtime
+            .begin_reload()
+            .unwrap()
+            .expect("overlap reload")
+            .complete()
+            .await
+            .unwrap();
+        let (new_overlap_client, new_overlap_server) = connect_with!(ServerGeneration::New);
+        assert!(new_overlap_client.is_ok());
+        assert!(new_overlap_server.is_some());
+        drop(new_overlap_client);
+        drop(new_overlap_server);
+        let (old_overlap_client, old_overlap_server) = connect_with!(ServerGeneration::Old);
+        assert!(old_overlap_client.is_ok());
+        assert!(old_overlap_server.is_some());
+        drop(old_overlap_client);
+        drop(old_overlap_server);
+
+        std::fs::write(&trust_path, RT06_NEW_ROOT_PEM).unwrap();
+        runtime
+            .begin_reload()
+            .unwrap()
+            .expect("new-only reload")
+            .complete()
+            .await
+            .unwrap();
+        let (new_client, new_channel) = connect_with!(ServerGeneration::New);
+        assert!(new_client.is_ok());
+        assert!(new_channel.is_some());
+        drop(new_client);
+        drop(new_channel);
+        let (removed_old_client, removed_old_channel) = connect_with!(ServerGeneration::Old);
+        assert!(
+            removed_old_client.is_err(),
+            "new connection accepted a server signed only by the removed old root"
+        );
+        assert!(
+            removed_old_channel.is_none(),
+            "removed old server unexpectedly completed its TLS handshake"
+        );
+
+        let destination =
+            access_flow::AccessFlowDestination::new(std::net::Ipv4Addr::LOCALHOST, 443).unwrap();
+        AccessFlowPreface::new(
+            destination,
+            IdentityPresentation::Bearer(
+                access_identity::SensitiveBearer::new(TEST_ACCESS_FLOW_BEARER).unwrap(),
+            ),
+        )
+        .write_to(&mut old_client)
+        .await
+        .unwrap();
+        let admission_cancellation = RelayCancellation::default();
+        let accepted = AccessFlowAcceptor::new(
+            AccessFlowPresentationMode::Required,
+            [std::num::NonZeroU16::new(443).unwrap()],
+        )
+        .unwrap()
+        .accept(
+            old_channel,
+            Instant::now() + Duration::from_secs(2),
+            &admission_cancellation,
+            &ExpectProductTlsPreface { destination },
+        )
+        .await
+        .unwrap();
+        let mut old_channel = accepted.into_parts().io;
+        old_client
+            .write_all(b"old-generation-still-live")
+            .await
+            .unwrap();
+        let mut retained = [0_u8; 25];
+        old_channel.read_exact(&mut retained).await.unwrap();
+        assert_eq!(&retained, b"old-generation-still-live");
+        old_channel.write_all(b"drained").await.unwrap();
+        let mut drained = [0_u8; 7];
+        old_client.read_exact(&mut drained).await.unwrap();
+        assert_eq!(&drained, b"drained");
+
+        runtime.close();
+        drop(server_tx);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn integrated_relay_saturation_rejects_n_plus_one_and_recovers_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = dir.path().join("access-flow.sock");
+        let endpoint_listener = std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
+        endpoint_listener.set_nonblocking(true).unwrap();
+        let endpoint_listener = tokio::net::UnixListener::from_std(endpoint_listener).unwrap();
+        let source = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listen = source.local_addr().unwrap();
+        drop(source);
+        let mut config = test_config(listen.to_string(), endpoint.display().to_string());
+        config.max_connections = 1;
+        let (control, commands) = RelayControl::configured(&config);
+        let state = Arc::new(AgentState::new(
+            dir.path().join("state"),
+            None,
+            false,
+            None,
+            None,
+            Some(control.clone()),
+        ));
+        let supervisor = tokio::spawn(run_relay_supervisor(
+            config,
+            IdentityPresentation::Disabled,
+            Vec::new(),
+            state,
+            control.clone(),
+            commands,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !control.is_ready() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut first = tokio::net::TcpStream::connect(listen).await.unwrap();
+        let (mut first_channel, _) = endpoint_listener.accept().await.unwrap();
+        let mut first_preface = [0_u8; 16];
+        first_channel.read_exact(&mut first_preface).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while control.active_flows() != 1 {
+                assert!(control.active_flows() <= 1);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut saturated = tokio::net::TcpStream::connect(listen).await.unwrap();
+        let mut eof = [0_u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(250), saturated.read(&mut eof))
+                .await
+                .expect("saturated connection was not rejected immediately")
+                .unwrap(),
+            0
+        );
+        assert_eq!(control.active_flows(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), endpoint_listener.accept())
+                .await
+                .is_err(),
+            "saturated connection reached the transport connector"
+        );
+
+        first.shutdown().await.unwrap();
+        drop(first);
+        drop(first_channel);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while control.active_flows() != 0 {
+                assert!(control.active_flows() <= 1);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let recovered = tokio::net::TcpStream::connect(listen).await.unwrap();
+        let (mut recovered_channel, _) = endpoint_listener.accept().await.unwrap();
+        let mut recovered_preface = [0_u8; 16];
+        recovered_channel
+            .read_exact(&mut recovered_preface)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while control.active_flows() != 1 {
+                assert!(control.active_flows() <= 1);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(recovered);
+        drop(recovered_channel);
+
+        control.close_admission().await;
+        control
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), supervisor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(control.active_flows(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stable_trust_mutation_during_reload_gates_unix_and_tls_until_recovery() {
+        let dir = tempfile::Builder::new()
+            .prefix(".relay-mixed-mutation-test-")
+            .tempdir_in(std::env::var_os("HOME").unwrap())
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let trust_path = dir.path().join("access-flow-root.pem");
+        std::fs::write(&trust_path, RT06_OLD_ROOT_PEM).unwrap();
+        std::fs::set_permissions(&trust_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let unix_path = dir.path().join("access-flow.sock");
+        let unix_listener = std::os::unix::net::UnixListener::bind(&unix_path).unwrap();
+        unix_listener.set_nonblocking(true).unwrap();
+        let unix_listener = tokio::net::UnixListener::from_std(unix_listener).unwrap();
+        let tls_tcp = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let tls_address = tls_tcp.local_addr().unwrap();
+
+        let http_source = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let http_listen = http_source.local_addr().unwrap();
+        drop(http_source);
+        let https_source = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let https_listen = https_source.local_addr().unwrap();
+        drop(https_source);
+        let config = AccessFlowRelayConfig {
+            setup_timeout: "2s".into(),
+            drain_timeout: "1s".into(),
+            max_connections: 4,
+            copy_buffer_bytes_per_direction: 4096,
+            start_after_services: Vec::new(),
+            presentation: AccessFlowRelayPresentation::BearerEnvironment {
+                variable: "AW_ACCESS_FLOW_TEST_TOKEN".into(),
+            },
+            routes: vec![
+                AccessFlowRelayRoute {
+                    name: "http".into(),
+                    listen: http_listen.to_string(),
+                    allowed_destination_ports: vec![http_listen.port()],
+                    transport: AccessFlowRelayTransport::Unix {
+                        path: unix_path.display().to_string(),
+                    },
+                },
+                AccessFlowRelayRoute {
+                    name: "https".into(),
+                    listen: https_listen.to_string(),
+                    allowed_destination_ports: vec![https_listen.port()],
+                    transport: AccessFlowRelayTransport::TlsTcp {
+                        address: tls_address.to_string(),
+                        server_name: "access-flow.test".into(),
+                        trust: AccessFlowRelayTrust::PemBundle {
+                            path: trust_path.display().to_string(),
+                        },
+                    },
+                },
+            ],
+        };
+        let (control, commands) = RelayControl::configured(&config);
+        let (reload_reached, resume_reload) = control.pause_blocking_reload();
+        let state = Arc::new(AgentState::new(
+            dir.path().join("state"),
+            None,
+            false,
+            None,
+            None,
+            Some(control.clone()),
+        ));
+        let supervisor = tokio::spawn(run_relay_supervisor(
+            config,
+            IdentityPresentation::Bearer(
+                access_identity::SensitiveBearer::new(TEST_ACCESS_FLOW_BEARER).unwrap(),
+            ),
+            Vec::new(),
+            state,
+            control.clone(),
+            commands,
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !control.is_ready() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        control.initiate_security_reload().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || reload_reached.recv()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        std::fs::write(&trust_path, b"stable invalid trust material").unwrap();
+
+        let mut rejected_unix = tokio::net::TcpStream::connect(http_listen).await.unwrap();
+        let mut eof = [0_u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(250), rejected_unix.read(&mut eof))
+                .await
+                .expect("Unix route did not reject during trust reload")
+                .unwrap(),
+            0
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), unix_listener.accept())
+                .await
+                .is_err(),
+            "Unix connector ran while trust reload gated the relay"
+        );
+
+        let mut rejected_tls = tokio::net::TcpStream::connect(https_listen).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(250), rejected_tls.read(&mut eof))
+                .await
+                .expect("TLS route did not reject during trust reload")
+                .unwrap(),
+            0
+        );
+        tls_tcp.set_nonblocking(true).unwrap();
+        assert_eq!(
+            tls_tcp.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "TLS connector ran while trust reload gated the relay"
+        );
+
+        resume_reload.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while control.reload_in_progress.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!control.is_ready());
+
+        std::fs::write(&trust_path, RT06_OLD_ROOT_PEM).unwrap();
+        control.initiate_security_reload().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while control.reload_in_progress.load(Ordering::Acquire) || !control.is_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let recovered_unix = tokio::net::TcpStream::connect(http_listen).await.unwrap();
+        let (mut recovered_unix_channel, _) = unix_listener.accept().await.unwrap();
+        let mut unix_preface = [0_u8; 48];
+        recovered_unix_channel
+            .read_exact(&mut unix_preface)
+            .await
+            .unwrap();
+        drop(recovered_unix);
+        drop(recovered_unix_channel);
+
+        let mut tls_listener = TlsAccessFlowTcpListener::from_std(tls_tcp).unwrap();
+        let tls_server = rt06_server_adapter(RT06_OLD_LEAF_PEM, RT06_OLD_KEY_PEM, 1);
+        let tls_server_task = tokio::spawn(async move {
+            let cancellation = RelayCancellation::default();
+            let channel = tls_server
+                .accept(&mut tls_listener, &cancellation)
+                .await
+                .unwrap()
+                .establish(&cancellation)
+                .await
+                .unwrap();
+            let destination = access_flow::AccessFlowDestination::new(
+                std::net::Ipv4Addr::LOCALHOST,
+                https_listen.port(),
+            )
+            .unwrap();
+            let accepted = AccessFlowAcceptor::new(
+                AccessFlowPresentationMode::Required,
+                [std::num::NonZeroU16::new(https_listen.port()).unwrap()],
+            )
+            .unwrap()
+            .accept(
+                channel,
+                Instant::now() + Duration::from_secs(2),
+                &cancellation,
+                &ExpectProductTlsPreface { destination },
+            )
+            .await
+            .unwrap();
+            let mut stream = accepted.into_parts().io;
+            let mut byte = [0_u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            assert_eq!(byte, [b'R']);
+        });
+        let mut recovered_tls = tokio::net::TcpStream::connect(https_listen).await.unwrap();
+        recovered_tls.write_all(b"R").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), tls_server_task)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(recovered_tls);
+
+        control.close_admission().await;
+        control
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), supervisor)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[cfg(target_os = "linux")]
