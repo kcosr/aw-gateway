@@ -233,15 +233,23 @@ done
 sudo -n true
 docker info >/dev/null
 docker image inspect '"$(printf '%q' "$REMOTE_IMAGE")"' >/dev/null
+provider_python=$(docker run --rm --pull=never --user 0:0 \
+    '"$(printf '%q' "$REMOTE_IMAGE")"' sh -c "command -v python3")
 printf "ssh_source=%s\n" "${SSH_CONNECTION%% *}"
 printf "home=%s\n" "$HOME"
+printf "provider_python=%s\n" "$provider_python"
 '
 ) || fail "remote prerequisites or cached image are unavailable"
 SSH_SOURCE=$(awk -F= '$1 == "ssh_source" {print $2}' <<<"$REMOTE_FACTS")
 REMOTE_HOME=$(awk -F= '$1 == "home" {print $2}' <<<"$REMOTE_FACTS")
+REMOTE_PROVIDER_PYTHON=$(
+    awk -F= '$1 == "provider_python" {print $2}' <<<"$REMOTE_FACTS"
+)
 validate_ipv4 "$SSH_SOURCE" || fail "remote SSH source discovery was invalid"
 [[ $REMOTE_HOME == /* && $REMOTE_HOME =~ ^[A-Za-z0-9._/-]+$ ]] \
     || fail "remote HOME is not a safe absolute path"
+[[ $REMOTE_PROVIDER_PYTHON =~ ^/[A-Za-z0-9._/-]+$ ]] \
+    || fail "remote image Python path is not a safe absolute path"
 
 if [[ -z $REMOTE_ADDRESS ]]; then
     REMOTE_ADDRESS=$(
@@ -671,7 +679,7 @@ path = "/bundle/identity-token"
 
 [authorization.providers.cross_host]
 kind = "process"
-command = "/usr/local/bin/python3"
+command = "$REMOTE_PROVIDER_PYTHON"
 args = ["/bundle/provider.py", "/state/provider.jsonl", "/bundle/private-expected"]
 timeout = "2s"
 inherit_environment = false
