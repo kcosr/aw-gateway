@@ -561,6 +561,10 @@ import threading
 import time
 
 
+class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):
+    request_queue_size = 256
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -626,9 +630,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-http_server = http.server.ThreadingHTTPServer(("0.0.0.0", 80), Handler)
-escape_server = http.server.ThreadingHTTPServer(("0.0.0.0", 8080), Handler)
-https_server = http.server.ThreadingHTTPServer(("0.0.0.0", 443), Handler)
+http_server = FixtureThreadingHttpServer(("0.0.0.0", 80), Handler)
+escape_server = FixtureThreadingHttpServer(("0.0.0.0", 8080), Handler)
+https_server = FixtureThreadingHttpServer(("0.0.0.0", 443), Handler)
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 context.load_cert_chain(sys.argv[1], sys.argv[2])
 https_server.socket = context.wrap_socket(https_server.socket, server_side=True)
@@ -653,6 +657,10 @@ hop_headers = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
 }
+
+
+class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):
+    request_queue_size = 256
 
 
 def record(**event):
@@ -732,7 +740,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-http.server.ThreadingHTTPServer(("0.0.0.0", 8888), Handler).serve_forever()
+FixtureThreadingHttpServer(("0.0.0.0", 8888), Handler).serve_forever()
 PY
 
 docker run -d --name "$ORIGIN_CONTAINER" --network "$NETWORK" \

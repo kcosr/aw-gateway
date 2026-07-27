@@ -598,6 +598,8 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
         "wait_for_measurement_file \"$MEASUREMENT_CONTROL_DIR/pids-bound\"",
         "cat /tmp/measurement-clients.failure",
         "client=%s exit=%s",
+        "class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):",
+        "request_queue_size = 256",
         "--gateway-projection-probe <absolute-regular-file>",
         "gateway_projected_bytes\t$GATEWAY_PROJECTED_BYTES",
         "gateway_projected_descriptors\t$GATEWAY_PROJECTED_DESCRIPTORS",
@@ -623,6 +625,19 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
         if script.contains(forbidden) {
             return Err(forbidden);
         }
+    }
+    if script
+        .matches("class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):")
+        .count()
+        != 2
+    {
+        return Err("class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):");
+    }
+    if script.matches("request_queue_size = 256").count() != 2 {
+        return Err("request_queue_size = 256");
+    }
+    if script.matches("FixtureThreadingHttpServer((").count() != 4 {
+        return Err("FixtureThreadingHttpServer((");
     }
     Ok(())
 }
@@ -684,6 +699,9 @@ fn tls_access_flow_stack_smoke_is_integrated_non_vacuous_and_mutation_guarded() 
         "wait_for_measurement_file \"$MEASUREMENT_CONTROL_DIR/pids-bound\"",
         "cat /tmp/measurement-clients.failure",
         "client=%s exit=%s",
+        "class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):",
+        "request_queue_size = 256",
+        "FixtureThreadingHttpServer((",
         "--gateway-projection-probe <absolute-regular-file>",
         "gateway_projected_bytes\t$GATEWAY_PROJECTED_BYTES",
         "gateway_projected_descriptors\t$GATEWAY_PROJECTED_DESCRIPTORS",
