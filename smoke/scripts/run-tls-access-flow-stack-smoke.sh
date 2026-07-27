@@ -1528,7 +1528,7 @@ wait_for_measurement_file() {
 measurement_active_flows() {
     docker exec "$WORKLOAD_CONTAINER" sh -eu -c \
         "printf '%s' '{\"id\":\"measurement\",\"method\":\"status\"}' \
-            | nc -w 1 -U /run/aw-gateway/agent.sock" \
+            | nc -N -w 1 -U /run/aw-gateway/agent.sock" \
         | jq -er '.result.access_flow_relay.active_flows'
 }
 
