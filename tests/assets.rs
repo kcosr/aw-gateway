@@ -620,6 +620,10 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
         "--gateway-projection-probe <absolute-regular-file>",
         "gateway_projected_bytes\t$GATEWAY_PROJECTED_BYTES",
         "gateway_projected_descriptors\t$GATEWAY_PROJECTED_DESCRIPTORS",
+        "gateway_minimum_active_bytes_per_flow\t$GATEWAY_MINIMUM_ACTIVE_BYTES_PER_FLOW",
+        "composed_minimum_active_bytes_per_flow\t$COMPOSED_MINIMUM_ACTIVE_BYTES_PER_FLOW",
+        "PROXY_MINIMUM_ACTIVE_BYTES_PER_FLOW\n            + GATEWAY_MINIMUM_ACTIVE_BYTES_PER_FLOW",
+        "$((active * COMPOSED_MINIMUM_ACTIVE_BYTES_PER_FLOW))",
         "nc -N -w 1 -U /run/aw-gateway/agent.sock",
         "test ! -e /run/acl-proxy/transparent-http.sock",
         "tls-access-flow-stack-smoke=passed",
@@ -639,6 +643,8 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
         "proxy-loss-fail-closed=passed",
         "pinned-inode-rebind=passed",
         "max_inflight_wire_body_bytes_per_quota_key",
+        "gateway_minimum_active_bytes_per_flow\t147456",
+        "composed_minimum_active_bytes_per_flow\t327680",
     ] {
         if script.contains(forbidden) {
             return Err(forbidden);
@@ -757,6 +763,10 @@ fn tls_access_flow_stack_smoke_is_integrated_non_vacuous_and_mutation_guarded() 
         "--gateway-projection-probe <absolute-regular-file>",
         "gateway_projected_bytes\t$GATEWAY_PROJECTED_BYTES",
         "gateway_projected_descriptors\t$GATEWAY_PROJECTED_DESCRIPTORS",
+        "gateway_minimum_active_bytes_per_flow\t$GATEWAY_MINIMUM_ACTIVE_BYTES_PER_FLOW",
+        "composed_minimum_active_bytes_per_flow\t$COMPOSED_MINIMUM_ACTIVE_BYTES_PER_FLOW",
+        "PROXY_MINIMUM_ACTIVE_BYTES_PER_FLOW\n            + GATEWAY_MINIMUM_ACTIVE_BYTES_PER_FLOW",
+        "$((active * COMPOSED_MINIMUM_ACTIVE_BYTES_PER_FLOW))",
         "nc -N -w 1 -U /run/aw-gateway/agent.sock",
         "tls-access-flow-stack-smoke=passed",
     ] {

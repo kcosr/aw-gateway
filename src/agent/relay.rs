@@ -1460,6 +1460,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         assert_eq!(relay_config.routes.len(), 2);
         assert_eq!(relay_config.copy_buffer_bytes_per_direction, 16 * 1024);
         relay_config.max_connections = 128;
+        let projected_flows = u64::try_from(relay_config.max_connections).unwrap();
 
         let dir = tempfile::Builder::new()
             .prefix(".relay-rt06-boundary-")
@@ -1510,6 +1511,29 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         let projection = relay.resource_projection();
         assert!(projection.total_descriptors <= budget.descriptors);
         assert!(projection.total_memory_bytes <= budget.memory_bytes);
+        for active_component in [
+            projection.flow_task_session_bytes,
+            projection.copy_buffer_bytes,
+            projection.connector_active_bytes,
+        ] {
+            assert_eq!(
+                active_component % projected_flows,
+                0,
+                "the Gateway RT06 active-flow component must divide exactly by the flow ceiling"
+            );
+        }
+        let minimum_active_bytes_per_flow = projection
+            .flow_task_session_bytes
+            .checked_add(projection.copy_buffer_bytes)
+            .and_then(|value| value.checked_add(projection.connector_active_bytes))
+            .and_then(|value| value.checked_div(projected_flows))
+            .expect("the Gateway RT06 active-flow projection must fit u64");
+        assert!(
+            minimum_active_bytes_per_flow
+                .checked_mul(projected_flows)
+                .is_some_and(|value| value <= projection.total_memory_bytes),
+            "the Gateway RT06 active-flow floor must fit its total relay projection"
+        );
         if let Some(output) = std::env::var_os("AW_GATEWAY_RT06_PROJECTION_OUTPUT") {
             use std::fs::OpenOptions;
             use std::io::Write;
@@ -1536,7 +1560,8 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
                 file,
                 "name\tvalue\n\
                  gateway_projected_bytes\t{projected_memory_bytes}\n\
-                 gateway_projected_descriptors\t{projected_descriptors}"
+                 gateway_projected_descriptors\t{projected_descriptors}\n\
+                 gateway_minimum_active_bytes_per_flow\t{minimum_active_bytes_per_flow}"
             )
             .expect("the Gateway RT06 projection output must be writable");
             file.sync_all()

@@ -35,6 +35,8 @@ PROXY_PROJECTED_DESCRIPTORS=
 PROXY_MINIMUM_ACTIVE_BYTES_PER_FLOW=
 GATEWAY_PROJECTED_BYTES=
 GATEWAY_PROJECTED_DESCRIPTORS=
+GATEWAY_MINIMUM_ACTIVE_BYTES_PER_FLOW=
+COMPOSED_MINIMUM_ACTIVE_BYTES_PER_FLOW=
 MEASUREMENT_CLIENTS_STARTED=0
 SUCCESS=0
 
@@ -310,7 +312,8 @@ print(
 )
 PY
     ) || fail "could not consume the Proxy-owned RT06 projection probe"
-    read -r GATEWAY_PROJECTED_BYTES GATEWAY_PROJECTED_DESCRIPTORS < <(
+    read -r GATEWAY_PROJECTED_BYTES GATEWAY_PROJECTED_DESCRIPTORS \
+        GATEWAY_MINIMUM_ACTIVE_BYTES_PER_FLOW < <(
         python3 - "$GATEWAY_PROJECTION_PROBE" <<'PY'
 import csv
 from pathlib import Path
@@ -318,7 +321,11 @@ import sys
 
 with Path(sys.argv[1]).open(encoding="ascii", newline="") as source:
     rows = list(csv.DictReader(source, delimiter="\t"))
-expected = {"gateway_projected_bytes", "gateway_projected_descriptors"}
+expected = {
+    "gateway_projected_bytes",
+    "gateway_projected_descriptors",
+    "gateway_minimum_active_bytes_per_flow",
+}
 if (
     not rows
     or set(rows[0]) != {"name", "value"}
@@ -338,9 +345,17 @@ for row in rows:
 print(
     values["gateway_projected_bytes"],
     values["gateway_projected_descriptors"],
+    values["gateway_minimum_active_bytes_per_flow"],
 )
 PY
     ) || fail "could not consume the Gateway-owned RT06 projection probe"
+    ((PROXY_MINIMUM_ACTIVE_BYTES_PER_FLOW
+        <= 9223372036854775807 - GATEWAY_MINIMUM_ACTIVE_BYTES_PER_FLOW)) \
+        || fail "composed RT06 active-flow projection exceeds signed 64-bit arithmetic"
+    COMPOSED_MINIMUM_ACTIVE_BYTES_PER_FLOW=$((
+        PROXY_MINIMUM_ACTIVE_BYTES_PER_FLOW
+            + GATEWAY_MINIMUM_ACTIVE_BYTES_PER_FLOW
+    ))
 fi
 
 for command in awk curl docker git jq openssl python3 sha256sum stat timeout; do
@@ -1624,7 +1639,8 @@ write_measurement_phase() {
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$epoch" "$phase" "$active" "$http" "$https" \
         "$((active * 3))" "$((active * 2))" "$((active * 98304))" \
-        "$((active * 327680))" >>"$MEASUREMENT_CONTROL_DIR/logical.tsv"
+        "$((active * COMPOSED_MINIMUM_ACTIVE_BYTES_PER_FLOW))" \
+        >>"$MEASUREMENT_CONTROL_DIR/logical.tsv"
 }
 
 write_measurement_control_phase() {
@@ -1643,8 +1659,8 @@ gateway_projected_bytes	$GATEWAY_PROJECTED_BYTES
 proxy_projected_descriptors	$PROXY_PROJECTED_DESCRIPTORS
 gateway_projected_descriptors	$GATEWAY_PROJECTED_DESCRIPTORS
 proxy_minimum_active_bytes_per_flow	$PROXY_MINIMUM_ACTIVE_BYTES_PER_FLOW
-gateway_minimum_active_bytes_per_flow	147456
-composed_minimum_active_bytes_per_flow	327680
+gateway_minimum_active_bytes_per_flow	$GATEWAY_MINIMUM_ACTIVE_BYTES_PER_FLOW
+composed_minimum_active_bytes_per_flow	$COMPOSED_MINIMUM_ACTIVE_BYTES_PER_FLOW
 known_buffer_bytes_per_flow	98304
 logical_permits_per_flow	3
 logical_tasks_per_flow	2
