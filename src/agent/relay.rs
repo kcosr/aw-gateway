@@ -1510,6 +1510,38 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         let projection = relay.resource_projection();
         assert!(projection.total_descriptors <= budget.descriptors);
         assert!(projection.total_memory_bytes <= budget.memory_bytes);
+        if let Some(output) = std::env::var_os("AW_GATEWAY_RT06_PROJECTION_OUTPUT") {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+
+            let output = PathBuf::from(output);
+            assert!(
+                output.is_absolute() && output.file_name().is_some(),
+                "AW_GATEWAY_RT06_PROJECTION_OUTPUT must name a new absolute output file"
+            );
+            let projected_memory_bytes = projection
+                .total_memory_bytes
+                .checked_add(transport_reserve.memory_bytes)
+                .expect("the Gateway RT06 memory projection must fit u64");
+            let projected_descriptors = projection
+                .total_descriptors
+                .checked_add(transport_reserve.descriptors)
+                .expect("the Gateway RT06 descriptor projection must fit u64");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(output)
+                .expect("the Gateway RT06 projection output must not already exist");
+            writeln!(
+                file,
+                "name\tvalue\n\
+                 gateway_projected_bytes\t{projected_memory_bytes}\n\
+                 gateway_projected_descriptors\t{projected_descriptors}"
+            )
+            .expect("the Gateway RT06 projection output must be writable");
+            file.sync_all()
+                .expect("the Gateway RT06 projection output must be durable");
+        }
 
         let obsolete_summed_phase_bytes = projection
             .total_memory_bytes

@@ -28,10 +28,13 @@ FORWARDER_PID=
 MEASUREMENT_CONTROL_DIR=
 MEASUREMENT_LOAD=
 PROXY_PROJECTION_PROBE=
+GATEWAY_PROJECTION_PROBE=
 MEASUREMENT_SECRET_SCAN_FILE=
 PROXY_PROJECTED_BYTES=
 PROXY_PROJECTED_DESCRIPTORS=
 PROXY_MINIMUM_ACTIVE_BYTES_PER_FLOW=
+GATEWAY_PROJECTED_BYTES=
+GATEWAY_PROJECTED_DESCRIPTORS=
 MEASUREMENT_CLIENTS_STARTED=0
 SUCCESS=0
 
@@ -54,6 +57,7 @@ Usage: run-tls-access-flow-stack-smoke.sh \
   [--measurement-control-dir <absolute-empty-directory> \
    --measurement-load <0|32|128> \
    --proxy-projection-probe <absolute-regular-file> \
+   --gateway-projection-probe <absolute-regular-file> \
    --measurement-secret-scan-file <absolute-new-file>]
 EOF
     exit 2
@@ -224,6 +228,12 @@ while (($#)); do
             PROXY_PROJECTION_PROBE=$2
             shift 2
             ;;
+        --gateway-projection-probe)
+            (($# >= 2)) || usage
+            [[ -z $GATEWAY_PROJECTION_PROBE ]] || usage
+            GATEWAY_PROJECTION_PROBE=$2
+            shift 2
+            ;;
         --measurement-secret-scan-file)
             (($# >= 2)) || usage
             [[ -z $MEASUREMENT_SECRET_SCAN_FILE ]] || usage
@@ -238,10 +248,14 @@ done
     && -n $ACCESS_RUNTIME_REPO && -n $AW_REPO && -n $EXPECTED_ACL_SHA \
     && -n $EXPECTED_ACCESS_RUNTIME_SHA && -n $EXPECTED_AW_SHA ]] || usage
 if [[ -n $MEASUREMENT_CONTROL_DIR || -n $MEASUREMENT_LOAD \
-    || -n $PROXY_PROJECTION_PROBE || -n $MEASUREMENT_SECRET_SCAN_FILE ]]; then
+    || -n $PROXY_PROJECTION_PROBE || -n $GATEWAY_PROJECTION_PROBE \
+    || -n $MEASUREMENT_SECRET_SCAN_FILE ]]; then
     [[ -n $MEASUREMENT_CONTROL_DIR && $MEASUREMENT_LOAD =~ ^(0|32|128)$ \
         && $PROXY_PROJECTION_PROBE == /* && -f $PROXY_PROJECTION_PROBE \
-        && ! -L $PROXY_PROJECTION_PROBE && $MEASUREMENT_SECRET_SCAN_FILE == /* \
+        && ! -L $PROXY_PROJECTION_PROBE \
+        && $GATEWAY_PROJECTION_PROBE == /* && -f $GATEWAY_PROJECTION_PROBE \
+        && ! -L $GATEWAY_PROJECTION_PROBE \
+        && $MEASUREMENT_SECRET_SCAN_FILE == /* \
         && ! -e $MEASUREMENT_SECRET_SCAN_FILE && ! -L $MEASUREMENT_SECRET_SCAN_FILE \
         && -d $(dirname -- "$MEASUREMENT_SECRET_SCAN_FILE") \
         && ! -L $(dirname -- "$MEASUREMENT_SECRET_SCAN_FILE") ]] || usage
@@ -255,6 +269,8 @@ if [[ -n $MEASUREMENT_CONTROL_DIR || -n $MEASUREMENT_LOAD \
         || fail "required command is unavailable: python3"
     PROXY_PROJECTION_PROBE=$(cd -- "$(dirname -- "$PROXY_PROJECTION_PROBE")" \
         && pwd -P)/$(basename -- "$PROXY_PROJECTION_PROBE")
+    GATEWAY_PROJECTION_PROBE=$(cd -- "$(dirname -- "$GATEWAY_PROJECTION_PROBE")" \
+        && pwd -P)/$(basename -- "$GATEWAY_PROJECTION_PROBE")
     MEASUREMENT_SECRET_SCAN_FILE=$(cd -- "$(dirname -- "$MEASUREMENT_SECRET_SCAN_FILE")" \
         && pwd -P)/$(basename -- "$MEASUREMENT_SECRET_SCAN_FILE")
     read -r PROXY_PROJECTED_BYTES PROXY_PROJECTED_DESCRIPTORS \
@@ -294,6 +310,37 @@ print(
 )
 PY
     ) || fail "could not consume the Proxy-owned RT06 projection probe"
+    read -r GATEWAY_PROJECTED_BYTES GATEWAY_PROJECTED_DESCRIPTORS < <(
+        python3 - "$GATEWAY_PROJECTION_PROBE" <<'PY'
+import csv
+from pathlib import Path
+import sys
+
+with Path(sys.argv[1]).open(encoding="ascii", newline="") as source:
+    rows = list(csv.DictReader(source, delimiter="\t"))
+expected = {"gateway_projected_bytes", "gateway_projected_descriptors"}
+if (
+    not rows
+    or set(rows[0]) != {"name", "value"}
+    or {row["name"] for row in rows} != expected
+    or len(rows) != len(expected)
+):
+    raise SystemExit("Gateway projection probe has an invalid contract")
+values = {}
+for row in rows:
+    try:
+        value = int(row["value"])
+    except ValueError:
+        raise SystemExit("Gateway projection probe contains a non-integer") from None
+    if value <= 0:
+        raise SystemExit("Gateway projection probe contains a nonpositive value")
+    values[row["name"]] = value
+print(
+    values["gateway_projected_bytes"],
+    values["gateway_projected_descriptors"],
+)
+PY
+    ) || fail "could not consume the Gateway-owned RT06 projection probe"
 fi
 
 for command in awk curl docker git jq openssl python3 sha256sum stat timeout; do
@@ -1548,45 +1595,14 @@ write_measurement_control_phase() {
 }
 
 write_measurement_projection() {
-    local relay_log gateway_memory gateway_descriptors
-    relay_log=$(docker exec "$WORKLOAD_CONTAINER" cat /tmp/relay.stderr)
-    read -r gateway_memory gateway_descriptors < <(
-        python3 -c '
-import json
-import re
-import sys
-
-for line in sys.stdin:
-    if "access flow relay resource preflight passed" not in line:
-        continue
-    try:
-        record = json.loads(line)
-    except json.JSONDecodeError:
-        record = None
-    if isinstance(record, dict):
-        fields = record.get("fields", record)
-        memory = fields.get("memory_bytes")
-        descriptors = fields.get("descriptors")
-        if isinstance(memory, int) and isinstance(descriptors, int):
-            print(memory, descriptors)
-            raise SystemExit
-    memory = re.search(r"\bmemory_bytes[=: ]+(\d+)", line)
-    descriptors = re.search(r"\bdescriptors[=: ]+(\d+)", line)
-    if memory and descriptors:
-        print(memory.group(1), descriptors.group(1))
-        raise SystemExit
-raise SystemExit("agent log omitted the resource preflight projection")
-' <<<"$relay_log"
-    ) || fail "could not recover the Gateway resource projection"
-
     cat >"$MEASUREMENT_CONTROL_DIR/projection.tsv" <<EOF
 name	value
 proxy_feature_ceiling_bytes	268435456
 gateway_feature_ceiling_bytes	268435456
 proxy_projected_bytes	$PROXY_PROJECTED_BYTES
-gateway_projected_bytes	$gateway_memory
+gateway_projected_bytes	$GATEWAY_PROJECTED_BYTES
 proxy_projected_descriptors	$PROXY_PROJECTED_DESCRIPTORS
-gateway_projected_descriptors	$gateway_descriptors
+gateway_projected_descriptors	$GATEWAY_PROJECTED_DESCRIPTORS
 proxy_minimum_active_bytes_per_flow	$PROXY_MINIMUM_ACTIVE_BYTES_PER_FLOW
 gateway_minimum_active_bytes_per_flow	147456
 composed_minimum_active_bytes_per_flow	327680
