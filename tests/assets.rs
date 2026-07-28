@@ -24,6 +24,201 @@ fn example_asset(runtime: &str, name: &str) -> String {
         .to_string()
 }
 
+fn validate_cross_host_agent_carrier(smoke: &str) -> Result<(), String> {
+    for required in [
+        "--agent-image <image>",
+        "--agent-image) WORKLOAD_AGENT_IMAGE=$2",
+        "workload agent image must use an immutable sha256 digest",
+        "[[ $WORKLOAD_AGENT_IMAGE_ID =~ ^sha256:[0-9a-f]{64}$ ]]",
+        "docker run -d --pull=never --name \"$AGENT_CONTAINER\"",
+        "--network \"container:$WORKLOAD_CONTAINER\"",
+        "src=$AGENT_BIN,dst=/opt/aw-gateway/bin/aw-container-agent,readonly",
+        "src=$fifo,dst=/run/aw-gateway/identity-token.fifo",
+        "\"$WORKLOAD_AGENT_IMAGE\" bash /usr/local/bin/agent-carrier",
+        "[[ $executed_agent_image_id == \"$WORKLOAD_AGENT_IMAGE_ID\" ]]",
+        "agent-carrier-inspect.json",
+        "--config /etc/aw-gateway/container-agent.toml --log-level debug run",
+        "docker rm -f \"$agent_container\"",
+        "agent carrier container remained after teardown",
+        "workload container remained after teardown",
+        "$2 == \"0100007F:0C38\" && $4 == \"0A\" { http = 1 }",
+        "$2 == \"0100007F:0C39\" && $4 == \"0A\" { https = 1 }",
+        "END { exit !(http && https) }",
+        "/proc/net/tcp",
+        "docker network create \"$NETWORK\"",
+        "NETWORK_GATEWAY=$(docker network inspect \"$NETWORK\"",
+        "docker network rm \"$NETWORK\"",
+        "local workload network remained after teardown",
+        "workload-agent-image=$WORKLOAD_AGENT_IMAGE",
+        "workload-agent-image-id=$WORKLOAD_AGENT_IMAGE_ID",
+        "local-topology-cleanup=passed",
+        "docker cp \"$AGENT_CONTAINER:$log\" -",
+        "capture-ready)",
+        "capture-ready)\n        (($# == 0)) || exit 2\n        load_state",
+        "\"$REMOTE_DIR/bundle/remote-control.sh\" capture-start &",
+        "CAPTURE_CONTROLLER_PID=$!",
+        "wait_capture_controller",
+        "timeout --foreground --signal=TERM --kill-after=2s \"$limit\"",
+        "ssh_bounded 15s rm -rf -- \"$REMOTE_DIR\"",
+        "remote_control_bounded 5s capture-counts",
+        "remote_control_bounded 15s capture-stop",
+        "remote_control_bounded 60s stop",
+        "for signal in none TERM KILL; do",
+        "if wait \"$CAPTURE_CONTROLLER_PID\"; then",
+        "if ((status != 0)); then",
+        "attached packet-capture controller did not stop cleanly",
+        "attached packet-capture controller survived bounded KILL teardown",
+        "attached packet-capture controller exited unsuccessfully",
+        "host $3",
+        "\"/sys/class/net/$route_interface/bridge\"",
+        "\"/sys/class/net/$route_interface/brif/\"*",
+        "\"/sys/class/net/$member/device\"",
+        "remote route bridge must have one physical member or --remote-interface must be specified",
+        "-v sources=\"$SOURCE_ADDRESSES\"",
+        "http=$(awk -v sources=\"$SOURCE_ADDRESSES\"",
+        "--remote-source-addresses <IPv4[,IPv4...]>",
+        "--remote-source-addresses) REMOTE_SOURCE_ADDRESSES_CSV=$2",
+        "[[ $part == 0 || $part != 0* ]] || return 1",
+        "Get-NetIPAddress -AddressFamily IPv4",
+        "LOCAL_SOURCE_ADDRESSES[$local_source_address]=1",
+        "remote-source-addresses must belong to the initiating host",
+        "remote source allow-set spans multiple route interfaces",
+        "remote-allowed-source-addresses=$REMOTE_SOURCE_ADDRESSES_CSV",
+        "for source in \"${sources[@]}\"; do",
+        "target=\"$PUBLIC_ADDRESS.$HTTP_PORT\"",
+        "target=\"$PUBLIC_ADDRESS.$HTTPS_PORT\"",
+        "remote packet capture did not become ready",
+        "tcpdump: listening on $CAPTURE_INTERFACE,",
+        "$(stat -c %s \"$STATE/outer.pcap\") >= 24",
+        "exec tcpdump --immediate-mode -i \"$2\" -nn -U",
+        "\"dst host $3 and (dst port $4 or dst port $5)\"",
+        "' sh \"$STATE/tcpdump.pid\" \"$CAPTURE_INTERFACE\" \"$PUBLIC_ADDRESS\"",
+        "capture-counts)",
+        "[[ ! -f $STATE/outer.pcap ]] || capture_counts || true",
+        "awk -v tag=\"$TAG.\" 'index($0, tag)'",
+        "    rejection-count)\n        (($# == 0)) || exit 2",
+        "    verify-rejection-and-restart)\n        (($# == 0)) || exit 2",
+        "remote_control_bounded 30s verify-rejection-and-restart",
+        "docker stop --time 5 \"$PROXY_CONTAINER\"",
+        "for path in root.iterdir()",
+        "observed=$(rejection_count)",
+        "[[ $observed == 1 ]]",
+        "docker start \"$PROXY_CONTAINER\"",
+        "TLS/TCP Access Flow preface or bearer was rejected",
+        "INVALID_REJECTIONS_BEFORE=$(remote_control_bounded 10s rejection-count)",
+        "grep -qx rejected-and-ready",
+        "fail \"invalid bearer did not reach Access Flow authentication\"",
+        "remote packet capture did not drain the five expected outer connections",
+        "remote-capture-interface=$REMOTE_INTERFACE",
+        "report_diagnostics()",
+        "require_empty_diagnostics()",
+        "tar -m -C \"$REMOTE_DIR/bundle\" -xf -",
+        "tar -m -C \"$TMP_DIR/remote-state\" -xf -",
+        "require_empty_diagnostics \\\n    \"remote evidence export\"",
+    ] {
+        if !smoke.contains(required) {
+            return Err(format!("missing carrier contract {required:?}"));
+        }
+    }
+    let capture_ready = smoke
+        .split_once("    capture-ready)")
+        .and_then(|(_, suffix)| suffix.split_once("\n        ;;\n"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| "missing packet-capture readiness action".to_owned())?;
+    for required in [
+        "load_state",
+        "tcpdump: listening on $CAPTURE_INTERFACE,",
+        "$(stat -c %s \"$STATE/outer.pcap\") >= 24",
+    ] {
+        if !capture_ready.contains(required) {
+            return Err(format!(
+                "missing packet-capture readiness contract {required:?}"
+            ));
+        }
+    }
+    if smoke.contains("REMOTE_SOURCE_ADDRESSES_CSV=$SSH_SOURCE") {
+        return Err("SSH source was reused as the workload firewall source".to_owned());
+    }
+    let source_parse = smoke
+        .find("IFS=, read -r -a REMOTE_SOURCE_ADDRESSES")
+        .ok_or_else(|| "missing bounded source allow-set parsing".to_owned())?;
+    let remote_start = smoke
+        .find("REMOTE_STARTED=1")
+        .ok_or_else(|| "missing remote topology start".to_owned())?;
+    if source_parse >= remote_start {
+        return Err("source allow-set was not validated before firewall publication".to_owned());
+    }
+    let capture_wait = smoke
+        .split_once("wait_capture_controller() {")
+        .and_then(|(_, suffix)| suffix.split_once("\n}\n\nstop_remote() {"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| "missing bounded capture-controller wait".to_owned())?;
+    for required in [
+        "for signal in none TERM KILL; do",
+        "if wait \"$CAPTURE_CONTROLLER_PID\"; then",
+        "if ((status != 0)); then",
+        "attached packet-capture controller survived bounded KILL teardown",
+        "attached packet-capture controller exited unsuccessfully",
+    ] {
+        if !capture_wait.contains(required) {
+            return Err(format!(
+                "missing capture-controller lifecycle contract {required:?}"
+            ));
+        }
+    }
+    let start = smoke
+        .split_once("start_workload() {")
+        .and_then(|(_, suffix)| suffix.split_once("\n}\n\nstop_workload() {"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| "missing start_workload body".to_owned())?;
+    let carrier_launch = start
+        .split_once("docker run -d --pull=never --name \"$AGENT_CONTAINER\"")
+        .and_then(|(_, suffix)| suffix.split_once("\n    local executed_agent_image_id"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| "missing bounded agent carrier launch".to_owned())?;
+    if carrier_launch.contains("AW_IDENTITY_TOKEN=")
+        || carrier_launch.contains("--env")
+        || carrier_launch.contains(" -e ")
+    {
+        return Err("agent bearer was placed in container launch metadata".to_owned());
+    }
+    if start.contains("/dev/tcp/127.0.0.1/3128") || start.contains("/dev/tcp/127.0.0.1/3129") {
+        return Err("relay readiness opens application flows".to_owned());
+    }
+    if start.find("test -f /tmp/firewall.ready")
+        >= start.find("docker run -d --pull=never --name \"$AGENT_CONTAINER\"")
+    {
+        return Err("agent carrier starts before the workload firewall is ready".to_owned());
+    }
+    let stop = smoke
+        .split_once("stop_workload() {")
+        .and_then(|(_, suffix)| suffix.split_once("\n}\n\ncapture_local_evidence() {"))
+        .map(|(body, _)| body)
+        .ok_or_else(|| "missing stop_workload body".to_owned())?;
+    if stop.find("docker rm -f \"$agent_container\"")
+        >= stop.find("docker rm -f \"$WORKLOAD_CONTAINER\"")
+    {
+        return Err("network namespace owner is removed before the agent carrier".to_owned());
+    }
+    let completion = smoke
+        .rsplit_once("\nstop_workload\n")
+        .map(|(_, suffix)| suffix)
+        .ok_or_else(|| "missing final local topology teardown".to_owned())?;
+    let network_remove = completion
+        .find("docker network rm \"$NETWORK\"")
+        .ok_or_else(|| "missing final network removal".to_owned())?;
+    let network_verify = completion
+        .find("docker network inspect \"$NETWORK\"")
+        .ok_or_else(|| "missing final network removal verification".to_owned())?;
+    let transcript = completion
+        .find("'local-topology-cleanup=passed'")
+        .ok_or_else(|| "missing local topology cleanup transcript".to_owned())?;
+    if !(network_remove < network_verify && network_verify < transcript) {
+        return Err("cleanup transcript precedes verified network removal".to_owned());
+    }
+    Ok(())
+}
+
 fn start_container_sshd_scripts() -> Vec<(&'static str, String)> {
     let mut scripts = vec![("assets", asset("start-container-sshd"))];
     scripts.extend(
@@ -59,6 +254,8 @@ fn asset_scripts_are_shell_syntax_valid() {
 
     for script in [
         "run-host-socket-exposure-smoke.sh",
+        "run-tls-access-flow-cross-host-smoke.sh",
+        "run-tls-access-flow-stack-smoke.sh",
         "run-transparent-firewall-smoke.sh",
         "run-transparent-uds-stack-smoke.sh",
     ] {
@@ -377,14 +574,515 @@ fn transparent_stack_smoke_covers_both_access_flow_relay_consumers() {
     );
 }
 
+fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
+    for required in [
+        "Usage: run-tls-access-flow-stack-smoke.sh",
+        "schema_version = 4",
+        "kind = \"tls_tcp\"",
+        "server_name = \"proxy.access-flow.test\"",
+        "kind = \"pem_bundle\"",
+        "[container_agent.access_flow_relay]",
+        "/opt/aw-gateway/bin/aw-container-agent",
+        "invalid bearer reached the authorization provider",
+        "delegate-allow-pass-deny=passed",
+        "private-inbound-field=passed",
+        "provider-client-sentinel=0.0.0.0",
+        "capture-client-sentinel=0.0.0.0:0",
+        "policy-log-client-sentinel=0.0.0.0",
+        "one-outer-connection-per-workload-flow=passed",
+        "websocket-upgrade-frame=passed",
+        "half-close=passed",
+        "low-concurrency-cancellation=passed",
+        ") >\"$MEASUREMENT_CONTROL_DIR/process-request.tsv\"",
+        "(umask 0077; : >\"$MEASUREMENT_CONTROL_DIR/process-request-ready\")",
+        "wait_for_measurement_file \"$MEASUREMENT_CONTROL_DIR/pids-bound\"",
+        "cat /tmp/measurement-clients.failure",
+        "client=%s exit=%s",
+        "wait_for_measurement_response_heads",
+        "/tmp/measurement-clients.response-heads-ready",
+        "write_measurement_phase 3 draining 0 0 0",
+        "touch \"$MEASUREMENT_CONTROL_DIR/draining-ready\"",
+        "wait_for_measurement_file \"$MEASUREMENT_CONTROL_DIR/drain-stable\"",
+        "write_measurement_phase 4 drained 0 0 0",
+        "--dump-header \"/tmp/measurement-client-http-$index.headers\"",
+        "--dump-header \"/tmp/measurement-client-https-$index.headers\"",
+        "cleanup_clients()",
+        "trap 'exit 143' TERM",
+        "class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):",
+        "request_queue_size = 256",
+        "measurement_hold_response_bytes = 16 * 1024 * 1024",
+        "str(measurement_hold_response_bytes)",
+        "class Server(socketserver.ThreadingTCPServer):",
+        "max_request_wire_bytes = 1048576",
+        "max_request_decoded_bytes = 1048576",
+        "max_response_wire_bytes = 16777216",
+        "max_response_decoded_bytes = 16777216",
+        "--gateway-projection-probe <absolute-regular-file>",
+        "gateway_projected_bytes\t$GATEWAY_PROJECTED_BYTES",
+        "gateway_projected_descriptors\t$GATEWAY_PROJECTED_DESCRIPTORS",
+        "gateway_minimum_active_bytes_per_flow\t$GATEWAY_MINIMUM_ACTIVE_BYTES_PER_FLOW",
+        "composed_minimum_active_bytes_per_flow\t$COMPOSED_MINIMUM_ACTIVE_BYTES_PER_FLOW",
+        "PROXY_MINIMUM_ACTIVE_BYTES_PER_FLOW\n            + GATEWAY_MINIMUM_ACTIVE_BYTES_PER_FLOW",
+        "$((active * COMPOSED_MINIMUM_ACTIVE_BYTES_PER_FLOW))",
+        "nc -N -w 1 -U /run/aw-gateway/agent.sock",
+        "test ! -e /run/acl-proxy/transparent-http.sock",
+        "tls-access-flow-stack-smoke=passed",
+    ] {
+        if !script.contains(required) {
+            return Err(required);
+        }
+    }
+    for forbidden in [
+        "--relay-bin",
+        "--relay-consumer",
+        "--access-flow-transport",
+        "kind = \"unix\"",
+        "schema_version = 3",
+        "acl-proxy-access-flow-relay --config",
+        "token-rotation-resolver-reload=passed",
+        "proxy-loss-fail-closed=passed",
+        "pinned-inode-rebind=passed",
+        "max_inflight_wire_body_bytes_per_quota_key",
+        "gateway_minimum_active_bytes_per_flow\t147456",
+        "composed_minimum_active_bytes_per_flow\t327680",
+    ] {
+        if script.contains(forbidden) {
+            return Err(forbidden);
+        }
+    }
+    if script
+        .matches("class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):")
+        .count()
+        != 2
+    {
+        return Err("class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):");
+    }
+    if script.matches("request_queue_size = 256").count() != 3 {
+        return Err("request_queue_size = 256");
+    }
+    if script.matches("FixtureThreadingHttpServer((").count() != 4 {
+        return Err("FixtureThreadingHttpServer((");
+    }
+    if script
+        .matches("wait_for_measurement_response_heads")
+        .count()
+        != 2
+    {
+        return Err("wait_for_measurement_response_heads");
+    }
+    if script
+        .matches("/tmp/measurement-clients.response-heads-ready")
+        .count()
+        != 2
+    {
+        return Err("/tmp/measurement-clients.response-heads-ready");
+    }
+    if script.matches("trap 'exit 143' TERM").count() != 2 {
+        return Err("trap 'exit 143' TERM");
+    }
+    Ok(())
+}
+
+fn validate_resource_process_binder(script: &str) -> Result<(), &'static str> {
+    for required in [
+        "def find_agent_host_pid(",
+        "def belongs_to_container(",
+        "os.path.samefile(proc_exe, expected_exe)",
+        "start_before != start_after",
+        "os.O_DIRECTORY | os.O_NOFOLLOW",
+        "os.O_EXCL | os.O_NOFOLLOW",
+        "dir_fd=directory_fd",
+        "os.fchown(descriptor, output_uid, output_gid)",
+        "os.fchmod(descriptor, 0o600)",
+        "args.output_uid != int(sudo_uid)",
+        "args.output_gid != int(sudo_gid)",
+    ] {
+        if !script.contains(required) {
+            return Err(required);
+        }
+    }
+    if script.matches("dir_fd=directory_fd").count() != 3 {
+        return Err("dir_fd=directory_fd");
+    }
+    Ok(())
+}
+
+#[test]
+fn tls_access_flow_stack_smoke_is_integrated_non_vacuous_and_mutation_guarded() {
+    let smoke = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("smoke/scripts/run-tls-access-flow-stack-smoke.sh"),
+    )
+    .unwrap();
+    validate_tls_access_flow_smoke(&smoke).unwrap();
+    assert_eq!(smoke.matches("/dev/tcp/").count(), 5);
+    for (offset, _) in smoke.match_indices("/dev/tcp/") {
+        let probe = &smoke[offset..smoke.len().min(offset + 180)];
+        assert!(
+            probe.contains(">/dev/null 2>&1"),
+            "readiness probe can leak expected connection diagnostics: {probe:?}"
+        );
+    }
+
+    for marker in [
+        "invalid bearer reached the authorization provider",
+        "delegate-allow-pass-deny=passed",
+        "private-inbound-field=passed",
+        "provider-client-sentinel=0.0.0.0",
+        "capture-client-sentinel=0.0.0.0:0",
+        "policy-log-client-sentinel=0.0.0.0",
+        "one-outer-connection-per-workload-flow=passed",
+        "websocket-upgrade-frame=passed",
+        "half-close=passed",
+        "low-concurrency-cancellation=passed",
+        ") >\"$MEASUREMENT_CONTROL_DIR/process-request.tsv\"",
+        "(umask 0077; : >\"$MEASUREMENT_CONTROL_DIR/process-request-ready\")",
+        "wait_for_measurement_file \"$MEASUREMENT_CONTROL_DIR/pids-bound\"",
+        "cat /tmp/measurement-clients.failure",
+        "client=%s exit=%s",
+        "wait_for_measurement_response_heads",
+        "/tmp/measurement-clients.response-heads-ready",
+        "write_measurement_phase 3 draining 0 0 0",
+        "touch \"$MEASUREMENT_CONTROL_DIR/draining-ready\"",
+        "wait_for_measurement_file \"$MEASUREMENT_CONTROL_DIR/drain-stable\"",
+        "write_measurement_phase 4 drained 0 0 0",
+        "--dump-header \"/tmp/measurement-client-http-$index.headers\"",
+        "--dump-header \"/tmp/measurement-client-https-$index.headers\"",
+        "cleanup_clients()",
+        "trap 'exit 143' TERM",
+        "class FixtureThreadingHttpServer(http.server.ThreadingHTTPServer):",
+        "request_queue_size = 256",
+        "FixtureThreadingHttpServer((",
+        "measurement_hold_response_bytes = 16 * 1024 * 1024",
+        "str(measurement_hold_response_bytes)",
+        "class Server(socketserver.ThreadingTCPServer):",
+        "max_request_wire_bytes = 1048576",
+        "max_request_decoded_bytes = 1048576",
+        "max_response_wire_bytes = 16777216",
+        "max_response_decoded_bytes = 16777216",
+        "--gateway-projection-probe <absolute-regular-file>",
+        "gateway_projected_bytes\t$GATEWAY_PROJECTED_BYTES",
+        "gateway_projected_descriptors\t$GATEWAY_PROJECTED_DESCRIPTORS",
+        "gateway_minimum_active_bytes_per_flow\t$GATEWAY_MINIMUM_ACTIVE_BYTES_PER_FLOW",
+        "composed_minimum_active_bytes_per_flow\t$COMPOSED_MINIMUM_ACTIVE_BYTES_PER_FLOW",
+        "PROXY_MINIMUM_ACTIVE_BYTES_PER_FLOW\n            + GATEWAY_MINIMUM_ACTIVE_BYTES_PER_FLOW",
+        "$((active * COMPOSED_MINIMUM_ACTIVE_BYTES_PER_FLOW))",
+        "nc -N -w 1 -U /run/aw-gateway/agent.sock",
+        "tls-access-flow-stack-smoke=passed",
+    ] {
+        let mutated = smoke.replacen(marker, "removed-by-mutation", 1);
+        assert!(
+            validate_tls_access_flow_smoke(&mutated).is_err(),
+            "removing {marker:?} did not invalidate the smoke contract"
+        );
+    }
+}
+
+#[test]
+fn tls_access_flow_resource_process_binder_is_identity_and_mutation_guarded() {
+    let binder = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("smoke/scripts/bind-access-flow-resource-processes.py"),
+    )
+    .unwrap();
+    validate_resource_process_binder(&binder).unwrap();
+    for marker in [
+        "def find_agent_host_pid(",
+        "def belongs_to_container(",
+        "os.path.samefile(proc_exe, expected_exe)",
+        "start_before != start_after",
+        "os.O_DIRECTORY | os.O_NOFOLLOW",
+        "os.O_EXCL | os.O_NOFOLLOW",
+        "dir_fd=directory_fd",
+        "os.fchown(descriptor, output_uid, output_gid)",
+        "os.fchmod(descriptor, 0o600)",
+        "args.output_uid != int(sudo_uid)",
+        "args.output_gid != int(sudo_gid)",
+    ] {
+        let mutated = binder.replacen(marker, "removed-by-mutation", 1);
+        assert!(
+            validate_resource_process_binder(&mutated).is_err(),
+            "removing {marker:?} did not invalidate the process-binder contract"
+        );
+    }
+}
+
+#[test]
+fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() {
+    let smoke = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("smoke/scripts/run-tls-access-flow-cross-host-smoke.sh"),
+    )
+    .unwrap();
+    validate_cross_host_agent_carrier(&smoke).unwrap();
+    for marker in [
+        "--agent-image) WORKLOAD_AGENT_IMAGE=$2",
+        "--network \"container:$WORKLOAD_CONTAINER\"",
+        "[[ $executed_agent_image_id == \"$WORKLOAD_AGENT_IMAGE_ID\" ]]",
+        "docker rm -f \"$agent_container\"",
+        "fail \"local workload network remained after teardown\"",
+        "workload-agent-image-id=$WORKLOAD_AGENT_IMAGE_ID",
+        "local-topology-cleanup=passed",
+        "$2 == \"0100007F:0C38\" && $4 == \"0A\" { http = 1 }",
+        "$2 == \"0100007F:0C39\" && $4 == \"0A\" { https = 1 }",
+        "END { exit !(http && https) }",
+        "/proc/net/tcp",
+        "NETWORK_GATEWAY=$(docker network inspect \"$NETWORK\"",
+        "capture-ready)",
+        "capture-ready)\n        (($# == 0)) || exit 2\n        load_state",
+        "remote packet capture did not become ready",
+        "timeout --foreground --signal=TERM --kill-after=2s \"$limit\"",
+        "ssh_bounded 15s rm -rf -- \"$REMOTE_DIR\"",
+        "remote_control_bounded 5s capture-counts",
+        "remote_control_bounded 15s capture-stop",
+        "remote_control_bounded 60s stop",
+        "for signal in none TERM KILL; do",
+        "if wait \"$CAPTURE_CONTROLLER_PID\"; then",
+        "if ((status != 0)); then",
+        "tcpdump: listening on $CAPTURE_INTERFACE,",
+        "$(stat -c %s \"$STATE/outer.pcap\") >= 24",
+        "exec tcpdump --immediate-mode -i \"$2\" -nn -U",
+        "\"dst host $3 and (dst port $4 or dst port $5)\"",
+        "' sh \"$STATE/tcpdump.pid\" \"$CAPTURE_INTERFACE\" \"$PUBLIC_ADDRESS\"",
+        "--remote-source-addresses) REMOTE_SOURCE_ADDRESSES_CSV=$2",
+        "[[ $part == 0 || $part != 0* ]] || return 1",
+        "Get-NetIPAddress -AddressFamily IPv4",
+        "LOCAL_SOURCE_ADDRESSES[$local_source_address]=1",
+        "remote-source-addresses must belong to the initiating host",
+        "remote source allow-set spans multiple route interfaces",
+        "\"$REMOTE_DIR/bundle/remote-control.sh\" capture-start &",
+        "remote-allowed-source-addresses=$REMOTE_SOURCE_ADDRESSES_CSV",
+        "http=$(awk -v sources=\"$SOURCE_ADDRESSES\"",
+        "    rejection-count)\n        (($# == 0)) || exit 2",
+        "    verify-rejection-and-restart)\n        (($# == 0)) || exit 2",
+        "remote_control_bounded 30s verify-rejection-and-restart",
+        "for path in root.iterdir()",
+        "grep -qx rejected-and-ready",
+        "remote-capture-interface=$REMOTE_INTERFACE",
+        "report_diagnostics()",
+        "require_empty_diagnostics()",
+        "tar -m -C \"$REMOTE_DIR/bundle\" -xf -",
+        "tar -m -C \"$TMP_DIR/remote-state\" -xf -",
+        "require_empty_diagnostics \\\n    \"remote evidence export\"",
+    ] {
+        let mutated = smoke.replacen(marker, "removed-by-mutation", 1);
+        assert!(
+            validate_cross_host_agent_carrier(&mutated).is_err(),
+            "removing {marker:?} did not invalidate the carrier contract"
+        );
+    }
+    assert!(!smoke.contains("for (index ="));
+    assert!(!smoke.contains("$(index +"));
+    assert!(!smoke.contains("trap stop_all ERR"));
+    assert!(!smoke.contains("remote_control capture-start &"));
+    assert!(!smoke.contains("AW_TLS_CROSS_HOST_REMOTE_IMAGE"));
+    assert!(!smoke.contains("AW_TLS_CROSS_HOST_SMOKE_IMAGE"));
+    assert!(!smoke.contains("REMOTE_IMAGE:-"));
+    assert!(!smoke.contains("BASE_IMAGE:-"));
+    assert!(smoke.contains("--workload-image <image>"));
+    assert!(smoke.contains("--remote-image <image>"));
+    assert!(smoke.contains("--workload-image) WORKLOAD_BASE_IMAGE=$2"));
+    assert!(smoke.contains("--remote-image) REMOTE_IMAGE=$2"));
+    assert!(smoke.contains("&& -n $REMOTE_HOST && -n $WORKLOAD_BASE_IMAGE"));
+    assert!(smoke.contains("--format \"{{.Id}}\""));
+    assert!(smoke.contains("^sha256:[0-9a-f]{64}$"));
+    assert!(smoke.contains("\"workload-base-image=$WORKLOAD_BASE_IMAGE\""));
+    assert!(smoke.contains("\"workload-base-image-id=$WORKLOAD_BASE_IMAGE_ID\""));
+    assert!(smoke.contains("\"remote-image=$REMOTE_IMAGE\""));
+    assert!(smoke.contains("\"remote-image-id=$REMOTE_IMAGE_ID\""));
+    assert!(!smoke.contains("agent-carrier-image="));
+    assert!(!smoke.contains("agent-carrier-image-id="));
+    assert!(!smoke.contains("agent-carrier-executed-image-id="));
+    assert!(smoke.contains("podman-rootless-netavark"));
+    assert!(smoke.contains("remote-container-security=selinux-label-disabled"));
+    assert_eq!(smoke.matches("--security-opt label=disable").count(), 5);
+    assert!(smoke.contains("probe-denied-source"));
+    assert!(smoke.contains("remote-firewall-negative-source=passed"));
+    assert!(smoke.contains("remote-firewall-cleanup=passed"));
+    assert!(smoke.contains("local-machine-id-sha256=$LOCAL_MACHINE_ID_SHA256"));
+    assert!(smoke.contains("remote-machine-id-sha256=$REMOTE_MACHINE_ID_SHA256"));
+    assert!(!smoke.contains("docker build"));
+    assert!(!smoke.contains("apt-get"));
+    assert!(smoke.contains("workload-image-material=cached-direct"));
+    assert!(smoke.contains("workload-image-tools=bash,curl,ip,iptables,nsenter"));
+    assert!(smoke.contains(
+        "workload-image-package-manifest-sha256=$WORKLOAD_IMAGE_PACKAGE_MANIFEST_SHA256"
+    ));
+    assert!(smoke.contains("apk info -vv"));
+    assert!(smoke.contains("remote container image must use an immutable sha256 digest"));
+    assert!(smoke.contains("executed-image-id)"));
+    assert!(
+        smoke.contains("container_image_id=$(docker inspect \"$container\" --format '{{.Image}}')")
+    );
+    assert!(
+        smoke.contains("REMOTE_EXECUTED_IMAGE_ID=$(remote_control_bounded 10s executed-image-id)")
+    );
+    assert!(smoke.contains("[[ $REMOTE_EXECUTED_IMAGE_ID == \"$REMOTE_IMAGE_ID\" ]]"));
+    assert!(smoke.contains("[[ $WORKLOAD_IMAGE_PACKAGE_MANIFEST_SHA256 =~ ^[0-9a-f]{64}$ ]]"));
+    assert!(smoke.contains("cat \"$STATE/config-validate.log\""));
+    assert!(smoke.contains("if docker inspect \"$PROXY_CONTAINER\""));
+    assert_eq!(smoke.matches("--user 0:0").count(), 9);
+    assert!(!smoke.contains("$BUNDLE:/bundle:"));
+    assert!(!smoke.contains("$STATE:/state:"));
+    assert!(smoke.contains("$BUNDLE/origin.py:/fixture/origin.py:ro,z"));
+    assert!(smoke.contains("$BUNDLE/origin-cert.pem:/fixture/origin-cert.pem:ro,z"));
+    assert!(smoke.contains("$BUNDLE/origin-key.pem:/fixture/origin-key.pem:ro,z"));
+    assert!(smoke.contains("$STATE/origin.jsonl:/state/origin.jsonl:rw,z"));
+    assert!(smoke.contains("$BUNDLE/parent.py:/fixture/parent.py:ro,z"));
+    assert!(smoke.contains("$STATE/parent.jsonl:/state/parent.jsonl:rw,z"));
+    assert!(smoke.contains("tagged firewall rules remain after bounded removal"));
+    assert!(smoke.contains("could not verify tagged firewall cleanup"));
+    let remote_absence_check = smoke
+        .split_once("verify_remote_topology_absent() {")
+        .and_then(|(_, suffix)| suffix.split_once("\n}\n\nstop_all() {"))
+        .map(|(body, _)| body)
+        .expect("remote topology absence verifier");
+    assert!(remote_absence_check.contains("docker container ls -a --format '{{.Names}}'"));
+    assert!(remote_absence_check.contains("docker network ls --format '{{.Name}}'"));
+    assert!(remote_absence_check.contains("grep -Fxq -- \"$name\""));
+    assert!(remote_absence_check.contains("grep -Fxq -- \"$NETWORK\""));
+    let capture_stop = smoke
+        .split_once("stop_capture() {")
+        .and_then(|(_, suffix)| suffix.split_once("\n}\n\nverify_remote_topology_absent() {"))
+        .map(|(body, _)| body)
+        .expect("remote capture teardown");
+    assert!(capture_stop.contains("current_start_time=$(awk '{print $22}'"));
+    assert!(capture_stop.contains("for signal in INT TERM KILL; do"));
+    assert!(capture_stop.contains("tcpdump capture remains after bounded teardown"));
+    assert!(!capture_stop.contains("kill -INT \"$pid\" 2>/dev/null || true"));
+    assert!(!capture_stop.contains("kill -TERM \"$pid\" 2>/dev/null || true"));
+    assert!(smoke.contains("printf \"%s %s\\n\" \"$$\" \"$start_time\" >\"$1\""));
+    let stop_all = smoke
+        .split_once("stop_all() {")
+        .and_then(|(_, suffix)| suffix.split_once("\n}\n\ncase \"$ACTION\" in"))
+        .map(|(body, _)| body)
+        .expect("remote stop_all body");
+    let absence_offset = stop_all
+        .find("verify_remote_topology_absent")
+        .expect("remote absence verification");
+    let firewall_offset = stop_all
+        .find("remove_firewall")
+        .expect("remote firewall removal");
+    assert!(
+        absence_offset < firewall_offset,
+        "remote firewall is removed before topology absence is verified"
+    );
+    assert!(
+        stop_all.contains(
+            "remote topology teardown is unverified; retaining protective firewall rules"
+        )
+    );
+    assert!(
+        smoke.contains("remote firewall cleanup failed; host=%s tag=%s control_dir=%s (preserved)")
+    );
+    assert!(smoke.contains("REMOTE_CLEANUP_FAILED=1"));
+    assert!(smoke.contains("if [[ -n $REMOTE_DIR && $REMOTE_CLEANUP_FAILED == 0 ]]; then"));
+    assert!(!smoke.contains("remote_control stop >/dev/null 2>&1 || true"));
+    assert!(smoke.contains("stop_remote || fail \"remote topology cleanup did not complete\""));
+    let proxy_mounts = smoke
+        .split_once("PROXY_INPUT_MOUNTS=(")
+        .and_then(|(_, suffix)| suffix.split_once("\n        )"))
+        .map(|(mounts, _)| mounts)
+        .expect("proxy input mount array");
+    for required in [
+        "acl-proxy:/bundle/acl-proxy:ro",
+        "acl-proxy.toml:/bundle/acl-proxy.toml:ro",
+        "access-flow-server-chain.pem:/bundle/access-flow-server-chain.pem:ro",
+        "access-flow-server-key.pem:/bundle/access-flow-server-key.pem:ro",
+        "mitm-ca-cert.pem:/bundle/mitm-ca-cert.pem:ro",
+        "mitm-ca-key.pem:/bundle/mitm-ca-key.pem:ro",
+        "identity-token:/bundle/identity-token:ro",
+        "provider.py:/bundle/provider.py:ro",
+        "private-expected:/bundle/private-expected:ro",
+        "origin-root.pem:/bundle/origin-root.pem:ro",
+    ] {
+        assert!(
+            proxy_mounts.contains(required),
+            "missing proxy mount {required:?}"
+        );
+    }
+    for forbidden in [
+        "access-flow-root-key.pem",
+        "origin-root-key.pem",
+        "origin-key.pem",
+        "origin.jsonl",
+        "parent.jsonl",
+    ] {
+        assert!(
+            !proxy_mounts.contains(forbidden),
+            "proxy input mounts expose {forbidden:?}"
+        );
+    }
+    let proxy_launches = smoke
+        .split_once("PROXY_INPUT_MOUNTS=(")
+        .map(|(_, suffix)| {
+            suffix
+                .split_once("        for _ in {1..200};")
+                .map(|(launches, _)| launches)
+                .unwrap()
+        })
+        .unwrap();
+    assert!(!proxy_launches.contains("/state/origin.jsonl"));
+    assert!(!proxy_launches.contains("/state/parent.jsonl"));
+    assert_eq!(
+        proxy_launches
+            .matches("\"${PROXY_INPUT_MOUNTS[@]}\"")
+            .count(),
+        2
+    );
+    for required in [
+        "$STATE/validate/generated-certs:/state/generated-certs:rw",
+        "$STATE/validate/captures:/state/captures:rw",
+        "$STATE/validate/proxy-logs:/state/proxy-logs:rw",
+        "$STATE/validate/provider.jsonl:/state/provider.jsonl:rw",
+        "$STATE/generated-certs:/state/generated-certs:rw",
+        "$STATE/captures:/state/captures:rw",
+        "$STATE/proxy-logs:/state/proxy-logs:rw",
+        "$STATE/provider.jsonl:/state/provider.jsonl:rw",
+    ] {
+        assert!(
+            proxy_launches.contains(required),
+            "missing isolated proxy state mount {required:?}"
+        );
+    }
+    assert!(!smoke.contains("http = http.server.ThreadingHTTPServer"));
+    assert!(!smoke.contains("retire_timeout = \"2s\""));
+    assert!(smoke.contains("retire_timeout = \"30s\""));
+    assert!(smoke.contains("max_inflight_body_bytes = 134217728"));
+    assert!(smoke.contains("command = \"$REMOTE_PROVIDER_PYTHON\""));
+    assert!(!smoke.contains("label=$2 fifo=\"$TMP_DIR/$label.fifo\""));
+    assert!(!smoke.contains("label=$1 destination=\"$TMP_DIR/local-evidence/$label\""));
+    assert!(smoke.contains("max_connections = 64"));
+    assert_eq!(
+        smoke
+            .matches("path = \"/run/aw-gateway/trust/access-flow-root.pem\"")
+            .count(),
+        2
+    );
+    assert!(smoke.contains("install -D -o 0 -g 0 -m 0644"));
+    assert!(smoke.contains("install -D -o 65534 -g 65534 -m 0400"));
+    assert!(smoke.contains("\"connection\", \"content-length\", \"transfer-encoding\""));
+}
+
 #[test]
 fn embedded_relay_uses_shared_runtime_engine_without_a_copied_data_plane() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let cargo = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
     let relay = std::fs::read_to_string(root.join("src/agent/relay.rs")).unwrap();
-    let production = relay.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+    let relay_production = relay.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+    let transport = std::fs::read_to_string(root.join("src/agent/relay_transport.rs")).unwrap();
+    let transport_production = transport
+        .split("\n#[cfg(all(test, unix))]\nmod tests")
+        .next()
+        .unwrap();
+    let production = format!("{relay_production}\n{transport_production}");
 
-    for dependency in ["access-flow-relay", "access-flow-unix", "access-identity"] {
+    for dependency in [
+        "access-flow-relay",
+        "access-flow-tls",
+        "access-flow-unix",
+        "access-identity",
+    ] {
         assert!(
             cargo.contains(dependency),
             "missing shared Runtime dependency {dependency:?}"
@@ -392,7 +1090,10 @@ fn embedded_relay_uses_shared_runtime_engine_without_a_copied_data_plane() {
     }
     for required in [
         "AccessFlowRelay::new(",
+        "RelayTransportRuntime::prepare(",
+        ".activate_prepared()",
         "UnixAccessFlowConnector::new()",
+        "TlsAccessFlowConnector::with_system_resolver(",
         "RunningAccessFlowRelay",
     ] {
         assert!(

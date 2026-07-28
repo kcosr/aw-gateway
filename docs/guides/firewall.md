@@ -134,6 +134,68 @@ policy.
 See [Proxy And CA Policy](proxy.md) for the matching proxy service and trust
 store pieces.
 
+## Remote Access Flow TLS/TCP
+
+A remote Access Flow route still uses local transparent interception. The
+network namespace redirects workload TCP port 80 to the relay's HTTP loopback
+listener and TCP port 443 to its HTTPS loopback listener. The embedded relay
+then opens a separate TLS/TCP connection to the configured remote Proxy
+listener.
+
+The filter policy must permit that outer connection without opening general
+web egress:
+
+- allow established and related traffic;
+- allow loopback so redirected workload traffic reaches the relay;
+- allow only the required DNS resolver when a DNS address is configured;
+- allow TCP only to the provisioned Proxy address and exact Access Flow
+  listener ports;
+- redirect workload TCP 80 and 443 to the corresponding loopback relay ports;
+- drop direct TCP 80/443 and every other unapproved egress path; and
+- on the Proxy host, accept the Access Flow listener ports only from the
+  intended relay network and apply the Proxy's configured source/global abuse
+  controls.
+
+For the shipped example shape, those are local relay ports `3128` and `3129`
+and remote Proxy ports `7443` and `7444`. Replace all example values. A
+production firewall should use stable provisioned Proxy IP addresses. The
+route may independently use a DNS `server_name` for certificate verification.
+If `address` itself is DNS-named, the firewall owner must maintain the exact
+approved resolved address set as part of the same bounded deployment
+transaction; DNS changes do not automatically update firewall rules.
+
+Do not use a process-UID bypass as the only exception when workloads can run
+under the same UID as `aw-container-agent`. A destination-and-port exception is
+the enforceable boundary in that deployment. The repository's existing
+`aw-iptables` and `aw-transparent-uds-firewall` assets demonstrate other
+topologies and must not be reused unchanged for remote TLS: their local-proxy
+exceptions do not establish the remote address/port policy above.
+
+TLS authenticates ACL Proxy to the relay, but it does not authenticate the
+relay or workload. The required AWAF bearer remains the sole workload
+authentication input. Do not terminate the outer TLS connection at a load
+balancer or middlebox; doing so would require a separate trusted second-hop and
+bearer-forwarding design. A completely network-disabled container also
+requires a separate constrained forwarding mechanism and is not delivered by
+this transport.
+
+Make firewall installation or validation a required relay prerequisite before
+SSH or workload services become ready. The repository TLS examples intentionally
+do not name a site firewall service because the safe rules depend on concrete
+addresses, runtime namespaces, and privilege ownership. Add the deployed
+service to `access_flow_relay.start_after_services`, and make dependent services
+wait on `@access-flow-relay`.
+
+Verify both halves of the policy:
+
+1. Transparent HTTP and HTTPS reach an allowed destination through the remote
+   Proxy.
+2. A denied destination is rejected by Proxy policy.
+3. Direct TCP 80/443 and an unapproved external port fail.
+4. Removing the remote Proxy allow rule fails closed.
+5. Stopping the Proxy produces no direct, Unix, stale-trust, or alternate
+   endpoint fallback.
+
 ## Colima Notes
 
 When `aw-gateway` runs on macOS against Colima, the containers live inside the

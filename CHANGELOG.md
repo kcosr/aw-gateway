@@ -26,6 +26,15 @@
 
 ### Added
 
+- Access Flow relay routes now support an exact server-authenticated TLS 1.3
+  transport with explicit address, independent verification name, bounded PEM
+  trust, immutable Runtime pins, mixed Unix/TLS dispatch, and no fallback,
+  pooling, or client TLS identity.
+- `aw-container-agent` now owns one signal broker: `SIGHUP` atomically reloads
+  Access Flow trust while `SIGTERM` and Ctrl-C retain ordered shutdown
+  semantics with or without the control socket. Failed trust reloads close new
+  relay admission and readiness while established flows drain, and a later
+  successful reload recovers admission.
 - Access Flow relay presentation now supports strict `disabled`, `anonymous`,
   and environment-backed bearer modes. Container bootstrap and agent startup
   suppress core/dump capture before sensitive work, bearer activation is
@@ -65,6 +74,11 @@
 
 ### Fixed
 
+- TLS Access Flow relay preflight now charges one exact plan-wide trust-loader
+  peak before reading trust material while retaining the per-flow reserve needed
+  for long-lived connections across arbitrary successful reloads. The shipped
+  two-route profile uses a verified 96-connection ceiling that fits both
+  bridge-disabled and bridge-enabled 256 MiB agent budgets.
 - Host socket exposure readiness retries now stop at their shared endpoint
   deadline instead of sleeping a full retry interval beyond it, while terminal
   probe timeouts retain the last completed readiness failure.

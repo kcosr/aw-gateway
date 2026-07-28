@@ -1,0 +1,194 @@
+# Remote Access Flow TLS/TCP configuration-shape example.
+#
+# This file intentionally does not install a site firewall. Before production
+# use, redirect workload TCP 80/443 to the loopback relay listeners, allow only
+# the exact configured Proxy addresses and ports, and make that required
+# firewall service a relay prerequisite with start_after_services. See
+# docs/guides/firewall.md#remote-access-flow-tlstcp. Relay configuration alone
+# does not provide transparent interception or a network-disabled container.
+
+schema_version = "1"
+default_target = "ubuntu"
+
+[runtime]
+type = "docker"
+docker_host = "unix:///var/run/docker.sock"
+
+[logging]
+level = "info"
+directory = "{state}/logs/gateway"
+max_bytes = 104857600
+max_files = 5
+console = false
+
+[target_defaults.workspace]
+path = "workspace"
+state_dir = ".aw-gateway"
+
+[ssh_dispatch]
+allow_interactive_shell = true
+allow_container_commands = true
+enabled_actions = [
+  "connect",
+  "up",
+  "status",
+  "targets",
+  "stop",
+  "set-default",
+  "show-default",
+  "reset-default",
+  "add-key",
+  "add-host-key",
+  "add-container-key",
+  "client-config",
+  "client-bundle",
+  "help",
+]
+
+[client_config]
+inner_alias_template = "aw-{target}"
+container_host_template = "aw-container-{target}"
+host = "localhost"
+gateway_path = "/opt/aw-gateway/bin/aw-gateway"
+default_identity_dir = "~/.ssh/aw-gateway"
+
+[targets.ubuntu]
+image = "aw-gateway/ubuntu-base"
+mode = "fixed"
+name = "{image_slug}"
+stop_when_idle = true
+remove_on_stop = false
+container_user = "root"
+container_home = "/home/{user}"
+
+[targets.ubuntu.local_ssh]
+mode = "listen"
+backend = "socket"
+readiness = "agent_control"
+host = "127.0.0.1"
+
+[targets.ubuntu.identity]
+bootstrap_user = "root"
+session_user = "{user}"
+session_uid = "{uid}"
+session_gid = "{gid}"
+session_home = "/home/{user}"
+session_shell = "/bin/bash"
+
+[targets.ubuntu.idle_cleanup]
+owner = "agent"
+action = "exit_container"
+idle_grace = "5m"
+preserve_processes = ["tmux", "screen"]
+poll_interval = "30s"
+shutdown_timeout = "20s"
+
+[[target_defaults.lifecycle_steps]]
+phase = "pre_start"
+name = "ensure-workspace"
+required = true
+timeout = "60s"
+command = ["/usr/bin/mkdir", "-p", "{workspace}"]
+
+[[target_defaults.container_mounts]]
+source = "/opt/aw-gateway/runtime/linux/aw-container-bootstrap"
+target = "/opt/aw-gateway/bin/aw-container-bootstrap"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/opt/aw-gateway/runtime/linux/aw-container-agent"
+target = "/opt/aw-gateway/bin/aw-container-agent"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/opt/aw-gateway/runtime/linux/aw-ssh-command-filter"
+target = "/opt/aw-gateway/bin/aw-ssh-command-filter"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/opt/aw-gateway/runtime/linux/start-container-sshd"
+target = "/opt/aw-gateway/bin/start-container-sshd"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/opt/aw-gateway/runtime/linux/sshd_config_agent"
+target = "/etc/ssh/sshd_config_agent"
+mode = "ro"
+
+[[target_defaults.container_mounts]]
+source = "/opt/aw-gateway/trust/acl-proxy"
+target = "/etc/aw-gateway/acl-proxy-trust"
+mode = "ro"
+
+[target_defaults.container_bootstrap]
+enabled = true
+entrypoint = "/opt/aw-gateway/bin/aw-container-bootstrap"
+agent_program = "/opt/aw-gateway/bin/aw-container-agent"
+
+[target_defaults.container_ssh.transfer]
+sftp = "allow"
+legacy_scp = "allow"
+
+[target_defaults.container_agent]
+enabled = true
+
+[target_defaults.container_agent.access_flow_relay]
+setup_timeout = "5s"
+drain_timeout = "10s"
+# Match each ACL Proxy TLS listener's global connection cap.
+max_connections = 64
+copy_buffer_bytes_per_direction = 16384
+# Production deployments add their required firewall service here:
+# start_after_services = ["remote-access-flow-firewall"]
+
+[target_defaults.container_agent.access_flow_relay.presentation]
+kind = "bearer_environment"
+variable = "AW_IDENTITY_TOKEN"
+
+[[target_defaults.container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[target_defaults.container_agent.access_flow_relay.routes.transport]
+kind = "tls_tcp"
+address = "proxy.example.com:7443"
+server_name = "proxy.example.com"
+
+[target_defaults.container_agent.access_flow_relay.routes.transport.trust]
+kind = "pem_bundle"
+path = "/etc/aw-gateway/acl-proxy-trust/roots.pem"
+
+[[target_defaults.container_agent.access_flow_relay.routes]]
+name = "https"
+listen = "127.0.0.1:3129"
+allowed_destination_ports = [443]
+
+[target_defaults.container_agent.access_flow_relay.routes.transport]
+kind = "tls_tcp"
+address = "proxy.example.com:7444"
+server_name = "proxy.example.com"
+
+[target_defaults.container_agent.access_flow_relay.routes.transport.trust]
+kind = "pem_bundle"
+path = "/etc/aw-gateway/acl-proxy-trust/roots.pem"
+
+[[target_defaults.container_agent.services]]
+name = "container-sshd"
+required = true
+user = "root"
+command = ["/opt/aw-gateway/bin/start-container-sshd"]
+restart = "always"
+depends_on = ["@access-flow-relay"]
+
+[target_defaults.container_agent.services.health_check]
+type = "tcp"
+host = "127.0.0.1"
+port = 22
+interval = "2s"
+timeout = "1s"
+
+[target_defaults.container_agent.ssh_bridge]
+enabled = true
+target = "127.0.0.1:22"
+mode = "0600"

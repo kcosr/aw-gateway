@@ -564,7 +564,7 @@ HTTP_SOCKET="$TMP_DIR/socket-runtime/transparent-http.sock"
 HTTPS_SOCKET="$TMP_DIR/socket-runtime/transparent-https.sock"
 ACL_CONFIG="$TMP_DIR/config/acl-proxy.toml"
 cat >"$ACL_CONFIG" <<EOF
-schema_version = 3
+schema_version = 4
 
 [service]
 request_timeout = "30s"

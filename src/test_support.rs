@@ -233,6 +233,29 @@ mod tests {
 
         let blocked = blocked.expect_err("exec unexpectedly succeeded with an inherited writer");
         assert_eq!(blocked.raw_os_error(), Some(libc::ETXTBSY));
-        assert!(Command::new(&executable).status().unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut attempts = 0_u32;
+        loop {
+            attempts += 1;
+            match Command::new(&executable).status() {
+                Ok(status) => {
+                    assert_eq!(
+                        status.code(),
+                        Some(0),
+                        "executable returned nonzero after {attempts} readiness attempts"
+                    );
+                    break;
+                }
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!(
+                    "executable did not become ready after the inherited writer exited \
+                     after {attempts} attempts: {error}"
+                ),
+            }
+        }
     }
 }

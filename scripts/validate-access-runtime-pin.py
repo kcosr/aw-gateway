@@ -9,6 +9,7 @@ from pathlib import Path
 PRODUCTION_NAMES = {
     "access-async-contracts",
     "access-flow-relay",
+    "access-flow-tls",
     "access-flow-unix",
     "access-identity",
 }
@@ -28,6 +29,24 @@ def dependency_table(manifest: dict, path: tuple[str, ...]) -> dict:
     return value
 
 
+def direct_dependency_tables(manifest: dict):
+    for name in ("dependencies", "dev-dependencies", "build-dependencies"):
+        dependencies = manifest.get(name)
+        if isinstance(dependencies, dict):
+            yield (name,), dependencies
+
+    targets = manifest.get("target")
+    if not isinstance(targets, dict):
+        return
+    for target, target_config in targets.items():
+        if not isinstance(target_config, dict):
+            continue
+        for name in ("dependencies", "dev-dependencies", "build-dependencies"):
+            dependencies = target_config.get(name)
+            if isinstance(dependencies, dict):
+                yield ("target", target, name), dependencies
+
+
 def main() -> None:
     if len(sys.argv) != 4:
         raise SystemExit(
@@ -40,12 +59,17 @@ def main() -> None:
     with Path(lock_path).open("rb") as handle:
         lock = tomllib.load(handle)
 
+    if "patch" in manifest:
+        raise SystemExit("Cargo patch overrides are forbidden")
+
     tables = (
         (
+            ("dependencies",),
             dependency_table(manifest, ("dependencies",)),
             PRODUCTION_NAMES,
         ),
         (
+            ("target", LINUX_TARGET, "dev-dependencies"),
             dependency_table(
                 manifest,
                 ("target", LINUX_TARGET, "dev-dependencies"),
@@ -53,8 +77,22 @@ def main() -> None:
             LINUX_TEST_NAMES,
         ),
     )
+    approved_locations = {
+        (*path, name) for path, _, names in tables for name in names
+    }
+    for path, dependencies in direct_dependency_tables(manifest):
+        for name, dependency in dependencies.items():
+            if (
+                isinstance(dependency, dict)
+                and dependency.get("git") == expected_url
+                and (*path, name) not in approved_locations
+            ):
+                raise SystemExit(
+                    f"unexpected direct Access Runtime dependency: {'.'.join((*path, name))}"
+                )
+
     revisions = set()
-    for dependencies, names in tables:
+    for _, dependencies, names in tables:
         for name in names:
             dependency = dependencies.get(name)
             if not isinstance(dependency, dict):
@@ -75,15 +113,29 @@ def main() -> None:
     revision = revisions.pop()
 
     names = PRODUCTION_NAMES | LINUX_TEST_NAMES
-    locked = {
-        package["name"]: package.get("source")
-        for package in lock["package"]
-        if package["name"] in names
-    }
+    packages = lock.get("package")
+    if not isinstance(packages, list):
+        raise SystemExit("Cargo.lock package inventory is missing")
+    runtime_source_prefix = f"git+{expected_url}"
+    for package in packages:
+        name = package.get("name")
+        source = package.get("source")
+        if (
+            isinstance(source, str)
+            and source.startswith(runtime_source_prefix)
+            and name not in names
+        ):
+            raise SystemExit(f"unexpected Access Runtime lock package: {name!r}")
+
+    expected_source = f"git+{expected_url}?rev={revision}#{revision}"
     for name in names:
-        source = locked.get(name)
-        expected = f"git+{expected_url}?rev={revision}#{revision}"
-        if source != expected:
+        matching = [package for package in packages if package.get("name") == name]
+        if len(matching) != 1:
+            raise SystemExit(
+                f"{name} must have exactly one Cargo.lock package entry; found {len(matching)}"
+            )
+        source = matching[0].get("source")
+        if source != expected_source:
             raise SystemExit(f"{name} lock source mismatch: {source!r}")
 
     print(revision)

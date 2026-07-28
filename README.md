@@ -633,7 +633,7 @@ checks can require status codes and top-level JSON field matches.
 The optional Access Flow relay runs inside `aw-container-agent`; it is not a
 supervised child process. Every route listens on IPv4 loopback, recovers the
 original redirected destination, publishes an AW Access Flow preface, and
-connects to one Unix socket. Presentation is a strict tagged choice of
+connects through one configured Access Flow transport. Presentation is a strict tagged choice of
 `disabled`, `anonymous`, or `bearer_environment`:
 
 ```toml
@@ -657,6 +657,172 @@ allowed_destination_ports = [80]
 kind = "unix"
 path = "/run/acl-proxy/transparent-http.sock"
 ```
+
+A route may instead use server-authenticated TLS/TCP. Provision its explicit
+trust bundle through a read-only mount. Mount the containing directory rather
+than the individual file so an atomic host-side replacement remains visible
+to a later `SIGHUP`:
+
+```toml
+[[target_defaults.container_mounts]]
+source = "/opt/aw-gateway/trust/acl-proxy"
+target = "/etc/aw-gateway/acl-proxy-trust"
+mode = "ro"
+```
+
+The dedicated
+[`examples/docker/gateway-access-flow-tls.toml`](examples/docker/gateway-access-flow-tls.toml)
+profile shows the mount and relay configuration together. It is a configuration
+shape, not a complete transparent-network policy: the deployment must also
+redirect workload TCP ports 80 and 443 to the loopback relay listeners and
+permit only the relay's narrowly scoped network path to the configured remote
+proxy addresses and ports. See
+[Remote Access Flow TLS/TCP](docs/guides/firewall.md#remote-access-flow-tlstcp)
+for the required firewall boundary.
+
+The dedicated TLS examples assume one relay source per Proxy and cap the relay
+at 64 active flows, matching each corresponding Proxy listener's global
+`max_connections`. The shipped one-relay Proxy profile leaves its optional
+per-source connection and handshake policy disabled, so relay traffic is
+bounded by the global listener and handshake limits without an additional
+source-address throttle. Deployments with multiple independent relay source
+addresses may enable and size the Proxy's per-source policy explicitly.
+
+Before starting the profile's root-run container agent, provision the host
+source as root-owned, single-link material:
+
+```bash
+sudo install -d -o root -g root -m 0755 /opt/aw-gateway/trust/acl-proxy
+sudo install -o root -g root -m 0644 ./acl-proxy-roots.pem \
+  /opt/aw-gateway/trust/acl-proxy/roots.pem
+```
+
+The secure loader evaluates metadata in the container's filesystem view.
+`/`, every directory component, and the PEM leaf must be owned by root or the
+agent's effective UID and must not be group- or world-writable. No component
+may be a symlink. The leaf must be a nonempty regular file with exactly one
+hard link and is limited to 1 MiB. For the shipped root-run profile, use
+root ownership as shown above. A read-only mount prevents container writes but
+does not make unsafe source ownership, modes, links, or host-side mutation
+trusted.
+
+The corresponding TLS route is:
+
+```toml
+[[target_defaults.container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[target_defaults.container_agent.access_flow_relay.routes.transport]
+kind = "tls_tcp"
+address = "proxy.example.com:7443"
+server_name = "proxy.example.com"
+
+[target_defaults.container_agent.access_flow_relay.routes.transport.trust]
+kind = "pem_bundle"
+path = "/etc/aw-gateway/acl-proxy-trust/roots.pem"
+```
+
+TLS routes require `bearer_environment`; disabled and anonymous presentation
+remain available only to Unix-only relays. Unix and TLS routes may coexist in
+one bearer-authenticated relay. TLS uses version 1.3, verifies the independently
+configured name against the explicit PEM bundle, requires the exact Access
+Flow ALPN, and opens one outer connection for each workload connection. It
+does not use client certificates, ambient proxy settings, cleartext fallback,
+endpoint fallback, pooling, or multiplexing. Address, server name, and trust
+path are literal and are not rendered from target variables.
+
+Treat the trust bundle as a direct authority to receive the reusable AWAF
+bearer. Any endpoint whose certificate chains to that bundle and satisfies the
+configured `server_name` can receive it. Use a dedicated, minimally scoped CA
+and name rather than a broad organizational trust bundle. The server private
+key remains only on the remote ACL Proxy host; do not mount it into the
+container, install it in AW Gateway, or expose it to workloads. Access Flow
+TLS performs no online OCSP or CRL retrieval. Revocation therefore requires
+short-lived server certificates and explicit trust-generation replacement.
+
+The agent securely loads a stable regular PEM source with bounded size and
+certificate count before reporting relay readiness. No remote reachability
+probe is required. `SIGHUP` atomically reloads the complete trust generation
+without reloading route configuration or the bearer. Existing flows retain
+their established generation and drain. A failed reload keeps them alive but
+makes the relay unready and rejects new Unix and TLS flows until a later
+successful `SIGHUP`. `SIGTERM` and Ctrl-C retain their ordered shutdown
+behavior whether or not the agent control socket is enabled. Foreground
+`aw-gateway` signal behavior is unchanged.
+
+Agent relay logs expose only fixed event kinds (`Prepared`, `Ready`,
+`ConnectionOpened`, `ConnectionRejected`, `AdmissionClosed`,
+`ConnectionClosed`, `Drained`, `Forced`, and `Failed`), a validated route name
+when present, the active-flow count, and a fixed close category when applicable.
+Close categories are `Complete`, `Saturated`, `OriginalDestination`,
+`DestinationPort`, `Channel`, `Dns`, `TcpConnect`, `TlsHandshake`,
+`Authentication`, `Alpn`, `Preface`, `ResourceExhausted`, `SetupDeadline`,
+`Cancelled`, `Copy`, and `Truncation`. Remote transport observations never
+contain the bearer, raw source addresses, DNS answers, certificate subjects,
+SANs, DER bytes or fingerprints, trust or key paths, key material, arbitrary
+TLS errors, or untrusted bytes. TLS key logging is disabled.
+
+### Remote Access Flow Rotation
+
+Server identity and relay trust are independent atomic generations. When the
+issuing CA changes, rotate them in this order:
+
+1. Issue a currently valid server-authentication certificate whose SAN matches
+   the configured `server_name`. Keep its private key on the Proxy host.
+2. Atomically replace the relay PEM bundle with one bounded bundle containing
+   both the old and new trust anchors. Send `SIGHUP` to `aw-container-agent`,
+   not the foreground `aw-gateway`, and verify aggregate agent readiness.
+3. Atomically replace the Proxy certificate chain and matching private key,
+   send `SIGHUP` to ACL Proxy, and verify Proxy readiness plus a real HTTP and
+   HTTPS Access Flow through every relay population.
+4. After every relay has loaded the overlap bundle and old flows have drained,
+   atomically replace the relay bundle with the new anchor only, send
+   `SIGHUP` to each agent, and repeat readiness and flow verification.
+
+If the server certificate remains under the same trust anchor, skip the overlap
+steps and rotate only the complete Proxy identity generation. Never publish a
+partial chain/key pair or mutate a mounted PEM file in place.
+
+A failed agent trust reload keeps established flows alive but makes the relay
+unready and closes all new Access Flow admission in that agent, including Unix
+routes. Restore the last valid complete PEM file and send another `SIGHUP`; do
+not add a fallback endpoint or weaken verification. A failed Proxy
+certificate/key reload has the corresponding fail-closed effect on Proxy
+Access Flow admission. Restore a complete valid identity at the same configured
+paths and reload again.
+
+Bearer rotation is deliberately separate and disruptive. Stop admitting work,
+drain and stop the agent, update the sensitive bearer source and the Proxy
+resolver as one deployment transaction, restart the agent, verify readiness and
+authenticated flows, and only then reopen workload admission. Trust reload does
+not reload the bearer, route configuration, address, or server name.
+
+### Unix To Remote TLS Cutover
+
+Unix and TLS/TCP are strict transport alternatives, not availability fallbacks.
+To move an existing route:
+
+1. Start and validate the remote Proxy TLS listener, server identity, workload
+   bearer resolver, and deny-by-default policy before changing the relay.
+2. Install the dedicated relay trust bundle and the exact firewall rules for
+   the remote Proxy address and listener ports. Verify that direct web egress
+   remains blocked.
+3. Build and validate one complete agent configuration that replaces each
+   selected route's `unix` transport with `tls_tcp`. Preserve its loopback
+   listener and allowed destination ports; do not author alternate endpoints.
+4. Drain and stop the target agent, deploy the complete configuration and
+   sensitive bearer together, restart, then test transparent HTTP, nested
+   HTTPS, policy denial, and fail-closed Proxy loss.
+
+Route shape is restart-required. Rollback is the same explicit transaction in
+reverse: drain and stop the agent, restore the complete prior Unix
+configuration and its required socket exposure, restore the matching firewall,
+and restart. The relay never attempts Unix after TLS failure or TLS after Unix
+failure. Remote TLS still requires a constrained network path from the
+container to the Proxy; it does not provide a network-disabled or no-NAT
+container mode.
 
 `bearer_environment` makes the gateway provision its existing host identity
 token under the configured agent variable. Bootstrap disables core/dump
@@ -946,9 +1112,10 @@ Gateway configs commonly include:
 - `[target_defaults.container_agent]`: optional in-container supervision and SSH bridge
   support.
 - `[target_defaults.container_agent.access_flow_relay]`: optional embedded
-  transparent TCP-to-Access-Flow relay with strict Unix routes. The relay table
-  replaces as one object in target overlays; an omitted table inherits, while
-  a present incomplete table is invalid and never borrows omitted fields.
+  transparent TCP-to-Access-Flow relay with strict Unix or
+  server-authenticated TLS/TCP routes. The relay table replaces as one object
+  in target overlays; an omitted table inherits, while a present incomplete
+  table is invalid and never borrows omitted fields.
 - `[[target_defaults.container_agent.services]]`: in-container services supervised by
   `aw-container-agent`. Use `depends_on` and dependency health checks to order
   managed services. Required `container_bootstrap_steps` perform privileged
