@@ -1176,7 +1176,8 @@ fn start_container_sshd_uses_agent_config() {
     assert!(script.contains("AW_SSHD_LISTEN_ADDRESS"));
     assert!(script.contains("set_listen_address"));
     assert!(script.contains("merge_setenv_config"));
-    assert!(script.contains("sed -i '/^[[:space:]]*Subsystem"));
+    assert!(script.contains("remove_sftp_subsystem"));
+    assert!(!script.contains("sed -i "));
     assert!(script.contains("ForceCommand"));
     assert!(script.contains("/usr/sbin/sshd -t -f \"$config\""));
     assert!(script.contains("exec /usr/sbin/sshd -e -D -f \"$config\""));

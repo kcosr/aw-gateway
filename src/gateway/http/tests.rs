@@ -328,7 +328,7 @@ async fn serve_live_http_app(app: Router) -> (std::net::SocketAddr, tokio::task:
 }
 
 async fn wait_for_path(path: &std::path::Path) {
-    for _ in 0..50 {
+    for _ in 0..150 {
         if path.exists() {
             return;
         }

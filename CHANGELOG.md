@@ -77,6 +77,11 @@
 
 ### Fixed
 
+- Updated the pinned Access Runtime for macOS TLS trust compatibility and made
+  the test suite portable across Darwin path aliases, executable locations,
+  Linux-only relay/runtime behavior, and bounded asynchronous fixture waits.
+- Made the container SSH setup script remove disabled SFTP subsystems without
+  relying on GNU-only in-place `sed` syntax.
 - TLS Access Flow relay preflight now charges one exact plan-wide trust-loader
   peak before reading trust material while retaining the per-flow reserve needed
   for long-lived connections across arbitrary successful reloads. The shipped

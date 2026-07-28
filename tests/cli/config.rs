@@ -48,6 +48,7 @@ name = "{image_slug}"
         .stdout(predicate::str::contains("ok"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn gateway_config_validate_rejects_relative_leading_socket_path_templates() {
     let dir = tempdir().unwrap();

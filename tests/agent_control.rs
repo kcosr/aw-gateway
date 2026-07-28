@@ -536,6 +536,7 @@ restart = "never"
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn bearer_relay_consumes_source_before_runtime_and_child_start() {
     let dir = tempdir().unwrap();
@@ -646,6 +647,7 @@ restart = "never"
     assert!(!rendered.contains(bearer));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn combined_relay_and_service_identity_consumes_canonical_or_distinct_locators() {
     for relay_source in ["AW_IDENTITY_TOKEN", "AW_ACCESS_FLOW_COMBINED_TOKEN"] {
@@ -845,7 +847,7 @@ control_socket = false
 
 [[container_agent.services]]
 name = "approved"
-command = ["/bin/true"]
+command = ["/usr/bin/true"]
 restart = "never"
 
 [container_agent.services.env]
@@ -888,7 +890,7 @@ fn bootstrap_steps_receive_a_cleared_environment_before_agent_exec() {
         format!(
             r#"
 schema_version = "2"
-agent_program = "/bin/true"
+agent_program = "/usr/bin/true"
 agent_config = "{}"
 skip_identity_prepare = true
 chown_existing_identity_dirs = false
@@ -1439,6 +1441,7 @@ fn wait_for_log(receiver: &Receiver<String>, needle: &str) {
     panic!("timed out waiting for log {needle:?}; observed {observed:?}");
 }
 
+#[cfg(target_os = "linux")]
 fn wait_for_relay_ready(control_socket: &std::path::Path, expected: bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -1454,6 +1457,7 @@ fn wait_for_relay_ready(control_socket: &std::path::Path, expected: bool) {
     panic!("timed out waiting for access flow relay ready={expected}");
 }
 
+#[cfg(target_os = "linux")]
 fn wait_for_child_exit_with_logs(
     child: &mut Child,
     logs: &Receiver<String>,

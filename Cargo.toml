@@ -22,12 +22,12 @@ name = "aw-ssh-command-filter"
 path = "src/bin/aw-ssh-command-filter.rs"
 
 [dependencies]
-access-async-contracts = { git = "https://github.com/kcosr/access-runtime.git", rev = "62fe64934aa8e39390aa3a6902b5dcd747dc41cd" }
-access-flow-relay = { git = "https://github.com/kcosr/access-runtime.git", rev = "62fe64934aa8e39390aa3a6902b5dcd747dc41cd" }
-access-flow-tls = { git = "https://github.com/kcosr/access-runtime.git", rev = "62fe64934aa8e39390aa3a6902b5dcd747dc41cd" }
-access-flow-unix = { git = "https://github.com/kcosr/access-runtime.git", rev = "62fe64934aa8e39390aa3a6902b5dcd747dc41cd" }
-access-identity = { git = "https://github.com/kcosr/access-runtime.git", rev = "62fe64934aa8e39390aa3a6902b5dcd747dc41cd" }
-access-tls-trust = { git = "https://github.com/kcosr/access-runtime.git", rev = "62fe64934aa8e39390aa3a6902b5dcd747dc41cd" }
+access-async-contracts = { git = "https://github.com/kcosr/access-runtime.git", rev = "83f059b318eb4d8d51e74f8770ca12442deea0cb" }
+access-flow-relay = { git = "https://github.com/kcosr/access-runtime.git", rev = "83f059b318eb4d8d51e74f8770ca12442deea0cb" }
+access-flow-tls = { git = "https://github.com/kcosr/access-runtime.git", rev = "83f059b318eb4d8d51e74f8770ca12442deea0cb" }
+access-flow-unix = { git = "https://github.com/kcosr/access-runtime.git", rev = "83f059b318eb4d8d51e74f8770ca12442deea0cb" }
+access-identity = { git = "https://github.com/kcosr/access-runtime.git", rev = "83f059b318eb4d8d51e74f8770ca12442deea0cb" }
+access-tls-trust = { git = "https://github.com/kcosr/access-runtime.git", rev = "83f059b318eb4d8d51e74f8770ca12442deea0cb" }
 anyhow = "1.0.103"
 axum = { version = "0.8.7", features = ["ws"] }
 clap = { version = "4.5.53", features = ["derive", "env"] }
@@ -58,5 +58,5 @@ tokio-tungstenite = "0.29.0"
 tower = { version = "0.5.2", features = ["util"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-access-flow = { git = "https://github.com/kcosr/access-runtime.git", rev = "62fe64934aa8e39390aa3a6902b5dcd747dc41cd" }
-access-flow-conformance = { git = "https://github.com/kcosr/access-runtime.git", rev = "62fe64934aa8e39390aa3a6902b5dcd747dc41cd" }
+access-flow = { git = "https://github.com/kcosr/access-runtime.git", rev = "83f059b318eb4d8d51e74f8770ca12442deea0cb" }
+access-flow-conformance = { git = "https://github.com/kcosr/access-runtime.git", rev = "83f059b318eb4d8d51e74f8770ca12442deea0cb" }

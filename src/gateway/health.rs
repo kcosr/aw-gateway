@@ -413,7 +413,10 @@ mod tests {
 
         assert_eq!(
             std::fs::read_to_string(output).unwrap(),
-            format!("{}:from-env", dir.path().display())
+            format!(
+                "{}:from-env",
+                std::fs::canonicalize(dir.path()).unwrap().display()
+            )
         );
     }
 }

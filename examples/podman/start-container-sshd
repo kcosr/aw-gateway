@@ -416,12 +416,20 @@ policy_value() {
   ' "$policy"
 }
 
+remove_sftp_subsystem() {
+  local tmp_config
+  tmp_config=$(mktemp "$run_dir/sshd_config_agent.XXXXXX")
+  sed '/^[[:space:]]*Subsystem[[:space:]][[:space:]]*sftp[[:space:]]/d' \
+    "$config" > "$tmp_config"
+  mv "$tmp_config" "$config"
+}
+
 sftp=$(policy_value sftp allow)
 legacy_scp=$(policy_value legacy_scp allow)
 
 case "$sftp" in
   allow) ;;
-  deny) sed -i '/^[[:space:]]*Subsystem[[:space:]]\+sftp[[:space:]]/d' "$config" ;;
+  deny) remove_sftp_subsystem ;;
   *) echo "invalid sftp policy value: $sftp" >&2; exit 1 ;;
 esac
 

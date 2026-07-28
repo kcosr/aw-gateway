@@ -132,7 +132,7 @@ JSON
         ;;
     esac
     echo started > "{log}"
-    sleep 0.2
+    sleep 0.5
     echo done >> "{log}"
     ;;
 esac
@@ -158,7 +158,7 @@ fn session_marker_count(dir: &Path) -> usize {
 }
 
 async fn wait_for_background_marker_clear(log: &Path, marker_dir: &Path, panic_message: &str) {
-    for _ in 0..20 {
+    for _ in 0..60 {
         let done = std::fs::read_to_string(log)
             .map(|value| value.contains("done"))
             .unwrap_or(false);
@@ -171,7 +171,7 @@ async fn wait_for_background_marker_clear(log: &Path, marker_dir: &Path, panic_m
 }
 
 async fn wait_for_session_marker_count(marker_dir: &Path, expected: usize, panic_message: &str) {
-    for _ in 0..20 {
+    for _ in 0..60 {
         if session_marker_count(marker_dir) == expected {
             return;
         }
@@ -2508,7 +2508,7 @@ async fn begin_ready_session_writes_marker_under_lifecycle_lock() {
     assert_eq!(session_marker_count(&runtime.session_marker_dir()), 0);
 
     drop(lock);
-    let (session, ready_result) = tokio::time::timeout(Duration::from_secs(2), ready_session)
+    let (session, ready_result) = tokio::time::timeout(Duration::from_secs(10), ready_session)
         .await
         .unwrap()
         .unwrap();

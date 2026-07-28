@@ -3035,6 +3035,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn socket_exposure_runtime_preflight_rejects_remote_or_vm_backends() {
         let colima = ContainerRuntime {

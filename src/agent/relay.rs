@@ -58,6 +58,7 @@ enum RelayCommand {
         completed: oneshot::Sender<()>,
     },
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     InjectFailure {
         failure: AccessFlowRelayFailure,
         observed: oneshot::Sender<()>,
@@ -187,6 +188,7 @@ impl RelayControl {
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(super) async fn close_admission(&self) {
         let deadline = Instant::now()
             .checked_add(self.drain_timeout)
@@ -338,6 +340,7 @@ impl RelayControl {
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     async fn inject_failure(&self, failure: AccessFlowRelayFailure) {
         let (observed, wait) = oneshot::channel();
         if self
@@ -362,6 +365,7 @@ impl RelayControl {
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     async fn pause_before_activation(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (reached, wait_for_reached) = oneshot::channel();
         let (resume, wait_for_resume) = oneshot::channel();
@@ -383,6 +387,7 @@ impl RelayControl {
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn pause_blocking_reload(
         &self,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
@@ -401,6 +406,7 @@ impl RelayControl {
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     async fn pause_before_reload_command(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (reached, wait_for_reached) = oneshot::channel();
         let (resume, wait_for_resume) = oneshot::channel();
@@ -426,6 +432,7 @@ impl RelayControl {
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     async fn observe_close_before_reload_join(&self) -> oneshot::Receiver<()> {
         let (reached, wait_for_reached) = oneshot::channel();
         let previous = self.close_reload_join_reached.lock().await.replace(reached);
@@ -444,6 +451,7 @@ impl RelayControl {
     }
 
     #[cfg(test)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     async fn observe_close_after_reload_join(&self) -> oneshot::Receiver<()> {
         let (completed, wait_for_completed) = oneshot::channel();
         let previous = self
@@ -1246,7 +1254,9 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use access_flow_conformance::load_tls_pki_fixture;
-    use access_flow_relay::{AccessFlowConnector, AccessFlowRelayFailureKind};
+    #[cfg(target_os = "linux")]
+    use access_flow_relay::AccessFlowConnector;
+    use access_flow_relay::AccessFlowRelayFailureKind;
     #[cfg(target_os = "linux")]
     use access_flow_tls::{
         EstablishedTlsAccessFlowChannel, TlsAccessFlowCertificateChain, TlsAccessFlowGeneration,
@@ -1261,9 +1271,9 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[cfg(target_os = "linux")]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    #[cfg(target_os = "linux")]
     const TEST_ACCESS_FLOW_BEARER: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEF";
 
     #[cfg(unix)]
@@ -1562,6 +1572,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn blocked_trust_operation_preserves_readiness_excludes_reload_and_recovers() {
         let source = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -1662,6 +1673,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         supervisor.await.unwrap().unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn shutdown_deadline_detaches_and_accounts_noninterruptible_reload() {
         let source = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -2980,6 +2992,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         assert_eq!(active_flows.load(Ordering::Acquire), 0);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn supervisor_keeps_live_flow_until_drain_deadline_then_forces_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -3084,6 +3097,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn slow_relay_dependent_stop_does_not_consume_the_flow_drain_window() {
         let dir = tempfile::tempdir().unwrap();
@@ -3187,6 +3201,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         assert_eq!(control.active_flows(), 0);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn fatal_listener_path_retains_live_flows_until_root_ordered_shutdown() {
         let dir = tempfile::tempdir().unwrap();
@@ -3272,6 +3287,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         assert_eq!(control.active_flows(), 0);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn ordered_shutdown_cancellation_during_activation_stops_cleanly() {
         let dir = tempfile::tempdir().unwrap();

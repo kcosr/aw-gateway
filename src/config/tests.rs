@@ -6721,6 +6721,7 @@ command = ["worker"]
     assert!(err.contains("service.user"), "{err}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn host_socket_exposures_parse_and_replace_same_keys_atomically() {
     let cfg: GatewayConfig = toml::from_str(
@@ -6870,6 +6871,7 @@ selinux_relabel = "none"
     assert!(err.contains("container_path duplicates"), "{err}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn host_socket_exposure_static_validation_allows_rendered_container_paths() {
     let cfg: GatewayConfig = toml::from_str(
