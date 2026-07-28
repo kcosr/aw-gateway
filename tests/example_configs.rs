@@ -96,7 +96,7 @@ fn remote_tls_gateway_and_agent_examples_share_one_relay_contract() {
     let gateway_relay = gateway_agent.access_flow_relay.as_ref().unwrap();
     assert_eq!(agent_relay.setup_timeout, gateway_relay.setup_timeout);
     assert_eq!(agent_relay.drain_timeout, gateway_relay.drain_timeout);
-    assert_eq!(agent_relay.max_connections, 96);
+    assert_eq!(agent_relay.max_connections, 64);
     assert_eq!(agent_relay.max_connections, gateway_relay.max_connections);
     assert_eq!(
         agent_relay.copy_buffer_bytes_per_direction,

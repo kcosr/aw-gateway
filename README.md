@@ -678,8 +678,17 @@ redirect workload TCP ports 80 and 443 to the loopback relay listeners and
 permit only the relay's narrowly scoped network path to the configured remote
 proxy addresses and ports. See
 [Remote Access Flow TLS/TCP](docs/guides/firewall.md#remote-access-flow-tlstcp)
-for the required firewall boundary. Before starting the profile's root-run
-container agent, provision the host source as root-owned, single-link material:
+for the required firewall boundary.
+
+The dedicated TLS examples assume one relay source per Proxy and cap the relay
+at 64 active flows. Match that value to each corresponding Proxy listener's
+global `max_connections` and `max_connections_per_source`; the Proxy sample
+also permits 100 handshakes per second with a burst of 200. Deployments with
+multiple relay source addresses may size the Proxy's global listener capacity
+independently from its per-source cap.
+
+Before starting the profile's root-run container agent, provision the host
+source as root-owned, single-link material:
 
 ```bash
 sudo install -d -o root -g root -m 0755 /opt/aw-gateway/trust/acl-proxy
