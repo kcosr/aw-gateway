@@ -12,11 +12,13 @@ PRODUCTION_NAMES = {
     "access-flow-tls",
     "access-flow-unix",
     "access-identity",
+    "access-tls-trust",
 }
 LINUX_TEST_NAMES = {
     "access-flow",
     "access-flow-conformance",
 }
+TRANSITIVE_NAMES = {"access-tls-trust-windows"}
 LINUX_TARGET = 'cfg(target_os = "linux")'
 
 
@@ -113,6 +115,7 @@ def main() -> None:
     revision = revisions.pop()
 
     names = PRODUCTION_NAMES | LINUX_TEST_NAMES
+    lock_names = names | TRANSITIVE_NAMES
     packages = lock.get("package")
     if not isinstance(packages, list):
         raise SystemExit("Cargo.lock package inventory is missing")
@@ -123,12 +126,12 @@ def main() -> None:
         if (
             isinstance(source, str)
             and source.startswith(runtime_source_prefix)
-            and name not in names
+            and name not in lock_names
         ):
             raise SystemExit(f"unexpected Access Runtime lock package: {name!r}")
 
     expected_source = f"git+{expected_url}?rev={revision}#{revision}"
-    for name in names:
+    for name in lock_names:
         matching = [package for package in packages if package.get("name") == name]
         if len(matching) != 1:
             raise SystemExit(

@@ -71,6 +71,11 @@ pub(super) async fn shutdown_agent(state: Arc<AgentState>) -> bool {
 async fn perform_shutdown(state: Arc<AgentState>) {
     tracing::info!("container agent shutdown starting");
     state.accepting_bridge.store(false, Ordering::SeqCst);
+    let relay_close_deadline = state.access_flow_relay.as_ref().map(|relay| {
+        std::time::Instant::now()
+            .checked_add(relay.drain_timeout())
+            .unwrap_or_else(std::time::Instant::now)
+    });
     for phase in shutdown_phases(state.access_flow_relay.is_some()) {
         match phase {
             ShutdownPhase::CloseRelayAdmission => {
@@ -78,7 +83,9 @@ async fn perform_shutdown(state: Arc<AgentState>) {
                     .access_flow_relay
                     .as_ref()
                     .expect("relay shutdown phase requires configured relay")
-                    .close_admission()
+                    .close_admission_by(
+                        relay_close_deadline.expect("relay shutdown deadline must be available"),
+                    )
                     .await;
             }
             ShutdownPhase::StopRelayDependents => stop_relay_dependents(&state).await,

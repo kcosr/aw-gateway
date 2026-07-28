@@ -239,12 +239,16 @@ pub(crate) struct AccessFlowRelayStatus {
     pub(crate) ready: bool,
     pub(crate) active_flows: usize,
     pub(crate) routes: Vec<AccessFlowRelayRouteStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trust_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct AccessFlowRelayRouteStatus {
     pub(crate) name: String,
     pub(crate) accepting: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) trust_mode: Option<access_tls_trust::TlsClientTrustMode>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]

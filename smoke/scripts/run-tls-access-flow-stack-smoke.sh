@@ -1245,20 +1245,16 @@ AGENT_HTTP_TRANSPORT=$(cat <<EOF
 kind = "tls_tcp"
 address = "$NETWORK_GATEWAY:$AGENT_TLS_HTTP_PORT"
 server_name = "proxy.access-flow.test"
-
-[container_agent.access_flow_relay.routes.transport.trust]
-kind = "pem_bundle"
-path = "/run/aw-gateway/trust/access-flow-root.pem"
+trust = "custom"
+ca_certificate = "/run/aw-gateway/trust/access-flow-root.pem"
 EOF
 )
 AGENT_HTTPS_TRANSPORT=$(cat <<EOF
 kind = "tls_tcp"
 address = "$NETWORK_GATEWAY:$AGENT_TLS_HTTPS_PORT"
 server_name = "proxy.access-flow.test"
-
-[container_agent.access_flow_relay.routes.transport.trust]
-kind = "pem_bundle"
-path = "/run/aw-gateway/trust/access-flow-root.pem"
+trust = "custom"
+ca_certificate = "/run/aw-gateway/trust/access-flow-root.pem"
 EOF
 )
 FIREWALL_COMMAND=$(cat <<'EOF'

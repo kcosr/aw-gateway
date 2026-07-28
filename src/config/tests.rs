@@ -5807,10 +5807,8 @@ path = "/run/acl-proxy/transparent-http.sock""#,
             r#"kind = "tls_tcp"
 address = "proxy.example.test:7443"
 server_name = "proxy.example.test"
-
-[container_agent.access_flow_relay.routes.transport.trust]
-kind = "pem_bundle"
-path = "/etc/aw-gateway/acl-proxy-roots.pem""#,
+trust = "custom"
+ca_certificate = "/etc/aw-gateway/acl-proxy-roots.pem""#,
         )
 }
 
@@ -5833,10 +5831,8 @@ allowed_destination_ports = [443]
 kind = "tls_tcp"
 address = "proxy.example.test:7444"
 server_name = "proxy.example.test"
-
-[container_agent.access_flow_relay.routes.transport.trust]
-kind = "pem_bundle"
-path = "/etc/aw-gateway/acl-proxy-roots.pem"
+trust = "custom"
+ca_certificate = "/etc/aw-gateway/acl-proxy-roots.pem"
 
 "#;
     unix.replacen(
@@ -5874,7 +5870,9 @@ fn container_agent_accepts_strict_tls_and_mixed_relay_transports() {
             tls_index,
             address,
             server_name,
+            trust_mode,
             trust_path,
+            ..
         } = compiled.plan.routes()[0].endpoint()
         else {
             panic!("TLS route compiled as the wrong transport");
@@ -5883,7 +5881,11 @@ fn container_agent_accepts_strict_tls_and_mixed_relay_transports() {
         assert_eq!(address.port().get(), 7443);
         assert_eq!(address.host().dns_name(), Some("proxy.example.test"));
         assert_eq!(server_name.host().dns_name(), Some("proxy.example.test"));
-        assert_eq!(trust_path, Path::new("/etc/aw-gateway/acl-proxy-roots.pem"));
+        assert_eq!(*trust_mode, access_tls_trust::TlsClientTrustMode::Custom);
+        assert_eq!(
+            trust_path.as_deref(),
+            Some(Path::new("/etc/aw-gateway/acl-proxy-roots.pem"))
+        );
     }
 
     let mixed: ContainerAgentFile = toml::from_str(&mixed_access_flow_relay()).unwrap();
@@ -5906,6 +5908,56 @@ fn container_agent_accepts_strict_tls_and_mixed_relay_transports() {
 }
 
 #[test]
+fn tls_transport_enforces_explicit_four_mode_trust_matrix() {
+    let custom = bearer_tls_access_flow_relay();
+    for accepted in [
+        custom.clone(),
+        custom.replace("trust = \"custom\"", "trust = \"system_plus_custom\""),
+        custom
+            .replace("trust = \"custom\"\n", "trust = \"system\"\n")
+            .replace(
+                "ca_certificate = \"/etc/aw-gateway/acl-proxy-roots.pem\"\n",
+                "",
+            ),
+        custom
+            .replace("trust = \"custom\"\n", "trust = \"insecure\"\n")
+            .replace(
+                "ca_certificate = \"/etc/aw-gateway/acl-proxy-roots.pem\"\n",
+                "",
+            ),
+    ] {
+        let config: ContainerAgentFile = toml::from_str(&accepted).unwrap();
+        config.validate().unwrap();
+    }
+
+    for rejected in [
+        custom.replace("trust = \"custom\"\n", ""),
+        custom.replace(
+            "trust = \"custom\"",
+            "trust = \"system\"\nca_certificate_extra = \"forbidden\"",
+        ),
+        custom.replace(
+            "trust = \"custom\"\nca_certificate = \"/etc/aw-gateway/acl-proxy-roots.pem\"",
+            "trust = \"system\"\nca_certificate = \"/etc/aw-gateway/acl-proxy-roots.pem\"",
+        ),
+        custom.replace(
+            "trust = \"custom\"\nca_certificate = \"/etc/aw-gateway/acl-proxy-roots.pem\"",
+            "trust = \"insecure\"\nca_certificate = \"/etc/aw-gateway/acl-proxy-roots.pem\"",
+        ),
+        custom.replace(
+            "trust = \"custom\"\nca_certificate = \"/etc/aw-gateway/acl-proxy-roots.pem\"",
+            "[container_agent.access_flow_relay.routes.transport.trust]\nkind = \"pem_bundle\"\npath = \"/etc/aw-gateway/acl-proxy-roots.pem\"",
+        ),
+    ] {
+        let parsed = toml::from_str::<ContainerAgentFile>(&rejected);
+        assert!(
+            parsed.as_ref().is_err() || parsed.unwrap().validate().is_err(),
+            "unexpectedly accepted:\n{rejected}"
+        );
+    }
+}
+
+#[test]
 fn tls_route_indices_are_sequential_and_exclude_unix_routes() {
     let second_tls = r#"
 [[container_agent.access_flow_relay.routes]]
@@ -5917,10 +5969,8 @@ allowed_destination_ports = [8443]
 kind = "tls_tcp"
 address = "proxy-two.example.test:7443"
 server_name = "proxy-two.example.test"
-
-[container_agent.access_flow_relay.routes.transport.trust]
-kind = "pem_bundle"
-path = "/etc/aw-gateway/second-roots.pem"
+trust = "custom"
+ca_certificate = "/etc/aw-gateway/second-roots.pem"
 
 "#;
     let raw = mixed_access_flow_relay().replacen(
@@ -6092,11 +6142,11 @@ fn tls_transport_rejects_invalid_addresses_names_and_trust_paths() {
 fn tls_trust_path_enforces_authored_byte_and_component_bounds() {
     let exact_bytes = format!(
         "/{}",
-        "a".repeat(super::agent::MAX_ACCESS_FLOW_TRUST_PATH_BYTES - 1)
+        "a".repeat(access_tls_trust::MAX_TLS_TRUST_SOURCE_LOCATOR_BYTES - 1)
     );
     assert_eq!(
         exact_bytes.len(),
-        super::agent::MAX_ACCESS_FLOW_TRUST_PATH_BYTES
+        access_tls_trust::MAX_TLS_TRUST_SOURCE_LOCATOR_BYTES
     );
     let exact_bytes_raw =
         bearer_tls_access_flow_relay().replace("/etc/aw-gateway/acl-proxy-roots.pem", &exact_bytes);
@@ -6109,7 +6159,7 @@ fn tls_trust_path_enforces_authored_byte_and_component_bounds() {
     let over_bytes_config: ContainerAgentFile = toml::from_str(&over_bytes_raw).unwrap();
     let over_bytes_error = over_bytes_config.validate().unwrap_err().to_string();
     assert!(
-        over_bytes_error.contains("at most 4096 UTF-8 bytes"),
+        over_bytes_error.contains("exceeds a resource bound"),
         "{over_bytes_error}"
     );
     assert!(
@@ -6119,9 +6169,7 @@ fn tls_trust_path_enforces_authored_byte_and_component_bounds() {
 
     let exact_components = format!(
         "/{}",
-        std::iter::repeat_n("a", super::agent::MAX_ACCESS_FLOW_TRUST_PATH_COMPONENTS)
-            .collect::<Vec<_>>()
-            .join("/")
+        std::iter::repeat_n("a", 256).collect::<Vec<_>>().join("/")
     );
     let exact_components_raw = bearer_tls_access_flow_relay()
         .replace("/etc/aw-gateway/acl-proxy-roots.pem", &exact_components);
@@ -6135,7 +6183,7 @@ fn tls_trust_path_enforces_authored_byte_and_component_bounds() {
     let over_components_config: ContainerAgentFile = toml::from_str(&over_components_raw).unwrap();
     let over_components_error = over_components_config.validate().unwrap_err().to_string();
     assert!(
-        over_components_error.contains("at most 256 components"),
+        over_components_error.contains("exceeds a resource bound"),
         "{over_components_error}"
     );
     assert!(
@@ -6156,11 +6204,15 @@ fn relay_transport_schema_rejects_unknown_cross_variant_and_trust_shapes() {
             "address = \"proxy.example.test:7443\"",
             "address = \"proxy.example.test:7443\"\npath = \"/run/fallback.sock\"",
         ),
-        tls.replace("kind = \"pem_bundle\"", "kind = \"platform\""),
         tls.replace(
-            "kind = \"pem_bundle\"",
-            "kind = \"pem_bundle\"\ninsecure = true",
+            "trust = \"custom\"",
+            "trust = \"custom\"\ninsecure = true",
         ),
+        tls.replace(
+            "trust = \"custom\"\nca_certificate = \"/etc/aw-gateway/acl-proxy-roots.pem\"",
+            "trust = \"custom\"\npath = \"/etc/aw-gateway/acl-proxy-roots.pem\"",
+        ),
+        tls.replace("trust = \"custom\"", "trust = \"platform\""),
         AGENT_ACCESS_FLOW_RELAY.replace(
             "path = \"/run/acl-proxy/transparent-http.sock\"",
             "path = \"/run/acl-proxy/transparent-http.sock\"\naddress = \"proxy.example.test:7443\"",

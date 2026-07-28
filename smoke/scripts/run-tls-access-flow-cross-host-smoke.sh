@@ -1763,10 +1763,8 @@ allowed_destination_ports = [80]
 kind = "tls_tcp"
 address = "$REMOTE_ADDRESS:$TLS_HTTP_PORT"
 server_name = "proxy.access-flow.test"
-
-[container_agent.access_flow_relay.routes.transport.trust]
-kind = "pem_bundle"
-path = "/run/aw-gateway/trust/access-flow-root.pem"
+trust = "custom"
+ca_certificate = "/run/aw-gateway/trust/access-flow-root.pem"
 
 [[container_agent.access_flow_relay.routes]]
 name = "https"
@@ -1777,10 +1775,8 @@ allowed_destination_ports = [443]
 kind = "tls_tcp"
 address = "$REMOTE_ADDRESS:$TLS_HTTPS_PORT"
 server_name = "proxy.access-flow.test"
-
-[container_agent.access_flow_relay.routes.transport.trust]
-kind = "pem_bundle"
-path = "/run/aw-gateway/trust/access-flow-root.pem"
+trust = "custom"
+ca_certificate = "/run/aw-gateway/trust/access-flow-root.pem"
 EOF
 chmod 0600 "$TMP_DIR/container-agent.toml"
 

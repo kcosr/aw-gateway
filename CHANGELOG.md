@@ -2,14 +2,10 @@
 
 ## [Unreleased]
 
-- Embedded the shared Access Flow relay in `aw-container-agent` behind strict
-  typed Unix-route configuration, synthetic dependency readiness, checked
-  process resource budgets, and admission-first bounded shutdown. The
-  integrated Apple host-proxy profile no longer mounts or supervises a
-  standalone relay executable or JSON file.
-
 ### Breaking Changes
 
+- Replaced the nested Access Flow TLS `pem_bundle` trust table with required flat
+  `trust` and conditional `ca_certificate` fields.
 - Existing generated identity-token files are now validated byte-for-byte as
   32-4096 RFC 9110 `tchar` bytes. Files from older releases that end in a
   newline, or otherwise contain non-bearer bytes, fail container startup.
@@ -26,6 +22,13 @@
 
 ### Added
 
+- Added shared `system`, `custom`, `system_plus_custom`, and `insecure` TLS
+  client trust modes for remote Access Flow routes.
+- Embedded the shared Access Flow relay in `aw-container-agent` behind strict
+  typed Unix-route configuration, synthetic dependency readiness, checked
+  process resource budgets, and admission-first bounded shutdown. The
+  integrated Apple host-proxy profile no longer mounts or supervises a
+  standalone relay executable or JSON file.
 - Access Flow relay routes now support an exact server-authenticated TLS 1.3
   transport with explicit address, independent verification name, bounded PEM
   trust, immutable Runtime pins, mixed Unix/TLS dispatch, and no fallback,

@@ -14,10 +14,11 @@ use access_flow_relay::{
 use access_flow_tls::{TlsAccessFlowAddress, TlsAccessFlowServerName};
 use access_flow_unix::{NormalizedUnixSocketPath, UnixAccessFlowEndpoint, UnixExecutionTarget};
 use access_identity::{IdentityPresentation, SensitiveBearer};
+use access_tls_trust::{
+    TlsClientTrustMode, TlsClientTrustPlan, TlsTrustFileSource, TlsTrustLoadError,
+};
 
 pub const ACCESS_FLOW_RELAY_NODE: &str = "@access-flow-relay";
-pub(crate) const MAX_ACCESS_FLOW_TRUST_PATH_BYTES: usize = 4096;
-pub(crate) const MAX_ACCESS_FLOW_TRUST_PATH_COMPONENTS: usize = 256;
 const REMOVED_LOCAL_FLOW_RELAY_NODE: &str = "@local-flow-relay";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -691,7 +692,9 @@ pub(crate) enum CompiledAccessFlowRelayEndpoint {
         tls_index: usize,
         address: TlsAccessFlowAddress,
         server_name: TlsAccessFlowServerName,
-        trust_path: PathBuf,
+        trust_mode: TlsClientTrustMode,
+        trust_plan: TlsClientTrustPlan,
+        trust_path: Option<PathBuf>,
     },
 }
 
@@ -804,7 +807,13 @@ impl AccessFlowRelayRoute {
                         address,
                         server_name,
                         trust,
-                    } => validate_tls_transport_templates(address, server_name, trust)?,
+                        ca_certificate,
+                    } => validate_tls_transport_templates(
+                        address,
+                        server_name,
+                        *trust,
+                        ca_certificate.as_deref(),
+                    )?,
                 }
                 if self.listen.contains('{') {
                     anyhow::bail!(
@@ -831,7 +840,13 @@ impl AccessFlowRelayRoute {
                         address,
                         server_name,
                         trust,
-                    } => validate_tls_transport_templates(address, server_name, trust)?,
+                        ca_certificate,
+                    } => validate_tls_transport_templates(
+                        address,
+                        server_name,
+                        *trust,
+                        ca_certificate.as_deref(),
+                    )?,
                 }
                 self.listen.parse::<SocketAddrV4>()?
             }
@@ -855,10 +870,23 @@ impl AccessFlowRelayRoute {
                 address,
                 server_name,
                 trust,
+                ca_certificate,
             } => {
                 let tls_index =
                     tls_index.expect("the relay compiler assigns an index to every TLS transport");
-                let AccessFlowRelayTrust::PemBundle { path } = trust;
+                let trust_path = ca_certificate.as_ref().map(PathBuf::from);
+                let authored_source = trust_path
+                    .clone()
+                    .map(TlsTrustFileSource::new)
+                    .transpose()
+                    .map_err(map_tls_trust_source_config_error)?;
+                let trust_plan = TlsClientTrustPlan::new(
+                    *trust,
+                    authored_source
+                        .as_ref()
+                        .map(TlsTrustFileSource::authored_source_id),
+                )
+                .map_err(map_tls_trust_config_error)?;
                 CompiledAccessFlowRelayEndpoint::TlsTcp {
                     tls_index,
                     address: TlsAccessFlowAddress::parse(address).context(
@@ -867,7 +895,9 @@ impl AccessFlowRelayRoute {
                     server_name: TlsAccessFlowServerName::parse(server_name).context(
                         "container_agent.access_flow_relay.routes.transport.server_name is invalid",
                     )?,
-                    trust_path: normalized_absolute_trust_path(path)?,
+                    trust_mode: *trust,
+                    trust_plan,
+                    trust_path,
                 }
             }
         };
@@ -915,7 +945,8 @@ fn compile_unix_endpoint(path: &str) -> anyhow::Result<UnixAccessFlowEndpoint> {
 fn validate_tls_transport_templates(
     address: &str,
     server_name: &str,
-    trust: &AccessFlowRelayTrust,
+    trust: TlsClientTrustMode,
+    ca_certificate: Option<&str>,
 ) -> anyhow::Result<()> {
     validate_template(
         "container_agent.access_flow_relay.routes.transport.address",
@@ -927,49 +958,24 @@ fn validate_tls_transport_templates(
         server_name,
         &[],
     )?;
-    let AccessFlowRelayTrust::PemBundle { path } = trust;
-    validate_template(
-        "container_agent.access_flow_relay.routes.transport.trust.path",
-        path,
-        &[],
+    if let Some(path) = ca_certificate {
+        validate_template(
+            "container_agent.access_flow_relay.routes.transport.ca_certificate",
+            path,
+            &[],
+        )?;
+    }
+    let source = ca_certificate
+        .map(PathBuf::from)
+        .map(TlsTrustFileSource::new)
+        .transpose()
+        .map_err(map_tls_trust_source_config_error)?;
+    TlsClientTrustPlan::new(
+        trust,
+        source.as_ref().map(TlsTrustFileSource::authored_source_id),
     )
-}
-
-fn normalized_absolute_trust_path(path: &str) -> anyhow::Result<PathBuf> {
-    if path.len() > MAX_ACCESS_FLOW_TRUST_PATH_BYTES {
-        anyhow::bail!(
-            "container_agent.access_flow_relay.routes.transport.trust.path must contain at most {MAX_ACCESS_FLOW_TRUST_PATH_BYTES} UTF-8 bytes"
-        );
-    }
-    let mut segments = path.split('/');
-    let rooted = segments.next() == Some("");
-    if !rooted {
-        anyhow::bail!(
-            "container_agent.access_flow_relay.routes.transport.trust.path must be a normalized absolute non-root path"
-        );
-    }
-    let mut component_count = 0_usize;
-    for segment in segments {
-        if segment.is_empty() || matches!(segment, "." | "..") {
-            anyhow::bail!(
-                "container_agent.access_flow_relay.routes.transport.trust.path must be a normalized absolute non-root path"
-            );
-        }
-        component_count = component_count
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("trust path component count overflow"))?;
-        if component_count > MAX_ACCESS_FLOW_TRUST_PATH_COMPONENTS {
-            anyhow::bail!(
-                "container_agent.access_flow_relay.routes.transport.trust.path must contain at most {MAX_ACCESS_FLOW_TRUST_PATH_COMPONENTS} components"
-            );
-        }
-    }
-    if component_count == 0 {
-        anyhow::bail!(
-            "container_agent.access_flow_relay.routes.transport.trust.path must be a normalized absolute non-root path"
-        );
-    }
-    Ok(PathBuf::from(path))
+    .map(|_| ())
+    .map_err(map_tls_trust_config_error)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -981,14 +987,37 @@ pub enum AccessFlowRelayTransport {
     TlsTcp {
         address: String,
         server_name: String,
-        trust: AccessFlowRelayTrust,
+        trust: TlsClientTrustMode,
+        ca_certificate: Option<String>,
     },
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AccessFlowRelayTrust {
-    PemBundle { path: String },
+fn map_tls_trust_config_error(error: TlsTrustLoadError) -> anyhow::Error {
+    match error {
+        TlsTrustLoadError::InvalidPlan => anyhow::anyhow!(
+            "container_agent.access_flow_relay.routes.transport ca_certificate does not match trust mode"
+        ),
+        TlsTrustLoadError::ResourceLimit => anyhow::anyhow!(
+            "container_agent.access_flow_relay.routes.transport.ca_certificate exceeds a resource bound"
+        ),
+        _ => anyhow::anyhow!(
+            "container_agent.access_flow_relay.routes.transport.ca_certificate is invalid"
+        ),
+    }
+}
+
+fn map_tls_trust_source_config_error(error: TlsTrustLoadError) -> anyhow::Error {
+    match error {
+        TlsTrustLoadError::InvalidPlan => anyhow::anyhow!(
+            "container_agent.access_flow_relay.routes.transport.ca_certificate must be a normalized absolute non-root path"
+        ),
+        TlsTrustLoadError::ResourceLimit => anyhow::anyhow!(
+            "container_agent.access_flow_relay.routes.transport.ca_certificate exceeds a resource bound"
+        ),
+        _ => anyhow::anyhow!(
+            "container_agent.access_flow_relay.routes.transport.ca_certificate is invalid"
+        ),
+    }
 }
 
 fn map_relay_plan_error(error: AccessFlowRelayPlanError) -> anyhow::Error {

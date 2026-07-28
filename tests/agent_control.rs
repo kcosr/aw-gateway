@@ -1054,10 +1054,8 @@ allowed_destination_ports = [{destination_port}]
 kind = "tls_tcp"
 address = "{remote_address}"
 server_name = "access-flow.test"
-
-[container_agent.access_flow_relay.routes.transport.trust]
-kind = "pem_bundle"
-path = "{trust_path}"
+trust = "custom"
+ca_certificate = "{trust_path}"
 
 [[container_agent.services]]
 name = "base"
@@ -1110,11 +1108,32 @@ depends_on = ["base"]
     wait_for_path(&base_ready);
     wait_for_path(&dependent_ready);
     wait_for_relay_ready(&control_socket, true);
+    let ready = control_request(
+        &control_socket,
+        br#"{"id":"ready-status","method":"status"}"#,
+    );
+    assert_eq!(
+        ready["result"]["access_flow_relay"]["routes"][0]["trust_mode"],
+        "custom"
+    );
+    assert!(
+        ready["result"]["access_flow_relay"]
+            .get("trust_failure")
+            .is_none()
+    );
 
     std::fs::write(&trust_path, "not a PEM trust bundle").unwrap();
     signal_process(&child, libc::SIGHUP);
     wait_for_log(&log_rx, "access flow relay trust reload failed");
     wait_for_relay_ready(&control_socket, false);
+    let failed = control_request(
+        &control_socket,
+        br#"{"id":"failed-status","method":"status"}"#,
+    );
+    assert_eq!(
+        failed["result"]["access_flow_relay"]["trust_failure"],
+        "invalid_material"
+    );
     assert!(child.try_wait().unwrap().is_none());
     assert!(!stop_order.exists());
 

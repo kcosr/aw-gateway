@@ -5,12 +5,12 @@ version = 4
 [[package]]
 name = "access-async-contracts"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=c1031b70ab4dd9f372622d1e3a0e68da49971720#c1031b70ab4dd9f372622d1e3a0e68da49971720"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=62fe64934aa8e39390aa3a6902b5dcd747dc41cd#62fe64934aa8e39390aa3a6902b5dcd747dc41cd"
 
 [[package]]
 name = "access-flow"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=c1031b70ab4dd9f372622d1e3a0e68da49971720#c1031b70ab4dd9f372622d1e3a0e68da49971720"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=62fe64934aa8e39390aa3a6902b5dcd747dc41cd#62fe64934aa8e39390aa3a6902b5dcd747dc41cd"
 dependencies = [
  "access-async-contracts",
  "access-identity",
@@ -21,7 +21,7 @@ dependencies = [
 [[package]]
 name = "access-flow-conformance"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=c1031b70ab4dd9f372622d1e3a0e68da49971720#c1031b70ab4dd9f372622d1e3a0e68da49971720"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=62fe64934aa8e39390aa3a6902b5dcd747dc41cd#62fe64934aa8e39390aa3a6902b5dcd747dc41cd"
 dependencies = [
  "access-async-contracts",
  "access-flow",
@@ -29,6 +29,7 @@ dependencies = [
  "access-flow-tls",
  "access-flow-unix",
  "access-identity",
+ "access-tls-trust",
  "base64",
  "serde",
  "serde_json",
@@ -38,7 +39,7 @@ dependencies = [
 [[package]]
 name = "access-flow-relay"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=c1031b70ab4dd9f372622d1e3a0e68da49971720#c1031b70ab4dd9f372622d1e3a0e68da49971720"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=62fe64934aa8e39390aa3a6902b5dcd747dc41cd#62fe64934aa8e39390aa3a6902b5dcd747dc41cd"
 dependencies = [
  "access-async-contracts",
  "access-flow",
@@ -50,11 +51,12 @@ dependencies = [
 [[package]]
 name = "access-flow-tls"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=c1031b70ab4dd9f372622d1e3a0e68da49971720#c1031b70ab4dd9f372622d1e3a0e68da49971720"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=62fe64934aa8e39390aa3a6902b5dcd747dc41cd#62fe64934aa8e39390aa3a6902b5dcd747dc41cd"
 dependencies = [
  "access-async-contracts",
  "access-flow",
  "access-flow-relay",
+ "access-tls-trust",
  "idna",
  "rustix",
  "rustls",
@@ -69,7 +71,7 @@ dependencies = [
 [[package]]
 name = "access-flow-unix"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=c1031b70ab4dd9f372622d1e3a0e68da49971720#c1031b70ab4dd9f372622d1e3a0e68da49971720"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=62fe64934aa8e39390aa3a6902b5dcd747dc41cd#62fe64934aa8e39390aa3a6902b5dcd747dc41cd"
 dependencies = [
  "access-async-contracts",
  "access-flow",
@@ -81,7 +83,7 @@ dependencies = [
 [[package]]
 name = "access-identity"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=c1031b70ab4dd9f372622d1e3a0e68da49971720#c1031b70ab4dd9f372622d1e3a0e68da49971720"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=62fe64934aa8e39390aa3a6902b5dcd747dc41cd#62fe64934aa8e39390aa3a6902b5dcd747dc41cd"
 dependencies = [
  "access-async-contracts",
  "hmac",
@@ -89,6 +91,30 @@ dependencies = [
  "sha2",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "access-tls-trust"
+version = "0.1.0"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=62fe64934aa8e39390aa3a6902b5dcd747dc41cd#62fe64934aa8e39390aa3a6902b5dcd747dc41cd"
+dependencies = [
+ "access-async-contracts",
+ "access-tls-trust-windows",
+ "pem-rfc7468 0.7.0",
+ "rustix",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "access-tls-trust-windows"
+version = "0.1.0"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=62fe64934aa8e39390aa3a6902b5dcd747dc41cd#62fe64934aa8e39390aa3a6902b5dcd747dc41cd"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -194,6 +220,7 @@ dependencies = [
  "access-flow-tls",
  "access-flow-unix",
  "access-identity",
+ "access-tls-trust",
  "anyhow",
  "assert_cmd",
  "axum",
@@ -203,7 +230,7 @@ dependencies = [
  "getrandom 0.3.4",
  "glob",
  "libc",
- "pem-rfc7468",
+ "pem-rfc7468 1.0.0",
  "portable-pty",
  "predicates",
  "serde",
@@ -400,6 +427,22 @@ name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
+
+[[package]]
+name = "core-foundation"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
+
+[[package]]
+name = "core-foundation-sys"
+version = "0.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cpufeatures"
@@ -1052,6 +1095,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
+name = "openssl-probe"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
+
+[[package]]
+name = "pem-rfc7468"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
+dependencies = [
+ "base64ct",
+]
+
+[[package]]
 name = "pem-rfc7468"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1317,6 +1375,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-native-certs"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "612460d5f7bea540c490b2b6395d8e34a953e52b491accd6c86c8164c5932a63"
+dependencies = [
+ "openssl-probe",
+ "rustls-pki-types",
+ "schannel",
+ "security-framework",
+]
+
+[[package]]
 name = "rustls-pki-types"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1341,6 +1411,38 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "schannel"
+version = "0.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91c1b7e4904c873ef0710c1f407dde2e6287de2bebc1bbbf7d430bb7cbffd939"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "security-framework"
+version = "3.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
+dependencies = [
+ "bitflags 2.11.1",
+ "core-foundation",
+ "core-foundation-sys",
+ "libc",
+ "security-framework-sys",
+]
+
+[[package]]
+name = "security-framework-sys"
+version = "2.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
 
 [[package]]
 name = "semver"

@@ -5,58 +5,106 @@ use access_flow_relay::{
     AccessFlowConnector, AccessFlowRelayPlan,
 };
 use access_flow_tls::{
-    ACTIVE_CHANNEL_BYTES, GENERATION_CONTROL_BYTES, MAX_DER_CERTIFICATE_BYTES,
-    MAX_TRUST_ANCHOR_BYTES, MAX_TRUST_ANCHORS, TlsAccessFlowClientEndpoint,
-    TlsAccessFlowClientLimits, TlsAccessFlowConnector, TlsAccessFlowGeneration,
-    TlsAccessFlowPreparedClientEndpoint, TlsAccessFlowStream, TlsAccessFlowTrust,
-    project_tls_client_resources,
+    ACTIVE_CHANNEL_BYTES, CLIENT_DNS_ADDRESS_BYTES, CLIENT_PEER_CHAIN_BYTES, HANDSHAKE_BYTES,
+    TlsAccessFlowClientEndpoint, TlsAccessFlowClientLimits, TlsAccessFlowConnector,
+    TlsAccessFlowPreparedClientEndpoint, TlsAccessFlowStream,
 };
 use access_flow_unix::{UnixAccessFlowConnector, UnixAccessFlowStream};
+use access_tls_trust::{
+    CUSTOM_COMPONENT_RETAINED_CEILING, EFFECTIVE_PLAN_CONTROL_BYTES, GENERATION_CONTROL_BYTES,
+    MAX_CUSTOM_DER_BYTES, MAX_CUSTOM_PEM_BYTES, MAX_SYSTEM_DER_BYTES, PreparedTlsTrustCandidate,
+    SYSTEM_COMPONENT_RETAINED_CEILING, TRUST_SOURCE_WORKSPACE_CONTROL_BYTES, TlsClientTrustMode,
+    TlsClientTrustPlan, TlsTrustFileSource, TlsTrustGeneration, TlsTrustLoadError,
+    TlsTrustLoadLimits, TlsTrustLoadWorkspace, TlsTrustRevalidationProgress,
+    WORKSPACE_SCRATCH_BYTES,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::watch;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
-const CERTIFICATE_BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
-const CERTIFICATE_END: &[u8] = b"-----END CERTIFICATE-----";
-const MAX_TRUST_SOURCE_BYTES: usize = 1024 * 1024;
-const MAX_TRUST_READ_BUFFER_BYTES: usize = MAX_TRUST_SOURCE_BYTES + 1;
-const TRUST_LOAD_DESCRIPTOR_ENVELOPE: u64 = 2;
-// Frozen envelopes for Vec/Box/BTree/CString/Arc metadata after exact
-// address, name, path, certificate, and policy bytes are counted.
-const TLS_ROUTE_CONTROL_BYTES: u64 = 4 * 1024;
-const TLS_UNIQUE_SOURCE_CONTROL_BYTES: u64 = 4 * 1024;
+const MAX_PUBLISHED_TRUST_GENERATIONS: usize = 8;
+#[cfg(test)]
+const TEST_TLS_TRUST_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(test)]
+const TEST_TLS_TRUST_DESCRIPTOR_BUDGET: u64 = 32;
+const TLS_ENDPOINT_CONTROL_BYTES: u64 = 8 * 1024;
+const TRUST_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const TRUST_CANCELLATION_JOIN_GRACE: Duration = Duration::from_millis(10);
+const TRUST_CANDIDATE_BASE_TIMEOUT: Duration = Duration::from_secs(60);
+const TRUST_CANDIDATE_MAX_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Fixed, path-free product transport failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RelayTransportError {
-    Unavailable,
+    SystemStoreEmpty,
+    SystemStoreUnavailable,
     UntrustedSource,
-    ResourceLimit,
     InvalidMaterial,
+    SourceResourceLimit,
     InvalidPlan,
+    Cancelled,
+    Internal,
+    TrustGenerationLimit,
     ReloadInProgress,
-    Coordinator,
+    Unavailable,
     ShuttingDown,
+}
+
+impl RelayTransportError {
+    fn keeps_active_generation_ready(self) -> bool {
+        matches!(
+            self,
+            Self::SystemStoreEmpty
+                | Self::SystemStoreUnavailable
+                | Self::Cancelled
+                | Self::TrustGenerationLimit
+                | Self::ReloadInProgress
+        )
+    }
+
+    pub(super) const fn status_code(self) -> &'static str {
+        match self {
+            Self::SystemStoreEmpty => "system_store_empty",
+            Self::SystemStoreUnavailable => "system_store_unavailable",
+            Self::UntrustedSource => "untrusted_source",
+            Self::InvalidMaterial => "invalid_material",
+            Self::SourceResourceLimit => "trust_source_resource_limit",
+            Self::InvalidPlan => "invalid_plan",
+            Self::Cancelled => "cancelled",
+            Self::Internal => "internal",
+            Self::TrustGenerationLimit => "trust_generation_limit",
+            Self::ReloadInProgress => "trust_reload_blocked",
+            Self::Unavailable => "unavailable",
+            Self::ShuttingDown => "shutting_down",
+        }
+    }
 }
 
 impl fmt::Display for RelayTransportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::Unavailable => "Access Flow trust source is unavailable",
+            Self::SystemStoreEmpty => "Access Flow system trust store is empty",
+            Self::SystemStoreUnavailable => "Access Flow system trust store is unavailable",
             Self::UntrustedSource => "Access Flow trust source is not trusted",
-            Self::ResourceLimit => "Access Flow trust source exceeds a resource bound",
             Self::InvalidMaterial => "Access Flow trust material is invalid",
+            Self::SourceResourceLimit => "Access Flow trust source exceeds a resource bound",
             Self::InvalidPlan => "Access Flow transport plan is invalid",
+            Self::Cancelled => "Access Flow trust reload was cancelled",
+            Self::Internal => "Access Flow transport coordinator failed",
+            Self::TrustGenerationLimit => "Access Flow trust generation limit was reached",
             Self::ReloadInProgress => "Access Flow transport reload is already in progress",
-            Self::Coordinator => "Access Flow transport coordinator failed",
+            Self::Unavailable => "Access Flow transport is unavailable",
             Self::ShuttingDown => "Access Flow transport is shutting down",
         })
     }
@@ -64,16 +112,43 @@ impl fmt::Display for RelayTransportError {
 
 impl Error for RelayTransportError {}
 
+impl From<TlsTrustLoadError> for RelayTransportError {
+    fn from(error: TlsTrustLoadError) -> Self {
+        match error {
+            TlsTrustLoadError::SystemStoreEmpty => Self::SystemStoreEmpty,
+            TlsTrustLoadError::SystemStoreUnavailable => Self::SystemStoreUnavailable,
+            TlsTrustLoadError::UntrustedSource => Self::UntrustedSource,
+            TlsTrustLoadError::InvalidMaterial => Self::InvalidMaterial,
+            TlsTrustLoadError::ResourceLimit => Self::SourceResourceLimit,
+            TlsTrustLoadError::InvalidPlan => Self::InvalidPlan,
+            TlsTrustLoadError::Cancelled => Self::Cancelled,
+            TlsTrustLoadError::Internal => Self::Internal,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct TlsRouteSource {
     address: access_flow_tls::TlsAccessFlowAddress,
     server_name: access_flow_tls::TlsAccessFlowServerName,
-    trust_path: PathBuf,
+    mode: TlsClientTrustMode,
+    plan: TlsClientTrustPlan,
+    trust_path: Option<PathBuf>,
 }
 
-struct RelayTransportGeneration {
-    id: TlsAccessFlowGeneration,
+pub(super) struct RelayTransportGeneration {
+    id: TlsTrustGeneration,
     tls_endpoints: Box<[TlsAccessFlowPreparedClientEndpoint]>,
+    trust_candidate: Option<PreparedTlsTrustCandidate>,
+}
+
+impl RelayTransportGeneration {
+    fn retained_bytes(&self) -> u64 {
+        self.trust_candidate
+            .as_ref()
+            .map(|candidate| candidate.resource_projection().retained_bytes())
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Clone)]
@@ -90,8 +165,12 @@ struct RelayTransportInner {
     readiness: Arc<AtomicBool>,
     next_generation: AtomicU64,
     reload_in_progress: AtomicBool,
+    blocked_operation: AtomicBool,
+    trust_budget: OnceLock<RelayTransportTrustBudget>,
     publication: Mutex<()>,
+    retained_generations: Mutex<Vec<Weak<RelayTransportGeneration>>>,
     shutdown_started: AtomicBool,
+    shutdown_cancellation: CancellationToken,
     unix: UnixAccessFlowConnector,
     tls: TlsAccessFlowConnector,
 }
@@ -104,6 +183,12 @@ pub(super) struct RelayTransportRuntime {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct RelayTransportResourceReserve {
+    pub(super) descriptors: u64,
+    pub(super) memory_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RelayTransportTrustBudget {
     pub(super) descriptors: u64,
     pub(super) memory_bytes: u64,
 }
@@ -124,8 +209,12 @@ impl RelayTransportRuntime {
                 readiness,
                 next_generation: AtomicU64::new(2),
                 reload_in_progress: AtomicBool::new(false),
+                blocked_operation: AtomicBool::new(false),
+                trust_budget: OnceLock::new(),
                 publication: Mutex::new(()),
+                retained_generations: Mutex::new(Vec::new()),
                 shutdown_started: AtomicBool::new(false),
+                shutdown_cancellation: CancellationToken::new(),
                 unix: UnixAccessFlowConnector::new(),
                 tls: TlsAccessFlowConnector::with_system_resolver(
                     TlsAccessFlowClientLimits::default(),
@@ -140,12 +229,53 @@ impl RelayTransportRuntime {
         readiness: Arc<AtomicBool>,
     ) -> Result<Self, RelayTransportError> {
         let runtime = Self::prepare(plan, readiness)?;
+        runtime.configure_trust_budget(RelayTransportTrustBudget {
+            descriptors: TEST_TLS_TRUST_DESCRIPTOR_BUDGET,
+            memory_bytes: TEST_TLS_TRUST_BUDGET_BYTES,
+        })?;
         runtime.activate_prepared().await?;
         Ok(runtime)
     }
 
+    pub(super) fn configure_trust_budget(
+        &self,
+        budget: RelayTransportTrustBudget,
+    ) -> Result<(), RelayTransportError> {
+        let candidate_memory = project_candidate_loader_peak(&self.inner.sources)?;
+        let candidate_descriptors = projected_candidate_descriptors(&self.inner.sources)?;
+        if !self.inner.sources.is_empty()
+            && (budget.descriptors == 0
+                || budget.memory_bytes == 0
+                || candidate_memory > budget.memory_bytes
+                || candidate_descriptors > budget.descriptors)
+        {
+            return Err(RelayTransportError::SourceResourceLimit);
+        }
+        self.inner
+            .trust_budget
+            .set(budget)
+            .map_err(|_| RelayTransportError::InvalidPlan)
+    }
+
     pub(super) async fn activate_prepared(&self) -> Result<(), RelayTransportError> {
-        let initial = load_generation(self.inner.sources.to_vec(), 1).await?;
+        if self.inner.blocked_operation.load(Ordering::Acquire) {
+            return Err(RelayTransportError::ReloadInProgress);
+        }
+        let budget = self.inner.trust_budget()?;
+        let initial = match load_generation(
+            self.inner.sources.to_vec(),
+            1,
+            budget,
+            self.inner.shutdown_cancellation.clone(),
+        )
+        .await
+        {
+            GenerationLoadOutcome::Finished(result) => result?,
+            GenerationLoadOutcome::TimedOut(watcher) => {
+                self.inner.install_blocked_operation(watcher);
+                return Err(RelayTransportError::Cancelled);
+            }
+        };
         let _publication = self
             .inner
             .publication
@@ -155,9 +285,10 @@ impl RelayTransportRuntime {
             return Err(RelayTransportError::ShuttingDown);
         }
         if !matches!(&*self.inner.state.borrow(), RelayTransportState::Pending) {
-            return Err(RelayTransportError::Coordinator);
+            return Err(RelayTransportError::Internal);
         }
-        self.inner.publish_generation_as_healthy(Arc::new(initial));
+        self.inner
+            .publish_generation_as_healthy(Arc::new(initial))?;
         Ok(())
     }
 
@@ -167,16 +298,21 @@ impl RelayTransportRuntime {
         }
     }
 
+    pub(super) fn reload_blocked(&self) -> bool {
+        self.inner.blocked_operation.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_test_blocked_operation(&self, watcher: tokio::task::JoinHandle<()>) {
+        self.inner.install_blocked_operation(watcher);
+    }
+
     pub(super) fn resource_reserve(
         plan: &AccessFlowRelayPlan<CompiledAccessFlowRelayEndpoint>,
     ) -> Result<RelayTransportResourceReserve, RelayTransportError> {
         let sources = collect_tls_sources(plan)?;
         Ok(RelayTransportResourceReserve {
-            descriptors: if sources.is_empty() {
-                0
-            } else {
-                TRUST_LOAD_DESCRIPTOR_ENVELOPE
-            },
+            descriptors: projected_candidate_descriptors(&sources)?,
             memory_bytes: project_candidate_loader_peak(&sources)?,
         })
     }
@@ -210,6 +346,9 @@ impl RelayTransportRuntime {
         if matches!(&*self.inner.state.borrow(), RelayTransportState::Pending) {
             return Err(RelayTransportError::Unavailable);
         }
+        if self.inner.blocked_operation.load(Ordering::Acquire) {
+            return Err(RelayTransportError::ReloadInProgress);
+        }
         if self.inner.sources.is_empty() {
             return Ok(None);
         }
@@ -221,7 +360,21 @@ impl RelayTransportRuntime {
         {
             return Err(RelayTransportError::ReloadInProgress);
         }
-        self.inner.preserve_generation_as_unhealthy();
+        let retained_bytes = self.inner.retained_generation_bytes()?;
+        let candidate_peak = project_candidate_loader_peak(&self.inner.sources)?;
+        let budget = self.inner.trust_budget()?;
+        let Some(working_limit) = budget.memory_bytes.checked_sub(retained_bytes) else {
+            self.inner
+                .reload_in_progress
+                .store(false, Ordering::Release);
+            return Err(RelayTransportError::TrustGenerationLimit);
+        };
+        if candidate_peak > working_limit {
+            self.inner
+                .reload_in_progress
+                .store(false, Ordering::Release);
+            return Err(RelayTransportError::TrustGenerationLimit);
+        }
         let generation = match self.inner.next_generation.fetch_update(
             Ordering::AcqRel,
             Ordering::Acquire,
@@ -232,13 +385,26 @@ impl RelayTransportRuntime {
                 self.inner
                     .reload_in_progress
                     .store(false, Ordering::Release);
-                return Err(RelayTransportError::ResourceLimit);
+                return Err(RelayTransportError::TrustGenerationLimit);
             }
         };
         let sources = self.inner.sources.to_vec();
-        let worker = tokio::task::spawn_blocking(move || {
-            worker_started();
-            load_generation_blocking(&sources, generation)
+        let shutdown_cancellation = self.inner.shutdown_cancellation.clone();
+        let worker = tokio::spawn(async move {
+            let hook = tokio::task::spawn_blocking(worker_started);
+            if hook.await.is_err() {
+                return GenerationLoadOutcome::Finished(Err(RelayTransportError::Internal));
+            }
+            load_generation(
+                sources,
+                generation,
+                RelayTransportTrustBudget {
+                    descriptors: budget.descriptors,
+                    memory_bytes: working_limit,
+                },
+                shutdown_cancellation,
+            )
+            .await
         });
         Ok(Some(PendingRelayTransportReload {
             inner: Arc::clone(&self.inner),
@@ -246,12 +412,8 @@ impl RelayTransportRuntime {
         }))
     }
 
-    #[cfg(test)]
-    fn healthy(&self) -> bool {
-        self.inner.readiness.load(Ordering::Acquire)
-    }
-
     pub(super) fn close(&self) {
+        self.inner.shutdown_cancellation.cancel();
         let _publication = self
             .inner
             .publication
@@ -273,28 +435,60 @@ impl fmt::Debug for RelayTransportRuntime {
 #[must_use = "pending transport reload workers must be joined"]
 pub(super) struct PendingRelayTransportReload {
     inner: Arc<RelayTransportInner>,
-    worker: Option<tokio::task::JoinHandle<Result<RelayTransportGeneration, RelayTransportError>>>,
+    worker: Option<tokio::task::JoinHandle<GenerationLoadOutcome>>,
 }
 
 impl PendingRelayTransportReload {
-    /// Joins and publishes this reload. Cancelling the wait leaves the worker owned here.
     pub(super) async fn wait(&mut self) -> Result<(), RelayTransportError> {
-        let loaded = {
-            let worker = self
-                .worker
-                .as_mut()
-                .ok_or(RelayTransportError::Coordinator)?;
-            worker
-                .await
-                .unwrap_or(Err(RelayTransportError::Coordinator))
+        let outcome = {
+            let worker = self.worker.as_mut().ok_or(RelayTransportError::Internal)?;
+            worker.await.unwrap_or(GenerationLoadOutcome::Finished(Err(
+                RelayTransportError::Internal,
+            )))
         };
         self.worker = None;
-        self.publish(loaded)
+        match outcome {
+            GenerationLoadOutcome::Finished(loaded) => self.publish(loaded),
+            GenerationLoadOutcome::TimedOut(watcher) => {
+                self.inner.install_blocked_operation(watcher);
+                Err(RelayTransportError::Cancelled)
+            }
+        }
     }
 
-    /// Final join used by terminal shutdown after the runtime is closed.
     pub(super) async fn complete(mut self) -> Result<(), RelayTransportError> {
         self.wait().await
+    }
+
+    pub(super) async fn complete_by(
+        mut self,
+        deadline: Instant,
+    ) -> Result<(), RelayTransportError> {
+        let mut worker = self.worker.take().ok_or(RelayTransportError::Internal)?;
+        match tokio::time::timeout_at(deadline, &mut worker).await {
+            Ok(outcome) => match outcome.unwrap_or(GenerationLoadOutcome::Finished(Err(
+                RelayTransportError::Internal,
+            ))) {
+                GenerationLoadOutcome::Finished(loaded) => self.publish(loaded),
+                GenerationLoadOutcome::TimedOut(watcher) => {
+                    self.inner.install_blocked_operation(watcher);
+                    Err(RelayTransportError::Cancelled)
+                }
+            },
+            Err(_) => {
+                self.inner.shutdown_cancellation.cancel();
+                tokio::task::yield_now().await;
+                if worker.is_finished() {
+                    let _ = worker.await;
+                    self.inner
+                        .reload_in_progress
+                        .store(false, Ordering::Release);
+                } else {
+                    self.inner.install_blocked_candidate(worker);
+                }
+                Err(RelayTransportError::Cancelled)
+            }
+        }
     }
 
     fn publish(
@@ -310,12 +504,15 @@ impl PendingRelayTransportReload {
             Err(RelayTransportError::ShuttingDown)
         } else {
             match loaded {
-                Ok(generation) => {
-                    self.inner
-                        .publish_generation_as_healthy(Arc::new(generation));
-                    Ok(())
+                Ok(generation) => self
+                    .inner
+                    .publish_generation_as_healthy(Arc::new(generation)),
+                Err(error) => {
+                    if !error.keeps_active_generation_ready() {
+                        self.inner.preserve_generation_as_unhealthy();
+                    }
+                    Err(error)
                 }
-                Err(error) => Err(error),
             }
         };
         self.inner
@@ -332,44 +529,100 @@ impl fmt::Debug for PendingRelayTransportReload {
 }
 
 impl RelayTransportInner {
-    fn preserve_generation_as_unhealthy(&self) {
-        self.preserve_generation_as_unhealthy_with(|| {});
+    fn trust_budget(&self) -> Result<RelayTransportTrustBudget, RelayTransportError> {
+        self.trust_budget
+            .get()
+            .copied()
+            .ok_or(RelayTransportError::InvalidPlan)
     }
 
-    fn preserve_generation_as_unhealthy_with(&self, after_readiness: impl FnOnce()) {
+    fn install_blocked_operation(self: &Arc<Self>, watcher: tokio::task::JoinHandle<()>) {
+        self.blocked_operation.store(true, Ordering::Release);
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            let _ = watcher.await;
+            inner.blocked_operation.store(false, Ordering::Release);
+            inner.reload_in_progress.store(false, Ordering::Release);
+        });
+    }
+
+    fn install_blocked_candidate(
+        self: &Arc<Self>,
+        watcher: tokio::task::JoinHandle<GenerationLoadOutcome>,
+    ) {
+        self.blocked_operation.store(true, Ordering::Release);
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Ok(GenerationLoadOutcome::TimedOut(operation)) = watcher.await {
+                let _ = operation.await;
+            }
+            inner.blocked_operation.store(false, Ordering::Release);
+            inner.reload_in_progress.store(false, Ordering::Release);
+        });
+    }
+    fn retained_generation_bytes(&self) -> Result<u64, RelayTransportError> {
+        let mut retained = self
+            .retained_generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retained.retain(|generation| generation.strong_count() > 0);
+        retained
+            .iter()
+            .filter_map(Weak::upgrade)
+            .try_fold(0_u64, |total, generation| {
+                total.checked_add(generation.retained_bytes())
+            })
+            .ok_or(RelayTransportError::TrustGenerationLimit)
+    }
+
+    fn preserve_generation_as_unhealthy(&self) {
         let current = match self.state.borrow().clone() {
             RelayTransportState::Healthy(generation)
             | RelayTransportState::Unhealthy(generation) => generation,
             RelayTransportState::Pending | RelayTransportState::Closed => return,
         };
         self.readiness.store(false, Ordering::Release);
-        after_readiness();
         self.state
             .send_replace(RelayTransportState::Unhealthy(current));
     }
 
-    fn publish_generation_as_healthy(&self, generation: Arc<RelayTransportGeneration>) {
-        self.publish_generation_as_healthy_with(generation, || {});
-    }
-
-    fn publish_generation_as_healthy_with(
+    fn publish_generation_as_healthy(
         &self,
         generation: Arc<RelayTransportGeneration>,
-        after_state: impl FnOnce(),
-    ) {
+    ) -> Result<(), RelayTransportError> {
+        let mut retained = self
+            .retained_generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retained.retain(|generation| generation.strong_count() > 0);
+        let retained_bytes = retained
+            .iter()
+            .filter_map(Weak::upgrade)
+            .try_fold(0_u64, |total, generation| {
+                total.checked_add(generation.retained_bytes())
+            })
+            .ok_or(RelayTransportError::TrustGenerationLimit)?;
+        if retained.len() >= MAX_PUBLISHED_TRUST_GENERATIONS
+            || retained_bytes
+                .checked_add(generation.retained_bytes())
+                .is_none_or(|bytes| {
+                    self.trust_budget
+                        .get()
+                        .is_none_or(|budget| bytes > budget.memory_bytes)
+                })
+        {
+            return Err(RelayTransportError::TrustGenerationLimit);
+        }
+        retained.push(Arc::downgrade(&generation));
+        drop(retained);
         self.state
             .send_replace(RelayTransportState::Healthy(generation));
-        after_state();
         self.readiness.store(true, Ordering::Release);
+        Ok(())
     }
 
     fn publish_closed(&self) {
-        self.publish_closed_with(|| {});
-    }
-
-    fn publish_closed_with(&self, after_readiness: impl FnOnce()) {
         self.readiness.store(false, Ordering::Release);
-        after_readiness();
         self.state.send_replace(RelayTransportState::Closed);
     }
 
@@ -382,16 +635,7 @@ impl RelayTransportInner {
         }
     }
 
-    #[cfg(test)]
-    fn retained_generation(&self) -> Option<Arc<RelayTransportGeneration>> {
-        match self.state.borrow().clone() {
-            RelayTransportState::Healthy(generation)
-            | RelayTransportState::Unhealthy(generation) => Some(generation),
-            RelayTransportState::Pending | RelayTransportState::Closed => None,
-        }
-    }
-
-    fn generation_is_current(&self, expected: TlsAccessFlowGeneration) -> bool {
+    fn generation_is_current(&self, expected: TlsTrustGeneration) -> bool {
         matches!(
             &*self.state.borrow(),
             RelayTransportState::Healthy(generation) if generation.id == expected
@@ -399,7 +643,6 @@ impl RelayTransportInner {
     }
 }
 
-/// Exact product connector over the mutually exclusive Unix and TLS adapters.
 #[derive(Clone)]
 pub(super) struct RelayTransportConnector {
     inner: Arc<RelayTransportInner>,
@@ -411,17 +654,19 @@ impl fmt::Debug for RelayTransportConnector {
     }
 }
 
-/// Product stream sum that does not expose either physical adapter upstream.
 pub(super) enum RelayTransportStream {
     Unix(UnixAccessFlowStream),
-    Tls(TlsAccessFlowStream),
+    Tls {
+        stream: TlsAccessFlowStream,
+        _generation: Arc<RelayTransportGeneration>,
+    },
 }
 
 impl fmt::Debug for RelayTransportStream {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Unix(_) => "RelayTransportStream::Unix",
-            Self::Tls(_) => "RelayTransportStream::Tls",
+            Self::Tls { .. } => "RelayTransportStream::Tls",
         })
     }
 }
@@ -434,7 +679,7 @@ impl AsyncRead for RelayTransportStream {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Unix(stream) => Pin::new(stream).poll_read(context, buffer),
-            Self::Tls(stream) => Pin::new(stream).poll_read(context, buffer),
+            Self::Tls { stream, .. } => Pin::new(stream).poll_read(context, buffer),
         }
     }
 }
@@ -447,21 +692,21 @@ impl AsyncWrite for RelayTransportStream {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Self::Unix(stream) => Pin::new(stream).poll_write(context, buffer),
-            Self::Tls(stream) => Pin::new(stream).poll_write(context, buffer),
+            Self::Tls { stream, .. } => Pin::new(stream).poll_write(context, buffer),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Unix(stream) => Pin::new(stream).poll_flush(context),
-            Self::Tls(stream) => Pin::new(stream).poll_flush(context),
+            Self::Tls { stream, .. } => Pin::new(stream).poll_flush(context),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Unix(stream) => Pin::new(stream).poll_shutdown(context),
-            Self::Tls(stream) => Pin::new(stream).poll_shutdown(context),
+            Self::Tls { stream, .. } => Pin::new(stream).poll_shutdown(context),
         }
     }
 }
@@ -502,7 +747,10 @@ impl AccessFlowConnector for RelayTransportConnector {
                         .tls
                         .connect(endpoint, gated_context)
                         .await
-                        .map(RelayTransportStream::Tls)
+                        .map(|stream| RelayTransportStream::Tls {
+                            stream,
+                            _generation: Arc::clone(&generation),
+                        })
                 }
             }?;
             if self.inner.generation_is_current(generation.id) {
@@ -522,18 +770,29 @@ impl AccessFlowConnector for RelayTransportConnector {
             CompiledAccessFlowRelayEndpoint::Unix(endpoint) => {
                 self.inner.unix.resource_projection(endpoint)
             }
-            CompiledAccessFlowRelayEndpoint::TlsTcp {
-                address,
-                server_name,
-                trust_path,
-                ..
-            } => maximum_tls_channel_cost(address, server_name, trust_path),
+            CompiledAccessFlowRelayEndpoint::TlsTcp { .. } => {
+                let connecting_bytes = ACTIVE_CHANNEL_BYTES
+                    .checked_add(HANDSHAKE_BYTES)
+                    .and_then(|bytes| bytes.checked_add(CLIENT_PEER_CHAIN_BYTES))
+                    .and_then(|bytes| bytes.checked_add(CLIENT_DNS_ADDRESS_BYTES))
+                    .ok_or(AccessFlowChannelFailure::ResourceExhausted)?;
+                let active_bytes = ACTIVE_CHANNEL_BYTES
+                    .checked_add(CLIENT_PEER_CHAIN_BYTES)
+                    .ok_or(AccessFlowChannelFailure::ResourceExhausted)?;
+                AccessFlowChannelResourceCost::new(
+                    TLS_ENDPOINT_CONTROL_BYTES,
+                    1,
+                    1,
+                    connecting_bytes,
+                    active_bytes,
+                )
+            }
         }
     }
 }
 
 struct GenerationCancellation<'a> {
-    expected: TlsAccessFlowGeneration,
+    expected: TlsTrustGeneration,
     state: watch::Receiver<RelayTransportState>,
     caller: &'a dyn AccessCancellation,
 }
@@ -579,82 +838,6 @@ impl AccessCancellation for GenerationCancellation<'_> {
     }
 }
 
-fn tls_endpoint_metadata_bytes(
-    address: &access_flow_tls::TlsAccessFlowAddress,
-    server_name: &access_flow_tls::TlsAccessFlowServerName,
-) -> Result<u64, RelayTransportError> {
-    let marker_generation =
-        TlsAccessFlowGeneration::new(1).map_err(|_| RelayTransportError::ResourceLimit)?;
-    let marker_trust = TlsAccessFlowTrust::new(marker_generation, vec![vec![0_u8]])
-        .map_err(map_trust_contract_error)?;
-    let marker =
-        TlsAccessFlowClientEndpoint::new(address.clone(), server_name.clone(), marker_trust);
-    project_tls_client_resources(&marker, 1, 1)
-        .map(|projection| projection.endpoint_bytes())
-        .map_err(map_trust_contract_error)
-}
-
-fn maximum_tls_channel_cost(
-    address: &access_flow_tls::TlsAccessFlowAddress,
-    server_name: &access_flow_tls::TlsAccessFlowServerName,
-    trust_path: &Path,
-) -> Result<AccessFlowChannelResourceCost, AccessFlowChannelFailure> {
-    let endpoint_metadata = tls_endpoint_metadata_bytes(address, server_name)
-        .map_err(|_| AccessFlowChannelFailure::ResourceExhausted)?;
-    let trust_path_bytes = projected_trust_path_bytes(trust_path)
-        .map_err(|_| AccessFlowChannelFailure::InvalidEndpoint)?;
-    let maximum_generation = (MAX_TRUST_ANCHOR_BYTES as u64)
-        .checked_add(GENERATION_CONTROL_BYTES)
-        .ok_or(AccessFlowChannelFailure::ResourceExhausted)?;
-    let retained_endpoint_bytes = endpoint_metadata
-        .checked_mul(2)
-        .and_then(|bytes| bytes.checked_add(trust_path_bytes))
-        .and_then(|bytes| bytes.checked_add(maximum_generation))
-        .ok_or(AccessFlowChannelFailure::ResourceExhausted)?;
-    let connecting_bytes = access_flow_tls::HANDSHAKE_BYTES
-        .checked_add(access_flow_tls::CLIENT_DNS_ADDRESS_BYTES)
-        .ok_or(AccessFlowChannelFailure::ResourceExhausted)?;
-    AccessFlowChannelResourceCost::new(
-        retained_endpoint_bytes,
-        1,
-        1,
-        connecting_bytes,
-        // Established streams can retain policies from distinct prior reload
-        // generations, so the maximum policy remains per active flow.
-        ACTIVE_CHANNEL_BYTES
-            .checked_add(access_flow_tls::CLIENT_PEER_CHAIN_BYTES)
-            .and_then(|bytes| bytes.checked_add(maximum_generation))
-            .ok_or(AccessFlowChannelFailure::ResourceExhausted)?,
-    )
-}
-
-fn projected_trust_path_bytes(path: &Path) -> Result<u64, RelayTransportError> {
-    let value = path.to_str().ok_or(RelayTransportError::InvalidPlan)?;
-    if value.len() > crate::config::MAX_ACCESS_FLOW_TRUST_PATH_BYTES {
-        return Err(RelayTransportError::ResourceLimit);
-    }
-    let mut components = path.components();
-    if components.next() != Some(Component::RootDir) {
-        return Err(RelayTransportError::InvalidPlan);
-    }
-    let mut count = 0_usize;
-    for component in components {
-        if !matches!(component, Component::Normal(_)) {
-            return Err(RelayTransportError::InvalidPlan);
-        }
-        count = count
-            .checked_add(1)
-            .ok_or(RelayTransportError::ResourceLimit)?;
-        if count > crate::config::MAX_ACCESS_FLOW_TRUST_PATH_COMPONENTS {
-            return Err(RelayTransportError::ResourceLimit);
-        }
-    }
-    if count == 0 {
-        return Err(RelayTransportError::InvalidPlan);
-    }
-    u64::try_from(value.len()).map_err(|_| RelayTransportError::ResourceLimit)
-}
-
 fn collect_tls_sources(
     plan: &AccessFlowRelayPlan<CompiledAccessFlowRelayEndpoint>,
 ) -> Result<Vec<TlsRouteSource>, RelayTransportError> {
@@ -664,15 +847,18 @@ fn collect_tls_sources(
             tls_index,
             address,
             server_name,
+            trust_mode,
+            trust_plan,
             trust_path,
         } = route.endpoint()
         else {
             continue;
         };
-        projected_trust_path_bytes(trust_path)?;
         let source = TlsRouteSource {
             address: address.clone(),
             server_name: server_name.clone(),
+            mode: *trust_mode,
+            plan: *trust_plan,
             trust_path: trust_path.clone(),
         };
         if indexed.insert(*tls_index, source).is_some() {
@@ -690,107 +876,245 @@ fn collect_tls_sources(
     Ok(sources)
 }
 
+fn projected_candidate_descriptors(sources: &[TlsRouteSource]) -> Result<u64, RelayTransportError> {
+    if sources.is_empty() {
+        return Ok(0);
+    }
+    let custom_sources = sources
+        .iter()
+        .filter_map(|source| source.plan.custom_source())
+        .collect::<BTreeSet<_>>()
+        .len();
+    u64::try_from(custom_sources)
+        .ok()
+        .and_then(|count| count.checked_add(8))
+        .ok_or(RelayTransportError::SourceResourceLimit)
+}
+
 fn project_candidate_loader_peak(sources: &[TlsRouteSource]) -> Result<u64, RelayTransportError> {
     if sources.is_empty() {
         return Ok(0);
     }
-    let routes = u64::try_from(sources.len()).map_err(|_| RelayTransportError::ResourceLimit)?;
-    let unique_paths = sources
-        .iter()
-        .map(|source| &source.trust_path)
-        .collect::<BTreeSet<_>>();
-    let unique_source_count =
-        u64::try_from(unique_paths.len()).map_err(|_| RelayTransportError::ResourceLimit)?;
-    let maximum_generation = (MAX_TRUST_ANCHOR_BYTES as u64)
-        .checked_add(GENERATION_CONTROL_BYTES)
-        .ok_or(RelayTransportError::ResourceLimit)?;
-    let mut route_source_bytes = 0_u64;
-    let mut candidate_endpoint_bytes = 0_u64;
-    for source in sources {
-        let endpoint_metadata = tls_endpoint_metadata_bytes(&source.address, &source.server_name)?;
-        let path_bytes = projected_trust_path_bytes(&source.trust_path)?;
-        route_source_bytes = route_source_bytes
-            .checked_add(endpoint_metadata)
-            .and_then(|bytes| bytes.checked_add(path_bytes))
-            .ok_or(RelayTransportError::ResourceLimit)?;
-        candidate_endpoint_bytes = candidate_endpoint_bytes
-            .checked_add(endpoint_metadata)
-            .and_then(|bytes| bytes.checked_add(maximum_generation))
-            .ok_or(RelayTransportError::ResourceLimit)?;
-    }
-    let unique_path_bytes = unique_paths.iter().try_fold(0_u64, |total, path| {
-        projected_trust_path_bytes(path)
-            .ok()
-            .and_then(|length| total.checked_add(length))
-            .ok_or(RelayTransportError::ResourceLimit)
-    })?;
-    let loaded_anchor_bytes = unique_source_count
-        .checked_mul(MAX_TRUST_ANCHOR_BYTES as u64)
-        .ok_or(RelayTransportError::ResourceLimit)?;
-    let route_control_bytes = routes
-        .checked_mul(TLS_ROUTE_CONTROL_BYTES)
-        .ok_or(RelayTransportError::ResourceLimit)?;
-    let source_control_bytes = unique_source_count
-        .checked_mul(TLS_UNIQUE_SOURCE_CONTROL_BYTES)
-        .ok_or(RelayTransportError::ResourceLimit)?;
-    let activation_scratch_bytes = routes
-        .checked_mul(MAX_TRUST_ANCHOR_BYTES as u64)
-        .ok_or(RelayTransportError::ResourceLimit)?;
-    route_source_bytes
-        .checked_mul(2)
-        .and_then(|bytes| bytes.checked_add(unique_path_bytes))
-        .and_then(|bytes| bytes.checked_add(loaded_anchor_bytes))
-        .and_then(|bytes| bytes.checked_add(MAX_TRUST_READ_BUFFER_BYTES as u64))
-        .and_then(|bytes| bytes.checked_add(crate::config::MAX_ACCESS_FLOW_TRUST_PATH_BYTES as u64))
-        .and_then(|bytes| bytes.checked_add(candidate_endpoint_bytes))
-        .and_then(|bytes| bytes.checked_add(activation_scratch_bytes))
-        .and_then(|bytes| bytes.checked_add(route_control_bytes))
-        .and_then(|bytes| bytes.checked_add(source_control_bytes))
-        .ok_or(RelayTransportError::ResourceLimit)
+    let plan_count = u64::try_from(
+        sources
+            .iter()
+            .map(|source| source.plan)
+            .collect::<BTreeSet<_>>()
+            .len(),
+    )
+    .map_err(|_| RelayTransportError::SourceResourceLimit)?;
+    let custom_count = u64::try_from(
+        sources
+            .iter()
+            .filter_map(|source| source.plan.custom_source())
+            .collect::<BTreeSet<_>>()
+            .len(),
+    )
+    .map_err(|_| RelayTransportError::SourceResourceLimit)?;
+    let system_required = sources.iter().any(|source| {
+        matches!(
+            source.mode,
+            TlsClientTrustMode::System | TlsClientTrustMode::SystemPlusCustom
+        )
+    });
+    let retained_base = GENERATION_CONTROL_BYTES
+        .checked_add(
+            plan_count
+                .checked_mul(EFFECTIVE_PLAN_CONTROL_BYTES)
+                .ok_or(RelayTransportError::SourceResourceLimit)?,
+        )
+        .ok_or(RelayTransportError::SourceResourceLimit)?;
+    let workspace_base = WORKSPACE_SCRATCH_BYTES
+        .checked_add(
+            custom_count
+                .checked_mul(TRUST_SOURCE_WORKSPACE_CONTROL_BYTES)
+                .ok_or(RelayTransportError::SourceResourceLimit)?,
+        )
+        .and_then(|bytes| {
+            bytes.checked_add(if custom_count > 0 {
+                MAX_CUSTOM_PEM_BYTES as u64
+            } else {
+                0
+            })
+        })
+        .ok_or(RelayTransportError::SourceResourceLimit)?;
+    let retained_before_custom = retained_base
+        .checked_add(if system_required {
+            SYSTEM_COMPONENT_RETAINED_CEILING
+        } else {
+            0
+        })
+        .ok_or(RelayTransportError::SourceResourceLimit)?;
+    let retained_complete = retained_before_custom
+        .checked_add(
+            custom_count
+                .checked_mul(CUSTOM_COMPONENT_RETAINED_CEILING)
+                .ok_or(RelayTransportError::SourceResourceLimit)?,
+        )
+        .ok_or(RelayTransportError::SourceResourceLimit)?;
+    let system_step = if system_required {
+        retained_base
+            .checked_add(workspace_base)
+            .and_then(|bytes| bytes.checked_add(SYSTEM_COMPONENT_RETAINED_CEILING))
+            .and_then(|bytes| bytes.checked_add(MAX_SYSTEM_DER_BYTES as u64))
+            .ok_or(RelayTransportError::SourceResourceLimit)?
+    } else {
+        0
+    };
+    let custom_step = if custom_count > 0 {
+        retained_complete
+            .checked_add(workspace_base)
+            .and_then(|bytes| bytes.checked_add(MAX_CUSTOM_DER_BYTES as u64))
+            .ok_or(RelayTransportError::SourceResourceLimit)?
+    } else {
+        0
+    };
+    retained_complete
+        .checked_add(workspace_base)
+        .map(|complete| complete.max(system_step).max(custom_step))
+        .ok_or(RelayTransportError::SourceResourceLimit)
 }
 
 async fn load_generation(
     sources: Vec<TlsRouteSource>,
     generation: u64,
-) -> Result<RelayTransportGeneration, RelayTransportError> {
-    tokio::task::spawn_blocking(move || load_generation_blocking(&sources, generation))
-        .await
-        .map_err(|_| RelayTransportError::Coordinator)?
+    budget: RelayTransportTrustBudget,
+    shutdown_cancellation: CancellationToken,
+) -> GenerationLoadOutcome {
+    match load_generation_inner(&sources, generation, budget, shutdown_cancellation).await {
+        Ok(generation) => GenerationLoadOutcome::Finished(Ok(generation)),
+        Err(GenerationLoadFailure::Error(error)) => GenerationLoadOutcome::Finished(Err(error)),
+        Err(GenerationLoadFailure::TimedOut(watcher)) => GenerationLoadOutcome::TimedOut(watcher),
+    }
 }
 
-fn load_generation_blocking(
-    sources: &[TlsRouteSource],
-    generation: u64,
-) -> Result<RelayTransportGeneration, RelayTransportError> {
-    load_generation_blocking_with_hook(sources, generation, |_| {})
+enum GenerationLoadOutcome {
+    Finished(Result<RelayTransportGeneration, RelayTransportError>),
+    TimedOut(tokio::task::JoinHandle<()>),
 }
 
-fn load_generation_blocking_with_hook(
+enum GenerationLoadFailure {
+    Error(RelayTransportError),
+    TimedOut(tokio::task::JoinHandle<()>),
+}
+
+impl From<RelayTransportError> for GenerationLoadFailure {
+    fn from(error: RelayTransportError) -> Self {
+        Self::Error(error)
+    }
+}
+
+impl From<TlsTrustLoadError> for GenerationLoadFailure {
+    fn from(error: TlsTrustLoadError) -> Self {
+        Self::Error(error.into())
+    }
+}
+
+enum WorkspaceOperation {
+    LoadSystem,
+    LoadCustom(TlsTrustFileSource),
+    Revalidate,
+    #[cfg(test)]
+    Block(Arc<std::sync::Barrier>),
+    #[cfg(test)]
+    Mark(Arc<AtomicBool>),
+    #[cfg(test)]
+    WaitForCancellation {
+        started: Arc<AtomicBool>,
+        observed: Arc<AtomicBool>,
+    },
+}
+
+async fn load_generation_inner(
     sources: &[TlsRouteSource],
     generation: u64,
-    mut after_source: impl FnMut(usize),
-) -> Result<RelayTransportGeneration, RelayTransportError> {
-    let id =
-        TlsAccessFlowGeneration::new(generation).map_err(|_| RelayTransportError::ResourceLimit)?;
-    let mut loaded_sources = BTreeMap::<PathBuf, LoadedTrustSource>::new();
+    budget: RelayTransportTrustBudget,
+    shutdown_cancellation: CancellationToken,
+) -> Result<RelayTransportGeneration, GenerationLoadFailure> {
+    if sources.is_empty() {
+        return Ok(RelayTransportGeneration {
+            id: TlsTrustGeneration::new(generation)?,
+            tls_endpoints: Box::new([]),
+            trust_candidate: None,
+        });
+    }
+    let candidate_started = Instant::now();
+    let custom_count = sources
+        .iter()
+        .filter_map(|source| source.plan.custom_source())
+        .collect::<BTreeSet<_>>()
+        .len();
+    let candidate_timeout = candidate_timeout(custom_count)?;
+    let candidate_deadline = candidate_started + candidate_timeout;
+    let generation = TlsTrustGeneration::new(generation)?;
+    let plans = sources
+        .iter()
+        .map(|source| source.plan)
+        .collect::<BTreeSet<_>>();
+    let limits = TlsTrustLoadLimits::new(budget.memory_bytes, budget.descriptors)?;
+    let mut workspace = TlsTrustLoadWorkspace::new(generation, plans, limits)?;
+    if sources.iter().any(|source| {
+        matches!(
+            source.mode,
+            TlsClientTrustMode::System | TlsClientTrustMode::SystemPlusCustom
+        )
+    }) {
+        let (next, _) = supervise_workspace_operation(
+            workspace,
+            WorkspaceOperation::LoadSystem,
+            candidate_deadline,
+            &shutdown_cancellation,
+        )
+        .await?;
+        workspace = next;
+    }
+    let mut custom_sources = BTreeMap::new();
     for source in sources {
-        if !loaded_sources.contains_key(&source.trust_path) {
-            let loaded = load_trust_source(&source.trust_path)?;
-            loaded_sources.insert(source.trust_path.clone(), loaded);
-            after_source(loaded_sources.len() - 1);
+        let Some(path) = &source.trust_path else {
+            continue;
+        };
+        custom_sources
+            .entry(
+                source
+                    .plan
+                    .custom_source()
+                    .ok_or(RelayTransportError::InvalidPlan)?,
+            )
+            .or_insert_with(|| path.clone());
+    }
+    for path in custom_sources.into_values() {
+        let source = TlsTrustFileSource::new(path)?;
+        let (next, _) = supervise_workspace_operation(
+            workspace,
+            WorkspaceOperation::LoadCustom(source),
+            candidate_deadline,
+            &shutdown_cancellation,
+        )
+        .await?;
+        workspace = next;
+    }
+    loop {
+        let (next, progress) = supervise_workspace_operation(
+            workspace,
+            WorkspaceOperation::Revalidate,
+            candidate_deadline,
+            &shutdown_cancellation,
+        )
+        .await?;
+        workspace = next;
+        if progress == Some(TlsTrustRevalidationProgress::Complete) {
+            break;
         }
     }
-    for (path, source) in &loaded_sources {
-        source.revalidate(path)?;
+    if shutdown_cancellation.is_cancelled() || Instant::now() >= candidate_deadline {
+        return Err(RelayTransportError::Cancelled.into());
     }
+    let candidate = workspace.finalize()?;
     let mut endpoints = Vec::with_capacity(sources.len());
     for source in sources {
-        let anchors = loaded_sources
-            .get(&source.trust_path)
-            .ok_or(RelayTransportError::Coordinator)?
-            .anchors
-            .clone();
-        let trust = TlsAccessFlowTrust::new(id, anchors).map_err(map_trust_contract_error)?;
+        let trust = candidate
+            .prepared(&source.plan)
+            .ok_or(RelayTransportError::Internal)?;
         let endpoint = TlsAccessFlowClientEndpoint::new(
             source.address.clone(),
             source.server_name.clone(),
@@ -801,1214 +1125,447 @@ fn load_generation_blocking_with_hook(
         endpoints.push(endpoint);
     }
     Ok(RelayTransportGeneration {
-        id,
+        id: generation,
         tls_endpoints: endpoints.into_boxed_slice(),
+        trust_candidate: Some(candidate),
     })
 }
 
-fn map_trust_contract_error(
-    error: access_flow_tls::TlsAccessFlowContractError,
-) -> RelayTransportError {
-    use access_flow_tls::TlsAccessFlowContractError;
-    match error {
-        TlsAccessFlowContractError::CertificateCountExceeded
-        | TlsAccessFlowContractError::CertificateSizeExceeded
-        | TlsAccessFlowContractError::CertificateAggregateExceeded
-        | TlsAccessFlowContractError::ResourceOverflow => RelayTransportError::ResourceLimit,
-        _ => RelayTransportError::InvalidMaterial,
+async fn supervise_workspace_operation(
+    workspace: TlsTrustLoadWorkspace,
+    operation: WorkspaceOperation,
+    candidate_deadline: Instant,
+    shutdown_cancellation: &CancellationToken,
+) -> Result<(TlsTrustLoadWorkspace, Option<TlsTrustRevalidationProgress>), GenerationLoadFailure> {
+    if shutdown_cancellation.is_cancelled() || Instant::now() >= candidate_deadline {
+        return Err(RelayTransportError::Cancelled.into());
     }
-}
-
-#[cfg(unix)]
-struct LoadedTrustSource {
-    anchors: Vec<Vec<u8>>,
-    snapshot: StableMetadata,
-}
-
-#[cfg(unix)]
-impl LoadedTrustSource {
-    fn revalidate(&self, path: &Path) -> Result<(), RelayTransportError> {
-        let ((), current) = with_secure_trust_file(path, |_| Ok(()))?;
-        if current != self.snapshot {
-            return Err(RelayTransportError::UntrustedSource);
+    let operation_deadline = (Instant::now() + TRUST_OPERATION_TIMEOUT).min(candidate_deadline);
+    let cancellation = OperationCancellation {
+        operation: CancellationToken::new(),
+        shutdown: shutdown_cancellation.clone(),
+    };
+    let worker_cancellation = cancellation.clone();
+    let mut worker = tokio::task::spawn_blocking(move || {
+        let mut workspace = workspace;
+        let result = match operation {
+            WorkspaceOperation::LoadSystem => {
+                workspace.load_system(&worker_cancellation).map(|()| None)
+            }
+            WorkspaceOperation::LoadCustom(source) => workspace
+                .load_custom(&source, &worker_cancellation)
+                .map(|()| None),
+            WorkspaceOperation::Revalidate => {
+                workspace.revalidate_next(&worker_cancellation).map(Some)
+            }
+            #[cfg(test)]
+            WorkspaceOperation::Block(barrier) => {
+                barrier.wait();
+                Ok(None)
+            }
+            #[cfg(test)]
+            WorkspaceOperation::Mark(started) => {
+                started.store(true, Ordering::Release);
+                Ok(None)
+            }
+            #[cfg(test)]
+            WorkspaceOperation::WaitForCancellation { started, observed } => {
+                started.store(true, Ordering::Release);
+                while !worker_cancellation.is_cancelled() {
+                    std::thread::yield_now();
+                }
+                observed.store(true, Ordering::Release);
+                Err(TlsTrustLoadError::Cancelled)
+            }
+        };
+        (workspace, result)
+    });
+    let completion = tokio::select! {
+        result = tokio::time::timeout_at(operation_deadline, &mut worker) => Some(result),
+        () = shutdown_cancellation.cancelled() => None,
+    };
+    match completion {
+        Some(Ok(Ok((workspace, result)))) => Ok((workspace, result?)),
+        Some(Ok(Err(_))) => Err(RelayTransportError::Internal.into()),
+        Some(Err(_)) | None => {
+            cancellation.operation.cancel();
+            if tokio::time::timeout(TRUST_CANCELLATION_JOIN_GRACE, &mut worker)
+                .await
+                .is_ok()
+            {
+                return Err(RelayTransportError::Cancelled.into());
+            }
+            let watcher = tokio::spawn(async move {
+                let _ = worker.await;
+            });
+            Err(GenerationLoadFailure::TimedOut(watcher))
         }
-        Ok(())
     }
 }
 
-#[cfg(not(unix))]
-struct LoadedTrustSource {
-    anchors: Vec<Vec<u8>>,
+fn candidate_timeout(custom_count: usize) -> Result<Duration, RelayTransportError> {
+    let custom_allowance = Duration::from_millis(
+        u64::try_from(custom_count)
+            .map_err(|_| RelayTransportError::SourceResourceLimit)?
+            .checked_mul(250)
+            .ok_or(RelayTransportError::SourceResourceLimit)?,
+    );
+    Ok(TRUST_CANDIDATE_BASE_TIMEOUT
+        .checked_add(custom_allowance)
+        .unwrap_or(TRUST_CANDIDATE_MAX_TIMEOUT)
+        .min(TRUST_CANDIDATE_MAX_TIMEOUT))
 }
 
-#[cfg(not(unix))]
-impl LoadedTrustSource {
-    fn revalidate(&self, _path: &Path) -> Result<(), RelayTransportError> {
-        Err(RelayTransportError::Unavailable)
+#[derive(Clone)]
+struct OperationCancellation {
+    operation: CancellationToken,
+    shutdown: CancellationToken,
+}
+
+impl AccessCancellation for OperationCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.operation.is_cancelled() || self.shutdown.is_cancelled()
+    }
+
+    fn cancelled(&self) -> BoxAccessFuture<'_, ()> {
+        Box::pin(async move {
+            tokio::select! {
+                () = self.operation.cancelled() => {}
+                () = self.shutdown.cancelled() => {}
+            }
+        })
     }
 }
 
 #[cfg(test)]
-fn load_trust_anchors(path: &Path) -> Result<Vec<Vec<u8>>, RelayTransportError> {
-    let loaded = load_trust_source(path)?;
-    loaded.revalidate(path)?;
-    Ok(loaded.anchors)
-}
-
-#[cfg(all(test, unix))]
-fn load_trust_anchors_with_hook(
-    path: &Path,
-    after_read: impl FnOnce(),
-) -> Result<Vec<Vec<u8>>, RelayTransportError> {
-    let loaded = load_trust_source_with_hook(path, after_read)?;
-    loaded.revalidate(path)?;
-    Ok(loaded.anchors)
-}
-
-fn load_trust_source(path: &Path) -> Result<LoadedTrustSource, RelayTransportError> {
-    load_trust_source_with_hook(path, || {})
-}
-
-#[cfg(unix)]
-fn load_trust_source_with_hook(
-    path: &Path,
-    after_read: impl FnOnce(),
-) -> Result<LoadedTrustSource, RelayTransportError> {
-    use std::io::Read as _;
-
-    let (bytes, snapshot) = with_secure_trust_file(path, move |file| {
-        let opened_size = usize::try_from(
-            file.metadata()
-                .map_err(|_| RelayTransportError::Unavailable)?
-                .len(),
-        )
-        .map_err(|_| RelayTransportError::ResourceLimit)?;
-        if opened_size > MAX_TRUST_SOURCE_BYTES {
-            return Err(RelayTransportError::ResourceLimit);
-        }
-        let mut bytes = vec![0_u8; MAX_TRUST_READ_BUFFER_BYTES];
-        let mut length = 0_usize;
-        while length < bytes.len() {
-            match file.read(&mut bytes[length..]) {
-                Ok(0) => break,
-                Ok(read) => {
-                    length = length
-                        .checked_add(read)
-                        .ok_or(RelayTransportError::ResourceLimit)?;
-                }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => return Err(RelayTransportError::Unavailable),
-            }
-        }
-        bytes.truncate(length);
-        if bytes.len() > MAX_TRUST_SOURCE_BYTES {
-            return Err(RelayTransportError::ResourceLimit);
-        }
-        after_read();
-        if bytes.len() != opened_size {
-            return Err(RelayTransportError::UntrustedSource);
-        }
-        Ok(bytes)
-    })?;
-    Ok(LoadedTrustSource {
-        anchors: parse_trust_pem(&bytes)?,
-        snapshot,
-    })
-}
-
-#[cfg(unix)]
-fn with_secure_trust_file<T>(
-    path: &Path,
-    operation: impl FnOnce(&mut std::fs::File) -> Result<T, RelayTransportError>,
-) -> Result<(T, StableMetadata), RelayTransportError> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd as _, OwnedFd};
-    use std::os::unix::ffi::OsStrExt as _;
-
-    if path.as_os_str().as_bytes().len() > crate::config::MAX_ACCESS_FLOW_TRUST_PATH_BYTES {
-        return Err(RelayTransportError::ResourceLimit);
-    }
-    let mut components = path.components();
-    if components.next() != Some(Component::RootDir) {
-        return Err(RelayTransportError::UntrustedSource);
-    }
-    let names = components
-        .map(|component| match component {
-            Component::Normal(name) => {
-                CString::new(name.as_bytes()).map_err(|_| RelayTransportError::UntrustedSource)
-            }
-            Component::Prefix(_)
-            | Component::RootDir
-            | Component::CurDir
-            | Component::ParentDir => Err(RelayTransportError::UntrustedSource),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if names.len() > crate::config::MAX_ACCESS_FLOW_TRUST_PATH_COMPONENTS {
-        return Err(RelayTransportError::ResourceLimit);
-    }
-    let (leaf, ancestors) = names
-        .split_last()
-        .ok_or(RelayTransportError::UntrustedSource)?;
-    let effective_uid = unsafe { libc::geteuid() };
-    let root = CString::new("/").expect("filesystem root contains no NUL");
-    let root_fd = unsafe {
-        libc::open(
-            root.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    let mut directory = owned_fd(root_fd)?;
-    verify_trusted_directory(directory.as_raw_fd(), effective_uid)?;
-    for ancestor in ancestors {
-        let descriptor = unsafe {
-            libc::openat(
-                directory.as_raw_fd(),
-                ancestor.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            )
-        };
-        let next = owned_fd(descriptor)?;
-        verify_trusted_directory(next.as_raw_fd(), effective_uid)?;
-        directory = next;
-    }
-
-    let probed = probe_leaf(directory.as_raw_fd(), leaf)?;
-    verify_trust_file(&probed, effective_uid)?;
-    let descriptor = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            leaf.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
-        )
-    };
-    let descriptor: OwnedFd = owned_fd(descriptor)?;
-    let opened = descriptor_metadata(descriptor.as_raw_fd())?;
-    verify_trust_file(&opened, effective_uid)?;
-    if object_metadata(&opened) != object_metadata(&probed) {
-        return Err(RelayTransportError::UntrustedSource);
-    }
-    let mut file = std::fs::File::from(descriptor);
-    let opened_stable = stable_metadata(&file)?;
-    let result = operation(&mut file)?;
-    let post = descriptor_metadata(file.as_raw_fd())?;
-    verify_trust_file(&post, effective_uid)?;
-    let final_probe = probe_leaf(directory.as_raw_fd(), leaf)?;
-    if stable_metadata(&file)? != opened_stable
-        || object_metadata(&post) != object_metadata(&opened)
-        || object_metadata(&final_probe) != object_metadata(&opened)
-    {
-        return Err(RelayTransportError::UntrustedSource);
-    }
-    Ok((result, opened_stable))
-}
-
-#[cfg(not(unix))]
-fn load_trust_source_with_hook(
-    _path: &Path,
-    _after_read: impl FnOnce(),
-) -> Result<LoadedTrustSource, RelayTransportError> {
-    Err(RelayTransportError::Unavailable)
-}
-
-#[cfg(unix)]
-fn owned_fd(descriptor: libc::c_int) -> Result<std::os::fd::OwnedFd, RelayTransportError> {
-    use std::os::fd::FromRawFd as _;
-    if descriptor < 0 {
-        return Err(RelayTransportError::Unavailable);
-    }
-    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) })
-}
-
-#[cfg(unix)]
-fn descriptor_metadata(descriptor: std::os::fd::RawFd) -> Result<libc::stat, RelayTransportError> {
-    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(descriptor, metadata.as_mut_ptr()) } != 0 {
-        return Err(RelayTransportError::Unavailable);
-    }
-    Ok(unsafe { metadata.assume_init() })
-}
-
-#[cfg(unix)]
-fn probe_leaf(
-    directory: std::os::fd::RawFd,
-    leaf: &std::ffi::CStr,
-) -> Result<libc::stat, RelayTransportError> {
-    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe {
-        libc::fstatat(
-            directory,
-            leaf.as_ptr(),
-            metadata.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
-    {
-        return Err(RelayTransportError::Unavailable);
-    }
-    Ok(unsafe { metadata.assume_init() })
-}
-
-#[cfg(unix)]
-fn verify_trusted_directory(
-    descriptor: std::os::fd::RawFd,
-    effective_uid: libc::uid_t,
-) -> Result<(), RelayTransportError> {
-    let metadata = descriptor_metadata(descriptor)?;
-    if metadata.st_mode & libc::S_IFMT != libc::S_IFDIR
-        || !trusted_owner(metadata.st_uid, effective_uid)
-        || metadata.st_mode & 0o022 != 0
-    {
-        return Err(RelayTransportError::UntrustedSource);
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn verify_trust_file(
-    metadata: &libc::stat,
-    effective_uid: libc::uid_t,
-) -> Result<(), RelayTransportError> {
-    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG
-        || !trusted_owner(metadata.st_uid, effective_uid)
-        || metadata.st_mode & 0o022 != 0
-        || metadata.st_nlink != 1
-    {
-        return Err(RelayTransportError::UntrustedSource);
-    }
-    let size = usize::try_from(metadata.st_size).map_err(|_| RelayTransportError::ResourceLimit)?;
-    if size == 0 {
-        return Err(RelayTransportError::InvalidMaterial);
-    }
-    if size > MAX_TRUST_SOURCE_BYTES {
-        return Err(RelayTransportError::ResourceLimit);
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-const fn trusted_owner(owner: libc::uid_t, effective_uid: libc::uid_t) -> bool {
-    owner == 0 || owner == effective_uid
-}
-
-#[cfg(unix)]
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct ObjectMetadata {
-    device: libc::dev_t,
-    inode: libc::ino_t,
-    mode: libc::mode_t,
-    owner: libc::uid_t,
-    links: libc::nlink_t,
-    size: libc::off_t,
-}
-
-#[cfg(unix)]
-fn object_metadata(metadata: &libc::stat) -> ObjectMetadata {
-    ObjectMetadata {
-        device: metadata.st_dev,
-        inode: metadata.st_ino,
-        mode: metadata.st_mode,
-        owner: metadata.st_uid,
-        links: metadata.st_nlink,
-        size: metadata.st_size,
-    }
-}
-
-#[cfg(unix)]
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct StableMetadata {
-    device: u64,
-    inode: u64,
-    mode: u32,
-    owner: u32,
-    links: u64,
-    size: u64,
-    modified_seconds: i64,
-    modified_nanoseconds: i64,
-    changed_seconds: i64,
-    changed_nanoseconds: i64,
-}
-
-#[cfg(unix)]
-fn stable_metadata(file: &std::fs::File) -> Result<StableMetadata, RelayTransportError> {
-    use std::os::unix::fs::MetadataExt as _;
-    let metadata = file
-        .metadata()
-        .map_err(|_| RelayTransportError::Unavailable)?;
-    Ok(StableMetadata {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        mode: metadata.mode(),
-        owner: metadata.uid(),
-        links: metadata.nlink(),
-        size: metadata.size(),
-        modified_seconds: metadata.mtime(),
-        modified_nanoseconds: metadata.mtime_nsec(),
-        changed_seconds: metadata.ctime(),
-        changed_nanoseconds: metadata.ctime_nsec(),
-    })
-}
-
-fn parse_trust_pem(input: &[u8]) -> Result<Vec<Vec<u8>>, RelayTransportError> {
-    let mut remaining = input;
-    let mut anchors = Vec::new();
-    while !remaining.trim_ascii().is_empty() {
-        let (block, rest) = take_exact_pem_block(remaining)?;
-        let (label, der) =
-            pem_rfc7468::decode_vec(block).map_err(|_| RelayTransportError::InvalidMaterial)?;
-        if label != "CERTIFICATE" {
-            return Err(RelayTransportError::InvalidMaterial);
-        }
-        if der.is_empty() {
-            return Err(RelayTransportError::InvalidMaterial);
-        }
-        if der.len() > MAX_DER_CERTIFICATE_BYTES {
-            return Err(RelayTransportError::ResourceLimit);
-        }
-        anchors.push(der);
-        if anchors.len() > MAX_TRUST_ANCHORS {
-            return Err(RelayTransportError::ResourceLimit);
-        }
-        remaining = rest;
-    }
-    if anchors.is_empty() {
-        return Err(RelayTransportError::InvalidMaterial);
-    }
-    Ok(anchors)
-}
-
-fn take_exact_pem_block(input: &[u8]) -> Result<(&[u8], &[u8]), RelayTransportError> {
-    let trimmed = input.trim_ascii_start();
-    if !trimmed.starts_with(CERTIFICATE_BEGIN) {
-        return Err(RelayTransportError::InvalidMaterial);
-    }
-    let end_offset = trimmed
-        .windows(CERTIFICATE_END.len())
-        .position(|window| window == CERTIFICATE_END)
-        .ok_or(RelayTransportError::InvalidMaterial)?;
-    let block_end = end_offset
-        .checked_add(CERTIFICATE_END.len())
-        .ok_or(RelayTransportError::ResourceLimit)?;
-    Ok((&trimmed[..block_end], &trimmed[block_end..]))
-}
-
-#[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use access_flow_relay::{AccessFlowRoute, AccessFlowRouteName};
-    use access_flow_tls::{TlsAccessFlowAddress, TlsAccessFlowServerName};
-    use access_flow_unix::{NormalizedUnixSocketPath, UnixAccessFlowEndpoint};
-    use access_identity::{IdentityPresentation, SensitiveBearer};
-    use std::net::{Ipv4Addr, SocketAddrV4};
-    use std::num::{NonZeroU16, NonZeroUsize};
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
-    use std::time::{Duration, Instant};
+    use crate::config::{
+        AccessFlowRelayConfig, AccessFlowRelayPresentation, AccessFlowRelayRoute,
+        AccessFlowRelayTransport,
+    };
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
-    const TEST_ROOT_PEM: &str = "\
------BEGIN CERTIFICATE-----\n\
-MIIBZDCCAQqgAwIBAgIUVeNPvjXF+esAR5JSWSDHPhHi8Z8wCgYIKoZIzj0EAwIw\n\
-FzEVMBMGA1UEAwwMYWNsLXByb3h5IENBMCAXDTc1MDEwMTAwMDAwMFoYDzQwOTYw\n\
-MTAxMDAwMDAwWjAXMRUwEwYDVQQDDAxhY2wtcHJveHkgQ0EwWTATBgcqhkjOPQIB\n\
-BggqhkjOPQMBBwNCAASSq7ztpOLW2yTnbT6B7tdXn2E37SCt7/WeOajZV3mUDpvH\n\
-lpLGD6uz16wTm75vtZ6aoLpTq7iE4pzTO9jOwftTozIwMDAdBgNVHQ4EFgQUKOgN\n\
-bJ2u/7pEok6/UT9IFfajHPYwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNI\n\
-ADBFAiB005pgAL7CLsHpHJFXEEgDG/fmG91oI1vRO/ZFSVufDQIhAOYNaysbiwJR\n\
-c+E0ChYtUrWyHuDFX+/4kDlyJh3LeI70\n\
------END CERTIFICATE-----\n";
+    #[cfg(unix)]
+    const TEST_ROOT_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBeDCCASqgAwIBAgIUXLfYBhGLaC2YWMIvB0aPnyCXmZMwBQYDK2VwMCgxJjAk
+BgNVBAMMHUFXIEFjY2VzcyBGbG93IFJUMDEgVGVzdCBSb290MB4XDTI2MDcyNjE5
+NDMwN1oXDTM2MDcyMzE5NDMwN1owKDEmMCQGA1UEAwwdQVcgQWNjZXNzIEZsb3cg
+UlQwMSBUZXN0IFJvb3QwKjAFBgMrZXADIQBpAdFVn/HrfItwIx/XktXtNOZRrLFE
+bRD4FW2ahSmyWaNmMGQwHwYDVR0jBBgwFoAUEXrimwcSAhT4Ae6XbVXVkbSfUUgw
+EgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFBF6
+4psHEgIU+AHul21V1ZG0n1FIMAUGAytlcANBAFpX6ZvogOz9Sd4QpaxfhacxJKGu
+O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
+-----END CERTIFICATE-----
+"#;
 
-    struct NeverCancelled;
-
-    impl AccessCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-
-        fn cancelled(&self) -> BoxAccessFuture<'_, ()> {
-            Box::pin(std::future::pending())
-        }
+    fn insecure_workspace() -> TlsTrustLoadWorkspace {
+        let generation = TlsTrustGeneration::new(1).unwrap();
+        let plan = TlsClientTrustPlan::new(TlsClientTrustMode::Insecure, None).unwrap();
+        let limits = TlsTrustLoadLimits::new(TEST_TLS_TRUST_BUDGET_BYTES, 8).unwrap();
+        TlsTrustLoadWorkspace::new(generation, [plan], limits).unwrap()
     }
 
-    fn trusted_tempdir() -> tempfile::TempDir {
-        let home = std::env::var_os("HOME").expect("test user home directory");
-        let directory = tempfile::Builder::new()
-            .prefix(".relay-transport-test-")
-            .tempdir_in(home)
-            .expect("trusted temporary directory");
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("private temporary directory");
-        directory
+    #[test]
+    fn candidate_deadline_is_bounded_and_scales_with_custom_sources() {
+        assert_eq!(candidate_timeout(0).unwrap(), Duration::from_secs(60));
+        assert_eq!(candidate_timeout(16).unwrap(), Duration::from_secs(64));
+        assert_eq!(candidate_timeout(512).unwrap(), Duration::from_secs(180));
     }
 
-    fn write_trust(directory: &Path, contents: &[u8]) -> PathBuf {
-        let path = directory.join("trust.pem");
-        std::fs::write(&path, contents).expect("write trust");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
-            .expect("set trust mode");
-        path
-    }
-
-    fn presentation() -> IdentityPresentation {
-        IdentityPresentation::Bearer(
-            SensitiveBearer::new(b"abcdefghijklmnopqrstuvwxyzABCDEF").expect("test bearer"),
+    #[tokio::test]
+    async fn expired_candidate_does_not_start_a_blocking_operation() {
+        let started = Arc::new(AtomicBool::new(false));
+        let shutdown = CancellationToken::new();
+        let failure = match supervise_workspace_operation(
+            insecure_workspace(),
+            WorkspaceOperation::Mark(Arc::clone(&started)),
+            Instant::now(),
+            &shutdown,
         )
+        .await
+        {
+            Ok(_) => panic!("expired candidate deadline was accepted"),
+            Err(failure) => failure,
+        };
+        let GenerationLoadFailure::Error(RelayTransportError::Cancelled) = failure else {
+            panic!("expired candidate returned the wrong failure");
+        };
+        assert!(!started.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn timed_out_noninterruptible_operation_returns_an_owned_watcher() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let shutdown = CancellationToken::new();
+        let failure = match supervise_workspace_operation(
+            insecure_workspace(),
+            WorkspaceOperation::Block(Arc::clone(&barrier)),
+            Instant::now() + Duration::from_millis(20),
+            &shutdown,
+        )
+        .await
+        {
+            Ok(_) => panic!("noninterruptible operation did not time out"),
+            Err(failure) => failure,
+        };
+        let GenerationLoadFailure::TimedOut(watcher) = failure else {
+            panic!("noninterruptible operation returned the wrong failure");
+        };
+        barrier.wait();
+        watcher.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_cancellation_is_observed_and_cooperative_worker_is_joined() {
+        let started = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(AtomicBool::new(false));
+        let shutdown = CancellationToken::new();
+        let operation = supervise_workspace_operation(
+            insecure_workspace(),
+            WorkspaceOperation::WaitForCancellation {
+                started: Arc::clone(&started),
+                observed: Arc::clone(&observed),
+            },
+            Instant::now() + Duration::from_secs(1),
+            &shutdown,
+        );
+        tokio::pin!(operation);
+        tokio::select! {
+            _ = &mut operation => panic!("cooperative worker ended before cancellation"),
+            () = async {
+                while !started.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        shutdown.cancel();
+        let failure = operation.await.unwrap_err();
+        assert!(matches!(
+            failure,
+            GenerationLoadFailure::Error(RelayTransportError::Cancelled)
+        ));
+        assert!(observed.load(Ordering::Acquire));
+    }
+
+    fn insecure_plan() -> AccessFlowRelayPlan<CompiledAccessFlowRelayEndpoint> {
+        let config = AccessFlowRelayConfig {
+            setup_timeout: "2s".into(),
+            drain_timeout: "2s".into(),
+            max_connections: 8,
+            copy_buffer_bytes_per_direction: 4096,
+            start_after_services: Vec::new(),
+            presentation: AccessFlowRelayPresentation::BearerEnvironment {
+                variable: "AW_IDENTITY_TOKEN".into(),
+            },
+            routes: vec![AccessFlowRelayRoute {
+                name: "https".into(),
+                listen: "127.0.0.1:3129".into(),
+                allowed_destination_ports: vec![443],
+                transport: AccessFlowRelayTransport::TlsTcp {
+                    address: "proxy.example.test:7443".into(),
+                    server_name: "proxy.example.test".into(),
+                    trust: TlsClientTrustMode::Insecure,
+                    ca_certificate: None,
+                },
+            }],
+        };
+        config
+            .compile_with_presentation(
+                crate::config::AccessFlowRelayValidationMode::Agent,
+                access_identity::IdentityPresentation::Bearer(
+                    access_identity::SensitiveBearer::new(b"abcdefghijklmnopqrstuvwxyzABCDEF")
+                        .unwrap(),
+                ),
+            )
+            .unwrap()
+            .plan
     }
 
     fn tls_plan(
-        trust_path: PathBuf,
-        address: &str,
+        modes: &[(TlsClientTrustMode, Option<String>)],
     ) -> AccessFlowRelayPlan<CompiledAccessFlowRelayEndpoint> {
-        let endpoint = CompiledAccessFlowRelayEndpoint::TlsTcp {
-            tls_index: 0,
-            address: TlsAccessFlowAddress::parse(address).expect("test TLS address"),
-            server_name: TlsAccessFlowServerName::parse("localhost").expect("test server name"),
-            trust_path,
-        };
-        AccessFlowRelayPlan::new(
-            vec![
-                AccessFlowRoute::new(
-                    AccessFlowRouteName::new("tls").expect("route name"),
-                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18080),
-                    vec![NonZeroU16::new(80).expect("port")],
-                    endpoint,
-                )
-                .expect("TLS route"),
-            ],
-            presentation(),
-            Duration::from_secs(5),
-            NonZeroUsize::new(8).expect("connections"),
-            NonZeroUsize::new(4096).expect("buffer"),
-        )
-        .expect("TLS plan")
-    }
-
-    fn tls_sources(first: PathBuf, second: PathBuf) -> Vec<TlsRouteSource> {
-        [first, second]
-            .into_iter()
+        let routes = modes
+            .iter()
             .enumerate()
-            .map(|(index, trust_path)| TlsRouteSource {
-                address: TlsAccessFlowAddress::parse(&format!("127.0.0.1:{}", 7443 + index))
-                    .expect("test TLS address"),
-                server_name: TlsAccessFlowServerName::parse("localhost").expect("test server name"),
-                trust_path,
-            })
-            .collect()
-    }
-
-    fn unix_endpoint(path: &Path) -> CompiledAccessFlowRelayEndpoint {
-        CompiledAccessFlowRelayEndpoint::Unix(UnixAccessFlowEndpoint::new(
-            NormalizedUnixSocketPath::new(path.to_str().expect("UTF-8 path"))
-                .expect("normalized Unix path"),
-        ))
-    }
-
-    async fn complete_reload(runtime: &RelayTransportRuntime) -> Result<(), RelayTransportError> {
-        match runtime.begin_reload()? {
-            Some(pending) => pending.complete().await,
-            None => Ok(()),
-        }
-    }
-
-    #[test]
-    fn strict_pem_accepts_certificates_and_rejects_junk_or_other_labels() {
-        let anchors = parse_trust_pem(TEST_ROOT_PEM.as_bytes()).expect("valid root");
-        assert_eq!(anchors.len(), 1);
-        let invalid_inputs = [
-            b"junk\n".to_vec(),
-            b"-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n".to_vec(),
-            format!("{TEST_ROOT_PEM}junk").into_bytes(),
-            b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n".to_vec(),
-        ];
-        for invalid in invalid_inputs {
-            assert_eq!(
-                parse_trust_pem(&invalid),
-                Err(RelayTransportError::InvalidMaterial)
-            );
-        }
-    }
-
-    #[test]
-    fn strict_pem_enforces_certificate_count_and_size() {
-        let oversized = pem_rfc7468::encode_string(
-            "CERTIFICATE",
-            pem_rfc7468::LineEnding::LF,
-            &vec![7_u8; MAX_DER_CERTIFICATE_BYTES + 1],
-        )
-        .expect("encode oversized certificate");
-        assert_eq!(
-            parse_trust_pem(oversized.as_bytes()),
-            Err(RelayTransportError::ResourceLimit)
-        );
-
-        let mut over_count = String::new();
-        for index in 0..=MAX_TRUST_ANCHORS {
-            over_count.push_str(
-                &pem_rfc7468::encode_string(
-                    "CERTIFICATE",
-                    pem_rfc7468::LineEnding::LF,
-                    &[u8::try_from(index).expect("bounded index")],
-                )
-                .expect("encode certificate"),
-            );
-        }
-        assert_eq!(
-            parse_trust_pem(over_count.as_bytes()),
-            Err(RelayTransportError::ResourceLimit)
-        );
-    }
-
-    #[test]
-    fn secure_loader_accepts_stable_single_link_public_trust() {
-        let directory = trusted_tempdir();
-        let path = write_trust(directory.path(), TEST_ROOT_PEM.as_bytes());
-        let anchors = load_trust_anchors(&path).expect("stable trust source");
-        assert_eq!(anchors.len(), 1);
-    }
-
-    #[test]
-    fn secure_loader_rejects_leaf_symlink_hardlink_and_writable_mode() {
-        let directory = trusted_tempdir();
-        let path = write_trust(directory.path(), TEST_ROOT_PEM.as_bytes());
-        let link = directory.path().join("link.pem");
-        symlink(&path, &link).expect("trust symlink");
-        assert!(matches!(
-            load_trust_anchors(&link),
-            Err(RelayTransportError::Unavailable | RelayTransportError::UntrustedSource)
-        ));
-
-        let hardlink = directory.path().join("hardlink.pem");
-        std::fs::hard_link(&path, &hardlink).expect("trust hard link");
-        assert_eq!(
-            load_trust_anchors(&path),
-            Err(RelayTransportError::UntrustedSource)
-        );
-        std::fs::remove_file(&hardlink).expect("remove hard link");
-
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
-            .expect("unsafe trust mode");
-        assert_eq!(
-            load_trust_anchors(&path),
-            Err(RelayTransportError::UntrustedSource)
-        );
-    }
-
-    #[test]
-    fn secure_loader_rejects_symlinked_or_writable_ancestor() {
-        let directory = trusted_tempdir();
-        let real = directory.path().join("real");
-        std::fs::create_dir(&real).expect("real directory");
-        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700))
-            .expect("private directory");
-        let trust = write_trust(&real, TEST_ROOT_PEM.as_bytes());
-        let link = directory.path().join("linked");
-        symlink(&real, &link).expect("ancestor symlink");
-        assert!(matches!(
-            load_trust_anchors(&link.join("trust.pem")),
-            Err(RelayTransportError::Unavailable | RelayTransportError::UntrustedSource)
-        ));
-
-        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o777))
-            .expect("unsafe ancestor mode");
-        assert_eq!(
-            load_trust_anchors(&trust),
-            Err(RelayTransportError::UntrustedSource)
-        );
-    }
-
-    #[test]
-    fn secure_loader_detects_same_descriptor_mutation() {
-        let directory = trusted_tempdir();
-        let path = write_trust(directory.path(), TEST_ROOT_PEM.as_bytes());
-        let mutation_path = path.clone();
-        assert_eq!(
-            load_trust_anchors_with_hook(&path, move || {
-                let mut bytes = TEST_ROOT_PEM.as_bytes().to_vec();
-                bytes[40] ^= 1;
-                std::fs::write(mutation_path, bytes).expect("mutate trust");
-            }),
-            Err(RelayTransportError::UntrustedSource)
-        );
-    }
-
-    #[test]
-    fn secure_loader_enforces_raw_source_bound_and_regular_type() {
-        let directory = trusted_tempdir();
-        let oversized = write_trust(directory.path(), &vec![b' '; MAX_TRUST_SOURCE_BYTES + 1]);
-        assert_eq!(
-            load_trust_anchors(&oversized),
-            Err(RelayTransportError::ResourceLimit)
-        );
-        assert_eq!(
-            load_trust_anchors(directory.path()),
-            Err(RelayTransportError::UntrustedSource)
-        );
-    }
-
-    #[test]
-    fn secure_loader_enforces_path_memory_and_component_bounds() {
-        let oversized = PathBuf::from(format!(
-            "/{}",
-            "a".repeat(crate::config::MAX_ACCESS_FLOW_TRUST_PATH_BYTES)
-        ));
-        assert_eq!(
-            load_trust_anchors(&oversized),
-            Err(RelayTransportError::ResourceLimit)
-        );
-
-        let too_deep = PathBuf::from(format!(
-            "/{}",
-            std::iter::repeat_n(
-                "a",
-                crate::config::MAX_ACCESS_FLOW_TRUST_PATH_COMPONENTS + 1,
-            )
-            .collect::<Vec<_>>()
-            .join("/")
-        ));
-        assert_eq!(
-            load_trust_anchors(&too_deep),
-            Err(RelayTransportError::ResourceLimit)
-        );
-    }
-
-    #[test]
-    fn generation_revalidates_every_source_after_all_sources_are_read() {
-        let directory = trusted_tempdir();
-        let first = write_trust(directory.path(), TEST_ROOT_PEM.as_bytes());
-        let second = directory.path().join("second.pem");
-        std::fs::write(&second, TEST_ROOT_PEM).expect("write second trust");
-        std::fs::set_permissions(&second, std::fs::Permissions::from_mode(0o644))
-            .expect("set second trust mode");
-        let mutation_path = first.clone();
-        let sources = tls_sources(first, second);
-
-        let result = load_generation_blocking_with_hook(&sources, 2, move |index| {
-            if index == 1 {
-                let mut still_valid = TEST_ROOT_PEM.as_bytes().to_vec();
-                still_valid.push(b'\n');
-                std::fs::write(&mutation_path, still_valid)
-                    .expect("mutate first source after second read");
-            }
-        });
-
-        assert!(matches!(result, Err(RelayTransportError::UntrustedSource)));
-    }
-
-    #[tokio::test]
-    async fn failed_reload_is_atomic_unhealthy_and_later_reload_recovers() {
-        let directory = trusted_tempdir();
-        let trust = write_trust(directory.path(), TEST_ROOT_PEM.as_bytes());
-        let plan = tls_plan(trust.clone(), "127.0.0.1:7443");
-        let readiness = Arc::new(AtomicBool::new(false));
-        let runtime = RelayTransportRuntime::activate(&plan, Arc::clone(&readiness))
-            .await
-            .expect("initial activation");
-        assert!(runtime.healthy());
-        assert!(readiness.load(Ordering::Acquire));
-        let first = runtime
-            .inner
-            .healthy_generation()
-            .expect("initial generation")
-            .id;
-
-        std::fs::write(&trust, b"invalid").expect("invalidate trust");
-        assert_eq!(
-            complete_reload(&runtime).await,
-            Err(RelayTransportError::InvalidMaterial)
-        );
-        assert!(!runtime.healthy());
-        assert!(!readiness.load(Ordering::Acquire));
-        let retained = runtime
-            .inner
-            .retained_generation()
-            .expect("retained generation");
-        assert_eq!(retained.id, first);
-
-        std::fs::write(&trust, TEST_ROOT_PEM).expect("restore trust");
-        complete_reload(&runtime).await.expect("recover trust");
-        assert!(runtime.healthy());
-        assert!(readiness.load(Ordering::Acquire));
-        assert_ne!(
-            runtime
-                .inner
-                .healthy_generation()
-                .expect("recovered generation")
-                .id,
-            first
-        );
-    }
-
-    #[tokio::test]
-    async fn unhealthy_state_rejects_unix_and_tls_without_fallback() {
-        let directory = trusted_tempdir();
-        let trust = write_trust(directory.path(), TEST_ROOT_PEM.as_bytes());
-        let plan = tls_plan(trust.clone(), "127.0.0.1:7443");
-        let runtime = RelayTransportRuntime::activate(&plan, Arc::new(AtomicBool::new(false)))
-            .await
-            .expect("initial activation");
-        std::fs::write(&trust, b"invalid").expect("invalidate trust");
-        assert!(complete_reload(&runtime).await.is_err());
-        let connector = runtime.connector();
-        let cancellation = NeverCancelled;
-        let context =
-            AccessFlowConnectContext::new(Instant::now() + Duration::from_secs(1), &cancellation);
-        assert!(matches!(
-            connector
-                .connect(
-                    &unix_endpoint(&directory.path().join("missing.sock")),
-                    context
-                )
-                .await,
-            Err(AccessFlowChannelFailure::Unavailable)
-        ));
-        let context =
-            AccessFlowConnectContext::new(Instant::now() + Duration::from_secs(1), &cancellation);
-        assert!(matches!(
-            connector
-                .connect(plan.routes()[0].endpoint(), context)
-                .await,
-            Err(AccessFlowChannelFailure::Unavailable)
-        ));
-    }
-
-    #[tokio::test]
-    async fn synchronous_reload_gate_is_fail_closed_and_clone_can_recover() {
-        let directory = trusted_tempdir();
-        let trust = write_trust(directory.path(), TEST_ROOT_PEM.as_bytes());
-        let plan = tls_plan(trust, "127.0.0.1:7443");
-        let expected_memory =
-            project_candidate_loader_peak(&collect_tls_sources(&plan).unwrap()).unwrap();
-        assert_eq!(
-            RelayTransportRuntime::resource_reserve(&plan),
-            Ok(RelayTransportResourceReserve {
-                descriptors: TRUST_LOAD_DESCRIPTOR_ENVELOPE,
-                memory_bytes: expected_memory,
-            })
-        );
-        let readiness = Arc::new(AtomicBool::new(false));
-        let runtime = RelayTransportRuntime::activate(&plan, Arc::clone(&readiness))
-            .await
-            .expect("initial activation");
-        let initial = runtime
-            .inner
-            .healthy_generation()
-            .expect("initial generation")
-            .id;
-
-        let pending = runtime
-            .begin_reload()
-            .expect("begin reload")
-            .expect("TLS reload worker");
-        assert!(!readiness.load(Ordering::Acquire));
-        assert!(!runtime.healthy());
-        assert_eq!(
-            runtime
-                .inner
-                .retained_generation()
-                .expect("retained generation")
-                .id,
-            initial
-        );
-
-        let owned = runtime.clone();
-        tokio::spawn(async move { pending.complete().await })
-            .await
-            .expect("reload task")
-            .expect("reload recovery");
-        drop(owned);
-        assert!(readiness.load(Ordering::Acquire));
-        assert!(runtime.healthy());
-    }
-
-    #[tokio::test]
-    async fn prepared_transport_projects_before_any_trust_source_read() {
-        let directory = trusted_tempdir();
-        let missing = directory.path().join("missing.pem");
-        let plan = tls_plan(missing, "127.0.0.1:7443");
-        let readiness = Arc::new(AtomicBool::new(true));
-        let runtime = RelayTransportRuntime::prepare(&plan, Arc::clone(&readiness))
-            .expect("bounded transport preparation does not read trust");
-        assert!(!readiness.load(Ordering::Acquire));
-        assert!(
-            runtime
-                .connector()
-                .resource_projection(plan.routes()[0].endpoint())
-                .is_ok()
-        );
-        assert_eq!(
-            runtime.activate_prepared().await,
-            Err(RelayTransportError::Unavailable)
-        );
-        assert!(!readiness.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn pending_reload_owns_started_worker_until_terminal_join() {
-        let directory = trusted_tempdir();
-        let trust = write_trust(directory.path(), TEST_ROOT_PEM.as_bytes());
-        let plan = tls_plan(trust, "127.0.0.1:7443");
-        let readiness = Arc::new(AtomicBool::new(false));
-        let runtime = RelayTransportRuntime::activate(&plan, Arc::clone(&readiness))
-            .await
-            .expect("initial activation");
-        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
-        let mut pending = runtime
-            .begin_reload_with_hook(move || {
-                started_tx.send(()).expect("report worker start");
-                release_rx.recv().expect("release blocking worker");
-            })
-            .expect("begin reload")
-            .expect("TLS reload worker");
-
-        started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("blocking worker actually started");
-        assert!(!readiness.load(Ordering::Acquire));
-        assert_eq!(
-            runtime.begin_reload().unwrap_err(),
-            RelayTransportError::ReloadInProgress
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), pending.wait())
-                .await
-                .is_err(),
-            "select-style wait remains pending while the worker is paused"
-        );
-
-        runtime.close();
-        release_tx.send(()).expect("release blocking worker");
-        assert_eq!(
-            pending.complete().await,
-            Err(RelayTransportError::ShuttingDown)
-        );
-        assert!(!readiness.load(Ordering::Acquire));
-        assert!(matches!(
-            &*runtime.inner.state.borrow(),
-            RelayTransportState::Closed
-        ));
-    }
-
-    #[tokio::test]
-    async fn readiness_publication_orders_each_state_transition() {
-        let directory = trusted_tempdir();
-        let trust = write_trust(directory.path(), TEST_ROOT_PEM.as_bytes());
-        let plan = tls_plan(trust, "127.0.0.1:7443");
-        let readiness = Arc::new(AtomicBool::new(false));
-        let runtime = RelayTransportRuntime::activate(&plan, Arc::clone(&readiness))
-            .await
-            .expect("initial activation");
-        let generation = runtime
-            .inner
-            .healthy_generation()
-            .expect("initial generation");
-
-        runtime.inner.preserve_generation_as_unhealthy_with(|| {
-            assert!(!readiness.load(Ordering::Acquire));
-            assert!(matches!(
-                &*runtime.inner.state.borrow(),
-                RelayTransportState::Healthy(_)
-            ));
-        });
-        assert!(matches!(
-            &*runtime.inner.state.borrow(),
-            RelayTransportState::Unhealthy(_)
-        ));
-
-        runtime
-            .inner
-            .publish_generation_as_healthy_with(generation, || {
-                assert!(matches!(
-                    &*runtime.inner.state.borrow(),
-                    RelayTransportState::Healthy(_)
-                ));
-                assert!(!readiness.load(Ordering::Acquire));
-            });
-        assert!(readiness.load(Ordering::Acquire));
-
-        runtime.inner.publish_closed_with(|| {
-            assert!(!readiness.load(Ordering::Acquire));
-            assert!(matches!(
-                &*runtime.inner.state.borrow(),
-                RelayTransportState::Healthy(_)
-            ));
-        });
-        assert!(matches!(
-            &*runtime.inner.state.borrow(),
-            RelayTransportState::Closed
-        ));
-    }
-
-    #[tokio::test]
-    async fn failed_reload_cancels_tls_connect_already_in_progress() {
-        let directory = trusted_tempdir();
-        let trust = write_trust(directory.path(), TEST_ROOT_PEM.as_bytes());
-        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("TCP listener");
-        let address = listener.local_addr().expect("listener address");
-        let plan = tls_plan(trust.clone(), &address.to_string());
-        let runtime = RelayTransportRuntime::activate(&plan, Arc::new(AtomicBool::new(false)))
-            .await
-            .expect("initial activation");
-        let connector = runtime.connector();
-        let cancellation = NeverCancelled;
-        let context =
-            AccessFlowConnectContext::new(Instant::now() + Duration::from_secs(10), &cancellation);
-        let connect = connector.connect(plan.routes()[0].endpoint(), context);
-        tokio::pin!(connect);
-        let accept = listener.accept();
-        tokio::pin!(accept);
-        let accepted_stream = tokio::select! {
-            accepted = &mut accept => {
-                accepted.expect("accepted TLS TCP").0
-            }
-            result = &mut connect => panic!("TLS setup finished before reload: {result:?}"),
-        };
-
-        std::fs::write(&trust, b"invalid").expect("invalidate trust");
-        let pending = runtime
-            .begin_reload()
-            .expect("begin reload")
-            .expect("TLS reload worker");
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(1), &mut connect)
-                .await
-                .expect("generation cancellation"),
-            Err(AccessFlowChannelFailure::Cancelled)
-        ));
-        assert_eq!(
-            pending.complete().await,
-            Err(RelayTransportError::InvalidMaterial)
-        );
-        drop(accepted_stream);
-    }
-
-    #[tokio::test]
-    async fn tls_projection_and_transport_reserve_have_distinct_ownership() {
-        let directory = trusted_tempdir();
-        let trust = write_trust(directory.path(), TEST_ROOT_PEM.as_bytes());
-        let plan = tls_plan(trust, "127.0.0.1:7443");
-        let runtime = RelayTransportRuntime::activate(&plan, Arc::new(AtomicBool::new(false)))
-            .await
-            .expect("initial activation");
-        let connector = runtime.connector();
-        let endpoint = plan.routes()[0].endpoint();
-        let projected = connector
-            .resource_projection(endpoint)
-            .expect("product projection");
-        let generation_bytes = MAX_TRUST_ANCHOR_BYTES as u64 + GENERATION_CONTROL_BYTES;
-        let CompiledAccessFlowRelayEndpoint::TlsTcp {
-            tls_index,
-            address,
-            server_name,
-            trust_path,
-        } = endpoint
-        else {
-            panic!("TLS endpoint expected");
-        };
-        let endpoint_metadata = tls_endpoint_metadata_bytes(address, server_name).unwrap();
-        let trust_path_bytes = trust_path.as_os_str().as_encoded_bytes().len() as u64;
-        let trust_der_bytes = parse_trust_pem(TEST_ROOT_PEM.as_bytes())
-            .unwrap()
-            .into_iter()
-            .map(|anchor| anchor.len() as u64)
-            .sum::<u64>();
-        let generation = runtime
-            .inner
-            .retained_generation()
-            .expect("retained generation");
-        let base = runtime
-            .inner
-            .tls
-            .resource_projection(&generation.tls_endpoints[*tls_index])
-            .expect("base projection");
-        assert_eq!(
-            projected.retained_endpoint_bytes,
-            base.retained_endpoint_bytes
-                + endpoint_metadata
-                + trust_path_bytes
-                + (MAX_TRUST_ANCHOR_BYTES as u64 - trust_der_bytes)
-        );
-        assert_eq!(projected.active_bytes, base.active_bytes + generation_bytes);
-        let candidate_bytes =
-            project_candidate_loader_peak(&collect_tls_sources(&plan).unwrap()).unwrap();
-        assert_eq!(
-            RelayTransportRuntime::resource_reserve(&plan),
-            Ok(RelayTransportResourceReserve {
-                descriptors: TRUST_LOAD_DESCRIPTOR_ENVELOPE,
-                memory_bytes: candidate_bytes,
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn candidate_loader_peak_is_one_plan_reserve_across_shared_routes() {
-        let directory = trusted_tempdir();
-        let trust = write_trust(directory.path(), TEST_ROOT_PEM.as_bytes());
-        let routes = (0_u16..2)
-            .map(|index| {
-                let endpoint = CompiledAccessFlowRelayEndpoint::TlsTcp {
-                    tls_index: usize::from(index),
-                    address: TlsAccessFlowAddress::parse(&format!("127.0.0.1:{}", 7443 + index))
-                        .expect("test TLS address"),
-                    server_name: TlsAccessFlowServerName::parse("localhost")
-                        .expect("test server name"),
-                    trust_path: trust.clone(),
-                };
-                AccessFlowRoute::new(
-                    AccessFlowRouteName::new(format!("tls-{index}")).expect("route name"),
-                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18080 + index),
-                    vec![NonZeroU16::new(80).expect("port")],
-                    endpoint,
-                )
-                .expect("TLS route")
+            .map(|(index, (trust, ca_certificate))| AccessFlowRelayRoute {
+                name: format!("tls-{index}"),
+                listen: format!("127.0.0.1:{}", 32000 + index),
+                allowed_destination_ports: vec![443],
+                transport: AccessFlowRelayTransport::TlsTcp {
+                    address: "127.0.0.1:7443".into(),
+                    server_name: "proxy.example.test".into(),
+                    trust: *trust,
+                    ca_certificate: ca_certificate.clone(),
+                },
             })
             .collect();
-        let plan = AccessFlowRelayPlan::new(
+        AccessFlowRelayConfig {
+            setup_timeout: "2s".into(),
+            drain_timeout: "2s".into(),
+            max_connections: 8,
+            copy_buffer_bytes_per_direction: 4096,
+            start_after_services: Vec::new(),
+            presentation: AccessFlowRelayPresentation::BearerEnvironment {
+                variable: "AW_IDENTITY_TOKEN".into(),
+            },
             routes,
-            presentation(),
-            Duration::from_secs(5),
-            NonZeroUsize::new(8).expect("connections"),
-            NonZeroUsize::new(4096).expect("buffer"),
-        )
-        .expect("TLS plan");
-        let runtime = RelayTransportRuntime::activate(&plan, Arc::new(AtomicBool::new(false)))
-            .await
-            .expect("initial activation");
-        let connector = runtime.connector();
-        let generation = runtime
-            .inner
-            .retained_generation()
-            .expect("retained generation");
-        let generation_bytes = MAX_TRUST_ANCHOR_BYTES as u64 + GENERATION_CONTROL_BYTES;
-
-        for (index, route) in plan.routes().iter().enumerate() {
-            let projected = connector
-                .resource_projection(route.endpoint())
-                .expect("product projection");
-            let base = runtime
-                .inner
-                .tls
-                .resource_projection(&generation.tls_endpoints[index])
-                .expect("base projection");
-            assert!(projected.retained_endpoint_bytes > base.retained_endpoint_bytes);
-            assert_eq!(projected.active_bytes, base.active_bytes + generation_bytes);
         }
-        let candidate_bytes =
-            project_candidate_loader_peak(&collect_tls_sources(&plan).unwrap()).unwrap();
-        assert_eq!(
-            RelayTransportRuntime::resource_reserve(&plan),
-            Ok(RelayTransportResourceReserve {
-                descriptors: TRUST_LOAD_DESCRIPTOR_ENVELOPE,
-                memory_bytes: candidate_bytes,
-            })
-        );
+        .compile_with_presentation(
+            crate::config::AccessFlowRelayValidationMode::Agent,
+            access_identity::IdentityPresentation::Bearer(
+                access_identity::SensitiveBearer::new(b"abcdefghijklmnopqrstuvwxyzABCDEF").unwrap(),
+            ),
+        )
+        .unwrap()
+        .plan
     }
 
     #[test]
-    fn candidate_loader_peak_is_plan_global_and_deduplicates_trust_paths() {
-        let shared = PathBuf::from("/tmp/shared.pem");
-        let distinct = PathBuf::from("/tmp/other.pem");
-        let generation_bytes = MAX_TRUST_ANCHOR_BYTES as u64 + GENERATION_CONTROL_BYTES;
-
-        let one = tls_sources(shared.clone(), shared.clone())
-            .into_iter()
-            .take(1)
-            .collect::<Vec<_>>();
-        let one_peak = project_candidate_loader_peak(&one).unwrap();
-        assert!(one_peak > 2 * MAX_TRUST_ANCHOR_BYTES as u64 + generation_bytes);
-
-        let shared_routes = tls_sources(shared.clone(), shared);
-        let shared_peak = project_candidate_loader_peak(&shared_routes).unwrap();
-        let second_metadata =
-            tls_endpoint_metadata_bytes(&shared_routes[1].address, &shared_routes[1].server_name)
-                .unwrap();
-        let second_path = shared_routes[1]
-            .trust_path
-            .as_os_str()
-            .as_encoded_bytes()
-            .len() as u64;
+    fn system_only_one_plan_has_exact_design_peak() {
+        let plan = tls_plan(&[(TlsClientTrustMode::System, None)]);
+        let reserve = RelayTransportRuntime::resource_reserve(&plan).unwrap();
+        assert_eq!(reserve.memory_bytes, 58_855_424);
+        let accepted =
+            RelayTransportRuntime::prepare(&plan, Arc::new(AtomicBool::new(false))).unwrap();
+        accepted
+            .configure_trust_budget(RelayTransportTrustBudget {
+                descriptors: reserve.descriptors,
+                memory_bytes: reserve.memory_bytes,
+            })
+            .unwrap();
+        let rejected =
+            RelayTransportRuntime::prepare(&plan, Arc::new(AtomicBool::new(false))).unwrap();
         assert_eq!(
-            shared_peak - one_peak,
-            3 * second_metadata
-                + 2 * second_path
-                + generation_bytes
-                + MAX_TRUST_ANCHOR_BYTES as u64
-                + TLS_ROUTE_CONTROL_BYTES
+            rejected.configure_trust_budget(RelayTransportTrustBudget {
+                descriptors: reserve.descriptors,
+                memory_bytes: reserve.memory_bytes - 1,
+            }),
+            Err(RelayTransportError::SourceResourceLimit)
         );
+    }
 
-        let distinct_routes = tls_sources(PathBuf::from("/tmp/first.pem"), distinct);
-        let distinct_peak = project_candidate_loader_peak(&distinct_routes).unwrap();
-        let same_path_routes = tls_sources(
-            PathBuf::from("/tmp/first.pem"),
-            PathBuf::from("/tmp/first.pem"),
-        );
-        let same_path_peak = project_candidate_loader_peak(&same_path_routes).unwrap();
-        assert_eq!(
-            distinct_peak - same_path_peak,
-            MAX_TRUST_ANCHOR_BYTES as u64
-                + "/tmp/other.pem".len() as u64
-                + TLS_UNIQUE_SOURCE_CONTROL_BYTES
-        );
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn system_and_composite_modes_activate_reload_and_mix_atomically() {
+        let dir = tempfile::Builder::new()
+            .prefix(".relay-shared-trust-modes-")
+            .tempdir_in(std::env::var_os("HOME").unwrap())
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let trust_path = dir.path().join("roots.pem");
+        std::fs::write(&trust_path, TEST_ROOT_PEM).unwrap();
+        std::fs::set_permissions(&trust_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let trust_path = trust_path.display().to_string();
+
+        for modes in [
+            vec![(TlsClientTrustMode::System, None)],
+            vec![(
+                TlsClientTrustMode::SystemPlusCustom,
+                Some(trust_path.clone()),
+            )],
+            vec![
+                (TlsClientTrustMode::System, None),
+                (TlsClientTrustMode::Custom, Some(trust_path.clone())),
+                (
+                    TlsClientTrustMode::SystemPlusCustom,
+                    Some(trust_path.clone()),
+                ),
+                (TlsClientTrustMode::Insecure, None),
+            ],
+        ] {
+            let readiness = Arc::new(AtomicBool::new(false));
+            let runtime =
+                RelayTransportRuntime::activate(&tls_plan(&modes), Arc::clone(&readiness))
+                    .await
+                    .unwrap();
+            let initial = runtime.inner.healthy_generation().unwrap();
+            reload(&runtime).await.unwrap();
+            let reloaded = runtime.inner.healthy_generation().unwrap();
+            assert_ne!(initial.id, reloaded.id);
+            assert!(readiness.load(Ordering::Acquire));
+            assert_eq!(reloaded.tls_endpoints.len(), modes.len());
+        }
+    }
+
+    async fn reload(runtime: &RelayTransportRuntime) -> Result<(), RelayTransportError> {
+        runtime
+            .begin_reload()?
+            .expect("TLS trust reload")
+            .complete()
+            .await
     }
 
     #[tokio::test]
-    async fn close_is_terminal_and_empty_tls_set_reload_is_noop() {
-        let directory = trusted_tempdir();
-        let endpoint = unix_endpoint(&directory.path().join("relay.sock"));
-        let plan = AccessFlowRelayPlan::new(
-            vec![
-                AccessFlowRoute::new(
-                    AccessFlowRouteName::new("unix").expect("route name"),
-                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, 18081),
-                    vec![NonZeroU16::new(80).expect("port")],
-                    endpoint,
-                )
-                .expect("Unix route"),
-            ],
-            presentation(),
-            Duration::from_secs(5),
-            NonZeroUsize::new(8).expect("connections"),
-            NonZeroUsize::new(4096).expect("buffer"),
-        )
-        .expect("Unix plan");
-        assert_eq!(
-            RelayTransportRuntime::resource_reserve(&plan),
-            Ok(RelayTransportResourceReserve {
-                descriptors: 0,
-                memory_bytes: 0,
-            })
-        );
+    async fn insecure_only_reload_stays_ready_and_publishes_a_new_generation() {
         let readiness = Arc::new(AtomicBool::new(false));
-        let runtime = RelayTransportRuntime::activate(&plan, Arc::clone(&readiness))
+        let runtime = RelayTransportRuntime::activate(&insecure_plan(), Arc::clone(&readiness))
             .await
-            .expect("Unix-only activation");
+            .unwrap();
+        let initial = runtime.inner.healthy_generation().unwrap();
+        let mut pending = runtime.begin_reload().unwrap().unwrap();
         assert!(readiness.load(Ordering::Acquire));
-        assert!(runtime.begin_reload().expect("Unix-only reload").is_none());
+        pending.wait().await.unwrap();
         assert!(readiness.load(Ordering::Acquire));
-        assert!(runtime.healthy());
-        runtime.close();
-        assert!(!runtime.healthy());
-        assert!(!readiness.load(Ordering::Acquire));
-        assert_eq!(
-            runtime.begin_reload().map(|_| ()),
-            Err(RelayTransportError::ShuttingDown)
-        );
+        let current = runtime.inner.healthy_generation().unwrap();
+        assert_ne!(initial.id, current.id);
     }
 
-    #[test]
-    fn mutation_fixture_really_changes_descriptor_metadata() {
-        let directory = trusted_tempdir();
-        let path = write_trust(directory.path(), TEST_ROOT_PEM.as_bytes());
-        let before = std::fs::metadata(&path).expect("before");
-        std::fs::write(&path, b"changed").expect("change");
-        let after = std::fs::metadata(&path).expect("after");
-        assert_eq!(before.dev(), after.dev());
-        assert_eq!(before.ino(), after.ino());
-        assert!(
-            before.len() != after.len()
-                || before.mtime() != after.mtime()
-                || before.mtime_nsec() != after.mtime_nsec()
-                || before.ctime() != after.ctime()
-                || before.ctime_nsec() != after.ctime_nsec()
+    #[tokio::test]
+    async fn eight_retained_generations_reject_then_recover_after_retirement() {
+        let readiness = Arc::new(AtomicBool::new(false));
+        let runtime = RelayTransportRuntime::activate(&insecure_plan(), Arc::clone(&readiness))
+            .await
+            .unwrap();
+        let mut leases = vec![runtime.inner.healthy_generation().unwrap()];
+        for _ in 1..MAX_PUBLISHED_TRUST_GENERATIONS {
+            reload(&runtime).await.unwrap();
+            leases.push(runtime.inner.healthy_generation().unwrap());
+        }
+        assert_eq!(
+            reload(&runtime).await,
+            Err(RelayTransportError::TrustGenerationLimit)
         );
+        assert!(readiness.load(Ordering::Acquire));
+        leases.remove(0);
+        reload(&runtime).await.unwrap();
+        assert!(readiness.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn startup_blocked_operation_keeps_not_ready_and_excludes_activation() {
+        let readiness = Arc::new(AtomicBool::new(false));
+        let plan = insecure_plan();
+        let runtime = RelayTransportRuntime::prepare(&plan, Arc::clone(&readiness)).unwrap();
+        runtime
+            .configure_trust_budget(RelayTransportTrustBudget {
+                descriptors: TEST_TLS_TRUST_DESCRIPTOR_BUDGET,
+                memory_bytes: TEST_TLS_TRUST_BUDGET_BYTES,
+            })
+            .unwrap();
+        let (release, wait_for_release) = tokio::sync::oneshot::channel::<()>();
+        runtime.install_test_blocked_operation(tokio::spawn(async move {
+            let _ = wait_for_release.await;
+        }));
+        assert_eq!(
+            runtime.activate_prepared().await,
+            Err(RelayTransportError::ReloadInProgress)
+        );
+        assert!(!readiness.load(Ordering::Acquire));
+        assert_eq!(
+            runtime.activate_prepared().await,
+            Err(RelayTransportError::ReloadInProgress)
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.reload_blocked() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        runtime.activate_prepared().await.unwrap();
+        assert!(readiness.load(Ordering::Acquire));
     }
 }
