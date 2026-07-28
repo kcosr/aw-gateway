@@ -1,3 +1,12 @@
+# Remote Access Flow TLS/TCP configuration-shape example.
+#
+# This file intentionally does not install a site firewall. Before production
+# use, redirect workload TCP 80/443 to the loopback relay listeners, allow only
+# the exact configured Proxy addresses and ports, and make that required
+# firewall service a relay prerequisite with start_after_services. See
+# docs/guides/firewall.md#remote-access-flow-tlstcp. Relay configuration alone
+# does not provide transparent interception or a network-disabled container.
+
 schema_version = "1"
 default_target = "ubuntu"
 
@@ -128,6 +137,8 @@ setup_timeout = "5s"
 drain_timeout = "10s"
 max_connections = 96
 copy_buffer_bytes_per_direction = 16384
+# Production deployments add their required firewall service here:
+# start_after_services = ["remote-access-flow-firewall"]
 
 [target_defaults.container_agent.access_flow_relay.presentation]
 kind = "bearer_environment"

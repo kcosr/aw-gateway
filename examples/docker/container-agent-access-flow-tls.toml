@@ -1,3 +1,10 @@
+# Remote Access Flow TLS/TCP configuration-shape example.
+#
+# This file does not install transparent redirect or egress firewall policy.
+# Production use must redirect workload TCP 80/443 to these loopback relay
+# listeners and permit only the exact configured Proxy addresses and ports.
+# See docs/guides/firewall.md#remote-access-flow-tlstcp.
+
 schema_version = "1"
 
 [logging]
@@ -13,6 +20,8 @@ setup_timeout = "5s"
 drain_timeout = "10s"
 max_connections = 96
 copy_buffer_bytes_per_direction = 16384
+# Production deployments add their required firewall service here:
+# start_after_services = ["remote-access-flow-firewall"]
 
 [container_agent.access_flow_relay.presentation]
 kind = "bearer_environment"

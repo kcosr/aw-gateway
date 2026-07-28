@@ -672,9 +672,14 @@ mode = "ro"
 
 The dedicated
 [`examples/docker/gateway-access-flow-tls.toml`](examples/docker/gateway-access-flow-tls.toml)
-profile shows the mount and relay configuration together. Before starting its
-root-run container agent, provision the host source as root-owned, single-link
-material:
+profile shows the mount and relay configuration together. It is a configuration
+shape, not a complete transparent-network policy: the deployment must also
+redirect workload TCP ports 80 and 443 to the loopback relay listeners and
+permit only the relay's narrowly scoped network path to the configured remote
+proxy addresses and ports. See
+[Remote Access Flow TLS/TCP](docs/guides/firewall.md#remote-access-flow-tlstcp)
+for the required firewall boundary. Before starting the profile's root-run
+container agent, provision the host source as root-owned, single-link material:
 
 ```bash
 sudo install -d -o root -g root -m 0755 /opt/aw-gateway/trust/acl-proxy
@@ -718,6 +723,15 @@ does not use client certificates, ambient proxy settings, cleartext fallback,
 endpoint fallback, pooling, or multiplexing. Address, server name, and trust
 path are literal and are not rendered from target variables.
 
+Treat the trust bundle as a direct authority to receive the reusable AWAF
+bearer. Any endpoint whose certificate chains to that bundle and satisfies the
+configured `server_name` can receive it. Use a dedicated, minimally scoped CA
+and name rather than a broad organizational trust bundle. The server private
+key remains only on the remote ACL Proxy host; do not mount it into the
+container, install it in AW Gateway, or expose it to workloads. Access Flow
+TLS performs no online OCSP or CRL retrieval. Revocation therefore requires
+short-lived server certificates and explicit trust-generation replacement.
+
 The agent securely loads a stable regular PEM source with bounded size and
 certificate count before reporting relay readiness. No remote reachability
 probe is required. `SIGHUP` atomically reloads the complete trust generation
@@ -727,6 +741,66 @@ makes the relay unready and rejects new Unix and TLS flows until a later
 successful `SIGHUP`. `SIGTERM` and Ctrl-C retain their ordered shutdown
 behavior whether or not the agent control socket is enabled. Foreground
 `aw-gateway` signal behavior is unchanged.
+
+### Remote Access Flow Rotation
+
+Server identity and relay trust are independent atomic generations. When the
+issuing CA changes, rotate them in this order:
+
+1. Issue a currently valid server-authentication certificate whose SAN matches
+   the configured `server_name`. Keep its private key on the Proxy host.
+2. Atomically replace the relay PEM bundle with one bounded bundle containing
+   both the old and new trust anchors. Send `SIGHUP` to `aw-container-agent`,
+   not the foreground `aw-gateway`, and verify aggregate agent readiness.
+3. Atomically replace the Proxy certificate chain and matching private key,
+   send `SIGHUP` to ACL Proxy, and verify Proxy readiness plus a real HTTP and
+   HTTPS Access Flow through every relay population.
+4. After every relay has loaded the overlap bundle and old flows have drained,
+   atomically replace the relay bundle with the new anchor only, send
+   `SIGHUP` to each agent, and repeat readiness and flow verification.
+
+If the server certificate remains under the same trust anchor, skip the overlap
+steps and rotate only the complete Proxy identity generation. Never publish a
+partial chain/key pair or mutate a mounted PEM file in place.
+
+A failed agent trust reload keeps established flows alive but makes the relay
+unready and closes all new Access Flow admission in that agent, including Unix
+routes. Restore the last valid complete PEM file and send another `SIGHUP`; do
+not add a fallback endpoint or weaken verification. A failed Proxy
+certificate/key reload has the corresponding fail-closed effect on Proxy
+Access Flow admission. Restore a complete valid identity at the same configured
+paths and reload again.
+
+Bearer rotation is deliberately separate and disruptive. Stop admitting work,
+drain and stop the agent, update the sensitive bearer source and the Proxy
+resolver as one deployment transaction, restart the agent, verify readiness and
+authenticated flows, and only then reopen workload admission. Trust reload does
+not reload the bearer, route configuration, address, or server name.
+
+### Unix To Remote TLS Cutover
+
+Unix and TLS/TCP are strict transport alternatives, not availability fallbacks.
+To move an existing route:
+
+1. Start and validate the remote Proxy TLS listener, server identity, workload
+   bearer resolver, and deny-by-default policy before changing the relay.
+2. Install the dedicated relay trust bundle and the exact firewall rules for
+   the remote Proxy address and listener ports. Verify that direct web egress
+   remains blocked.
+3. Build and validate one complete agent configuration that replaces each
+   selected route's `unix` transport with `tls_tcp`. Preserve its loopback
+   listener and allowed destination ports; do not author alternate endpoints.
+4. Drain and stop the target agent, deploy the complete configuration and
+   sensitive bearer together, restart, then test transparent HTTP, nested
+   HTTPS, policy denial, and fail-closed Proxy loss.
+
+Route shape is restart-required. Rollback is the same explicit transaction in
+reverse: drain and stop the agent, restore the complete prior Unix
+configuration and its required socket exposure, restore the matching firewall,
+and restart. The relay never attempts Unix after TLS failure or TLS after Unix
+failure. Remote TLS still requires a constrained network path from the
+container to the Proxy; it does not provide a network-disabled or no-NAT
+container mode.
 
 `bearer_environment` makes the gateway provision its existing host identity
 token under the configured agent variable. Bootstrap disables core/dump
