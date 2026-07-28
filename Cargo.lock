@@ -5,12 +5,12 @@ version = 4
 [[package]]
 name = "access-async-contracts"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=8fe1d8530c743d6b46d43e1532751d539dba337d#8fe1d8530c743d6b46d43e1532751d539dba337d"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=22f96f766e050845d36aaeb2927648c185d44eed#22f96f766e050845d36aaeb2927648c185d44eed"
 
 [[package]]
 name = "access-flow"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=8fe1d8530c743d6b46d43e1532751d539dba337d#8fe1d8530c743d6b46d43e1532751d539dba337d"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=22f96f766e050845d36aaeb2927648c185d44eed#22f96f766e050845d36aaeb2927648c185d44eed"
 dependencies = [
  "access-async-contracts",
  "access-identity",
@@ -21,7 +21,7 @@ dependencies = [
 [[package]]
 name = "access-flow-conformance"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=8fe1d8530c743d6b46d43e1532751d539dba337d#8fe1d8530c743d6b46d43e1532751d539dba337d"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=22f96f766e050845d36aaeb2927648c185d44eed#22f96f766e050845d36aaeb2927648c185d44eed"
 dependencies = [
  "access-async-contracts",
  "access-flow",
@@ -38,7 +38,7 @@ dependencies = [
 [[package]]
 name = "access-flow-relay"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=8fe1d8530c743d6b46d43e1532751d539dba337d#8fe1d8530c743d6b46d43e1532751d539dba337d"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=22f96f766e050845d36aaeb2927648c185d44eed#22f96f766e050845d36aaeb2927648c185d44eed"
 dependencies = [
  "access-async-contracts",
  "access-flow",
@@ -50,7 +50,7 @@ dependencies = [
 [[package]]
 name = "access-flow-tls"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=8fe1d8530c743d6b46d43e1532751d539dba337d#8fe1d8530c743d6b46d43e1532751d539dba337d"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=22f96f766e050845d36aaeb2927648c185d44eed#22f96f766e050845d36aaeb2927648c185d44eed"
 dependencies = [
  "access-async-contracts",
  "access-flow",
@@ -69,7 +69,7 @@ dependencies = [
 [[package]]
 name = "access-flow-unix"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=8fe1d8530c743d6b46d43e1532751d539dba337d#8fe1d8530c743d6b46d43e1532751d539dba337d"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=22f96f766e050845d36aaeb2927648c185d44eed#22f96f766e050845d36aaeb2927648c185d44eed"
 dependencies = [
  "access-async-contracts",
  "access-flow",
@@ -81,7 +81,7 @@ dependencies = [
 [[package]]
 name = "access-identity"
 version = "0.1.0"
-source = "git+https://github.com/kcosr/access-runtime.git?rev=8fe1d8530c743d6b46d43e1532751d539dba337d#8fe1d8530c743d6b46d43e1532751d539dba337d"
+source = "git+https://github.com/kcosr/access-runtime.git?rev=22f96f766e050845d36aaeb2927648c185d44eed#22f96f766e050845d36aaeb2927648c185d44eed"
 dependencies = [
  "access-async-contracts",
  "hmac",
