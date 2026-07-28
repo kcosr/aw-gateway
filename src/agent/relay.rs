@@ -1379,7 +1379,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
             .as_mut()
             .expect("shipped TLS relay");
         assert_eq!(relay_config.routes.len(), 2);
-        assert_eq!(relay_config.max_connections, 96);
+        assert_eq!(relay_config.max_connections, 64);
         assert_eq!(relay_config.copy_buffer_bytes_per_direction, 16 * 1024);
 
         let dir = tempfile::Builder::new()
