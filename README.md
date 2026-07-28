@@ -742,6 +742,18 @@ successful `SIGHUP`. `SIGTERM` and Ctrl-C retain their ordered shutdown
 behavior whether or not the agent control socket is enabled. Foreground
 `aw-gateway` signal behavior is unchanged.
 
+Agent relay logs expose only fixed event kinds (`Prepared`, `Ready`,
+`ConnectionOpened`, `ConnectionRejected`, `AdmissionClosed`,
+`ConnectionClosed`, `Drained`, `Forced`, and `Failed`), a validated route name
+when present, the active-flow count, and a fixed close category when applicable.
+Close categories are `Complete`, `Saturated`, `OriginalDestination`,
+`DestinationPort`, `Channel`, `Dns`, `TcpConnect`, `TlsHandshake`,
+`Authentication`, `Alpn`, `Preface`, `ResourceExhausted`, `SetupDeadline`,
+`Cancelled`, `Copy`, and `Truncation`. Remote transport observations never
+contain the bearer, raw source addresses, DNS answers, certificate subjects,
+SANs, DER bytes or fingerprints, trust or key paths, key material, arbitrary
+TLS errors, or untrusted bytes. TLS key logging is disabled.
+
 ### Remote Access Flow Rotation
 
 Server identity and relay trust are independent atomic generations. When the
