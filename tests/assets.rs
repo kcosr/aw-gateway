@@ -580,7 +580,7 @@ fn validate_tls_access_flow_smoke(script: &str) -> Result<(), &'static str> {
         "schema_version = 4",
         "kind = \"tls_tcp\"",
         "server_name = \"proxy.access-flow.test\"",
-        "kind = \"pem_bundle\"",
+        "trust = \"custom\"",
         "[container_agent.access_flow_relay]",
         "/opt/aw-gateway/bin/aw-container-agent",
         "invalid bearer reached the authorization provider",
@@ -1055,7 +1055,7 @@ fn tls_access_flow_cross_host_smoke_preserves_diagnostics_and_is_awk_portable() 
     assert!(smoke.contains("max_connections = 64"));
     assert_eq!(
         smoke
-            .matches("path = \"/run/aw-gateway/trust/access-flow-root.pem\"")
+            .matches("ca_certificate = \"/run/aw-gateway/trust/access-flow-root.pem\"")
             .count(),
         2
     );

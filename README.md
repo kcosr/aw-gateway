@@ -658,10 +658,11 @@ kind = "unix"
 path = "/run/acl-proxy/transparent-http.sock"
 ```
 
-A route may instead use server-authenticated TLS/TCP. Provision its explicit
-trust bundle through a read-only mount. Mount the containing directory rather
-than the individual file so an atomic host-side replacement remains visible
-to a later `SIGHUP`:
+A route may instead use TLS/TCP. `system` uses the container process's platform
+store and needs no CA mount. For `custom` or `system_plus_custom`, provision the
+explicit trust bundle through a read-only mount. Mount the containing directory
+rather than the individual file so an atomic host-side replacement remains
+visible to a later `SIGHUP`:
 
 ```toml
 [[target_defaults.container_mounts]]
@@ -701,10 +702,10 @@ The secure loader evaluates metadata in the container's filesystem view.
 `/`, every directory component, and the PEM leaf must be owned by root or the
 agent's effective UID and must not be group- or world-writable. No component
 may be a symlink. The leaf must be a nonempty regular file with exactly one
-hard link and is limited to 1 MiB. For the shipped root-run profile, use
-root ownership as shown above. A read-only mount prevents container writes but
-does not make unsafe source ownership, modes, links, or host-side mutation
-trusted.
+hard link, at most 2,113,536 bytes of PEM, at most 128 certificates, and at
+most 1 MiB of aggregate DER. For the shipped root-run profile, use root
+ownership as shown above. A read-only mount prevents container writes but does
+not make unsafe source ownership, modes, links, or host-side mutation trusted.
 
 The corresponding TLS route is:
 
@@ -718,39 +719,44 @@ allowed_destination_ports = [80]
 kind = "tls_tcp"
 address = "proxy.example.com:7443"
 server_name = "proxy.example.com"
-
-[target_defaults.container_agent.access_flow_relay.routes.transport.trust]
-kind = "pem_bundle"
-path = "/etc/aw-gateway/acl-proxy-trust/roots.pem"
+trust = "custom"
+ca_certificate = "/etc/aw-gateway/acl-proxy-trust/roots.pem"
 ```
 
 TLS routes require `bearer_environment`; disabled and anonymous presentation
 remain available only to Unix-only relays. Unix and TLS routes may coexist in
-one bearer-authenticated relay. TLS uses version 1.3, verifies the independently
-configured name against the explicit PEM bundle, requires the exact Access
+one bearer-authenticated relay. Every TLS route requires an explicit `trust`
+mode: `system`, `custom`, `system_plus_custom`, or `insecure`. The
+`ca_certificate` field is required only for `custom` and
+`system_plus_custom`. TLS uses version 1.3, verifies the independently
+configured name in every verified mode, requires the exact Access
 Flow ALPN, and opens one outer connection for each workload connection. It
 does not use client certificates, ambient proxy settings, cleartext fallback,
 endpoint fallback, pooling, or multiplexing. Address, server name, and trust
-path are literal and are not rendered from target variables.
+source are literal and are not rendered from target variables.
 
-Treat the trust bundle as a direct authority to receive the reusable AWAF
-bearer. Any endpoint whose certificate chains to that bundle and satisfies the
-configured `server_name` can receive it. Use a dedicated, minimally scoped CA
-and name rather than a broad organizational trust bundle. The server private
-key remains only on the remote ACL Proxy host; do not mount it into the
-container, install it in AW Gateway, or expose it to workloads. Access Flow
-TLS performs no online OCSP or CRL retrieval. Revocation therefore requires
-short-lived server certificates and explicit trust-generation replacement.
+Every verified trust mode grants its complete authority set permission to
+authenticate a server that can receive the reusable AWAF bearer. For custom
+trust, use a dedicated, minimally scoped CA and name rather than a broad
+organizational bundle. `system` deliberately grants the complete platform
+store that authority. The server private key remains only on the remote ACL
+Proxy host; do not mount it into the container, install it in AW Gateway, or
+expose it to workloads. Access Flow TLS performs no online OCSP or CRL
+retrieval. Revocation therefore requires short-lived server certificates and
+explicit trust-generation replacement.
 
-The agent securely loads a stable regular PEM source with bounded size and
-certificate count before reporting relay readiness. No remote reachability
-probe is required. `SIGHUP` atomically reloads the complete trust generation
-without reloading route configuration or the bearer. Existing flows retain
-their established generation and drain. A failed reload keeps them alive but
-makes the relay unready and rejects new Unix and TLS flows until a later
-successful `SIGHUP`. `SIGTERM` and Ctrl-C retain their ordered shutdown
-behavior whether or not the agent control socket is enabled. Foreground
-`aw-gateway` signal behavior is unchanged.
+The agent prepares system roots, stable custom PEM sources, or their union
+through the shared Access Runtime trust component before reporting relay
+readiness. `insecure` still performs encrypted TLS and exact ALPN negotiation
+but deliberately skips certificate and server-name authentication. No remote
+reachability probe is required. `SIGHUP` atomically reloads the complete trust
+generation without reloading route configuration or the bearer. Existing flows
+retain their established generation and drain. Candidate construction leaves
+the current valid generation ready. Material, custody, or internal failures
+then close new admission; transient system-store failures, cancellation, and
+generation-budget rejection preserve the ready generation. `SIGTERM` and
+Ctrl-C retain their ordered shutdown behavior whether or not the agent control
+socket is enabled. Foreground `aw-gateway` signal behavior is unchanged.
 
 Agent relay logs expose only fixed event kinds (`Prepared`, `Ready`,
 `ConnectionOpened`, `ConnectionRejected`, `AdmissionClosed`,

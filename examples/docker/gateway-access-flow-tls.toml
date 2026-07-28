@@ -154,10 +154,8 @@ allowed_destination_ports = [80]
 kind = "tls_tcp"
 address = "proxy.example.com:7443"
 server_name = "proxy.example.com"
-
-[target_defaults.container_agent.access_flow_relay.routes.transport.trust]
-kind = "pem_bundle"
-path = "/etc/aw-gateway/acl-proxy-trust/roots.pem"
+trust = "custom"
+ca_certificate = "/etc/aw-gateway/acl-proxy-trust/roots.pem"
 
 [[target_defaults.container_agent.access_flow_relay.routes]]
 name = "https"
@@ -168,10 +166,8 @@ allowed_destination_ports = [443]
 kind = "tls_tcp"
 address = "proxy.example.com:7444"
 server_name = "proxy.example.com"
-
-[target_defaults.container_agent.access_flow_relay.routes.transport.trust]
-kind = "pem_bundle"
-path = "/etc/aw-gateway/acl-proxy-trust/roots.pem"
+trust = "custom"
+ca_certificate = "/etc/aw-gateway/acl-proxy-trust/roots.pem"
 
 [[target_defaults.container_agent.services]]
 name = "container-sshd"

@@ -1,7 +1,6 @@
 use assert_cmd::Command;
 use aw_gateway::config::{
-    AccessFlowRelayTransport, AccessFlowRelayTrust, ContainerAgentFile, ContainerMountMode,
-    GatewayConfig,
+    AccessFlowRelayTransport, ContainerAgentFile, ContainerMountMode, GatewayConfig,
 };
 use std::path::Path;
 
@@ -116,18 +115,14 @@ fn remote_tls_gateway_and_agent_examples_share_one_relay_contract() {
             AccessFlowRelayTransport::TlsTcp {
                 address: agent_address,
                 server_name: agent_server_name,
-                trust:
-                    AccessFlowRelayTrust::PemBundle {
-                        path: agent_trust_path,
-                    },
+                trust: agent_trust,
+                ca_certificate: agent_trust_path,
             },
             AccessFlowRelayTransport::TlsTcp {
                 address: gateway_address,
                 server_name: gateway_server_name,
-                trust:
-                    AccessFlowRelayTrust::PemBundle {
-                        path: gateway_trust_path,
-                    },
+                trust: gateway_trust,
+                ca_certificate: gateway_trust_path,
             },
         ) = (&agent_route.transport, &gateway_route.transport)
         else {
@@ -135,10 +130,12 @@ fn remote_tls_gateway_and_agent_examples_share_one_relay_contract() {
         };
         assert_eq!(agent_address, gateway_address);
         assert_eq!(agent_server_name, gateway_server_name);
+        assert_eq!(agent_trust, gateway_trust);
+        assert_eq!(*agent_trust, access_tls_trust::TlsClientTrustMode::Custom);
         assert_eq!(agent_trust_path, gateway_trust_path);
         assert_eq!(
-            agent_trust_path,
-            "/etc/aw-gateway/acl-proxy-trust/roots.pem"
+            agent_trust_path.as_deref(),
+            Some("/etc/aw-gateway/acl-proxy-trust/roots.pem")
         );
     }
 

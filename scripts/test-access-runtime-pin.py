@@ -17,6 +17,7 @@ PRODUCTION_NAMES = (
     "access-flow-tls",
     "access-flow-unix",
     "access-identity",
+    "access-tls-trust",
 )
 LINUX_TEST_NAMES = ("access-flow", "access-flow-conformance")
 
