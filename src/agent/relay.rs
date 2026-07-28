@@ -1293,7 +1293,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         TlsAccessFlowServerAdapter::new(
             identity,
             TlsAccessFlowHandshakeTimeout::new(Duration::from_secs(2)).unwrap(),
-            TlsAccessFlowServerLimits::new(8, 8, 16, 32, 1).unwrap(),
+            TlsAccessFlowServerLimits::new(8, None).unwrap(),
         )
         .unwrap()
     }
@@ -1632,7 +1632,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         let tls_server = TlsAccessFlowServerAdapter::new(
             server_identity,
             TlsAccessFlowHandshakeTimeout::new(Duration::from_secs(2)).unwrap(),
-            TlsAccessFlowServerLimits::new(8, 8, 16, 32, 1).unwrap(),
+            TlsAccessFlowServerLimits::new(8, None).unwrap(),
         )
         .unwrap();
 
@@ -1777,7 +1777,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         let tls_server = TlsAccessFlowServerAdapter::new(
             server_identity,
             TlsAccessFlowHandshakeTimeout::new(Duration::from_secs(2)).unwrap(),
-            TlsAccessFlowServerLimits::new(8, 8, 16, 32, 1).unwrap(),
+            TlsAccessFlowServerLimits::new(8, None).unwrap(),
         )
         .unwrap();
         let server = tokio::spawn(async move {

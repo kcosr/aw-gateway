@@ -681,11 +681,12 @@ proxy addresses and ports. See
 for the required firewall boundary.
 
 The dedicated TLS examples assume one relay source per Proxy and cap the relay
-at 64 active flows. Match that value to each corresponding Proxy listener's
-global `max_connections` and `max_connections_per_source`; the Proxy sample
-also permits 100 handshakes per second with a burst of 200. Deployments with
-multiple relay source addresses may size the Proxy's global listener capacity
-independently from its per-source cap.
+at 64 active flows, matching each corresponding Proxy listener's global
+`max_connections`. The shipped one-relay Proxy profile leaves its optional
+per-source connection and handshake policy disabled, so relay traffic is
+bounded by the global listener and handshake limits without an additional
+source-address throttle. Deployments with multiple independent relay source
+addresses may enable and size the Proxy's per-source policy explicitly.
 
 Before starting the profile's root-run container agent, provision the host
 source as root-owned, single-link material:

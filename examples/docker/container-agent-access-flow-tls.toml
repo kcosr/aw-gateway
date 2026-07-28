@@ -18,7 +18,7 @@ control_socket = false
 [container_agent.access_flow_relay]
 setup_timeout = "5s"
 drain_timeout = "10s"
-# Match each ACL Proxy TLS listener's global and per-source connection caps.
+# Match each ACL Proxy TLS listener's global connection cap.
 max_connections = 64
 copy_buffer_bytes_per_direction = 16384
 # Production deployments add their required firewall service here:
