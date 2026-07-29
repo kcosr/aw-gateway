@@ -847,7 +847,7 @@ control_socket = false
 
 [[container_agent.services]]
 name = "approved"
-command = ["/usr/bin/true"]
+command = ["true"]
 restart = "never"
 
 [container_agent.services.env]
@@ -890,7 +890,7 @@ fn bootstrap_steps_receive_a_cleared_environment_before_agent_exec() {
         format!(
             r#"
 schema_version = "2"
-agent_program = "/usr/bin/true"
+agent_program = "true"
 agent_config = "{}"
 skip_identity_prepare = true
 chown_existing_identity_dirs = false
