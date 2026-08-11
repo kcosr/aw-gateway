@@ -637,6 +637,9 @@ connects through one configured Access Flow transport. Presentation is a strict 
 `disabled`, `anonymous`, or `bearer_environment`:
 
 ```toml
+[target_defaults.container_agent]
+access_flow_execution_context = "external"
+
 [target_defaults.container_agent.access_flow_relay]
 setup_timeout = "2s"
 drain_timeout = "10s"
@@ -657,6 +660,14 @@ allowed_destination_ports = [80]
 kind = "unix"
 path = "/run/acl-proxy/transparent-http.sock"
 ```
+
+`access_flow_execution_context` is an optional operator-authored label shared by
+every route in the relay plan. Values must match `[a-z][a-z0-9_-]{0,63}` and are
+literal: they are not rendered from target templates, runtime context, or the
+container environment. A present value requires an Access Flow relay; an absent
+value remains valid. Updated container agents always write AW Access Flow v2,
+using a zero-length context when the field is absent. Server-side v1 acceptance
+supports older agent binaries and does not synthesize a context.
 
 A route may instead use TLS/TCP. `system` uses the container process's platform
 store and needs no CA mount. For `custom` or `system_plus_custom`, provision the
@@ -1117,6 +1128,10 @@ Gateway configs commonly include:
   `[targets.<name>.container_ssh.transfer]`.
 - `[target_defaults.container_agent]`: optional in-container supervision and SSH bridge
   support.
+- `target_defaults.container_agent.access_flow_execution_context`: optional
+  literal execution context attached to every flow from the effective relay.
+  It overlays as an independent scalar without replacing inherited relay
+  routes or limits and is invalid when no relay is configured.
 - `[target_defaults.container_agent.access_flow_relay]`: optional embedded
   transparent TCP-to-Access-Flow relay with strict Unix or
   server-authenticated TLS/TCP routes. The relay table replaces as one object
@@ -1487,7 +1502,8 @@ Root inheritance uses these merge rules:
 - `container_agent.access_flow_relay` replaces as a whole typed component when
   a later target layer supplies it. Its routes and lifecycle bounds never merge
   piecemeal.
-- Scalars and ordinary arrays replace the inherited value. This includes
+- Scalars and ordinary arrays replace the inherited value. This includes the
+  independent `container_agent.access_flow_execution_context` scalar,
   `container_mounts`, runtime argument arrays, command arrays, dependency
   arrays, allow-list arrays, and launch variable value arrays.
 - Named service arrays merge by `name` at `target_defaults.container_agent.services`,
@@ -2189,6 +2205,10 @@ The `assets/` directory contains deployable helpers and image files:
 
 The gateway and container agent coordinate through environment variables and
 private state files:
+
+Access Flow execution context is not an environment variable. The gateway
+serializes its optional literal value into the private generated container-agent
+configuration, and the agent compiles it into the immutable relay plan.
 
 - `AW_IDENTITY_TOKEN`: generated or inherited by the gateway. It is provisioned
   only when a bearer Access Flow relay or an explicit service inheritance

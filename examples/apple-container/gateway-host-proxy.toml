@@ -175,6 +175,7 @@ legacy_scp = "allow"
 [target_defaults.container_agent]
 enabled = true
 control_socket = false
+access_flow_execution_context = "external"
 
 [target_defaults.container_agent.access_flow_relay]
 setup_timeout = "2s"

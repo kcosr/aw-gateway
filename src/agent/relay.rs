@@ -555,6 +555,7 @@ impl AccessFlowRelayObserver for RelayObserver {
 pub(super) async fn run_relay_supervisor(
     config: AccessFlowRelayConfig,
     presentation: IdentityPresentation,
+    execution_context: Option<String>,
     services: Vec<Arc<ManagedService>>,
     state: Arc<AgentState>,
     control: Arc<RelayControl>,
@@ -563,6 +564,7 @@ pub(super) async fn run_relay_supervisor(
     let result = run_relay(
         &config,
         presentation,
+        execution_context.as_deref(),
         &services,
         &state,
         &control,
@@ -582,6 +584,7 @@ pub(super) async fn run_relay_supervisor(
 async fn run_relay(
     config: &AccessFlowRelayConfig,
     presentation: IdentityPresentation,
+    execution_context: Option<&str>,
     services: &[Arc<ManagedService>],
     state: &AgentState,
     control: &RelayControl,
@@ -598,6 +601,7 @@ async fn run_relay(
         .compile_with_presentation(
             crate::config::AccessFlowRelayValidationMode::Agent,
             presentation,
+            execution_context,
         )
         .context("compile access flow relay configuration")?;
     for route in &config.routes {
@@ -1249,8 +1253,8 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use access_flow::{
-        AccessFlowAcceptor, AccessFlowAdmission, AccessFlowAdmissionInput, AccessFlowPreface,
-        AccessFlowPresentationMode,
+        ACCESS_FLOW_V2_HEADER_LEN, AccessFlowAcceptor, AccessFlowAdmission,
+        AccessFlowAdmissionInput, AccessFlowPreface, AccessFlowPresentationMode,
     };
     #[cfg(target_os = "linux")]
     use access_flow_conformance::load_tls_pki_fixture;
@@ -1358,6 +1362,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
     #[cfg(target_os = "linux")]
     struct ExpectProductTlsPreface {
         destination: access_flow::AccessFlowDestination,
+        execution_context: Option<&'static str>,
     }
 
     #[cfg(target_os = "linux")]
@@ -1370,6 +1375,12 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
             input: AccessFlowAdmissionInput<'a, TlsAccessFlowServerChannel>,
         ) -> BoxAccessFuture<'a, Result<Self::Facts, Self::Error>> {
             assert_eq!(input.destination, self.destination);
+            assert_eq!(
+                input
+                    .execution_context
+                    .map(access_execution_context::ExecutionContext::as_str),
+                self.execution_context
+            );
             let IdentityPresentation::Bearer(bearer) = input.presentation else {
                 panic!("product TLS route did not send the required bearer");
             };
@@ -1521,6 +1532,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
                     IdentityPresentation::Bearer(
                         access_identity::SensitiveBearer::new(TEST_ACCESS_FLOW_BEARER).unwrap(),
                     ),
+                    None,
                 )
                 .unwrap()
         };
@@ -1613,6 +1625,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
             IdentityPresentation::Bearer(
                 access_identity::SensitiveBearer::new(TEST_ACCESS_FLOW_BEARER).unwrap(),
             ),
+            None,
             Vec::new(),
             state,
             control.clone(),
@@ -1715,6 +1728,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
             IdentityPresentation::Bearer(
                 access_identity::SensitiveBearer::new(TEST_ACCESS_FLOW_BEARER).unwrap(),
             ),
+            None,
             Vec::new(),
             state,
             control.clone(),
@@ -1809,6 +1823,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
                     IdentityPresentation::Bearer(
                         access_identity::SensitiveBearer::new(&bearer).unwrap(),
                     ),
+                    None,
                 )
                 .unwrap();
             let transport_reserve =
@@ -1906,6 +1921,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
                 IdentityPresentation::Bearer(
                     access_identity::SensitiveBearer::new(&bearer).unwrap(),
                 ),
+                None,
             )
             .unwrap();
         let transport_reserve = RelayTransportRuntime::resource_reserve(&compiled.plan).unwrap();
@@ -2015,6 +2031,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
                     access_identity::SensitiveBearer::new(b"abcdefghijklmnopqrstuvwxyzABCDEF")
                         .unwrap(),
                 ),
+                None,
             )
             .unwrap();
         let transport =
@@ -2120,7 +2137,10 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
                     channel,
                     Instant::now() + Duration::from_secs(2),
                     &cancellation,
-                    &ExpectProductTlsPreface { destination },
+                    &ExpectProductTlsPreface {
+                        destination,
+                        execution_context: Some("internal"),
+                    },
                 )
                 .await
                 .unwrap();
@@ -2134,6 +2154,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         let mut supervisor = tokio::spawn(run_relay_supervisor(
             config,
             presentation,
+            Some("internal".into()),
             Vec::new(),
             state,
             control.clone(),
@@ -2250,6 +2271,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
                 IdentityPresentation::Bearer(
                     access_identity::SensitiveBearer::new(TEST_ACCESS_FLOW_BEARER).unwrap(),
                 ),
+                None,
             )
             .unwrap();
         let runtime =
@@ -2364,6 +2386,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
                 IdentityPresentation::Bearer(
                     access_identity::SensitiveBearer::new(TEST_ACCESS_FLOW_BEARER).unwrap(),
                 ),
+                None,
             )
             .unwrap();
         let runtime =
@@ -2448,6 +2471,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
             IdentityPresentation::Bearer(
                 access_identity::SensitiveBearer::new(TEST_ACCESS_FLOW_BEARER).unwrap(),
             ),
+            None,
         )
         .write_to(&mut old_client)
         .await
@@ -2462,7 +2486,10 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
             old_channel,
             Instant::now() + Duration::from_secs(2),
             &admission_cancellation,
-            &ExpectProductTlsPreface { destination },
+            &ExpectProductTlsPreface {
+                destination,
+                execution_context: None,
+            },
         )
         .await
         .unwrap();
@@ -2512,6 +2539,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         let supervisor = tokio::spawn(run_relay_supervisor(
             config,
             IdentityPresentation::Disabled,
+            None,
             Vec::new(),
             state,
             control.clone(),
@@ -2528,7 +2556,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
 
         let mut first = tokio::net::TcpStream::connect(listen).await.unwrap();
         let (mut first_channel, _) = endpoint_listener.accept().await.unwrap();
-        let mut first_preface = [0_u8; 16];
+        let mut first_preface = [0_u8; ACCESS_FLOW_V2_HEADER_LEN];
         first_channel.read_exact(&mut first_preface).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while control.active_flows() != 1 {
@@ -2570,7 +2598,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
 
         let recovered = tokio::net::TcpStream::connect(listen).await.unwrap();
         let (mut recovered_channel, _) = endpoint_listener.accept().await.unwrap();
-        let mut recovered_preface = [0_u8; 16];
+        let mut recovered_preface = [0_u8; ACCESS_FLOW_V2_HEADER_LEN];
         recovered_channel
             .read_exact(&mut recovered_preface)
             .await
@@ -2668,6 +2696,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
             IdentityPresentation::Bearer(
                 access_identity::SensitiveBearer::new(TEST_ACCESS_FLOW_BEARER).unwrap(),
             ),
+            None,
             Vec::new(),
             state,
             control.clone(),
@@ -2751,7 +2780,10 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
                 channel,
                 Instant::now() + Duration::from_secs(2),
                 &cancellation,
-                &ExpectProductTlsPreface { destination },
+                &ExpectProductTlsPreface {
+                    destination,
+                    execution_context: None,
+                },
             )
             .await
             .unwrap();
@@ -2837,6 +2869,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         let mut supervisor = tokio::spawn(run_relay_supervisor(
             config,
             presentation,
+            None,
             Vec::new(),
             state,
             control.clone(),
@@ -3016,6 +3049,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         let supervisor = tokio::spawn(run_relay_supervisor(
             config,
             IdentityPresentation::Disabled,
+            None,
             Vec::new(),
             state,
             control.clone(),
@@ -3037,7 +3071,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
 
         let mut client = tokio::net::TcpStream::connect(listen).await.unwrap();
         let (mut channel, _) = endpoint_listener.accept().await.unwrap();
-        let mut preface = [0_u8; 16];
+        let mut preface = [0_u8; ACCESS_FLOW_V2_HEADER_LEN];
         channel.read_exact(&mut preface).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while control.active_flows() != 1 {
@@ -3142,6 +3176,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         let supervisor = tokio::spawn(run_relay_supervisor(
             config,
             IdentityPresentation::Disabled,
+            None,
             Vec::new(),
             Arc::clone(&state),
             control.clone(),
@@ -3156,7 +3191,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         .unwrap();
         let mut client = tokio::net::TcpStream::connect(listen).await.unwrap();
         let (mut channel, _) = endpoint_listener.accept().await.unwrap();
-        let mut preface = [0_u8; 16];
+        let mut preface = [0_u8; ACCESS_FLOW_V2_HEADER_LEN];
         channel.read_exact(&mut preface).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while control.active_flows() != 1 {
@@ -3225,6 +3260,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         let supervisor = tokio::spawn(run_relay_supervisor(
             config,
             IdentityPresentation::Disabled,
+            None,
             Vec::new(),
             state.clone(),
             control.clone(),
@@ -3240,7 +3276,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         .unwrap();
         let mut client = tokio::net::TcpStream::connect(listen).await.unwrap();
         let (mut channel, _) = endpoint_listener.accept().await.unwrap();
-        let mut preface = [0_u8; 16];
+        let mut preface = [0_u8; ACCESS_FLOW_V2_HEADER_LEN];
         channel.read_exact(&mut preface).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while control.active_flows() != 1 {
@@ -3310,6 +3346,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         let supervisor = tokio::spawn(run_relay_supervisor(
             config,
             IdentityPresentation::Disabled,
+            None,
             Vec::new(),
             state.clone(),
             control.clone(),
@@ -3373,6 +3410,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         let supervisor = tokio::spawn(run_relay_supervisor(
             config,
             IdentityPresentation::Disabled,
+            None,
             vec![dependency],
             state.clone(),
             control.clone(),
@@ -3417,6 +3455,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         let result = run_relay_supervisor(
             config,
             IdentityPresentation::Disabled,
+            None,
             Vec::new(),
             state.clone(),
             control.clone(),
@@ -3500,7 +3539,7 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
             },
         });
         let compiled = config
-            .compile(crate::config::AccessFlowRelayValidationMode::Agent)
+            .compile(crate::config::AccessFlowRelayValidationMode::Agent, None)
             .unwrap();
         probe_unix_endpoints(&compiled).unwrap();
         let transport =
@@ -3532,14 +3571,14 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing");
         let compiled = test_config("127.0.0.1:3128".into(), missing.display().to_string())
-            .compile(crate::config::AccessFlowRelayValidationMode::Agent)
+            .compile(crate::config::AccessFlowRelayValidationMode::Agent, None)
             .unwrap();
         assert!(probe_unix_endpoints(&compiled).is_err());
 
         let regular = dir.path().join("regular");
         std::fs::write(&regular, b"not a socket").unwrap();
         let compiled = test_config("127.0.0.1:3128".into(), regular.display().to_string())
-            .compile(crate::config::AccessFlowRelayValidationMode::Agent)
+            .compile(crate::config::AccessFlowRelayValidationMode::Agent, None)
             .unwrap();
         assert!(probe_unix_endpoints(&compiled).is_err());
 
@@ -3549,14 +3588,14 @@ MC4CAQAwBQYDK2VwBCIEIGRXBokZ2/yO2kASVZKtUVGnOwIM7kZJKJgugoeMCRxd
         std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o777);
         std::fs::set_permissions(&socket, permissions).unwrap();
         let compiled = test_config("127.0.0.1:3128".into(), socket.display().to_string())
-            .compile(crate::config::AccessFlowRelayValidationMode::Agent)
+            .compile(crate::config::AccessFlowRelayValidationMode::Agent, None)
             .unwrap();
         probe_unix_endpoints(&compiled).unwrap();
 
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&socket, &link).unwrap();
         let compiled = test_config("127.0.0.1:3128".into(), link.display().to_string())
-            .compile(crate::config::AccessFlowRelayValidationMode::Agent)
+            .compile(crate::config::AccessFlowRelayValidationMode::Agent, None)
             .unwrap();
         assert!(probe_unix_endpoints(&compiled).is_err());
     }

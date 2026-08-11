@@ -5856,6 +5856,59 @@ fn container_agent_accepts_strict_access_flow_relay_and_absence() {
 }
 
 #[test]
+fn container_agent_execution_context_is_optional_checked_and_requires_a_relay() {
+    let with_context = AGENT_ACCESS_FLOW_RELAY.replace(
+        "[container_agent.access_flow_relay]",
+        "[container_agent]\naccess_flow_execution_context = \"internal\"\n\n[container_agent.access_flow_relay]",
+    );
+    let configured: ContainerAgentFile = toml::from_str(&with_context).unwrap();
+    configured.validate().unwrap();
+    assert_eq!(
+        configured
+            .container_agent
+            .access_flow_execution_context
+            .as_deref(),
+        Some("internal")
+    );
+    let compiled = configured
+        .container_agent
+        .access_flow_relay
+        .as_ref()
+        .unwrap()
+        .compile(AccessFlowRelayValidationMode::Agent, Some("internal"))
+        .unwrap();
+    assert_eq!(
+        compiled
+            .plan
+            .execution_context()
+            .map(access_execution_context::ExecutionContext::as_str),
+        Some("internal")
+    );
+
+    for invalid in ["Internal", "has space", "{target}"] {
+        let raw = with_context.replace("internal", invalid);
+        let config: ContainerAgentFile = toml::from_str(&raw).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("access_flow_execution_context"), "{error}");
+    }
+
+    let without_relay: ContainerAgentFile = toml::from_str(
+        r#"
+schema_version = "1"
+
+[container_agent]
+access_flow_execution_context = "external"
+"#,
+    )
+    .unwrap();
+    let error = without_relay.validate().unwrap_err().to_string();
+    assert!(
+        error.contains("requires container_agent.access_flow_relay"),
+        "{error}"
+    );
+}
+
+#[test]
 fn container_agent_accepts_strict_tls_and_mixed_relay_transports() {
     let tls: ContainerAgentFile = toml::from_str(&bearer_tls_access_flow_relay()).unwrap();
     tls.validate().unwrap();
@@ -5864,7 +5917,7 @@ fn container_agent_accepts_strict_tls_and_mixed_relay_transports() {
         AccessFlowRelayValidationMode::Gateway,
         AccessFlowRelayValidationMode::Agent,
     ] {
-        let compiled = tls.compile(mode).unwrap();
+        let compiled = tls.compile(mode, None).unwrap();
         assert_eq!(compiled.plan.routes().len(), 1);
         let CompiledAccessFlowRelayEndpoint::TlsTcp {
             tls_index,
@@ -5894,7 +5947,7 @@ fn container_agent_accepts_strict_tls_and_mixed_relay_transports() {
         .container_agent
         .access_flow_relay
         .unwrap()
-        .compile(AccessFlowRelayValidationMode::Agent)
+        .compile(AccessFlowRelayValidationMode::Agent, None)
         .unwrap();
     assert_eq!(compiled.plan.routes().len(), 2);
     assert!(matches!(
@@ -5983,7 +6036,7 @@ ca_certificate = "/etc/aw-gateway/second-roots.pem"
         .container_agent
         .access_flow_relay
         .unwrap()
-        .compile(AccessFlowRelayValidationMode::Agent)
+        .compile(AccessFlowRelayValidationMode::Agent, None)
         .unwrap();
     let indices = compiled
         .plan
@@ -6013,7 +6066,7 @@ fn tls_routes_require_authored_and_activated_bearers() {
                 .access_flow_relay
                 .as_ref()
                 .unwrap()
-                .compile(mode)
+                .compile(mode, None)
                 .err()
                 .expect("non-bearer TLS relay must be rejected")
                 .to_string();
@@ -6028,7 +6081,7 @@ fn tls_routes_require_authored_and_activated_bearers() {
         IdentityPresentation::Anonymous,
     ] {
         let error = relay
-            .compile_with_presentation(AccessFlowRelayValidationMode::Agent, presentation)
+            .compile_with_presentation(AccessFlowRelayValidationMode::Agent, presentation, None)
             .err()
             .expect("activated non-bearer TLS relay must be rejected")
             .to_string();
@@ -6040,6 +6093,7 @@ fn tls_routes_require_authored_and_activated_bearers() {
             IdentityPresentation::Bearer(
                 SensitiveBearer::new(b"abcdefghijklmnopqrstuvwxyzABCDEF").unwrap(),
             ),
+            None,
         )
         .unwrap();
 
@@ -6050,6 +6104,7 @@ fn tls_routes_require_authored_and_activated_bearers() {
         .compile_with_presentation(
             AccessFlowRelayValidationMode::Agent,
             IdentityPresentation::Disabled,
+            None,
         )
         .expect("Unix-only relay must retain disabled presentation");
 }
@@ -6076,7 +6131,10 @@ fn tls_transport_rejects_templates_in_both_validation_modes() {
             AccessFlowRelayValidationMode::Gateway,
             AccessFlowRelayValidationMode::Agent,
         ] {
-            assert!(relay.compile(mode).is_err(), "{mode:?} accepted:\n{raw}");
+            assert!(
+                relay.compile(mode, None).is_err(),
+                "{mode:?} accepted:\n{raw}"
+            );
         }
     }
 }
@@ -6667,6 +6725,58 @@ path = "/run/target.sock"
     assert_eq!(relay.setup_timeout, "3s");
     assert_eq!(relay.routes.len(), 1);
     assert_eq!(relay.routes[0].name, "target-https");
+}
+
+#[test]
+fn gateway_execution_context_overlays_without_replacing_the_relay() {
+    let config: GatewayConfig = toml::from_str(
+        r#"
+schema_version = "1"
+
+[target_defaults.container_agent]
+access_flow_execution_context = "external"
+
+[target_defaults.container_agent.access_flow_relay]
+setup_timeout = "2s"
+drain_timeout = "10s"
+max_connections = 32
+copy_buffer_bytes_per_direction = 16384
+
+[target_defaults.container_agent.access_flow_relay.presentation]
+kind = "disabled"
+
+[[target_defaults.container_agent.access_flow_relay.routes]]
+name = "http"
+listen = "127.0.0.1:3128"
+allowed_destination_ports = [80]
+
+[target_defaults.container_agent.access_flow_relay.routes.transport]
+kind = "unix"
+path = "/run/access-flow.sock"
+
+[targets.default]
+image = "ubuntu/dev"
+mode = "fixed"
+name = "default"
+
+[targets.default.container_agent]
+access_flow_execution_context = "internal"
+"#,
+    )
+    .unwrap();
+    config.validate().unwrap();
+    let target = config.effective_target("default").unwrap();
+    assert_eq!(
+        target
+            .container_agent
+            .access_flow_execution_context
+            .as_deref(),
+        Some("internal")
+    );
+    let relay = target.container_agent.access_flow_relay.unwrap();
+    assert_eq!(relay.setup_timeout, "2s");
+    assert_eq!(relay.routes.len(), 1);
+    assert_eq!(relay.routes[0].name, "http");
 }
 
 #[test]

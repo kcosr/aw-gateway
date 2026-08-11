@@ -238,6 +238,7 @@ async fn run_agent(prepared: PreparedAgent) -> anyhow::Result<()> {
         Some(tokio::spawn(run_relay_supervisor(
             config,
             presentation,
+            cfg.container_agent.access_flow_execution_context.clone(),
             services.clone(),
             state.clone(),
             control,
@@ -437,11 +438,12 @@ mod tests {
     };
     use crate::health_probe::{JsonFieldCheck, check_json_fields};
     #[cfg(target_os = "linux")]
-    use access_flow::write_access_flow_preface;
+    use access_flow::{
+        AccessFlowDestination, AccessFlowPreface, AccessFlowWireVersion, write_access_flow_preface,
+    };
     #[cfg(target_os = "linux")]
     use access_flow_conformance::{
-        FixturePresentationKind, NormalizedAccessFlowTransport, load_adapter_parity_fixture,
-        load_awaf_vector_suite, project_relay_plan,
+        NormalizedAccessFlowTransport, load_adapter_parity_fixture, project_relay_plan,
     };
     #[cfg(target_os = "linux")]
     use access_flow_unix::{NormalizedUnixSocketPath, UnixAccessFlowEndpoint};
@@ -490,6 +492,7 @@ mod tests {
     fn product_access_flow_relay_matches_shared_adapter_fixture() {
         let config = product_gateway_config();
         let target = config.effective_target("ubuntu-host-proxy").unwrap();
+        let execution_context = target.container_agent.access_flow_execution_context.clone();
         let relay = target.container_agent.access_flow_relay.unwrap();
         let AccessFlowRelayPresentation::BearerEnvironment { variable } = &relay.presentation
         else {
@@ -500,6 +503,7 @@ mod tests {
             .compile_with_presentation(
                 AccessFlowRelayValidationMode::Agent,
                 IdentityPresentation::Disabled,
+                execution_context.as_deref(),
             )
             .unwrap();
 
@@ -522,10 +526,23 @@ mod tests {
         let projected = project_relay_plan(&compiled.plan, compiled.drain_timeout, |endpoint| {
             normalize_product_endpoint(endpoint).unwrap()
         });
+        let fixture = load_adapter_parity_fixture().unwrap();
+        let expected = fixture.relay_plan();
         assert_eq!(
-            projected,
-            *load_adapter_parity_fixture().unwrap().relay_plan()
+            projected
+                .execution_context()
+                .map(access_execution_context::ExecutionContext::as_str),
+            Some("external")
         );
+        assert_eq!(
+            projected.copy_buffer_bytes_per_direction(),
+            expected.copy_buffer_bytes_per_direction()
+        );
+        assert_eq!(projected.drain_timeout(), expected.drain_timeout());
+        assert_eq!(projected.max_connections(), expected.max_connections());
+        assert_eq!(projected.presentation(), expected.presentation());
+        assert_eq!(projected.routes(), expected.routes());
+        assert_eq!(projected.setup_timeout(), expected.setup_timeout());
 
         let unknown_path = "/run/acl-proxy/unrecognized-sensitive-name.sock";
         let unknown =
@@ -539,118 +556,83 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn product_access_flow_wire_matches_shared_named_vectors() {
-        const IDENTITY_SOURCE: &str = "AW_IDENTITY_TOKEN";
-        const BEARER: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyzABCDEF";
-
+    async fn product_access_flow_writer_emits_v2_with_optional_plan_context() {
         let config = product_gateway_config();
         let target = config.effective_target("ubuntu-host-proxy").unwrap();
-        let suite = load_awaf_vector_suite().unwrap();
-        let adapter_fixture = load_adapter_parity_fixture().unwrap();
-        let vector_names = suite
-            .vectors()
-            .iter()
-            .map(|vector| vector.name())
-            .collect::<Vec<_>>();
-        let required_vector_names = adapter_fixture
-            .required_awaf_vectors()
-            .iter()
-            .map(AsRef::as_ref)
-            .collect::<Vec<_>>();
-        assert_eq!(vector_names, required_vector_names);
-        assert_eq!(
-            suite
-                .vectors()
-                .iter()
-                .map(|vector| vector.name())
-                .collect::<Vec<_>>(),
-            [
-                "absent",
-                "anonymous",
-                "bearer",
-                "unicast-before-multicast",
-                "reserved-after-multicast",
-                "high-unicast-before-broadcast",
-            ]
-        );
-
-        for vector in suite.vectors() {
-            let bearer_expected = vector.presentation() == FixturePresentationKind::Bearer;
-            let presentation_config = match vector.presentation() {
-                FixturePresentationKind::Disabled => AccessFlowRelayPresentation::Disabled {},
-                FixturePresentationKind::Anonymous => AccessFlowRelayPresentation::Anonymous {},
-                FixturePresentationKind::Bearer => AccessFlowRelayPresentation::BearerEnvironment {
-                    variable: IDENTITY_SOURCE.to_string(),
-                },
-            };
-            let mut agent_config = target.container_agent.clone();
-            agent_config
-                .access_flow_relay
-                .as_mut()
-                .unwrap()
-                .presentation = presentation_config;
-
-            let mut identity_requests = Vec::new();
-            let (presentation, service_identity) =
-                activate_identity_environment_with(&agent_config, |variable| {
-                    identity_requests.push(variable.to_string());
-                    assert!(bearer_expected);
-                    assert_eq!(variable, IDENTITY_SOURCE);
-                    Some(Zeroizing::new(BEARER.to_vec()))
-                })
-                .unwrap();
-            assert!(service_identity.is_none());
-            if bearer_expected {
-                assert_eq!(identity_requests, [IDENTITY_SOURCE]);
-            } else {
-                assert!(identity_requests.is_empty());
-            }
-
-            let relay = agent_config.access_flow_relay.unwrap();
-            let compiled = relay
-                .compile_with_presentation(
-                    AccessFlowRelayValidationMode::Agent,
-                    presentation.unwrap(),
-                )
-                .unwrap();
-            let matching_routes = compiled
-                .plan
-                .routes()
-                .iter()
-                .filter(|route| {
-                    route
-                        .allowed_destination_ports()
-                        .contains(&vector.destination().port())
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(
-                matching_routes.len(),
-                1,
-                "{} must map to one product route",
-                vector.name()
-            );
-            let mapped_destination = access_flow::AccessFlowDestination::new(
-                vector.destination().address(),
-                matching_routes[0]
-                    .allowed_destination_ports()
-                    .iter()
-                    .find(|port| **port == vector.destination().port())
-                    .expect("matching route contains the vector port")
-                    .get(),
+        let relay = target.container_agent.access_flow_relay.unwrap();
+        let with_context = relay
+            .compile_with_presentation(
+                AccessFlowRelayValidationMode::Agent,
+                IdentityPresentation::Disabled,
+                target
+                    .container_agent
+                    .access_flow_execution_context
+                    .as_deref(),
             )
             .unwrap();
-            assert_eq!(
-                mapped_destination,
-                vector.destination(),
-                "{}",
-                vector.name()
-            );
+        assert_eq!(with_context.plan.routes().len(), 2);
+        assert_eq!(
+            with_context
+                .plan
+                .execution_context()
+                .map(access_execution_context::ExecutionContext::as_str),
+            Some("external")
+        );
+
+        for route in with_context.plan.routes() {
+            let destination = AccessFlowDestination::new(
+                "192.0.2.1".parse().unwrap(),
+                route.allowed_destination_ports()[0].get(),
+            )
+            .unwrap();
             let mut wire = Zeroizing::new(Vec::<u8>::new());
-            write_access_flow_preface(&mut *wire, mapped_destination, compiled.plan.presentation())
-                .await
-                .unwrap();
-            assert_eq!(wire.as_slice(), vector.wire(), "vector {}", vector.name());
+            write_access_flow_preface(
+                &mut *wire,
+                destination,
+                with_context.plan.presentation(),
+                with_context.plan.execution_context(),
+            )
+            .await
+            .unwrap();
+            let decoded =
+                AccessFlowPreface::decode_exact(wire.as_slice(), route.allowed_destination_ports())
+                    .unwrap();
+            assert_eq!(decoded.wire_version(), AccessFlowWireVersion::Two);
+            assert_eq!(
+                decoded
+                    .execution_context()
+                    .map(access_execution_context::ExecutionContext::as_str),
+                Some("external")
+            );
         }
+
+        let without_context = relay
+            .compile_with_presentation(
+                AccessFlowRelayValidationMode::Agent,
+                IdentityPresentation::Disabled,
+                None,
+            )
+            .unwrap();
+        let route = &without_context.plan.routes()[0];
+        let destination = AccessFlowDestination::new(
+            "192.0.2.1".parse().unwrap(),
+            route.allowed_destination_ports()[0].get(),
+        )
+        .unwrap();
+        let mut wire = Zeroizing::new(Vec::<u8>::new());
+        write_access_flow_preface(
+            &mut *wire,
+            destination,
+            without_context.plan.presentation(),
+            without_context.plan.execution_context(),
+        )
+        .await
+        .unwrap();
+        let decoded =
+            AccessFlowPreface::decode_exact(wire.as_slice(), route.allowed_destination_ports())
+                .unwrap();
+        assert_eq!(decoded.wire_version(), AccessFlowWireVersion::Two);
+        assert!(decoded.execution_context().is_none());
     }
 
     fn identity_activation_config(

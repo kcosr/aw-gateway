@@ -22,6 +22,9 @@
 
 ### Added
 
+- Added an optional literal `container_agent.access_flow_execution_context`
+  scalar that overlays independently from relay configuration and is carried
+  plan-wide by updated container agents in AW Access Flow v2.
 - Added shared `system`, `custom`, `system_plus_custom`, and `insecure` TLS
   client trust modes for remote Access Flow routes.
 - Embedded the shared Access Flow relay in `aw-container-agent` behind strict

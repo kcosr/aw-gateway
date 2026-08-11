@@ -1378,6 +1378,7 @@ O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
                     access_identity::SensitiveBearer::new(b"abcdefghijklmnopqrstuvwxyzABCDEF")
                         .unwrap(),
                 ),
+                None,
             )
             .unwrap()
             .plan
@@ -1417,6 +1418,7 @@ O6IBKa79z07RBsJ3vyWrw6+ytc5B2vUiZTDhocxsDzNCyZPnHB1Iq7iIFwQ=
             access_identity::IdentityPresentation::Bearer(
                 access_identity::SensitiveBearer::new(b"abcdefghijklmnopqrstuvwxyzABCDEF").unwrap(),
             ),
+            None,
         )
         .unwrap()
         .plan

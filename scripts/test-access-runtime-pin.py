@@ -13,6 +13,7 @@ LOCK = ROOT / "Cargo.lock"
 RUNTIME_URL = "https://github.com/kcosr/access-runtime.git"
 PRODUCTION_NAMES = (
     "access-async-contracts",
+    "access-execution-context",
     "access-flow-relay",
     "access-flow-tls",
     "access-flow-unix",

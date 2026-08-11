@@ -8,6 +8,7 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use access_execution_context::ExecutionContext;
 use access_flow_relay::{
     AccessFlowRelayPlan, AccessFlowRelayPlanError, AccessFlowRoute, AccessFlowRouteName,
 };
@@ -31,6 +32,8 @@ pub struct ContainerAgentConfig {
     pub ssh_bridge: Option<SshBridgeConfig>,
     pub control_socket: Option<ControlSocketConfig>,
     pub idle_cleanup: Option<IdleCleanupConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_flow_execution_context: Option<String>,
     pub access_flow_relay: Option<AccessFlowRelayConfig>,
 }
 
@@ -42,6 +45,7 @@ impl Default for ContainerAgentConfig {
             ssh_bridge: None,
             control_socket: None,
             idle_cleanup: None,
+            access_flow_execution_context: None,
             access_flow_relay: None,
         }
     }
@@ -62,7 +66,10 @@ impl ContainerAgentConfig {
             bridge.validate_gateway()?;
         }
         if let Some(relay) = &self.access_flow_relay {
-            relay.validate(AccessFlowRelayValidationMode::Gateway)?;
+            relay.validate(
+                AccessFlowRelayValidationMode::Gateway,
+                self.access_flow_execution_context.as_deref(),
+            )?;
         }
         self.validate_common(ServiceUserTemplateMode::GatewayManaged)
     }
@@ -83,7 +90,10 @@ impl ContainerAgentConfig {
             )?;
         }
         if let Some(relay) = &self.access_flow_relay {
-            relay.validate(AccessFlowRelayValidationMode::Agent)?;
+            relay.validate(
+                AccessFlowRelayValidationMode::Agent,
+                self.access_flow_execution_context.as_deref(),
+            )?;
         }
         self.validate_common(ServiceUserTemplateMode::Literal)
     }
@@ -122,7 +132,17 @@ impl ContainerAgentConfig {
                     "container_agent.access_flow_relay requires container_agent.enabled = true"
                 );
             }
+            if self.access_flow_execution_context.is_some() {
+                anyhow::bail!(
+                    "container_agent.access_flow_execution_context requires container_agent.enabled = true"
+                );
+            }
             return Ok(());
+        }
+        if self.access_flow_execution_context.is_some() && self.access_flow_relay.is_none() {
+            anyhow::bail!(
+                "container_agent.access_flow_execution_context requires container_agent.access_flow_relay"
+            );
         }
         let mut names = BTreeSet::new();
         let presentation_source = self
@@ -242,6 +262,7 @@ pub struct ContainerAgentConfigInput {
     pub ssh_bridge: Option<SshBridgeConfigInput>,
     pub control_socket: Option<ControlSocketConfig>,
     pub idle_cleanup: Option<IdleCleanupConfigInput>,
+    pub access_flow_execution_context: Option<String>,
     pub access_flow_relay: Option<AccessFlowRelayConfig>,
 }
 
@@ -270,6 +291,9 @@ impl ContainerAgentConfigInput {
                     .overlay(idle_cleanup),
             );
         }
+        if let Some(access_flow_execution_context) = &later.access_flow_execution_context {
+            self.access_flow_execution_context = Some(access_flow_execution_context.clone());
+        }
         if let Some(access_flow_relay) = &later.access_flow_relay {
             self.access_flow_relay = Some(access_flow_relay.clone());
         }
@@ -286,6 +310,7 @@ impl ContainerAgentConfigInput {
                 .idle_cleanup
                 .map(IdleCleanupConfigInput::into_effective)
                 .transpose()?,
+            access_flow_execution_context: self.access_flow_execution_context,
             access_flow_relay: self.access_flow_relay,
         };
         cfg.validate_gateway()?;
@@ -328,7 +353,10 @@ impl ContainerAgentConfigInput {
             idle_cleanup.clone().into_effective()?;
         }
         if let Some(relay) = &self.access_flow_relay {
-            relay.validate(AccessFlowRelayValidationMode::Gateway)?;
+            relay.validate(
+                AccessFlowRelayValidationMode::Gateway,
+                self.access_flow_execution_context.as_deref(),
+            )?;
         }
         Ok(())
     }
@@ -563,23 +591,33 @@ pub struct AccessFlowRelayConfig {
 }
 
 impl AccessFlowRelayConfig {
-    fn validate(&self, mode: AccessFlowRelayValidationMode) -> anyhow::Result<()> {
+    fn validate(
+        &self,
+        mode: AccessFlowRelayValidationMode,
+        execution_context: Option<&str>,
+    ) -> anyhow::Result<()> {
         self.presentation.validate()?;
-        let _ = self.compile(mode)?;
+        let _ = self.compile(mode, execution_context)?;
         Ok(())
     }
 
     pub(crate) fn compile(
         &self,
         mode: AccessFlowRelayValidationMode,
+        execution_context: Option<&str>,
     ) -> anyhow::Result<CompiledAccessFlowRelayConfig> {
-        self.compile_with_presentation(mode, self.presentation.validation_value()?)
+        self.compile_with_presentation(
+            mode,
+            self.presentation.validation_value()?,
+            execution_context,
+        )
     }
 
     pub(crate) fn compile_with_presentation(
         &self,
         mode: AccessFlowRelayValidationMode,
         presentation: IdentityPresentation,
+        execution_context: Option<&str>,
     ) -> anyhow::Result<CompiledAccessFlowRelayConfig> {
         let has_tls_route = self
             .routes
@@ -647,9 +685,17 @@ impl AccessFlowRelayConfig {
                     .ok_or_else(|| anyhow::anyhow!("access flow TLS route count overflow"))?;
             }
         }
+        let execution_context = execution_context
+            .map(|value| {
+                ExecutionContext::new(value).context(
+                    "container_agent.access_flow_execution_context must match [a-z][a-z0-9_-]{0,63}",
+                )
+            })
+            .transpose()?;
         let plan = AccessFlowRelayPlan::new(
             routes,
             presentation,
+            execution_context,
             setup_timeout,
             max_connections,
             copy_buffer_bytes_per_direction,
