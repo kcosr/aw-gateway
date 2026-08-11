@@ -438,12 +438,17 @@ mod tests {
     };
     use crate::health_probe::{JsonFieldCheck, check_json_fields};
     #[cfg(target_os = "linux")]
+    use access_async_contracts::{AccessCancellation, BoxAccessFuture};
+    #[cfg(target_os = "linux")]
     use access_flow::{
-        AccessFlowDestination, AccessFlowPreface, AccessFlowWireVersion, write_access_flow_preface,
+        AccessFlowAcceptor, AccessFlowAdmission, AccessFlowAdmissionInput, AccessFlowIngressOrigin,
+        AccessFlowPreface, AccessFlowPresentationMode, AccessFlowWireVersion,
+        EstablishedAccessFlowChannel, write_access_flow_preface,
     };
     #[cfg(target_os = "linux")]
     use access_flow_conformance::{
-        NormalizedAccessFlowTransport, load_adapter_parity_fixture, project_relay_plan,
+        FixturePresentationKind, NormalizedAccessFlowTransport, load_adapter_parity_fixture,
+        load_awaf_vector_suite, project_relay_plan,
     };
     #[cfg(target_os = "linux")]
     use access_flow_unix::{NormalizedUnixSocketPath, UnixAccessFlowEndpoint};
@@ -462,6 +467,54 @@ mod tests {
     const CONFORMANCE_HTTP_ENDPOINT: &str = "/run/access-flow/conformance-http.sock";
     #[cfg(target_os = "linux")]
     const CONFORMANCE_HTTPS_ENDPOINT: &str = "/run/access-flow/conformance-https.sock";
+
+    #[cfg(target_os = "linux")]
+    struct NeverCancelled;
+
+    #[cfg(target_os = "linux")]
+    impl AccessCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+
+        fn cancelled(&self) -> BoxAccessFuture<'_, ()> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ExpectGoldenAdmission {
+        destination: access_flow::AccessFlowDestination,
+        presentation: FixturePresentationKind,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl AccessFlowAdmission<()> for ExpectGoldenAdmission {
+        type Facts = ();
+        type Error = std::convert::Infallible;
+
+        fn admit<'a>(
+            &'a self,
+            input: AccessFlowAdmissionInput<'a, ()>,
+        ) -> BoxAccessFuture<'a, Result<Self::Facts, Self::Error>> {
+            assert_eq!(input.destination, self.destination);
+            assert_eq!(
+                fixture_presentation_kind(input.presentation),
+                self.presentation
+            );
+            assert!(input.execution_context.is_none());
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fixture_presentation_kind(presentation: &IdentityPresentation) -> FixturePresentationKind {
+        match presentation {
+            IdentityPresentation::Disabled => FixturePresentationKind::Disabled,
+            IdentityPresentation::Anonymous => FixturePresentationKind::Anonymous,
+            IdentityPresentation::Bearer(_) => FixturePresentationKind::Bearer,
+        }
+    }
 
     #[cfg(target_os = "linux")]
     fn product_gateway_config() -> GatewayConfig {
@@ -556,83 +609,127 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn product_access_flow_writer_emits_v2_with_optional_plan_context() {
+    async fn product_access_flow_v1_acceptance_and_v2_writer_match_shared_goldens() {
         let config = product_gateway_config();
         let target = config.effective_target("ubuntu-host-proxy").unwrap();
         let relay = target.container_agent.access_flow_relay.unwrap();
-        let with_context = relay
-            .compile_with_presentation(
-                AccessFlowRelayValidationMode::Agent,
-                IdentityPresentation::Disabled,
-                target
-                    .container_agent
-                    .access_flow_execution_context
-                    .as_deref(),
-            )
-            .unwrap();
-        assert_eq!(with_context.plan.routes().len(), 2);
+        let suite = load_awaf_vector_suite().unwrap();
+        let fixture = load_adapter_parity_fixture().unwrap();
         assert_eq!(
-            with_context
-                .plan
-                .execution_context()
-                .map(access_execution_context::ExecutionContext::as_str),
-            Some("external")
+            suite
+                .vectors()
+                .iter()
+                .map(|vector| vector.name())
+                .collect::<Vec<_>>(),
+            fixture
+                .required_awaf_vectors()
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<_>>()
         );
 
-        for route in with_context.plan.routes() {
-            let destination = AccessFlowDestination::new(
-                "192.0.2.1".parse().unwrap(),
-                route.allowed_destination_ports()[0].get(),
-            )
-            .unwrap();
-            let mut wire = Zeroizing::new(Vec::<u8>::new());
-            write_access_flow_preface(
-                &mut *wire,
-                destination,
-                with_context.plan.presentation(),
-                with_context.plan.execution_context(),
-            )
-            .await
-            .unwrap();
-            let decoded =
-                AccessFlowPreface::decode_exact(wire.as_slice(), route.allowed_destination_ports())
+        for vector in suite.vectors() {
+            match vector.wire_version() {
+                AccessFlowWireVersion::One => {
+                    let decoded = AccessFlowPreface::decode_exact(
+                        vector.wire(),
+                        vector.allowed_destination_ports(),
+                    )
                     .unwrap();
-            assert_eq!(decoded.wire_version(), AccessFlowWireVersion::Two);
-            assert_eq!(
-                decoded
-                    .execution_context()
-                    .map(access_execution_context::ExecutionContext::as_str),
-                Some("external")
-            );
-        }
+                    assert_eq!(decoded.wire_version(), AccessFlowWireVersion::One);
+                    assert_eq!(decoded.destination(), vector.destination());
+                    assert_eq!(
+                        fixture_presentation_kind(decoded.presentation()),
+                        vector.presentation()
+                    );
+                    assert!(decoded.execution_context().is_none());
 
-        let without_context = relay
-            .compile_with_presentation(
-                AccessFlowRelayValidationMode::Agent,
-                IdentityPresentation::Disabled,
-                None,
-            )
-            .unwrap();
-        let route = &without_context.plan.routes()[0];
-        let destination = AccessFlowDestination::new(
-            "192.0.2.1".parse().unwrap(),
-            route.allowed_destination_ports()[0].get(),
-        )
-        .unwrap();
-        let mut wire = Zeroizing::new(Vec::<u8>::new());
-        write_access_flow_preface(
-            &mut *wire,
-            destination,
-            without_context.plan.presentation(),
-            without_context.plan.execution_context(),
-        )
-        .await
-        .unwrap();
-        let decoded =
-            AccessFlowPreface::decode_exact(wire.as_slice(), route.allowed_destination_ports())
-                .unwrap();
-        assert_eq!(decoded.wire_version(), AccessFlowWireVersion::Two);
-        assert!(decoded.execution_context().is_none());
+                    let mode = match vector.presentation() {
+                        FixturePresentationKind::Disabled => AccessFlowPresentationMode::Disabled,
+                        FixturePresentationKind::Anonymous => AccessFlowPresentationMode::Optional,
+                        FixturePresentationKind::Bearer => AccessFlowPresentationMode::Required,
+                    };
+                    let acceptor = AccessFlowAcceptor::new(
+                        mode,
+                        vector.allowed_destination_ports().iter().copied(),
+                    )
+                    .unwrap();
+                    let (mut client, server) = tokio::io::duplex(vector.wire().len());
+                    client.write_all(vector.wire()).await.unwrap();
+                    let accepted = acceptor
+                        .accept(
+                            EstablishedAccessFlowChannel::new(
+                                server,
+                                (),
+                                AccessFlowIngressOrigin::LocalWorkstation,
+                            ),
+                            std::time::Instant::now() + Duration::from_secs(1),
+                            &NeverCancelled,
+                            &ExpectGoldenAdmission {
+                                destination: vector.destination(),
+                                presentation: vector.presentation(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(accepted.destination(), vector.destination());
+                    assert!(accepted.execution_context().is_none());
+                }
+                AccessFlowWireVersion::Two => {
+                    let execution_context = match vector.name() {
+                        "v2-absent-context" => None,
+                        "v2-internal-context" => Some("internal"),
+                        name => panic!("unreviewed required AWAF v2 vector: {name}"),
+                    };
+                    assert_eq!(vector.presentation(), FixturePresentationKind::Disabled);
+                    assert_eq!(
+                        vector
+                            .execution_context()
+                            .map(access_execution_context::ExecutionContext::as_str),
+                        execution_context
+                    );
+                    let compiled = relay
+                        .compile_with_presentation(
+                            AccessFlowRelayValidationMode::Agent,
+                            IdentityPresentation::Disabled,
+                            execution_context,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        compiled
+                            .plan
+                            .execution_context()
+                            .map(access_execution_context::ExecutionContext::as_str),
+                        execution_context
+                    );
+                    let route = compiled
+                        .plan
+                        .routes()
+                        .iter()
+                        .find(|route| {
+                            route
+                                .allowed_destination_ports()
+                                .contains(&vector.destination().port())
+                        })
+                        .expect("product relay must carry the golden destination port");
+                    let mut wire = Zeroizing::new(Vec::<u8>::new());
+                    write_access_flow_preface(
+                        &mut *wire,
+                        vector.destination(),
+                        compiled.plan.presentation(),
+                        compiled.plan.execution_context(),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(wire.as_slice(), vector.wire(), "vector {}", vector.name());
+                    assert!(
+                        route
+                            .allowed_destination_ports()
+                            .contains(&vector.destination().port())
+                    );
+                }
+            }
+        }
     }
 
     fn identity_activation_config(
