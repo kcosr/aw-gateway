@@ -267,7 +267,7 @@ fn disable_default_container_agent(cfg: &mut GatewayConfig) {
         ssh_bridge: None,
         control_socket: None,
         idle_cleanup: None,
-
+        access_flow_execution_context: None,
         access_flow_relay: None,
     });
 }
@@ -284,7 +284,7 @@ fn enable_default_ssh_bridge(cfg: &mut GatewayConfig) {
         }),
         control_socket: None,
         idle_cleanup: None,
-
+        access_flow_execution_context: None,
         access_flow_relay: None,
     });
 }
@@ -336,7 +336,7 @@ fn enable_default_agent_services(cfg: &mut GatewayConfig) {
         }),
         control_socket: None,
         idle_cleanup: None,
-
+        access_flow_execution_context: None,
         access_flow_relay: None,
     });
 }
@@ -351,7 +351,7 @@ fn configure_apple_published_port_target(cfg: &mut GatewayConfig) {
         ssh_bridge: None,
         control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
         idle_cleanup: None,
-
+        access_flow_execution_context: None,
         access_flow_relay: None,
     });
     cfg.targets.get_mut("default").unwrap().local_ssh = Some(crate::config::LocalSshConfigInput {
@@ -373,7 +373,7 @@ fn configure_direct_published_port_target(
         ssh_bridge: None,
         control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
         idle_cleanup: None,
-
+        access_flow_execution_context: None,
         access_flow_relay: None,
     });
     cfg.targets.get_mut("default").unwrap().local_ssh = Some(crate::config::LocalSshConfigInput {
@@ -3052,7 +3052,7 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
-
+            access_flow_execution_context: None,
             access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
@@ -3102,7 +3102,7 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
-
+            access_flow_execution_context: None,
             access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
@@ -3184,7 +3184,7 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
-
+            access_flow_execution_context: None,
             access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
@@ -3239,7 +3239,7 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
-
+            access_flow_execution_context: None,
             access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
@@ -3559,7 +3559,7 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
-
+            access_flow_execution_context: None,
             access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
@@ -3613,7 +3613,7 @@ exit 0
             ssh_bridge: None,
             control_socket: Some(crate::config::ControlSocketConfig::Enabled(false)),
             idle_cleanup: None,
-
+            access_flow_execution_context: None,
             access_flow_relay: None,
         });
         cfg.targets.get_mut("default").unwrap().local_ssh =
@@ -6013,7 +6013,7 @@ async fn typed_agent_status_ready_drives_wait_and_runtime_status() {
             ssh_bridge: None,
             control_socket: None,
             idle_cleanup: None,
-
+            access_flow_execution_context: None,
             access_flow_relay: None,
         });
     });
@@ -6045,7 +6045,7 @@ async fn malformed_typed_agent_status_is_agent_unavailable() {
             ssh_bridge: None,
             control_socket: None,
             idle_cleanup: None,
-
+            access_flow_execution_context: None,
             access_flow_relay: None,
         });
     });
@@ -6188,6 +6188,7 @@ fn service_only_parent_presentation_inherits_identity_token_without_relay() {
 
     std::fs::create_dir_all(&runtime.paths.container_state_dir).unwrap();
     let agent_config_path = runtime.write_container_agent_config().unwrap();
+    assert_file_mode(&agent_config_path, 0o600);
     let agent_config = std::fs::read_to_string(agent_config_path).unwrap();
     assert!(agent_config.contains("inherit = \"AW_IDENTITY_TOKEN\""));
     assert!(!agent_config.contains("bearer_environment"));
@@ -6227,6 +6228,7 @@ fn bearer_relay_injects_host_identity_only_under_configured_source() {
             variable: "AW_ACCESS_FLOW_TEST_TOKEN".into(),
         },
     ));
+    target.container_agent.access_flow_execution_context = Some("internal".into());
     let container_runtime =
         ContainerRuntime::from_config(&cfg.runtime, "alice", Path::new("/home/alice")).unwrap();
     let container_state_dir = dir
@@ -6236,10 +6238,20 @@ fn bearer_relay_injects_host_identity_only_under_configured_source() {
 
     std::fs::create_dir_all(&runtime.paths.container_state_dir).unwrap();
     let agent_config_path = runtime.write_container_agent_config().unwrap();
+    assert_file_mode(&agent_config_path, 0o600);
     let agent_config = std::fs::read_to_string(agent_config_path).unwrap();
     assert!(agent_config.contains("kind = \"bearer_environment\""));
     assert!(agent_config.contains("variable = \"AW_ACCESS_FLOW_TEST_TOKEN\""));
+    assert!(agent_config.contains("access_flow_execution_context = \"internal\""));
     assert!(!agent_config.contains("abcdefghijklmnopqrstuvwxyzABCDEF"));
+    let parsed: crate::config::ContainerAgentFile = toml::from_str(&agent_config).unwrap();
+    assert_eq!(
+        parsed
+            .container_agent
+            .access_flow_execution_context
+            .as_deref(),
+        Some("internal")
+    );
 
     let spec = runtime
         .container_run_spec(Some("abcdefghijklmnopqrstuvwxyzABCDEF"), None)
@@ -6251,6 +6263,8 @@ fn bearer_relay_injects_host_identity_only_under_configured_source() {
         env.get("AW_ACCESS_FLOW_TEST_TOKEN").map(String::as_str),
         Some("abcdefghijklmnopqrstuvwxyzABCDEF")
     );
+    assert!(!env.contains_key("access_flow_execution_context"));
+    assert!(!env.contains_key("AW_ACCESS_FLOW_EXECUTION_CONTEXT"));
     assert!(!env.contains_key("AW_IDENTITY_TOKEN"));
     assert!(args.contains(&"AW_ACCESS_FLOW_TEST_TOKEN".to_string()));
     assert!(
